@@ -254,6 +254,7 @@ the whole pipeline.
 | Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` · `GET /api/public-renders/{token}/meta` — **unauthenticated**, token-gated; backs the branded `/share/{token}` landing page so a finished video can be shared without exposing the app login |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
 | Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |
+| System | `GET /api/system/info` — non-secret deployment overview (version, mock flag, ffmpeg availability, configured model ids, key-presence booleans, entity counts); backs the **Settings & Status** page |
 
 All routes except `GET /api/public-assets/{token}` and `/health` are gated by the MVP
 password cookie.

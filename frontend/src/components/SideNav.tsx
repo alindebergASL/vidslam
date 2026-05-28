@@ -9,6 +9,7 @@ const items = [
   { href: "/projects", label: "Projects", icon: "▷" },
   { href: "/cast", label: "Cast", icon: "☺" },
   { href: "/brand", label: "Brand", icon: "◆" },
+  { href: "/settings", label: "Settings", icon: "⚙" },
 ];
 
 export function SideNav() {

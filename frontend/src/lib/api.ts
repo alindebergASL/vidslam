@@ -71,6 +71,31 @@ export type Ingredient = {
   assets: Asset[];
 };
 
+export type SystemInfo = {
+  version: string;
+  mock_providers: boolean;
+  ffmpeg_available: boolean;
+  ffprobe_available: boolean;
+  data_dir: string;
+  public_base_url: string;
+  redis_configured: boolean;
+  keys: { openrouter: boolean; elevenlabs: boolean };
+  models: {
+    chat: string | null;
+    image: string | null;
+    video: string | null;
+    tts: string | null;
+    music: string | null;
+  };
+  counts: {
+    avatars: number;
+    ingredients: number;
+    brand_kits: number;
+    projects: number;
+    renders: number;
+  };
+};
+
 export type BrandKit = {
   id: number;
   name: string;
@@ -243,6 +268,7 @@ export const api = {
         latency_ms?: number;
       }[];
     }>("/api/providers/health-check", { method: "POST" }),
+  systemInfo: () => req<SystemInfo>("/api/system/info"),
 
   // avatars
   listAvatars: () => req<Avatar[]>("/api/avatars"),
