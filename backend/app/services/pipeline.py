@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -11,7 +10,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..config import get_settings
 from ..providers import get_chat, get_tts, get_video
-from ..providers.base import CastContext, ImageRef, SubmittedJob
+from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
 from . import storage
 from .captions import chunks_to_timed

@@ -35,5 +35,9 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP", "B"]
-ignore = ["E501"]
+# Errors, pyflakes, imports, warnings, bugbear. pyupgrade (UP) is intentionally
+# omitted — the codebase uses explicit typing.Optional/List style on purpose.
+select = ["E", "F", "I", "W", "B"]
+# E501: long lines handled by formatter. B008: FastAPI relies on Depends()/File()
+# as default-argument calls, which is the intended pattern.
+ignore = ["E501", "B008"]

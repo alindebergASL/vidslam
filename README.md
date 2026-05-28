@@ -295,6 +295,13 @@ smoke script — it exits non-zero on any failure, so it's CI/deploy-gate ready:
 cd backend && PYTHONPATH=. python -m scripts.smoke   # or: make smoke
 ```
 
+### CI
+
+`.github/workflows/ci.yml` runs on every push/PR: a **backend** job (ruff lint
+→ `pytest` → `python -m scripts.smoke`, with ffmpeg installed) and a
+**frontend** job (`npm run build`, which type-checks). Both run fully mocked, so
+no provider secrets are needed in CI.
+
 ---
 
 ## Deploying to EC2

@@ -16,7 +16,6 @@ from PIL import Image, ImageDraw, ImageFont
 from . import models
 from .config import get_settings
 from .db import SessionLocal, init_db
-from .services import storage
 
 log = logging.getLogger("avs.seed")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")

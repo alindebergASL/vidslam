@@ -32,7 +32,7 @@ class MockTTSProvider(TTSProvider):
             out = Path(td) / "voice.m4a"
             cmd = [
                 "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 "-t", str(seconds),
                 "-c:a", "aac", "-b:a", "128k",
                 str(out),

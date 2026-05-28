@@ -4,9 +4,8 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import get_settings

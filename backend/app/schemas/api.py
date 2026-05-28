@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .storyboard import StoryboardPlan
 
-
 # --- Avatars ---
 
 

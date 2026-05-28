@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -11,8 +12,6 @@ from ..db import get_db
 from ..schemas import ProjectStatusOut, RenderOut, ShotOut
 from ..services.preflight import run_preflight
 from ..services.safety import UnsafeScriptError, validate_script
-from pydantic import BaseModel
-
 from ..workers.jobs import (
     generate_plan_job,
     generate_video_job,

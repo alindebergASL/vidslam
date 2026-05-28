@@ -7,7 +7,6 @@ from pathlib import Path
 
 from .base import ModelInfo, MusicProvider
 
-
 # Twelve-tone equal temperament from A2 (110 Hz) so prompts hash to a key.
 _BASE_FREQUENCIES = [110.0 * (2 ** (i / 12)) for i in range(12)]
 

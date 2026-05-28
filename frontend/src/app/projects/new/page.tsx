@@ -93,6 +93,7 @@ function Inner() {
   const [script, setScript] = useState("");
   const [mode, setMode] = useState("reel_montage");
   const [duration, setDuration] = useState(25);
+  const [aspectRatio, setAspectRatio] = useState("9:16");
   const [cta, setCta] = useState("");
   const [captionStyle, setCaptionStyle] = useState("clean_white");
   const [disclosure, setDisclosure] = useState(true);
@@ -192,6 +193,7 @@ function Inner() {
         original_script: script,
         mode,
         target_duration_seconds: duration,
+        aspect_ratio: aspectRatio,
         cta_text: cta,
         caption_style: captionStyle,
         include_disclosure: disclosure,
@@ -353,6 +355,25 @@ function Inner() {
                 className="w-full"
               />
               <div className="text-sm">{duration}s</div>
+            </div>
+            <div>
+              <label className="label">Aspect ratio</label>
+              <div className="flex gap-2">
+                {[
+                  { id: "9:16", label: "9:16 Vertical" },
+                  { id: "1:1", label: "1:1 Square" },
+                  { id: "16:9", label: "16:9 Wide" },
+                ].map((a) => (
+                  <button
+                    key={a.id}
+                    type="button"
+                    onClick={() => setAspectRatio(a.id)}
+                    className={clsx("chip text-xs", aspectRatio === a.id && "chip-active")}
+                  >
+                    {a.label}
+                  </button>
+                ))}
+              </div>
             </div>
             <div>
               <label className="label">Caption style</label>
