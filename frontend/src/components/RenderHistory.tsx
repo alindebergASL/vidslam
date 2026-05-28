@@ -18,13 +18,26 @@ export function RenderHistory({ projectId }: { projectId: number }) {
     return null;
   }
 
+  const completedCount = renders.filter((r) => r.status === "completed").length;
+
   return (
     <section className="mb-6">
-      <div className="flex items-baseline justify-between mb-3">
+      <div className="flex items-baseline justify-between mb-3 gap-3">
         <h2 className="text-lg font-medium">Renders</h2>
-        <span className="text-xs text-ink-400">
-          A new version is created every time you re-compose or regenerate a shot.
-        </span>
+        <div className="flex items-baseline gap-3">
+          <span className="text-xs text-ink-400 hidden sm:inline">
+            A new version is created every time you re-compose or regenerate a shot.
+          </span>
+          {completedCount > 0 && (
+            <a
+              href={api.exportRendersUrl(projectId)}
+              className="btn-ghost text-xs whitespace-nowrap"
+              title="Download every completed render (MP4 + thumbnail) as a zip"
+            >
+              Export all ({completedCount})
+            </a>
+          )}
+        </div>
       </div>
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
         {renders.map((r, idx) => {

@@ -229,6 +229,8 @@ export const api = {
   studioPreview: (jobId: number) => `${API_BASE}/api/studio/jobs/${jobId}/preview`,
   renderDownload: (id: number) => `${API_BASE}/api/renders/${id}/download`,
   renderThumb: (id: number) => `${API_BASE}/api/renders/${id}/thumbnail`,
+  exportRendersUrl: (projectId: number) =>
+    `${API_BASE}/api/projects/${projectId}/renders/export`,
   shotClip: (projectId: number, shotId: number) =>
     `${API_BASE}/api/projects/${projectId}/shots/${shotId}/clip`,
   publicRender: (token: string) => `${API_BASE}/api/public-renders/${token}`,

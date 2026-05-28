@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
+import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from slugify import slugify
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -217,6 +220,38 @@ def list_renders(project_id: int, db: Session = Depends(get_db)) -> list[models.
         .order_by(models.Render.created_at.desc())
         .all()
     )
+
+
+@router.get("/projects/{project_id}/renders/export")
+def export_renders(project_id: int, db: Session = Depends(get_db)) -> StreamingResponse:
+    """Bundle every completed render's MP4 (+ thumbnail) for a project into a
+    single downloadable zip, newest version first."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    renders = (
+        db.query(models.Render)
+        .filter(models.Render.project_id == project_id, models.Render.status == "completed")
+        .order_by(models.Render.created_at.desc())
+        .all()
+    )
+    completed = [r for r in renders if r.final_video_path and Path(r.final_video_path).exists()]
+    if not completed:
+        raise HTTPException(404, "no completed renders to export")
+
+    slug = slugify(project.title or f"project-{project_id}") or f"project-{project_id}"
+    buf = io.BytesIO()
+    total = len(completed)
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for idx, r in enumerate(completed):
+            version = total - idx  # newest = highest version number
+            base = f"{slug}_v{version}"
+            zf.write(r.final_video_path, arcname=f"{base}.mp4")
+            if r.thumbnail_path and Path(r.thumbnail_path).exists():
+                zf.write(r.thumbnail_path, arcname=f"{base}.jpg")
+    buf.seek(0)
+    headers = {"Content-Disposition": f'attachment; filename="{slug}_renders.zip"'}
+    return StreamingResponse(buf, media_type="application/zip", headers=headers)
 
 
 @router.get("/renders/{render_id}", response_model=RenderOut)
