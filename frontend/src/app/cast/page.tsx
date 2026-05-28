@@ -278,6 +278,13 @@ function DetailDrawer({
   const [assetType, setAssetType] = useState(kind === "avatar" ? "hero" : "hero");
   const [rights, setRights] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [voices, setVoices] = useState<{ voice_id: string; name: string }[]>([]);
+
+  useEffect(() => {
+    if (kind === "avatar") {
+      api.voices().then(setVoices).catch(() => setVoices([]));
+    }
+  }, [kind, id]);
 
   const reload = async () => {
     if (kind === "avatar") setEntity(await api.getAvatar(id));
@@ -360,6 +367,39 @@ function DetailDrawer({
           </div>
           {error && <div className="text-xs text-accent">{error}</div>}
         </div>
+
+        {kind === "avatar" && (
+          <div className="card p-4 mb-4 space-y-3">
+            <div className="label">Voice</div>
+            <div className="flex items-center gap-2">
+              <select
+                className="input flex-1"
+                value={(entity as Avatar).elevenlabs_voice_id || ""}
+                onChange={async (e) => {
+                  const next = e.target.value;
+                  const updated = await api.updateAvatar(id, {
+                    elevenlabs_voice_id: next,
+                    default_voice_provider: next ? "elevenlabs" : "mock",
+                  });
+                  setEntity(updated);
+                  onChange();
+                }}
+              >
+                <option value="">— No specific voice (use TTS default) —</option>
+                {voices.map((v) => (
+                  <option key={v.voice_id} value={v.voice_id}>
+                    {v.name} ({v.voice_id.slice(0, 8)}…)
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="text-[10px] text-ink-400">
+              {voices.length === 0
+                ? "Mock TTS only — set ELEVENLABS_API_KEY to pick a real voice."
+                : `${voices.length} voice${voices.length === 1 ? "" : "s"} available from the configured TTS provider.`}
+            </div>
+          </div>
+        )}
 
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
           {(entity as any).assets.map((a: Asset) => (

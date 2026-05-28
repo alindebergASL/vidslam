@@ -187,6 +187,7 @@ export const api = {
   imageModels: () => req<{ id: string; name: string; description: string }[]>(
     "/api/providers/openrouter/image-models"
   ),
+  voices: () => req<{ voice_id: string; name: string }[]>("/api/providers/elevenlabs/voices"),
   captionStyles: () => req<string[]>("/api/providers/caption-styles"),
 
   // avatars

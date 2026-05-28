@@ -338,6 +338,21 @@ function PromptBar({
   const [prompt, setPrompt] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [imageModels, setImageModels] = useState<{ id: string; name: string }[]>([]);
+  const [videoModels, setVideoModels] = useState<{ id: string; name: string }[]>([]);
+  const [model, setModel] = useState<string>("");
+
+  useEffect(() => {
+    api.imageModels().then(setImageModels).catch(() => setImageModels([]));
+    api.videoModels().then(setVideoModels).catch(() => setVideoModels([]));
+  }, []);
+
+  const currentModels = outputKind === "image" ? imageModels : videoModels;
+  useEffect(() => {
+    // Reset to default when switching output kind so we don't carry a video
+    // model into an image generation request.
+    setModel(currentModels[0]?.id || "");
+  }, [outputKind, imageModels, videoModels]);
 
   const submit = async () => {
     if (!prompt.trim()) return;
@@ -382,6 +397,7 @@ function PromptBar({
         owner_id,
         prompt,
         reference_asset_ids: selectedRefs,
+        ...(model ? { model } : {}),
       };
       const job =
         outputKind === "image"
@@ -417,6 +433,20 @@ function PromptBar({
           >
             {outputKind === "image" ? "Image" : "Video · 5s"}
           </button>
+          {currentModels.length > 0 && (
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="chip text-xs bg-ink-800 max-w-[180px] truncate"
+              title="Provider model"
+            >
+              {currentModels.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name || m.id}
+                </option>
+              ))}
+            </select>
+          )}
           <input
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}

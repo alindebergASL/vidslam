@@ -50,6 +50,15 @@ def test_studio_clip_job_completes_in_mock(auth_client):
     assert j["output_kind"] == "video_clip"
 
 
+def test_elevenlabs_voices_returns_mock_in_mock_mode(auth_client):
+    r = auth_client.get("/api/providers/elevenlabs/voices")
+    assert r.status_code == 200
+    voices = r.json()
+    assert isinstance(voices, list)
+    assert len(voices) >= 1
+    assert "voice_id" in voices[0] and "name" in voices[0]
+
+
 def test_provider_status_endpoint(auth_client):
     r = auth_client.get("/api/providers/status")
     assert r.status_code == 200

@@ -41,3 +41,18 @@ def caption_styles() -> list[str]:
     from ..services.captions import available_styles
 
     return available_styles()
+
+
+@router.get("/elevenlabs/voices")
+def elevenlabs_voices() -> list[dict]:
+    """Return the configured TTS provider's available voices.
+
+    In MOCK_PROVIDERS mode this returns the mock provider's single voice;
+    when ElevenLabs is configured it fetches the live `/v1/voices` list.
+    Frontend uses this to populate the per-avatar voice picker."""
+    from ..providers import get_tts
+
+    try:
+        return get_tts().list_voices()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"failed to list voices: {e}") from e
