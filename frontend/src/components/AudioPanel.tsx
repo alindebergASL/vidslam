@@ -12,8 +12,24 @@ export function AudioPanel({
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [musicTab, setMusicTab] = useState<"generate" | "upload">("generate");
+  const [musicPrompt, setMusicPrompt] = useState("");
   const voiceInput = useRef<HTMLInputElement>(null);
   const musicInput = useRef<HTMLInputElement>(null);
+
+  const generateMusic = async () => {
+    if (!musicPrompt.trim()) return;
+    setBusy("music");
+    setError(null);
+    try {
+      const next = await api.generateMusic(project.id, musicPrompt.trim());
+      onChange(next);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const setSource = async (src: "tts" | "upload" | "silent") => {
     setError(null);
@@ -137,35 +153,69 @@ export function AudioPanel({
 
         <div>
           <div className="label">Background music</div>
-          <div className="flex flex-wrap gap-2 mb-2">
-            {project.music_upload_path ? (
-              <>
-                <span className="chip chip-active">Music attached</span>
+
+          <div className="flex gap-2 mb-3">
+            <button
+              onClick={() => setMusicTab("generate")}
+              className={clsx("chip", musicTab === "generate" && "chip-active")}
+              disabled={busy === "music"}
+            >
+              Generate from prompt
+            </button>
+            <button
+              onClick={() => setMusicTab("upload")}
+              className={clsx("chip", musicTab === "upload" && "chip-active")}
+              disabled={busy === "music"}
+            >
+              Upload file
+            </button>
+          </div>
+
+          {musicTab === "generate" ? (
+            <div className="space-y-2">
+              <textarea
+                className="input min-h-[64px] text-sm"
+                placeholder='e.g. "warm cinematic lo-fi with mellow piano, 80 bpm"'
+                value={musicPrompt}
+                onChange={(e) => setMusicPrompt(e.target.value)}
+              />
+              <div className="flex items-center gap-2">
                 <button
-                  className="btn-ghost text-xs"
-                  onClick={removeMusic}
-                  disabled={busy === "music"}
+                  className="btn-primary text-xs disabled:opacity-50"
+                  onClick={generateMusic}
+                  disabled={busy === "music" || !musicPrompt.trim()}
                 >
-                  Remove
+                  {busy === "music" ? "Generating…" : "Generate music →"}
                 </button>
+                <span className="text-[10px] text-ink-400">
+                  ~{project.target_duration_seconds}s, matches video length
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {project.music_upload_path ? (
+                <>
+                  <button
+                    className="btn-ghost text-xs"
+                    onClick={() => musicInput.current?.click()}
+                    disabled={busy === "music"}
+                  >
+                    Replace
+                  </button>
+                </>
+              ) : (
                 <button
                   className="btn-ghost text-xs"
                   onClick={() => musicInput.current?.click()}
                   disabled={busy === "music"}
                 >
-                  Replace
+                  + Upload music track
                 </button>
-              </>
-            ) : (
-              <button
-                className="btn-ghost text-xs"
-                onClick={() => musicInput.current?.click()}
-                disabled={busy === "music"}
-              >
-                + Upload music track
-              </button>
-            )}
-          </div>
+              )}
+            </div>
+          )}
+
           <input
             ref={musicInput}
             type="file"
@@ -173,13 +223,23 @@ export function AudioPanel({
             accept="audio/mpeg,audio/mp3,audio/mp4,audio/m4a,audio/x-m4a,audio/aac,audio/wav,audio/x-wav"
             onChange={(e) => e.target.files && handleMusic(e.target.files[0])}
           />
-          {project.music_upload_path && (
-            <>
-              <audio
-                controls
-                src={api.musicUrl(project.id)}
-                className="w-full h-8 max-w-full mt-1"
-              />
+
+          {project.music_upload_path ? (
+            <div className="mt-3">
+              <div className="flex items-center gap-2">
+                <audio
+                  controls
+                  src={api.musicUrl(project.id)}
+                  className="flex-1 h-8 max-w-full"
+                />
+                <button
+                  className="btn-ghost text-xs"
+                  onClick={removeMusic}
+                  disabled={busy === "music"}
+                >
+                  Remove
+                </button>
+              </div>
               <div className="mt-3">
                 <label className="label">
                   Music volume under voice ({Math.round((project.music_volume || 0.25) * 100)}%)
@@ -194,10 +254,9 @@ export function AudioPanel({
                   className="w-full"
                 />
               </div>
-            </>
-          )}
-          {!project.music_upload_path && (
-            <div className="text-xs text-ink-400">
+            </div>
+          ) : (
+            <div className="text-xs text-ink-400 mt-2">
               Music auto-loops to cover the full video and ducks under the voiceover.
             </div>
           )}

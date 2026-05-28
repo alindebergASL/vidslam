@@ -6,11 +6,13 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+from pydantic import BaseModel
+
 from .. import models
 from ..config import get_settings
 from ..db import get_db
 from ..schemas import ProjectOut
-from ..services import storage
+from ..services import pipeline, storage
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -139,3 +141,32 @@ def stream_music(project_id: int, db: Session = Depends(get_db)) -> FileResponse
     if not path.exists():
         raise HTTPException(404, "music file missing")
     return FileResponse(path)
+
+
+class MusicGenerateIn(BaseModel):
+    prompt: str
+    duration_seconds: float | None = None
+
+
+@router.post("/projects/{project_id}/music/generate", response_model=ProjectOut)
+def generate_music(
+    project_id: int,
+    body: MusicGenerateIn,
+    db: Session = Depends(get_db),
+) -> models.VideoProject:
+    """Synchronously generate a music bed from a prompt via the MusicProvider
+    and attach it to the project. The mock provider returns a deterministic
+    triad pad; the real ElevenLabs adapter calls /v1/music."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    try:
+        pipeline.generate_music_for_project(
+            db, project_id, prompt=body.prompt, duration_seconds=body.duration_seconds
+        )
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(502, f"music provider failed: {e}") from e
+    db.refresh(project)
+    return project

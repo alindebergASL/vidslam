@@ -61,6 +61,7 @@ def test_provider_status_endpoint(auth_client):
         "image": "mock",
         "video": "mock",
         "tts": "mock",
+        "music": "mock",
     }
 
 

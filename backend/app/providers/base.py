@@ -101,3 +101,21 @@ class TTSProvider(Protocol):
     ) -> bytes: ...
 
     def list_voices(self) -> list[dict]: ...
+
+
+class MusicProvider(Protocol):
+    def generate(
+        self,
+        *,
+        prompt: str,
+        duration_seconds: float,
+        settings: dict | None = None,
+    ) -> bytes:
+        """Synchronous music generation: returns audio bytes (mp3 or m4a)."""
+        ...
+
+    def output_extension(self) -> str:
+        """Return the file extension produced by `generate` (e.g. 'mp3')."""
+        ...
+
+    def list_models(self) -> list[ModelInfo]: ...

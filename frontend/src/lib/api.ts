@@ -303,6 +303,11 @@ export const api = {
   },
   deleteMusic: (id: number) =>
     req<Project>(`/api/projects/${id}/music`, { method: "DELETE" }),
+  generateMusic: (id: number, prompt: string, duration_seconds?: number) =>
+    req<Project>(`/api/projects/${id}/music/generate`, {
+      method: "POST",
+      body: JSON.stringify({ prompt, duration_seconds }),
+    }),
   generatePlan: (id: number) =>
     req<any>(`/api/projects/${id}/generate-plan`, { method: "POST" }),
   preflight: (id: number) =>

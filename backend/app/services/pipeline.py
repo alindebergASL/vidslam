@@ -341,6 +341,69 @@ def _music_path_if_any(project: models.VideoProject) -> Optional[Path]:
     return p if p and p.exists() else None
 
 
+def generate_music_for_project(
+    db: Session,
+    project_id: int,
+    *,
+    prompt: str,
+    duration_seconds: Optional[float] = None,
+) -> Path:
+    """Generate a music bed via the MusicProvider and save it as the project's
+    music_upload_path. Returns the saved file path. Overwrites any prior music."""
+    from ..providers import get_music
+
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise ValueError(f"project {project_id} not found")
+    if not prompt or not prompt.strip():
+        raise ValueError("music prompt is empty")
+
+    music = get_music()
+    target = float(duration_seconds or project.target_duration_seconds or 25)
+    try:
+        data = music.generate(prompt=prompt.strip(), duration_seconds=target)
+        ext = music.output_extension() or "mp3"
+    except Exception as e:  # noqa: BLE001
+        _log_provider_call(
+            db,
+            project_id=project.id,
+            provider=type(music).__name__,
+            endpoint="music.generate",
+            request_summary={"prompt_chars": len(prompt), "duration": target},
+            response_summary={"error": str(e)[:500]},
+            status="error",
+        )
+        raise
+
+    # Remove any previous music file (any extension) so we never leave orphans.
+    out_dir = storage.render_subdir(project.id)
+    for stale in out_dir.glob("music.*"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+    if project.music_upload_path:
+        try:
+            Path(project.music_upload_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    out_path = out_dir / f"music.{ext.lstrip('.')}"
+    out_path.write_bytes(data)
+    project.music_upload_path = str(out_path)
+    db.commit()
+
+    _log_provider_call(
+        db,
+        project_id=project.id,
+        provider=type(music).__name__,
+        endpoint="music.generate",
+        request_summary={"prompt_chars": len(prompt), "duration": target},
+        response_summary={"bytes": len(data), "ext": ext},
+    )
+    return out_path
+
+
 def render_project(db: Session, project_id: int) -> models.Render:
     project = db.get(models.VideoProject, project_id)
     if project is None:

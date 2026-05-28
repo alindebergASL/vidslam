@@ -127,7 +127,7 @@ Every project has three audio surfaces:
 | **Voiceover** | `voiceover_source = "tts"` (default) | TTS provider (ElevenLabs if configured, mock silent otherwise) speaks `StoryboardPlan.cleaned_voice_script` |
 | **Voiceover** | `voiceover_source = "upload"` | `POST /api/projects/{id}/voiceover` (mp3/m4a/wav/aac, ≤50 MB) — pipeline reads the file instead of calling TTS |
 | **Voiceover** | `voiceover_source = "silent"` | renderer skips the voice track entirely |
-| **Background music** | `POST /api/projects/{id}/music` | optional; mp3/m4a/wav/aac, ≤50 MB. Loops to cover the full video, mixed under the voiceover at `music_volume` (0.0–1.0, default 0.25) via FFmpeg `amix` |
+| **Background music** | `POST /api/projects/{id}/music` (upload) **or** `POST /api/projects/{id}/music/generate` (prompt → MusicProvider) | optional; mp3/m4a/wav/aac, ≤50 MB. Loops to cover the full video, mixed under the voiceover at `music_volume` (0.0–1.0, default 0.25) via FFmpeg `amix` |
 
 The renderer auto-routes:
 - voice only → AAC voice with apad to video length
@@ -136,7 +136,22 @@ The renderer auto-routes:
 - neither → silent video
 
 The editor's Audio panel exposes all three: voiceover source chips, audio
-preview, music attach/replace/remove, and a music volume slider.
+preview, music attach/replace/remove **or generate-from-prompt**, and a
+music volume slider.
+
+The MusicProvider is a clean Protocol like the other channels:
+
+```python
+class MusicProvider(Protocol):
+    def generate(self, *, prompt: str, duration_seconds: float, settings: dict | None = None) -> bytes: ...
+    def output_extension(self) -> str: ...
+    def list_models(self) -> list[ModelInfo]: ...
+```
+
+Implementations: `MockMusicProvider` (deterministic FFmpeg lavfi triad pad,
+used in `MOCK_PROVIDERS` mode and tests) and `ElevenLabsMusicProvider`
+(real `POST /v1/music` adapter). Swap in Suno, Stable Audio, etc. by
+adding another implementation to the registry without touching the UI.
 
 ### Cast model
 

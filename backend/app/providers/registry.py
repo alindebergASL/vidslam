@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..config import get_settings
-from .base import ChatProvider, ImageProvider, TTSProvider, VideoProvider
+from .base import ChatProvider, ImageProvider, MusicProvider, TTSProvider, VideoProvider
 
 _settings = get_settings()
 
@@ -46,6 +46,16 @@ def get_tts() -> TTSProvider:
     return ElevenLabsTTSProvider()
 
 
+def get_music() -> MusicProvider:
+    if _settings.music_is_mocked():
+        from .mock_music import MockMusicProvider
+
+        return MockMusicProvider()
+    from .elevenlabs_music import ElevenLabsMusicProvider
+
+    return ElevenLabsMusicProvider()
+
+
 def provider_status() -> dict:
     return {
         "mock_providers_env": _settings.mock_providers,
@@ -53,4 +63,5 @@ def provider_status() -> dict:
         "image": "mock" if _settings.image_is_mocked() else "openrouter",
         "video": "mock" if _settings.video_is_mocked() else "openrouter",
         "tts": "mock" if _settings.tts_is_mocked() else "elevenlabs",
+        "music": "mock" if _settings.music_is_mocked() else "elevenlabs",
     }

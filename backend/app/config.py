@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str = ""
     elevenlabs_default_voice_id: str = ""
     elevenlabs_model_id: str = "eleven_turbo_v2_5"
+    elevenlabs_music_model_id: str = ""
     elevenlabs_base_url: str = "https://api.elevenlabs.io/v1"
 
     @property
@@ -63,6 +64,9 @@ class Settings(BaseSettings):
         return self.mock_providers or not self.openrouter_api_key
 
     def tts_is_mocked(self) -> bool:
+        return self.mock_providers or not self.elevenlabs_api_key
+
+    def music_is_mocked(self) -> bool:
         return self.mock_providers or not self.elevenlabs_api_key
 
 
