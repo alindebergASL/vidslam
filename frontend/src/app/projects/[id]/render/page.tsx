@@ -98,7 +98,7 @@ function Inner() {
             <button
               className="btn-ghost"
               onClick={async () => {
-                const url = api.publicRender(render.share_token);
+                const url = `${window.location.origin}/share/${render.share_token}`;
                 try {
                   await navigator.clipboard.writeText(url);
                   setCopied(true);
@@ -107,7 +107,7 @@ function Inner() {
                   window.prompt("Copy this shareable link:", url);
                 }
               }}
-              title="Anyone with this link can watch the MP4 without logging in"
+              title="Anyone with this link can watch the video without logging in"
             >
               {copied ? "Link copied ✓" : "Copy share link"}
             </button>

@@ -12,6 +12,8 @@ const items = [
 
 export function SideNav() {
   const path = usePathname();
+  // Public share pages render without the app chrome.
+  if (path?.startsWith("/share/")) return null;
   return (
     <aside className="w-56 shrink-0 border-r border-ink-800 bg-ink-900 p-4 hidden md:flex md:flex-col">
       <div className="px-2 py-3 mb-4">

@@ -44,6 +44,22 @@ def public_render_thumbnail(token: str, db: Session = Depends(get_db)) -> FileRe
     return FileResponse(r.thumbnail_path, media_type="image/jpeg")
 
 
+@public_router.get("/public-renders/{token}/meta")
+def public_render_meta(token: str, db: Session = Depends(get_db)) -> dict:
+    """Minimal metadata for the public share landing page (no auth)."""
+    r = db.query(models.Render).filter(models.Render.share_token == token).first()
+    if r is None or r.status != "completed":
+        raise HTTPException(404, "render not found")
+    project = r.project
+    plan = project.generated_plan_json or {}
+    return {
+        "title": project.title or "AI-generated video",
+        "aspect_ratio": project.aspect_ratio,
+        "created_at": r.created_at.isoformat(),
+        "disclosure": plan.get("disclosure_text") or "AI-generated virtual creator",
+    }
+
+
 @router.post("/projects/{project_id}/generate-plan", status_code=202)
 def generate_plan(project_id: int, db: Session = Depends(get_db)) -> dict:
     project = db.get(models.VideoProject, project_id)

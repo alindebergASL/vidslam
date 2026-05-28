@@ -153,6 +153,15 @@ used in `MOCK_PROVIDERS` mode and tests) and `ElevenLabsMusicProvider`
 (real `POST /v1/music` adapter). Swap in Suno, Stable Audio, etc. by
 adding another implementation to the registry without touching the UI.
 
+### Provider key health probe
+
+`POST /api/providers/health-check` validates credentials without generating
+anything: OpenRouter (chat/image/video share one key) is checked via
+`GET /models`, ElevenLabs (tts/music) via `GET /voices`. Each group reports
+`ok` + latency, or `mock` when no key is needed. The dashboard's
+**Test provider keys** button surfaces this so a bad key is caught before a
+generation run rather than mid-pipeline.
+
 ### Cast model
 
 | Entity      | What it is                                                |
@@ -187,9 +196,9 @@ the whole pipeline.
 | Assets    | `GET /api/public-assets/{token}` · `DELETE /api/assets/{id}` |
 | Projects  | `GET/POST/PATCH /api/projects[/{id}]` · `PATCH /api/projects/{id}/cast` · `PATCH /api/projects/{id}/shots/{shot_id}` |
 | Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `GET /api/projects/{id}/status` · `GET /api/projects/{id}/renders` · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `GET /api/renders/{id}/download` |
-| Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` — **unauthenticated**, token-gated; lets you share a finished MP4 without exposing the app login |
+| Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` · `GET /api/public-renders/{token}/meta` — **unauthenticated**, token-gated; backs the branded `/share/{token}` landing page so a finished video can be shared without exposing the app login |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
-| Providers | `GET /api/providers/status` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` |
+| Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |
 
 All routes except `GET /api/public-assets/{token}` and `/health` are gated by the MVP
 password cookie.

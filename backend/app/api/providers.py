@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import time
+
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..config import get_settings
@@ -41,6 +44,67 @@ def caption_styles() -> list[str]:
     from ..services.captions import available_styles
 
     return available_styles()
+
+
+def _probe(name: str, url: str, headers: dict) -> dict:
+    """Hit a cheap auth-only endpoint and report ok/latency without generating anything."""
+    t0 = time.monotonic()
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(url, headers=headers)
+        latency = int((time.monotonic() - t0) * 1000)
+        if r.status_code == 200:
+            return {"group": name, "mode": "live", "ok": True,
+                    "message": f"authenticated (HTTP 200, {latency}ms)", "latency_ms": latency}
+        if r.status_code in (401, 403):
+            return {"group": name, "mode": "live", "ok": False,
+                    "message": f"auth rejected (HTTP {r.status_code}) — check the API key",
+                    "latency_ms": latency}
+        return {"group": name, "mode": "live", "ok": False,
+                "message": f"unexpected HTTP {r.status_code}", "latency_ms": latency}
+    except Exception as e:  # noqa: BLE001
+        return {"group": name, "mode": "live", "ok": False, "message": str(e)[:200]}
+
+
+@router.post("/health-check")
+def health_check() -> dict:
+    """Validate provider credentials with lightweight, no-generation calls.
+
+    OpenRouter (chat/image/video share one key) is checked via GET /models;
+    ElevenLabs (tts/music) via GET /voices. In mock mode each group reports
+    'mock' without making any external request."""
+    s = get_settings()
+    results: list[dict] = []
+
+    if s.mock_providers or not s.openrouter_api_key:
+        results.append({
+            "group": "openrouter",
+            "mode": "mock",
+            "ok": True,
+            "message": "mock mode — no key needed (chat / image / video)",
+        })
+    else:
+        results.append(_probe(
+            "openrouter",
+            f"{s.openrouter_base_url.rstrip('/')}/models",
+            {"Authorization": f"Bearer {s.openrouter_api_key}"},
+        ))
+
+    if s.mock_providers or not s.elevenlabs_api_key:
+        results.append({
+            "group": "elevenlabs",
+            "mode": "mock",
+            "ok": True,
+            "message": "mock mode — no key needed (tts / music)",
+        })
+    else:
+        results.append(_probe(
+            "elevenlabs",
+            f"{s.elevenlabs_base_url.rstrip('/')}/voices",
+            {"xi-api-key": s.elevenlabs_api_key},
+        ))
+
+    return {"ok": all(r["ok"] for r in results), "results": results}
 
 
 @router.get("/elevenlabs/voices")

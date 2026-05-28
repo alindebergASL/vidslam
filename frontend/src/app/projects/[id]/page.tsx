@@ -26,6 +26,7 @@ function Inner() {
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showPreflight, setShowPreflight] = useState(false);
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
   const router = useRouter();
   const timer = useRef<NodeJS.Timeout | null>(null);
 
@@ -149,15 +150,20 @@ function Inner() {
       <section className="mb-6">
         <div className="flex items-baseline justify-between mb-3">
           <h2 className="text-lg font-medium">Storyboard</h2>
-          <button
-            className="btn-ghost text-xs"
-            onClick={async () => {
-              await api.generatePlan(projectId);
-              setPolling(true);
-            }}
-          >
-            Re-plan
-          </button>
+          <div className="flex items-center gap-3">
+            {project.shots.length > 1 && (
+              <span className="text-xs text-ink-400">Drag a shot to reorder</span>
+            )}
+            <button
+              className="btn-ghost text-xs"
+              onClick={async () => {
+                await api.generatePlan(projectId);
+                setPolling(true);
+              }}
+            >
+              Re-plan
+            </button>
+          </div>
         </div>
         {project.shots.length === 0 ? (
           <div className="card p-6 text-ink-300 text-sm">
@@ -165,13 +171,30 @@ function Inner() {
           </div>
         ) : (
           <div className="space-y-3">
-            {project.shots.map((s) => (
+            {project.shots.map((s, idx) => (
               <ShotRow
                 key={s.id}
+                index={idx}
                 projectId={projectId}
                 shot={s}
                 castAssets={castAssets}
                 onChange={refresh}
+                dragIndex={dragIndex}
+                onDragStart={() => setDragIndex(idx)}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={async () => {
+                  if (dragIndex === null || dragIndex === idx) {
+                    setDragIndex(null);
+                    return;
+                  }
+                  const next = [...project.shots];
+                  const [moved] = next.splice(dragIndex, 1);
+                  next.splice(idx, 0, moved);
+                  setProject({ ...project, shots: next });
+                  setDragIndex(null);
+                  await api.reorderShots(projectId, next.map((x) => x.id));
+                }}
+                onDragEnd={() => setDragIndex(null)}
               />
             ))}
           </div>
@@ -209,15 +232,27 @@ function Inner() {
 }
 
 function ShotRow({
+  index,
   projectId,
   shot,
   castAssets,
   onChange,
+  dragIndex,
+  onDragStart,
+  onDragOver,
+  onDrop,
+  onDragEnd,
 }: {
+  index: number;
   projectId: number;
   shot: Shot;
   castAssets: Asset[];
   onChange: () => void;
+  dragIndex: number | null;
+  onDragStart: () => void;
+  onDragOver: (e: React.DragEvent) => void;
+  onDrop: () => void;
+  onDragEnd: () => void;
 }) {
   const [prompt, setPrompt] = useState(shot.prompt);
   const [dur, setDur] = useState(shot.duration_seconds);
@@ -243,10 +278,23 @@ function ShotRow({
   };
 
   return (
-    <div className="card p-4">
+    <div
+      className={`card p-4 transition ${dragIndex === index ? "opacity-50" : ""}`}
+      onDragOver={onDragOver}
+      onDrop={onDrop}
+    >
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1">
           <div className="flex items-center gap-2 mb-2">
+            <span
+              draggable
+              onDragStart={onDragStart}
+              onDragEnd={onDragEnd}
+              className="cursor-grab active:cursor-grabbing text-ink-400 hover:text-ink-200 select-none px-1"
+              title="Drag to reorder"
+            >
+              ⠿
+            </span>
             <span className="text-xs font-medium text-ink-200">Shot {shot.shot_order}</span>
             <span className="chip text-[10px] py-0.5">{shot.shot_type}</span>
             <StatusBadge status={shot.status} />

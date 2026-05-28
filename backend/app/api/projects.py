@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -126,6 +127,35 @@ def update_shot(
     db.commit()
     db.refresh(s)
     return s
+
+
+class ReorderIn(BaseModel):
+    shot_ids: list[int]
+
+
+@router.post("/projects/{project_id}/shots/reorder", response_model=ProjectOut)
+def reorder_shots(
+    project_id: int, body: ReorderIn, db: Session = Depends(get_db)
+) -> models.VideoProject:
+    """Set shot_order from the given ordering of shot ids. Ids not belonging to
+    the project are ignored; omitted shots keep a stable order after the listed ones."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    by_id = {s.id: s for s in project.shots}
+    order = 1
+    for sid in body.shot_ids:
+        shot = by_id.pop(sid, None)
+        if shot is not None:
+            shot.shot_order = order
+            order += 1
+    # Any shots not mentioned keep their relative order at the end.
+    for shot in sorted(by_id.values(), key=lambda s: s.shot_order):
+        shot.shot_order = order
+        order += 1
+    db.commit()
+    db.refresh(project)
+    return project
 
 
 @router.get("/projects/{project_id}/cast-assets", response_model=list[AssetOut])

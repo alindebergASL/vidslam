@@ -171,6 +171,11 @@ export const api = {
   renderDownload: (id: number) => `${API_BASE}/api/renders/${id}/download`,
   renderThumb: (id: number) => `${API_BASE}/api/renders/${id}/thumbnail`,
   publicRender: (token: string) => `${API_BASE}/api/public-renders/${token}`,
+  publicRenderThumb: (token: string) => `${API_BASE}/api/public-renders/${token}/thumbnail`,
+  publicRenderMeta: (token: string) =>
+    req<{ title: string; aspect_ratio: string; created_at: string; disclosure: string }>(
+      `/api/public-renders/${token}/meta`
+    ),
 
   // auth
   authStatus: () => req<{ authenticated: boolean }>("/api/auth/status"),
@@ -191,6 +196,17 @@ export const api = {
   ),
   voices: () => req<{ voice_id: string; name: string }[]>("/api/providers/elevenlabs/voices"),
   captionStyles: () => req<string[]>("/api/providers/caption-styles"),
+  healthCheck: () =>
+    req<{
+      ok: boolean;
+      results: {
+        group: string;
+        mode: string;
+        ok: boolean;
+        message: string;
+        latency_ms?: number;
+      }[];
+    }>("/api/providers/health-check", { method: "POST" }),
 
   // avatars
   listAvatars: () => req<Avatar[]>("/api/avatars"),
@@ -272,6 +288,11 @@ export const api = {
     req<Shot>(`/api/projects/${projectId}/shots/${shotId}`, {
       method: "PATCH",
       body: JSON.stringify(body),
+    }),
+  reorderShots: (projectId: number, shotIds: number[]) =>
+    req<Project>(`/api/projects/${projectId}/shots/reorder`, {
+      method: "POST",
+      body: JSON.stringify({ shot_ids: shotIds }),
     }),
   castAssets: (projectId: number) =>
     req<Asset[]>(`/api/projects/${projectId}/cast-assets`),

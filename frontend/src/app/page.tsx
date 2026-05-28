@@ -19,6 +19,11 @@ function Dashboard() {
   const [avatars, setAvatars] = useState<Avatar[]>([]);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [providerStatus, setProviderStatus] = useState<Record<string, any> | null>(null);
+  const [health, setHealth] = useState<{
+    ok: boolean;
+    results: { group: string; mode: string; ok: boolean; message: string; latency_ms?: number }[];
+  } | null>(null);
+  const [healthBusy, setHealthBusy] = useState(false);
 
   useEffect(() => {
     api.listProjects().then(async (ps) => {
@@ -58,15 +63,52 @@ function Dashboard() {
       </header>
 
       {providerStatus && (
-        <div className="card p-4 mb-8 flex flex-wrap gap-3 text-sm">
-          {Object.entries(providerStatus).map(([k, v]) => (
-            <span key={k} className="chip">
-              <span className="text-ink-300">{k}:</span>
-              <span className={v === "mock" || v === true ? "text-ink-200" : "text-accent"}>
-                {String(v)}
+        <div className="card p-4 mb-8">
+          <div className="flex flex-wrap items-center gap-3 text-sm">
+            {Object.entries(providerStatus).map(([k, v]) => (
+              <span key={k} className="chip">
+                <span className="text-ink-300">{k}:</span>
+                <span className={v === "mock" || v === true ? "text-ink-200" : "text-accent"}>
+                  {String(v)}
+                </span>
               </span>
-            </span>
-          ))}
+            ))}
+            <button
+              className="btn-ghost text-xs ml-auto"
+              disabled={healthBusy}
+              onClick={async () => {
+                setHealthBusy(true);
+                try {
+                  setHealth(await api.healthCheck());
+                } catch (e: any) {
+                  setHealth({ ok: false, results: [{ group: "error", mode: "", ok: false, message: e.message }] });
+                } finally {
+                  setHealthBusy(false);
+                }
+              }}
+            >
+              {healthBusy ? "Testing…" : "Test provider keys"}
+            </button>
+          </div>
+          {health && (
+            <div className="mt-3 space-y-1.5">
+              {health.results.map((r) => (
+                <div
+                  key={r.group}
+                  className={`flex items-center gap-2 text-xs rounded-md px-3 py-1.5 border ${
+                    r.ok
+                      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                      : "border-red-500/40 bg-red-500/10 text-red-300"
+                  }`}
+                >
+                  <span className="w-4 text-center">{r.ok ? "✓" : "✕"}</span>
+                  <span className="font-medium capitalize">{r.group}</span>
+                  <span className="text-ink-300">({r.mode})</span>
+                  <span className="text-ink-200">{r.message}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
