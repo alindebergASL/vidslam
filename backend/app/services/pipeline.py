@@ -449,6 +449,9 @@ def render_project(db: Session, project_id: int) -> models.Render:
         estimated_cost=estimate["total"],
     )
     db.add(render)
+    # Mark the project itself as generating so clients polling project_status keep
+    # polling while a worker-backed render runs in the background.
+    project.status = "generating"
     db.commit()
     db.refresh(render)
 

@@ -7,6 +7,7 @@ import { AuthGate } from "@/components/AuthGate";
 import { PreflightModal } from "@/components/PreflightModal";
 import { AudioPanel } from "@/components/AudioPanel";
 import { RenderHistory } from "@/components/RenderHistory";
+import { GenerationProgress } from "@/components/GenerationProgress";
 import { api, Asset, Project, Shot, Render } from "@/lib/api";
 
 export default function ProjectEditorPage() {
@@ -39,11 +40,13 @@ function Inner() {
       setRender(st.latest_render);
       const ca = await api.castAssets(projectId);
       setCastAssets(ca);
-      if (!["completed", "failed", "draft", "planned"].includes(st.project_status)) {
-        setPolling(true);
-      } else {
-        setPolling(false);
-      }
+      const renderActive =
+        !!st.latest_render &&
+        !["completed", "failed"].includes(st.latest_render.status);
+      const projectActive = !["completed", "failed", "draft", "planned"].includes(
+        st.project_status
+      );
+      setPolling(renderActive || projectActive);
     } catch (e: any) {
       setError(e.message);
     }
@@ -118,6 +121,11 @@ function Inner() {
           )}
         </div>
       </header>
+
+      {render &&
+        ["pending", "planning", "generating_audio", "generating_shots", "polling", "rendering", "failed"].includes(
+          render.status
+        ) && <GenerationProgress render={render} shots={project.shots} />}
 
       <section className="card p-4 mb-6">
         <div className="label">Voice script</div>
@@ -260,15 +268,6 @@ function Inner() {
       )}
 
       <RenderHistory projectId={projectId} />
-
-      {render?.error && (
-        <section className="card p-4 text-sm">
-          <div className="font-medium mb-2">Latest render error</div>
-          <pre className="p-3 bg-ink-800 text-xs text-accent whitespace-pre-wrap rounded">
-            {render.error}
-          </pre>
-        </section>
-      )}
     </div>
   );
 }
