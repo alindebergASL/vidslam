@@ -170,6 +170,10 @@ function Inner() {
 
       <AudioPanel project={project} onChange={(p) => setProject(p)} />
 
+      {project.generated_plan_json && (
+        <StoryboardScript project={project} onChange={(p) => setProject(p)} />
+      )}
+
       <section className="mb-6">
         <div className="flex items-baseline justify-between mb-3">
           <h2 className="text-lg font-medium">Storyboard</h2>
@@ -269,6 +273,88 @@ function Inner() {
 
       <RenderHistory projectId={projectId} />
     </div>
+  );
+}
+
+function StoryboardScript({
+  project,
+  onChange,
+}: {
+  project: Project;
+  onChange: (p: Project) => void;
+}) {
+  const plan = project.generated_plan_json || {};
+  const [script, setScript] = useState<string>(plan.cleaned_voice_script || "");
+  const [endCard, setEndCard] = useState<string>(plan.end_card_text || "");
+  const [saving, setSaving] = useState(false);
+  const [savedNote, setSavedNote] = useState<string | null>(null);
+
+  const dirty =
+    script !== (plan.cleaned_voice_script || "") || endCard !== (plan.end_card_text || "");
+
+  const save = async (resync: boolean) => {
+    setSaving(true);
+    setSavedNote(null);
+    try {
+      const updated = await api.editPlan(project.id, {
+        cleaned_voice_script: script,
+        end_card_text: endCard,
+        resync_captions: resync,
+      });
+      onChange(updated);
+      setSavedNote(resync ? "Saved + captions resynced" : "Saved");
+      setTimeout(() => setSavedNote(null), 2500);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const captionCount = Array.isArray(plan.caption_chunks) ? plan.caption_chunks.length : 0;
+
+  return (
+    <section className="card p-4 mb-6">
+      <div className="flex items-baseline justify-between mb-2">
+        <h2 className="text-lg font-medium">Voiceover & captions</h2>
+        <span className="text-[11px] text-ink-400">
+          What&apos;s actually spoken (TTS) and shown on screen — edits apply on the next render.
+        </span>
+      </div>
+      <label className="label">Spoken script</label>
+      <textarea
+        className="input min-h-[90px]"
+        value={script}
+        onChange={(e) => setScript(e.target.value)}
+      />
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+        <div>
+          <label className="label">End-card text</label>
+          <input className="input" value={endCard} onChange={(e) => setEndCard(e.target.value)} />
+        </div>
+        <div className="flex items-end">
+          <span className="text-xs text-ink-400">
+            {captionCount} caption chunk{captionCount === 1 ? "" : "s"} currently set
+          </span>
+        </div>
+      </div>
+      <div className="flex items-center gap-2 mt-3">
+        <button
+          className="btn-ghost text-xs disabled:opacity-50"
+          disabled={saving || !dirty}
+          onClick={() => save(false)}
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+        <button
+          className="btn-primary text-xs disabled:opacity-50"
+          disabled={saving}
+          onClick={() => save(true)}
+          title="Save and regenerate caption chunks from the spoken script"
+        >
+          Save + resync captions
+        </button>
+        {savedNote && <span className="text-xs text-emerald-300">{savedNote}</span>}
+      </div>
+    </section>
   );
 }
 

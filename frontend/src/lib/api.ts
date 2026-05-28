@@ -438,6 +438,15 @@ export const api = {
     }),
   generatePlan: (id: number) =>
     req<any>(`/api/projects/${id}/generate-plan`, { method: "POST" }),
+  editPlan: (
+    id: number,
+    body: {
+      cleaned_voice_script?: string;
+      end_card_text?: string;
+      disclosure_text?: string;
+      resync_captions?: boolean;
+    }
+  ) => req<Project>(`/api/projects/${id}/plan`, { method: "PATCH", body: JSON.stringify(body) }),
   preflight: (id: number) =>
     req<PreflightResult>(`/api/projects/${id}/preflight`),
   costEstimate: (id: number) =>

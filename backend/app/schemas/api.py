@@ -203,6 +203,17 @@ class ShotUpdate(BaseModel):
     camera_direction: Optional[str] = None
 
 
+class PlanEditIn(BaseModel):
+    """Edits to the generated storyboard plan's spoken script / end card /
+    disclosure. resync_captions re-derives caption_chunks from the (possibly
+    edited) spoken script."""
+
+    cleaned_voice_script: Optional[str] = None
+    end_card_text: Optional[str] = None
+    disclosure_text: Optional[str] = None
+    resync_captions: bool = False
+
+
 class ProjectOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int

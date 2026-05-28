@@ -1,9 +1,30 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..schemas.storyboard import CaptionChunk
+
+
+def chunk_script(script: str, total_seconds: float, max_words: int = 5) -> list[CaptionChunk]:
+    """Split a script into mobile-friendly caption chunks (~max_words each) with
+    evenly-spread start hints across total_seconds. Used to (re)derive captions
+    when the spoken script is edited."""
+    words = [w for w in re.split(r"\s+", script.strip()) if w]
+    if not words:
+        return []
+    chunks: list[str] = []
+    buf: list[str] = []
+    for w in words:
+        buf.append(w)
+        if len(buf) >= max_words:
+            chunks.append(" ".join(buf))
+            buf = []
+    if buf:
+        chunks.append(" ".join(buf))
+    per = (total_seconds / len(chunks)) if chunks else 0.0
+    return [CaptionChunk(start_hint=round(i * per, 2), text=t) for i, t in enumerate(chunks)]
 
 # ASS style presets per `caption_style` value used in the project model.
 # Colors are ASS &HBBGGRR& (alpha=00 opaque).

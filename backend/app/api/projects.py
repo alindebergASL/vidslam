@@ -9,12 +9,15 @@ from ..db import get_db
 from ..schemas import (
     AssetOut,
     CastMemberIn,
+    PlanEditIn,
     ProjectCreate,
     ProjectOut,
     ProjectUpdate,
     ShotOut,
     ShotUpdate,
 )
+from ..schemas.storyboard import StoryboardPlan
+from ..services.captions import chunk_script
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -132,6 +135,37 @@ def update_shot(
     db.commit()
     db.refresh(s)
     return s
+
+
+@router.patch("/projects/{project_id}/plan", response_model=ProjectOut)
+def edit_plan(
+    project_id: int, body: PlanEditIn, db: Session = Depends(get_db)
+) -> models.VideoProject:
+    """Edit the generated storyboard's spoken voiceover script, end-card text, or
+    disclosure — the values the renderer actually uses for TTS/captions/end card —
+    without re-running the planner. Optionally resync captions to the new script."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    if not project.generated_plan_json:
+        raise HTTPException(409, "generate a storyboard plan first")
+
+    plan = StoryboardPlan.model_validate(project.generated_plan_json)
+    if body.cleaned_voice_script is not None:
+        plan.cleaned_voice_script = body.cleaned_voice_script
+    if body.end_card_text is not None:
+        plan.end_card_text = body.end_card_text
+        project.cta_text = body.end_card_text  # keep the project's end card in sync
+    if body.disclosure_text is not None:
+        plan.disclosure_text = body.disclosure_text
+    if body.resync_captions:
+        total = sum(s.duration_seconds for s in plan.shots if s.shot_type != "end_card")
+        plan.caption_chunks = chunk_script(plan.cleaned_voice_script, max(total, 1.0))
+
+    project.generated_plan_json = plan.model_dump()
+    db.commit()
+    db.refresh(project)
+    return project
 
 
 class ReorderIn(BaseModel):
