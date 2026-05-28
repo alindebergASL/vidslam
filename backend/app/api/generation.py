@@ -112,6 +112,18 @@ def regenerate_shot(
     }
 
 
+@router.get("/projects/{project_id}/renders", response_model=list[RenderOut])
+def list_renders(project_id: int, db: Session = Depends(get_db)) -> list[models.Render]:
+    if db.get(models.VideoProject, project_id) is None:
+        raise HTTPException(404, "project not found")
+    return (
+        db.query(models.Render)
+        .filter(models.Render.project_id == project_id)
+        .order_by(models.Render.created_at.desc())
+        .all()
+    )
+
+
 @router.get("/renders/{render_id}", response_model=RenderOut)
 def get_render(render_id: int, db: Session = Depends(get_db)) -> models.Render:
     r = db.get(models.Render, render_id)

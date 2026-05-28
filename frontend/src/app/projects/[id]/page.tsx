@@ -6,6 +6,7 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { AuthGate } from "@/components/AuthGate";
 import { PreflightModal } from "@/components/PreflightModal";
 import { AudioPanel } from "@/components/AudioPanel";
+import { RenderHistory } from "@/components/RenderHistory";
 import { api, Asset, Project, Shot, Render } from "@/lib/api";
 
 export default function ProjectEditorPage() {
@@ -182,24 +183,14 @@ function Inner() {
         />
       )}
 
-      {render && (
+      <RenderHistory projectId={projectId} />
+
+      {render?.error && (
         <section className="card p-4 text-sm">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="font-medium">Latest render</div>
-              <div className="text-xs text-ink-300">{render.status}</div>
-            </div>
-            {render.status === "completed" && (
-              <Link href={`/projects/${projectId}/render`} className="btn-ghost text-xs">
-                Preview
-              </Link>
-            )}
-          </div>
-          {render.error && (
-            <pre className="mt-3 p-3 bg-ink-800 text-xs text-accent whitespace-pre-wrap rounded">
-              {render.error}
-            </pre>
-          )}
+          <div className="font-medium mb-2">Latest render error</div>
+          <pre className="p-3 bg-ink-800 text-xs text-accent whitespace-pre-wrap rounded">
+            {render.error}
+          </pre>
         </section>
       )}
     </div>

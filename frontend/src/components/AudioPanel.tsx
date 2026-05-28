@@ -3,6 +3,15 @@ import { useRef, useState } from "react";
 import clsx from "clsx";
 import { api, Project } from "@/lib/api";
 
+const MUSIC_PRESETS: { label: string; prompt: string }[] = [
+  { label: "Lo-fi", prompt: "warm lo-fi hip hop, mellow Rhodes piano, soft drums, 70 bpm" },
+  { label: "Cinematic", prompt: "cinematic orchestral pad, slow swelling strings, hopeful, 80 bpm" },
+  { label: "Upbeat", prompt: "upbeat indie pop with claps and bright synths, 120 bpm" },
+  { label: "Ambient", prompt: "soft ambient pad, no drums, dreamy, slow evolving texture" },
+  { label: "Tense", prompt: "tense electronic underscore with subtle pulse, 90 bpm" },
+  { label: "Acoustic", prompt: "warm acoustic guitar fingerpicking with light percussion, 85 bpm" },
+];
+
 export function AudioPanel({
   project,
   onChange,
@@ -173,6 +182,18 @@ export function AudioPanel({
 
           {musicTab === "generate" ? (
             <div className="space-y-2">
+              <div className="flex flex-wrap gap-1.5">
+                {MUSIC_PRESETS.map((p) => (
+                  <button
+                    key={p.label}
+                    onClick={() => setMusicPrompt(p.prompt)}
+                    className="chip text-[11px] py-1"
+                    title={p.prompt}
+                  >
+                    {p.label}
+                  </button>
+                ))}
+              </div>
               <textarea
                 className="input min-h-[64px] text-sm"
                 placeholder='e.g. "warm cinematic lo-fi with mellow piano, 80 bpm"'

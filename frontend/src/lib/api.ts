@@ -319,6 +319,8 @@ export const api = {
     ),
   recompose: (id: number) =>
     req<any>(`/api/projects/${id}/recompose`, { method: "POST" }),
+  listRenders: (id: number) => req<Render[]>(`/api/projects/${id}/renders`),
+  getRender: (id: number) => req<Render>(`/api/renders/${id}`),
   projectStatus: (id: number) =>
     req<{
       project_id: number;
