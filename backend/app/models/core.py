@@ -62,8 +62,29 @@ class Ingredient(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
-# --- Assets (shared shape across avatar + ingredient) ---
+# --- Brand kit: reusable end-card branding ---
 
+
+class BrandKit(Base):
+    """Reusable branding (logo + colors + default CTA/disclosure) applied to a
+    project's end card so a creator's videos stay visually consistent."""
+
+    __tablename__ = "brand_kits"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    primary_color: Mapped[str] = mapped_column(String(9), default="#FF5C8A")
+    end_card_bg_color: Mapped[str] = mapped_column(String(9), default="#0E0E12")
+    end_card_text_color: Mapped[str] = mapped_column(String(9), default="#FFFFFF")
+    default_cta_text: Mapped[str] = mapped_column(String(280), default="")
+    default_disclosure_text: Mapped[str] = mapped_column(String(200), default="")
+    logo_path: Mapped[str] = mapped_column(String(500), default="")
+    logo_public_token: Mapped[str] = mapped_column(String(80), default="", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+# --- Assets (shared shape across avatar + ingredient) ---
 
 class Asset(Base):
     """Common asset table; avatar/ingredient ownership via two FK columns (one nullable)."""
@@ -150,6 +171,7 @@ class VideoProject(Base):
     # draft|planning|planned|generating|completed|failed
     generated_plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     primary_avatar_id: Mapped[Optional[int]] = mapped_column(ForeignKey("avatars.id"))
+    brand_kit_id: Mapped[Optional[int]] = mapped_column(ForeignKey("brand_kits.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 

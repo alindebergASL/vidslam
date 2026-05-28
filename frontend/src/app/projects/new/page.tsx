@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
-import { api, Avatar, CastMember, Ingredient } from "@/lib/api";
+import { api, Avatar, BrandKit, CastMember, Ingredient } from "@/lib/api";
 
 const MODES = [
   { id: "reel_montage", label: "Reel Montage", desc: "2–5 short cuts (most reliable)" },
@@ -100,6 +100,8 @@ function Inner() {
   const [creativeDirection, setCreativeDirection] = useState("");
   const [cast, setCast] = useState<CastMember[]>([]);
   const [primary, setPrimary] = useState<number | null>(null);
+  const [brandKits, setBrandKits] = useState<BrandKit[]>([]);
+  const [brandKitId, setBrandKitId] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -124,6 +126,7 @@ function Inner() {
         setCast([{ member_kind: "avatar", avatar_id: avs[0].id, role: "host" }]);
       }
     });
+    api.listBrandKits().then(setBrandKits);
     api.listIngredients().then((ings) => {
       setIngredients(ings);
       if (seedOwnerKind === "ingredient" && seedOwnerId) {
@@ -195,6 +198,7 @@ function Inner() {
         disclosure_text: disclosureText,
         creative_direction: creativeDirection,
         primary_avatar_id: primary,
+        brand_kit_id: brandKitId,
         cast,
       });
       router.push(`/projects/${project.id}`);
@@ -394,6 +398,29 @@ function Inner() {
             onChange={(e) => setCta(e.target.value)}
             placeholder="Kissmet dating app coming soon"
           />
+        </div>
+
+        <div className="card p-4">
+          <label className="label">Brand kit (optional)</label>
+          {brandKits.length === 0 ? (
+            <div className="text-xs text-ink-400">
+              No brand kits yet — create one under <a href="/brand" className="underline">Brand</a> to
+              apply a logo + colors to the end card.
+            </div>
+          ) : (
+            <select
+              className="input"
+              value={brandKitId ?? ""}
+              onChange={(e) => setBrandKitId(e.target.value ? Number(e.target.value) : null)}
+            >
+              <option value="">— None —</option>
+              {brandKits.map((b) => (
+                <option key={b.id} value={b.id}>
+                  {b.name}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
 
         {error && <div className="text-sm text-accent">{error}</div>}

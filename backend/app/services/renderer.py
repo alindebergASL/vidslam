@@ -27,6 +27,9 @@ class RenderInputs:
     aspect_ratio: str = "9:16"
     music_path: Optional[Path] = None
     music_volume: float = 0.25
+    end_card_bg_color: str = "#0E0E12"
+    end_card_text_color: str = "#FFFFFF"
+    logo_path: Optional[Path] = None
 
 
 @dataclass
@@ -70,23 +73,58 @@ def _normalize_clip(src: Path, dst: Path, width: int, height: int) -> str:
     return log
 
 
-def _make_end_card(dst: Path, *, text: str, width: int, height: int, duration: float = 2.5) -> str:
-    """Generate a solid-color end card with centered text."""
-    # Escape characters for drawtext.
+def _make_end_card(
+    dst: Path,
+    *,
+    text: str,
+    width: int,
+    height: int,
+    duration: float = 2.5,
+    bg_color: str = "#0E0E12",
+    text_color: str = "#FFFFFF",
+    logo_path: Optional[Path] = None,
+) -> str:
+    """Generate a branded end card: solid bg, optional centered logo, centered text."""
     safe = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "’")
-    vf = (
-        f"color=c=#0E0E12:s={width}x{height}:d={duration},"
-        f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-        f"text='{safe}':fontcolor=white:fontsize=72:"
-        f"x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=18:box=0"
-    )
-    cmd = [
-        "ffmpeg", "-y", "-f", "lavfi", "-i", vf,
-        "-t", str(duration),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
-        "-r", str(FPS),
-        str(dst),
-    ]
+    base = f"color=c={bg_color}:s={width}x{height}:d={duration}"
+
+    if logo_path is not None and logo_path.exists():
+        # Logo centered in the upper third, text below center.
+        draw = (
+            "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"text='{safe}':fontcolor={text_color}:fontsize=64:"
+            f"x=(w-text_w)/2:y=h*0.60:line_spacing=18:box=0"
+        )
+        filter_complex = (
+            f"[1:v]scale={int(width * 0.42)}:-1[lg];"
+            f"[0:v][lg]overlay=(W-w)/2:H*0.22[bg];"
+            f"[bg]{draw}[out]"
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", base,
+            "-i", str(logo_path),
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+            "-t", str(duration),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+            "-r", str(FPS),
+            str(dst),
+        ]
+    else:
+        vf = (
+            f"{base},"
+            f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"text='{safe}':fontcolor={text_color}:fontsize=72:"
+            f"x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=18:box=0"
+        )
+        cmd = [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", vf,
+            "-t", str(duration),
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+            "-r", str(FPS),
+            str(dst),
+        ]
     rc, log = _run(cmd)
     if rc != 0:
         raise RuntimeError(f"ffmpeg end-card failed: {log[-2000:]}")
@@ -253,7 +291,15 @@ def compose(inputs: RenderInputs) -> RenderOutputs:
     if inputs.cta_text:
         ec = inputs.out_dir / "endcard.mp4"
         log_parts.append(
-            _make_end_card(ec, text=inputs.cta_text, width=width, height=height)
+            _make_end_card(
+                ec,
+                text=inputs.cta_text,
+                width=width,
+                height=height,
+                bg_color=inputs.end_card_bg_color,
+                text_color=inputs.end_card_text_color,
+                logo_path=inputs.logo_path,
+            )
         )
         normalized.append(ec)
 

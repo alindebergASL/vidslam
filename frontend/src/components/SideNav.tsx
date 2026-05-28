@@ -8,6 +8,7 @@ const items = [
   { href: "/studio", label: "Studio", icon: "✦" },
   { href: "/projects", label: "Projects", icon: "▷" },
   { href: "/cast", label: "Cast", icon: "☺" },
+  { href: "/brand", label: "Brand", icon: "◆" },
 ];
 
 export function SideNav() {

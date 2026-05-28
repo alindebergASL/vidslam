@@ -91,6 +91,39 @@ class IngredientOut(IngredientBase):
     assets: list[AssetOut] = Field(default_factory=list)
 
 
+# --- Brand kits ---
+
+
+class BrandKitBase(BaseModel):
+    name: str
+    primary_color: str = "#FF5C8A"
+    end_card_bg_color: str = "#0E0E12"
+    end_card_text_color: str = "#FFFFFF"
+    default_cta_text: str = ""
+    default_disclosure_text: str = ""
+
+
+class BrandKitCreate(BrandKitBase):
+    pass
+
+
+class BrandKitUpdate(BaseModel):
+    name: Optional[str] = None
+    primary_color: Optional[str] = None
+    end_card_bg_color: Optional[str] = None
+    end_card_text_color: Optional[str] = None
+    default_cta_text: Optional[str] = None
+    default_disclosure_text: Optional[str] = None
+
+
+class BrandKitOut(BrandKitBase):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    logo_public_token: str
+    created_at: datetime
+    updated_at: datetime
+
+
 # --- Projects ---
 
 
@@ -120,6 +153,7 @@ class ProjectCreate(BaseModel):
     voiceover_source: Literal["tts", "upload", "silent"] = "tts"
     music_volume: float = 0.25
     primary_avatar_id: Optional[int] = None
+    brand_kit_id: Optional[int] = None
     cast: list[CastMemberIn] = Field(default_factory=list)
 
 
@@ -137,6 +171,7 @@ class ProjectUpdate(BaseModel):
     voiceover_source: Optional[Literal["tts", "upload", "silent"]] = None
     music_volume: Optional[float] = None
     primary_avatar_id: Optional[int] = None
+    brand_kit_id: Optional[int] = None
     generated_plan_json: Optional[dict] = None
 
 
@@ -188,6 +223,7 @@ class ProjectOut(BaseModel):
     music_volume: float
     status: str
     primary_avatar_id: Optional[int]
+    brand_kit_id: Optional[int]
     generated_plan_json: Optional[dict]
     created_at: datetime
     updated_at: datetime

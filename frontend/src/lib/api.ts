@@ -71,6 +71,19 @@ export type Ingredient = {
   assets: Asset[];
 };
 
+export type BrandKit = {
+  id: number;
+  name: string;
+  primary_color: string;
+  end_card_bg_color: string;
+  end_card_text_color: string;
+  default_cta_text: string;
+  default_disclosure_text: string;
+  logo_public_token: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type CastMember = {
   id?: number;
   member_kind: "avatar" | "ingredient";
@@ -131,6 +144,7 @@ export type Project = {
   music_volume: number;
   status: string;
   primary_avatar_id: number | null;
+  brand_kit_id: number | null;
   generated_plan_json: any;
   created_at: string;
   updated_at: string;
@@ -289,6 +303,27 @@ export const api = {
     });
     if (!r.ok) throw new Error(await r.text());
     return (await r.json()) as Asset;
+  },
+
+  // brand kits
+  listBrandKits: () => req<BrandKit[]>("/api/brand-kits"),
+  createBrandKit: (body: Partial<BrandKit>) =>
+    req<BrandKit>("/api/brand-kits", { method: "POST", body: JSON.stringify(body) }),
+  updateBrandKit: (id: number, body: Partial<BrandKit>) =>
+    req<BrandKit>(`/api/brand-kits/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteBrandKit: (id: number) =>
+    req<void>(`/api/brand-kits/${id}`, { method: "DELETE" }),
+  brandLogoUrl: (id: number) => `${API_BASE}/api/brand-kits/${id}/logo`,
+  uploadBrandLogo: async (id: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch(`${API_BASE}/api/brand-kits/${id}/logo`, {
+      method: "POST",
+      credentials: "include",
+      body: fd,
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return (await r.json()) as BrandKit;
   },
 
   // projects

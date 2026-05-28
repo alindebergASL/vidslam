@@ -4,6 +4,7 @@ from . import (
     assets,
     auth,
     avatars,
+    brand_kits,
     generation,
     ingredients,
     project_audio,
@@ -16,6 +17,7 @@ api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/api", tags=["auth"])
 api_router.include_router(avatars.router, prefix="/api", tags=["avatars"])
 api_router.include_router(ingredients.router, prefix="/api", tags=["ingredients"])
+api_router.include_router(brand_kits.router, prefix="/api", tags=["brand-kits"])
 api_router.include_router(assets.router, prefix="/api", tags=["assets"])
 api_router.include_router(projects.router, prefix="/api", tags=["projects"])
 api_router.include_router(project_audio.router, prefix="/api", tags=["project-audio"])

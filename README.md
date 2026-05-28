@@ -173,6 +173,17 @@ any vertical without code changes:
 Both are editable in the New Project form and the project editor (re-plan to
 apply a changed brief).
 
+### Brand kits
+
+A `BrandKit` saves a logo + colors (primary / end-card background / end-card
+text) + default CTA and disclosure once, and a project can reference one via
+`brand_kit_id`. At render time the end card uses the kit's background/text
+colors and overlays the uploaded logo above the CTA, and the disclosure
+falls back to the kit's value (precedence: project override → brand kit →
+planner → default). CRUD + logo upload live at `/api/brand-kits`; the
+**Brand** page provides a live end-card preview with color pickers. Deleting a
+kit detaches it from any projects rather than breaking them.
+
 ### Cost estimation
 
 `GET /api/projects/{id}/cost-estimate` returns a transparent rate-card

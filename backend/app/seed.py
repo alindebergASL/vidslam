@@ -128,6 +128,22 @@ def run() -> None:
             ))
             log.info("seed: created ingredients (scene id=%s, style id=%s)", scene.id, style.id)
 
+        brand = None
+        if db.query(models.BrandKit).count() == 0:
+            brand = models.BrandKit(
+                name="Kissmet",
+                primary_color="#FF5C8A",
+                end_card_bg_color="#10243A",
+                end_card_text_color="#FFD0DE",
+                default_cta_text="Kissmet dating app coming soon",
+                default_disclosure_text="AI-generated virtual creator",
+            )
+            db.add(brand)
+            db.flush()
+            log.info("seed: created brand kit Kissmet (id=%s)", brand.id)
+        else:
+            brand = db.query(models.BrandKit).filter_by(name="Kissmet").first()
+
         if db.query(models.VideoProject).count() == 0:
             naina = db.query(models.Avatar).filter_by(name="Naina").one()
             arjun = db.query(models.Avatar).filter_by(name="Arjun").one()
@@ -149,6 +165,7 @@ def run() -> None:
                 caption_style="influencer_bold",
                 include_disclosure=True,
                 primary_avatar_id=naina.id,
+                brand_kit_id=brand.id if brand else None,
                 status="draft",
             )
             db.add(project)

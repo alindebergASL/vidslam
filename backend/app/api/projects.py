@@ -74,6 +74,7 @@ def create_project(body: ProjectCreate, db: Session = Depends(get_db)) -> models
         voiceover_source=body.voiceover_source,
         music_volume=body.music_volume,
         primary_avatar_id=primary_id,
+        brand_kit_id=body.brand_kit_id,
         status="draft",
     )
     db.add(p)

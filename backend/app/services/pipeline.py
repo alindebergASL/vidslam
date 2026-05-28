@@ -76,13 +76,24 @@ def _project_dict(project: models.VideoProject) -> dict:
     }
 
 
-def _disclosure_for(project: models.VideoProject, plan: StoryboardPlan) -> Optional[str]:
-    """Burn-in disclosure precedence: project override → planner value → default.
+def _brand_kit_for(db: Session, project: models.VideoProject) -> Optional[models.BrandKit]:
+    if not project.brand_kit_id:
+        return None
+    return db.get(models.BrandKit, project.brand_kit_id)
+
+
+def _disclosure_for(
+    project: models.VideoProject,
+    plan: StoryboardPlan,
+    brand: Optional[models.BrandKit] = None,
+) -> Optional[str]:
+    """Burn-in disclosure precedence: project override → brand kit → planner → default.
     Returns None when the project disables the overlay."""
     if not project.include_disclosure:
         return None
     return (
         (project.disclosure_text or "").strip()
+        or (brand.default_disclosure_text.strip() if brand and brand.default_disclosure_text else "")
         or (plan.disclosure_text or "").strip()
         or "AI-generated virtual creator"
     )
@@ -475,6 +486,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
         timed = chunks_to_timed(plan.caption_chunks, max(body_duration, 1.0))
 
         # 4. compose
+        brand = _brand_kit_for(db, project)
         out_dir = storage.render_subdir(project.id)
         outputs = compose(
             RenderInputs(
@@ -484,11 +496,16 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 audio_path=Path(render.audio_path) if render.audio_path else None,
                 caption_timings=timed,
                 caption_style=project.caption_style or "clean_white",
-                disclosure_text=_disclosure_for(project, plan),
+                disclosure_text=_disclosure_for(project, plan, brand),
                 cta_text=project.cta_text or None,
                 aspect_ratio=project.aspect_ratio,
                 music_path=_music_path_if_any(project),
                 music_volume=float(project.music_volume or 0.25),
+                end_card_bg_color=(brand.end_card_bg_color if brand else "#0E0E12"),
+                end_card_text_color=(brand.end_card_text_color if brand else "#FFFFFF"),
+                logo_path=(
+                    Path(brand.logo_path) if brand and brand.logo_path and Path(brand.logo_path).exists() else None
+                ),
             )
         )
         render.final_video_path = str(outputs.final_video_path)
@@ -625,6 +642,7 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
             s.duration_seconds for s in project.shots if s.shot_type != "end_card"
         )
         timed = chunks_to_timed(plan.caption_chunks, max(body_duration, 1.0))
+        brand = _brand_kit_for(db, project)
         out_dir = storage.render_subdir(project.id)
         outputs = compose(
             RenderInputs(
@@ -634,11 +652,16 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
                 audio_path=audio,
                 caption_timings=timed,
                 caption_style=project.caption_style or "clean_white",
-                disclosure_text=_disclosure_for(project, plan),
+                disclosure_text=_disclosure_for(project, plan, brand),
                 cta_text=project.cta_text or None,
                 aspect_ratio=project.aspect_ratio,
                 music_path=_music_path_if_any(project),
                 music_volume=float(project.music_volume or 0.25),
+                end_card_bg_color=(brand.end_card_bg_color if brand else "#0E0E12"),
+                end_card_text_color=(brand.end_card_text_color if brand else "#FFFFFF"),
+                logo_path=(
+                    Path(brand.logo_path) if brand and brand.logo_path and Path(brand.logo_path).exists() else None
+                ),
             )
         )
         render.final_video_path = str(outputs.final_video_path)
