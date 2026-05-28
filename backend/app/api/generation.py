@@ -9,8 +9,14 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db
 from ..schemas import ProjectStatusOut, RenderOut, ShotOut
+from ..services.preflight import run_preflight
 from ..services.safety import UnsafeScriptError, validate_script
-from ..workers.jobs import generate_plan_job, generate_video_job, regenerate_shot_job
+from ..workers.jobs import (
+    generate_plan_job,
+    generate_video_job,
+    recompose_project_job,
+    regenerate_shot_job,
+)
 from ..workers.queue import enqueue
 from .auth import require_auth
 
@@ -30,14 +36,41 @@ def generate_plan(project_id: int, db: Session = Depends(get_db)) -> dict:
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
 
+@router.get("/projects/{project_id}/preflight")
+def preflight(project_id: int, db: Session = Depends(get_db)) -> dict:
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    return run_preflight(db, project)
+
+
 @router.post("/projects/{project_id}/generate-video", status_code=202)
-def generate_video(project_id: int, db: Session = Depends(get_db)) -> dict:
+def generate_video(
+    project_id: int,
+    force: bool = False,
+    db: Session = Depends(get_db),
+) -> dict:
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
+    if not force:
+        result = run_preflight(db, project)
+        if not result["ok"]:
+            raise HTTPException(422, detail={"preflight": result})
     job_id = enqueue(generate_video_job, project_id)
+    return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
+
+
+@router.post("/projects/{project_id}/recompose", status_code=202)
+def recompose_video(project_id: int, db: Session = Depends(get_db)) -> dict:
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    if not project.generated_plan_json:
+        raise HTTPException(409, "generate a storyboard plan first")
+    job_id = enqueue(recompose_project_job, project_id)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
 
@@ -61,12 +94,22 @@ def project_status(project_id: int, db: Session = Depends(get_db)) -> ProjectSta
 
 
 @router.post("/projects/{project_id}/shots/{shot_id}/regenerate", status_code=202)
-def regenerate_shot(project_id: int, shot_id: int, db: Session = Depends(get_db)) -> dict:
+def regenerate_shot(
+    project_id: int,
+    shot_id: int,
+    recompose: bool = True,
+    db: Session = Depends(get_db),
+) -> dict:
     shot = db.get(models.VideoShot, shot_id)
     if shot is None or shot.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
-    job_id = enqueue(regenerate_shot_job, project_id, shot_id)
-    return {"shot_id": shot_id, "job_id": job_id, "status": "enqueued"}
+    job_id = enqueue(regenerate_shot_job, project_id, shot_id, recompose)
+    return {
+        "shot_id": shot_id,
+        "job_id": job_id,
+        "status": "enqueued",
+        "will_recompose": recompose,
+    }
 
 
 @router.get("/renders/{render_id}", response_model=RenderOut)

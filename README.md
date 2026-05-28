@@ -89,6 +89,35 @@ missing — partial configs work fine. `GET /api/providers/status` reflects what
        └───────┘
 ```
 
+### Quality control
+
+Before kicking off a real-provider video job (which spends money), the editor
+runs a **preflight check** that confirms:
+
+| Check | What it validates |
+| --- | --- |
+| `avatar_hero` | Every character in the cast has at least one `hero` asset |
+| `script_length` | Word count is within ~1.2× of what fits the target duration at 150 wpm |
+| `cta_or_disabled` | CTA text is set, or the user has explicitly left it blank |
+| `providers_configured` | OpenRouter key is present, or `MOCK_PROVIDERS=true` |
+| `output_writable` | `data/renders/{project_id}/` is writable with >100 MB free |
+
+Failures block `POST /api/projects/{id}/generate-video` with a `422` whose body
+includes the full check list. The UI shows a modal with traffic-light status per
+check; the user can fix the issue or pick **Generate anyway** (sends `?force=true`).
+
+### One-shot regeneration
+
+`POST /api/projects/{id}/shots/{shot_id}/regenerate?recompose=true` (the default)
+regenerates only that one clip and then re-runs the FFmpeg composition step
+using the existing audio + other shots' clips. A new `Render` row is created so
+version history is preserved, but no extra TTS / video provider calls are made
+for the unchanged shots.
+
+If you want to swap multiple shots before re-stitching, call regenerate with
+`recompose=false` once per shot then `POST /api/projects/{id}/recompose` to
+produce the final video in a single FFmpeg pass.
+
 ### Cast model
 
 | Entity      | What it is                                                |
@@ -122,7 +151,7 @@ the whole pipeline.
 | Ingredients | mirror of avatars (`/api/ingredients`) |
 | Assets    | `GET /api/public-assets/{token}` · `DELETE /api/assets/{id}` |
 | Projects  | `GET/POST/PATCH /api/projects[/{id}]` · `PATCH /api/projects/{id}/cast` · `PATCH /api/projects/{id}/shots/{shot_id}` |
-| Generation | `POST /api/projects/{id}/generate-plan` · `POST /api/projects/{id}/generate-video` · `GET /api/projects/{id}/status` · `POST /api/projects/{id}/shots/{shot_id}/regenerate` · `GET /api/renders/{id}/download` |
+| Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `GET /api/projects/{id}/status` · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `GET /api/renders/{id}/download` |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
 | Providers | `GET /api/providers/status` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` |
 

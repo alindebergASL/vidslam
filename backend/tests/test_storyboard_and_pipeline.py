@@ -6,6 +6,16 @@ from app.providers.base import CastContext
 from app.providers.mock_chat import MockChatProvider
 from app.schemas.storyboard import StoryboardPlan
 
+from .conftest import make_png_bytes
+
+
+def _upload_hero(client, avatar_id: int) -> None:
+    client.post(
+        f"/api/avatars/{avatar_id}/assets",
+        files={"file": ("hero.png", make_png_bytes(), "image/png")},
+        data={"asset_type": "hero", "rights_confirmed": "true"},
+    )
+
 
 def test_mock_chat_returns_valid_storyboard_with_cast():
     provider = MockChatProvider()
@@ -33,6 +43,7 @@ def test_mock_chat_returns_valid_storyboard_with_cast():
 
 def test_full_pipeline_produces_playable_mp4(auth_client, tmp_path: Path):
     aid = auth_client.post("/api/avatars", json={"name": "Naina"}).json()["id"]
+    _upload_hero(auth_client, aid)
     iid = auth_client.post(
         "/api/ingredients", json={"name": "Rooftop", "kind": "scene"}
     ).json()["id"]
@@ -92,8 +103,10 @@ def test_unsafe_script_blocked(auth_client):
 
 def test_regenerate_shot(auth_client):
     aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]
+    _upload_hero(auth_client, aid)
     pid = auth_client.post("/api/projects", json={
         "title": "x", "original_script": "a b c d e f",
+        "cta_text": "Try it",
         "cast": [{"member_kind": "avatar", "avatar_id": aid, "role": "host"}],
     }).json()["id"]
     auth_client.post(f"/api/projects/{pid}/generate-plan")

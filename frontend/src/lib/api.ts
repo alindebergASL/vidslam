@@ -129,6 +129,20 @@ export type Project = {
   shots: Shot[];
 };
 
+export type PreflightCheck = {
+  id: string;
+  label: string;
+  status: "ok" | "warn" | "fail";
+  message: string;
+  detail: string;
+};
+
+export type PreflightResult = {
+  ok: boolean;
+  summary: "ok" | "warn" | "fail";
+  checks: PreflightCheck[];
+};
+
 export type StudioJob = {
   id: number;
   owner_kind: "avatar" | "ingredient";
@@ -254,8 +268,15 @@ export const api = {
     }),
   generatePlan: (id: number) =>
     req<any>(`/api/projects/${id}/generate-plan`, { method: "POST" }),
-  generateVideo: (id: number) =>
-    req<any>(`/api/projects/${id}/generate-video`, { method: "POST" }),
+  preflight: (id: number) =>
+    req<PreflightResult>(`/api/projects/${id}/preflight`),
+  generateVideo: (id: number, force = false) =>
+    req<any>(
+      `/api/projects/${id}/generate-video${force ? "?force=true" : ""}`,
+      { method: "POST" }
+    ),
+  recompose: (id: number) =>
+    req<any>(`/api/projects/${id}/recompose`, { method: "POST" }),
   projectStatus: (id: number) =>
     req<{
       project_id: number;
@@ -263,10 +284,11 @@ export const api = {
       latest_render: Render | null;
       shots: Shot[];
     }>(`/api/projects/${id}/status`),
-  regenerateShot: (projectId: number, shotId: number) =>
-    req<any>(`/api/projects/${projectId}/shots/${shotId}/regenerate`, {
-      method: "POST",
-    }),
+  regenerateShot: (projectId: number, shotId: number, recompose = true) =>
+    req<any>(
+      `/api/projects/${projectId}/shots/${shotId}/regenerate?recompose=${recompose}`,
+      { method: "POST" }
+    ),
 
   // studio
   listStudioJobs: () => req<StudioJob[]>("/api/studio/jobs"),

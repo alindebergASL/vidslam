@@ -29,10 +29,18 @@ def generate_video_job(project_id: int) -> None:
         db.close()
 
 
-def regenerate_shot_job(project_id: int, shot_id: int) -> None:
+def regenerate_shot_job(project_id: int, shot_id: int, recompose: bool = True) -> None:
     db = SessionLocal()
     try:
-        pipeline.regenerate_shot(db, project_id, shot_id)
+        pipeline.regenerate_shot(db, project_id, shot_id, recompose=recompose)
+    finally:
+        db.close()
+
+
+def recompose_project_job(project_id: int) -> None:
+    db = SessionLocal()
+    try:
+        pipeline.recompose_project(db, project_id)
     finally:
         db.close()
 

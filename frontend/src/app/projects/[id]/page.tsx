@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { StatusBadge } from "@/components/StatusBadge";
 import { AuthGate } from "@/components/AuthGate";
+import { PreflightModal } from "@/components/PreflightModal";
 import { api, Project, Shot, Render } from "@/lib/api";
 
 export default function ProjectEditorPage() {
@@ -21,6 +22,7 @@ function Inner() {
   const [render, setRender] = useState<Render | null>(null);
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showPreflight, setShowPreflight] = useState(false);
   const router = useRouter();
   const timer = useRef<NodeJS.Timeout | null>(null);
 
@@ -85,18 +87,27 @@ function Inner() {
           {project.status === "planned" || project.status === "failed" ? (
             <button
               className="btn-primary"
-              onClick={async () => {
-                await api.generateVideo(projectId);
-                setPolling(true);
-              }}
+              onClick={() => setShowPreflight(true)}
             >
               Generate Video
             </button>
           ) : null}
           {project.status === "completed" && render && (
-            <Link href={`/projects/${projectId}/render`} className="btn-primary">
-              Open Render →
-            </Link>
+            <>
+              <button
+                className="btn-ghost"
+                title="Re-run only the FFmpeg compose step using existing clips + audio"
+                onClick={async () => {
+                  await api.recompose(projectId);
+                  setPolling(true);
+                }}
+              >
+                Re-compose
+              </button>
+              <Link href={`/projects/${projectId}/render`} className="btn-primary">
+                Open Render →
+              </Link>
+            </>
           )}
         </div>
       </header>
@@ -143,6 +154,22 @@ function Inner() {
         )}
       </section>
 
+      {showPreflight && (
+        <PreflightModal
+          projectId={projectId}
+          onClose={() => setShowPreflight(false)}
+          onConfirm={async (force) => {
+            setShowPreflight(false);
+            try {
+              await api.generateVideo(projectId, force);
+              setPolling(true);
+            } catch (e: any) {
+              setError(e.message);
+            }
+          }}
+        />
+      )}
+
       {render && (
         <section className="card p-4 text-sm">
           <div className="flex items-center justify-between">
@@ -178,6 +205,18 @@ function ShotRow({
 }) {
   const [prompt, setPrompt] = useState(shot.prompt);
   const [dur, setDur] = useState(shot.duration_seconds);
+  const [regenBusy, setRegenBusy] = useState(false);
+
+  const regenerate = async (recompose: boolean) => {
+    setRegenBusy(true);
+    try {
+      await api.regenerateShot(projectId, shot.id, recompose);
+      onChange();
+    } finally {
+      setRegenBusy(false);
+    }
+  };
+
   return (
     <div className="card p-4">
       <div className="flex items-start justify-between gap-4">
@@ -196,7 +235,7 @@ function ShotRow({
             className="input min-h-[60px]"
           />
         </div>
-        <div className="w-32 space-y-2 text-xs">
+        <div className="w-44 space-y-2 text-xs">
           <label className="label">Duration</label>
           <input
             type="number"
@@ -212,10 +251,20 @@ function ShotRow({
             }
           />
           <button
-            className="btn-ghost w-full text-xs"
-            onClick={() => api.regenerateShot(projectId, shot.id).then(onChange)}
+            className="btn-primary w-full text-xs disabled:opacity-50"
+            onClick={() => regenerate(true)}
+            disabled={regenBusy}
+            title="Regenerate just this shot's clip, then re-stitch the final video using existing audio + other shots."
           >
-            Regenerate
+            {regenBusy ? "Regenerating…" : "Regenerate + re-compose"}
+          </button>
+          <button
+            className="btn-ghost w-full text-xs disabled:opacity-50"
+            onClick={() => regenerate(false)}
+            disabled={regenBusy}
+            title="Just remake the clip; click Re-compose at the top when you want to update the final video."
+          >
+            Regenerate clip only
           </button>
         </div>
       </div>

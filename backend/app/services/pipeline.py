@@ -392,17 +392,114 @@ def render_project(db: Session, project_id: int) -> models.Render:
         raise
 
 
-def regenerate_shot(db: Session, project_id: int, shot_id: int) -> Path:
+def regenerate_shot(
+    db: Session, project_id: int, shot_id: int, *, recompose: bool = True
+) -> Path:
     project = db.get(models.VideoProject, project_id)
     shot = db.get(models.VideoShot, shot_id)
     if not project or not shot or shot.project_id != project.id:
         raise ValueError("shot not found in project")
-    # Force regeneration
+    # Force regeneration of this clip only — other shots keep their clip_path,
+    # so the next compose will reuse them.
     shot.clip_path = ""
     shot.status = "pending"
     shot.error = ""
     db.commit()
-    return _ensure_clip_for_shot(db, project, shot)
+    clip = _ensure_clip_for_shot(db, project, shot)
+    if recompose:
+        try:
+            recompose_project(db, project_id)
+        except Exception:  # noqa: BLE001
+            log.exception("recompose after shot regen failed")
+    return clip
+
+
+def _latest_completed_audio(db: Session, project_id: int) -> Optional[Path]:
+    """Find the audio file from the latest render that has one, if it still exists on disk."""
+    rows = (
+        db.query(models.Render)
+        .filter(models.Render.project_id == project_id)
+        .order_by(models.Render.created_at.desc())
+        .all()
+    )
+    for r in rows:
+        if r.audio_path and Path(r.audio_path).exists():
+            return Path(r.audio_path)
+    return None
+
+
+def recompose_project(db: Session, project_id: int) -> models.Render:
+    """Re-run only the FFmpeg composition step, reusing existing shot clips + audio.
+
+    Used when a single shot has been regenerated and the user wants the final video
+    rebuilt without paying for audio synthesis or other shots again. Creates a new
+    Render row so the history of versions is preserved.
+    """
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise ValueError(f"project {project_id} not found")
+    if not project.generated_plan_json:
+        raise ValueError("project has no storyboard plan yet")
+
+    plan = StoryboardPlan.model_validate(project.generated_plan_json)
+
+    missing: list[int] = []
+    clip_paths: list[Path] = []
+    for shot in project.shots:
+        if shot.shot_type == "end_card":
+            continue
+        if not shot.clip_path or not Path(shot.clip_path).exists():
+            missing.append(shot.shot_order)
+            continue
+        clip_paths.append(Path(shot.clip_path))
+    if missing:
+        raise ValueError(f"shots not yet generated: {missing}")
+    if not clip_paths:
+        raise ValueError("no shot clips available to recompose")
+
+    audio = _latest_completed_audio(db, project_id)
+
+    render = models.Render(
+        project_id=project.id,
+        status="rendering",
+        audio_path=str(audio) if audio else "",
+    )
+    db.add(render)
+    db.commit()
+    db.refresh(render)
+
+    try:
+        body_duration = sum(
+            s.duration_seconds for s in project.shots if s.shot_type != "end_card"
+        )
+        timed = chunks_to_timed(plan.caption_chunks, max(body_duration, 1.0))
+        out_dir = storage.render_subdir(project.id)
+        outputs = compose(
+            RenderInputs(
+                project_id=project.id,
+                out_dir=out_dir,
+                clip_paths=clip_paths,
+                audio_path=audio,
+                caption_timings=timed,
+                caption_style=project.caption_style or "clean_white",
+                disclosure_text=plan.disclosure_text if project.include_disclosure else None,
+                cta_text=project.cta_text or None,
+                aspect_ratio=project.aspect_ratio,
+            )
+        )
+        render.final_video_path = str(outputs.final_video_path)
+        render.thumbnail_path = str(outputs.thumbnail_path)
+        render.render_log = outputs.log
+        render.status = "completed"
+        project.status = "completed"
+        db.commit()
+        return render
+    except Exception as e:  # noqa: BLE001
+        log.exception("recompose failed")
+        render.status = "failed"
+        render.error = str(e)[:800]
+        db.commit()
+        raise
 
 
 def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
