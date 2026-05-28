@@ -1,4 +1,4 @@
-.PHONY: dev up down logs build seed test backend-test backend-shell frontend-shell clean
+.PHONY: dev up down logs build seed test backend-test smoke backend-shell frontend-shell clean
 
 dev: up logs
 
@@ -21,6 +21,9 @@ test: backend-test
 
 backend-test:
 	docker compose exec -e MOCK_PROVIDERS=true backend pytest -q
+
+smoke:
+	docker compose exec -e MOCK_PROVIDERS=true backend python -m scripts.smoke
 
 backend-shell:
 	docker compose exec backend bash

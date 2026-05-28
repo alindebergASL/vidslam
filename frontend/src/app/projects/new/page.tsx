@@ -17,6 +17,62 @@ const CAPTION_STYLES = [
   { id: "minimal_lower_third", label: "Minimal Lower Third" },
 ];
 
+// One-click briefs that prefill creative direction (and sensible mode/caption/disclosure)
+// for common verticals — the engine is not dating-app specific.
+const USE_CASE_PRESETS: {
+  label: string;
+  direction: string;
+  mode?: string;
+  caption?: string;
+  disclosure?: string;
+}[] = [
+  {
+    label: "Social creator",
+    direction:
+      "Punchy short-form social hook with a strong first line, fast energy, casual tone.",
+    mode: "reel_montage",
+    caption: "influencer_bold",
+  },
+  {
+    label: "Product demo",
+    direction:
+      "Calm, trustworthy product demo. Show the value clearly, clean visuals, confident neutral tone.",
+    mode: "reel_montage",
+    caption: "clean_white",
+    disclosure: "AI-generated demo",
+  },
+  {
+    label: "Tutorial / explainer",
+    direction:
+      "Patient step-by-step tutorial. Clear sequencing, instructional cadence, no hype.",
+    mode: "talking_head_beta",
+    caption: "minimal_lower_third",
+    disclosure: "AI-generated explainer",
+  },
+  {
+    label: "Fitness",
+    direction:
+      "High-energy fitness motivation, fast cuts, bold and encouraging tone.",
+    mode: "reel_montage",
+    caption: "influencer_bold",
+  },
+  {
+    label: "Music promo",
+    direction:
+      "Moody music-promo aesthetic, rhythmic cuts that hit the beat, atmospheric and stylish.",
+    mode: "reel_montage",
+    caption: "minimal_lower_third",
+  },
+  {
+    label: "Brand mascot",
+    direction:
+      "Friendly brand-mascot spot. Warm, playful, on-brand and memorable.",
+    mode: "static_motion",
+    caption: "clean_white",
+    disclosure: "AI-generated mascot",
+  },
+];
+
 export default function NewProjectPage() {
   return (
     <AuthGate>
@@ -178,6 +234,24 @@ function Inner() {
 
         <div className="card p-4">
           <label className="label">Creative direction (optional)</label>
+          <div className="flex flex-wrap gap-1.5 mb-2">
+            {USE_CASE_PRESETS.map((p) => (
+              <button
+                key={p.label}
+                type="button"
+                className="chip text-[11px] py-1"
+                title={p.direction}
+                onClick={() => {
+                  setCreativeDirection(p.direction);
+                  if (p.mode) setMode(p.mode);
+                  if (p.caption) setCaptionStyle(p.caption);
+                  if (p.disclosure !== undefined) setDisclosureText(p.disclosure);
+                }}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
           <textarea
             className="input min-h-[80px]"
             value={creativeDirection}

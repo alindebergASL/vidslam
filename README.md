@@ -31,6 +31,7 @@ useful for demos, CI, and local development.
 cp .env.example .env          # MOCK_PROVIDERS=true is the default
 make up                       # builds and starts redis + backend + worker + frontend
 make seed                     # creates demo Cast (Naina, Arjun, rooftop, 35mm) + sample project
+make smoke                    # drives the full mock pipeline end-to-end and asserts a playable MP4
 ```
 
 - Frontend → http://localhost:3000 (login with the password from `.env`, default `changeme`)
@@ -267,6 +268,14 @@ PYTHONPATH=. python -m pytest -q
 
 The suite is fully hermetic: no network calls, no real provider keys required.
 HTTP adapters are exercised via `respx`.
+
+For a single end-to-end sanity check (auth → avatar+asset → project →
+preflight → plan → cost → render → valid MP4 → public share link), run the
+smoke script — it exits non-zero on any failure, so it's CI/deploy-gate ready:
+
+```bash
+cd backend && PYTHONPATH=. python -m scripts.smoke   # or: make smoke
+```
 
 ---
 

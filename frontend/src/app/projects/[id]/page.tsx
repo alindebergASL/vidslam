@@ -356,14 +356,33 @@ function ShotRow({
             <span className="chip text-[10px] py-0.5">{shot.shot_type}</span>
             <StatusBadge status={shot.status} />
           </div>
-          <textarea
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            onBlur={() =>
-              api.updateShot(projectId, shot.id, { prompt }).then(onChange)
-            }
-            className="input min-h-[60px]"
-          />
+          <div className="flex gap-3">
+            {shot.status === "completed" && shot.clip_path && shot.shot_type !== "end_card" && (
+              <video
+                key={shot.clip_path}
+                src={api.shotClip(projectId, shot.id)}
+                className="w-24 shrink-0 rounded bg-black aspect-[9/16] object-cover"
+                muted
+                loop
+                playsInline
+                onMouseEnter={(e) => (e.currentTarget as HTMLVideoElement).play()}
+                onMouseLeave={(e) => {
+                  const v = e.currentTarget as HTMLVideoElement;
+                  v.pause();
+                  v.currentTime = 0;
+                }}
+                title="Hover to preview this shot's clip"
+              />
+            )}
+            <textarea
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              onBlur={() =>
+                api.updateShot(projectId, shot.id, { prompt }).then(onChange)
+              }
+              className="input min-h-[60px] flex-1"
+            />
+          </div>
           {castAssets.length > 0 && shot.shot_type !== "end_card" && (
             <div className="mt-3">
               <div className="label flex items-center gap-2">

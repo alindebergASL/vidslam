@@ -197,6 +197,17 @@ def regenerate_shot(
     }
 
 
+@router.get("/projects/{project_id}/shots/{shot_id}/clip")
+def shot_clip(project_id: int, shot_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    """Stream a single shot's generated clip for in-editor preview."""
+    shot = db.get(models.VideoShot, shot_id)
+    if shot is None or shot.project_id != project_id:
+        raise HTTPException(404, "shot not found in project")
+    if not shot.clip_path or not Path(shot.clip_path).exists():
+        raise HTTPException(404, "clip not generated yet")
+    return FileResponse(shot.clip_path, media_type="video/mp4")
+
+
 @router.get("/projects/{project_id}/renders", response_model=list[RenderOut])
 def list_renders(project_id: int, db: Session = Depends(get_db)) -> list[models.Render]:
     if db.get(models.VideoProject, project_id) is None:
