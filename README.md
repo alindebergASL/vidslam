@@ -177,12 +177,19 @@ apply a changed brief).
 
 A `BrandKit` saves a logo + colors (primary / end-card background / end-card
 text) + default CTA and disclosure once, and a project can reference one via
-`brand_kit_id`. At render time the end card uses the kit's background/text
-colors and overlays the uploaded logo above the CTA, and the disclosure
-falls back to the kit's value (precedence: project override → brand kit →
-planner → default). CRUD + logo upload live at `/api/brand-kits`; the
-**Brand** page provides a live end-card preview with color pickers. Deleting a
-kit detaches it from any projects rather than breaking them.
+`brand_kit_id`. At render time:
+
+- the **end card** uses the kit's background/text colors and overlays the
+  uploaded logo above the CTA;
+- the **captions** are recolored to the kit's `primary_color` (converted to an
+  ASS `&HAABBGGRR` value), so the whole video carries the palette — not just
+  the end card;
+- the **disclosure** falls back to the kit's value (precedence: project
+  override → brand kit → planner → default).
+
+CRUD + logo upload live at `/api/brand-kits`; the **Brand** page provides a
+live end-card preview with color pickers. Deleting a kit detaches it from any
+projects rather than breaking them.
 
 ### Cost estimation
 

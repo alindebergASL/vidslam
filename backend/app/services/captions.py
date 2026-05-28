@@ -86,6 +86,17 @@ def _fmt_ts(t: float) -> str:
     return f"{h:01d}:{m:02d}:{s:05.2f}"
 
 
+def hex_to_ass_color(hex_color: str) -> str:
+    """Convert a #RRGGBB (or #RGB) hex string to an ASS &HAABBGGRR (opaque) color."""
+    h = hex_color.strip().lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) != 6:
+        return "&H00FFFFFF"
+    r, g, b = h[0:2], h[2:4], h[4:6]
+    return f"&H00{b}{g}{r}".upper()
+
+
 def write_ass(
     out_path: Path,
     *,
@@ -93,8 +104,13 @@ def write_ass(
     style_name: str = "clean_white",
     width: int = 1080,
     height: int = 1920,
+    primary_color: str | None = None,
 ) -> Path:
-    style = _STYLES.get(style_name, _STYLES["clean_white"])
+    style = dict(_STYLES.get(style_name, _STYLES["clean_white"]))
+    if primary_color:
+        # Brand-driven caption color overrides the preset's PrimaryColour so the
+        # whole video carries the palette, not just the end card.
+        style["PrimaryColour"] = hex_to_ass_color(primary_color)
     style_line = ",".join(
         [
             "AVS",

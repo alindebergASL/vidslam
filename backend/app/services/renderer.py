@@ -30,6 +30,7 @@ class RenderInputs:
     end_card_bg_color: str = "#0E0E12"
     end_card_text_color: str = "#FFFFFF"
     logo_path: Optional[Path] = None
+    caption_color: Optional[str] = None
 
 
 @dataclass
@@ -317,6 +318,7 @@ def compose(inputs: RenderInputs) -> RenderOutputs:
             style_name=inputs.caption_style,
             width=width,
             height=height,
+            primary_color=inputs.caption_color,
         )
 
     # 5. Burn captions + disclosure + mix audio (voiceover + optional music).

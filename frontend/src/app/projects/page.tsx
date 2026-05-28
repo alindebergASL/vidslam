@@ -40,22 +40,34 @@ function Inner() {
                 </div>
                 <StatusBadge status={p.status} className="mt-3" />
               </Link>
-              <button
-                className="absolute top-2 right-2 text-ink-400 hover:text-accent opacity-0 group-hover:opacity-100 transition text-xs"
-                title="Delete project"
-                onClick={async () => {
-                  if (
-                    !window.confirm(
-                      `Delete project "${p.title || "Untitled"}"? This cannot be undone.`
+              <div className="absolute top-2 right-2 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition">
+                <button
+                  className="text-ink-400 hover:text-ink-100 text-xs"
+                  title="Duplicate project"
+                  onClick={async () => {
+                    const dup = await api.duplicateProject(p);
+                    window.location.href = `/projects/${dup.id}`;
+                  }}
+                >
+                  ⧉
+                </button>
+                <button
+                  className="text-ink-400 hover:text-accent text-xs"
+                  title="Delete project"
+                  onClick={async () => {
+                    if (
+                      !window.confirm(
+                        `Delete project "${p.title || "Untitled"}"? This cannot be undone.`
+                      )
                     )
-                  )
-                    return;
-                  await api.deleteProject(p.id);
-                  reload();
-                }}
-              >
-                ✕
-              </button>
+                      return;
+                    await api.deleteProject(p.id);
+                    reload();
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
             </div>
           ))}
         </div>

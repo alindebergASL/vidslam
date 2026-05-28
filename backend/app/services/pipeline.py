@@ -506,6 +506,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 logo_path=(
                     Path(brand.logo_path) if brand and brand.logo_path and Path(brand.logo_path).exists() else None
                 ),
+                caption_color=(brand.primary_color if brand else None),
             )
         )
         render.final_video_path = str(outputs.final_video_path)
@@ -662,6 +663,7 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
                 logo_path=(
                     Path(brand.logo_path) if brand and brand.logo_path and Path(brand.logo_path).exists() else None
                 ),
+                caption_color=(brand.primary_color if brand else None),
             )
         )
         render.final_video_path = str(outputs.final_video_path)

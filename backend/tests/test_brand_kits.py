@@ -65,6 +65,40 @@ def test_project_uses_brand_kit_disclosure_fallback(auth_client):
     assert out == "h264"
 
 
+def test_brand_primary_color_drives_caption_color(auth_client):
+    from pathlib import Path
+
+    bk = auth_client.post(
+        "/api/brand-kits", json={"name": "C", "primary_color": "#FF5C8A"}
+    ).json()
+    aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]
+    auth_client.post(
+        f"/api/avatars/{aid}/assets",
+        files={"file": ("h.png", make_png_bytes(), "image/png")},
+        data={"asset_type": "hero", "rights_confirmed": "true"},
+    )
+    pid = auth_client.post(
+        "/api/projects",
+        json={
+            "title": "T",
+            "original_script": "one two three four five",
+            "cta_text": "Go",
+            "brand_kit_id": bk["id"],
+            "cast": [{"member_kind": "avatar", "avatar_id": aid, "role": "host"}],
+        },
+    ).json()["id"]
+    auth_client.post(f"/api/projects/{pid}/generate-plan")
+    auth_client.post(f"/api/projects/{pid}/generate-video")
+    st = auth_client.get(f"/api/projects/{pid}/status").json()
+    assert st["project_status"] == "completed"
+    # The generated ASS caption file should carry the brand color (&H008A5CFF).
+    out_dir = Path(st["latest_render"]["final_video_path"]).parent
+    ass = out_dir / "captions.ass"
+    assert ass.exists()
+    style_line = next(l for l in ass.read_text().splitlines() if l.startswith("Style:"))
+    assert "8A5CFF" in style_line.upper()
+
+
 def test_deleting_brand_kit_detaches_projects(auth_client):
     bk = auth_client.post("/api/brand-kits", json={"name": "Temp"}).json()
     aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]

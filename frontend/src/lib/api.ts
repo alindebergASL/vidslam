@@ -331,6 +331,25 @@ export const api = {
   getProject: (id: number) => req<Project>(`/api/projects/${id}`),
   createProject: (body: any) =>
     req<Project>("/api/projects", { method: "POST", body: JSON.stringify(body) }),
+  duplicateProject: (p: Project) =>
+    req<Project>("/api/projects", {
+      method: "POST",
+      body: JSON.stringify({
+        title: `${p.title || "Untitled"} (copy)`,
+        original_script: p.original_script,
+        mode: p.mode,
+        aspect_ratio: p.aspect_ratio,
+        target_duration_seconds: p.target_duration_seconds,
+        cta_text: p.cta_text,
+        caption_style: p.caption_style,
+        include_disclosure: p.include_disclosure,
+        disclosure_text: p.disclosure_text,
+        creative_direction: p.creative_direction,
+        primary_avatar_id: p.primary_avatar_id,
+        brand_kit_id: p.brand_kit_id,
+        cast: p.cast_members,
+      }),
+    }),
   updateProject: (id: number, body: any) =>
     req<Project>(`/api/projects/${id}`, {
       method: "PATCH",
