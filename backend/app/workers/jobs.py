@@ -45,6 +45,14 @@ def recompose_project_job(project_id: int) -> None:
         db.close()
 
 
+def regenerate_shots_bulk_job(project_id: int, shot_ids: list[int]) -> None:
+    db = SessionLocal()
+    try:
+        pipeline.regenerate_shots_bulk(db, project_id, shot_ids)
+    finally:
+        db.close()
+
+
 def generate_asset_job(job_id: int) -> None:
     db = SessionLocal()
     try:

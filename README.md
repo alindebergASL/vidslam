@@ -153,6 +153,23 @@ used in `MOCK_PROVIDERS` mode and tests) and `ElevenLabsMusicProvider`
 (real `POST /v1/music` adapter). Swap in Suno, Stable Audio, etc. by
 adding another implementation to the registry without touching the UI.
 
+### Cost estimation
+
+`GET /api/projects/{id}/cost-estimate` returns a transparent rate-card
+projection of real-provider spend (storyboard chat call + per-second video +
+per-1k-char TTS + optional music), configurable via `COST_*` env vars. The
+preflight modal shows this before you commit to a run. Each `Render` records
+`estimated_cost` at creation and `actual_cost` at completion — `actual_cost`
+is `0` in mock mode (nothing billed).
+
+### Bulk shot re-roll
+
+`POST /api/projects/{id}/shots/regenerate-bulk {shot_ids}` regenerates several
+shots' clips in one pass, then runs a single FFmpeg recompose — so re-rolling
+three bad shots costs three clip generations and one stitch, not three full
+renders. The editor exposes this via a checkbox on each shot and a "Re-roll
+selected" toolbar action.
+
 ### Provider key health probe
 
 `POST /api/providers/health-check` validates credentials without generating
@@ -195,7 +212,7 @@ the whole pipeline.
 | Ingredients | mirror of avatars (`/api/ingredients`) |
 | Assets    | `GET /api/public-assets/{token}` · `DELETE /api/assets/{id}` |
 | Projects  | `GET/POST/PATCH /api/projects[/{id}]` · `PATCH /api/projects/{id}/cast` · `PATCH /api/projects/{id}/shots/{shot_id}` |
-| Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `GET /api/projects/{id}/status` · `GET /api/projects/{id}/renders` · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `GET /api/renders/{id}/download` |
+| Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `GET /api/projects/{id}/cost-estimate` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `GET /api/projects/{id}/status` · `GET /api/projects/{id}/renders` · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `POST /api/projects/{id}/shots/regenerate-bulk` · `GET /api/renders/{id}/download` |
 | Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` · `GET /api/public-renders/{token}/meta` — **unauthenticated**, token-gated; backs the branded `/share/{token}` landing page so a finished video can be shared without exposing the app login |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
 | Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |

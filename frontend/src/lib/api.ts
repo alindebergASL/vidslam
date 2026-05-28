@@ -107,6 +107,8 @@ export type Render = {
   render_log: string;
   error: string;
   share_token: string;
+  estimated_cost: number;
+  actual_cost: number;
   created_at: string;
   updated_at: string;
 };
@@ -146,6 +148,22 @@ export type PreflightResult = {
   ok: boolean;
   summary: "ok" | "warn" | "fail";
   checks: PreflightCheck[];
+};
+
+export type CostLine = {
+  item: string;
+  qty: number;
+  unit: string;
+  unit_cost: number;
+  cost: number;
+};
+
+export type CostEstimate = {
+  currency: string;
+  total: number;
+  lines: CostLine[];
+  is_estimate: boolean;
+  note: string;
 };
 
 export type StudioJob = {
@@ -336,6 +354,13 @@ export const api = {
     req<any>(`/api/projects/${id}/generate-plan`, { method: "POST" }),
   preflight: (id: number) =>
     req<PreflightResult>(`/api/projects/${id}/preflight`),
+  costEstimate: (id: number) =>
+    req<CostEstimate>(`/api/projects/${id}/cost-estimate`),
+  regenerateShotsBulk: (id: number, shotIds: number[]) =>
+    req<any>(`/api/projects/${id}/shots/regenerate-bulk`, {
+      method: "POST",
+      body: JSON.stringify({ shot_ids: shotIds }),
+    }),
   generateVideo: (id: number, force = false) =>
     req<any>(
       `/api/projects/${id}/generate-video${force ? "?force=true" : ""}`,

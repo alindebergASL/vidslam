@@ -27,6 +27,7 @@ function Inner() {
   const [error, setError] = useState<string | null>(null);
   const [showPreflight, setShowPreflight] = useState(false);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [selected, setSelected] = useState<number[]>([]);
   const router = useRouter();
   const timer = useRef<NodeJS.Timeout | null>(null);
 
@@ -151,18 +152,39 @@ function Inner() {
         <div className="flex items-baseline justify-between mb-3">
           <h2 className="text-lg font-medium">Storyboard</h2>
           <div className="flex items-center gap-3">
-            {project.shots.length > 1 && (
-              <span className="text-xs text-ink-400">Drag a shot to reorder</span>
+            {selected.length > 0 ? (
+              <>
+                <span className="text-xs text-ink-300">{selected.length} selected</span>
+                <button
+                  className="btn-primary text-xs"
+                  onClick={async () => {
+                    await api.regenerateShotsBulk(projectId, selected);
+                    setSelected([]);
+                    setPolling(true);
+                  }}
+                >
+                  Re-roll selected →
+                </button>
+                <button className="btn-ghost text-xs" onClick={() => setSelected([])}>
+                  Clear
+                </button>
+              </>
+            ) : (
+              <>
+                {project.shots.length > 1 && (
+                  <span className="text-xs text-ink-400">Drag to reorder · tick to bulk re-roll</span>
+                )}
+                <button
+                  className="btn-ghost text-xs"
+                  onClick={async () => {
+                    await api.generatePlan(projectId);
+                    setPolling(true);
+                  }}
+                >
+                  Re-plan
+                </button>
+              </>
             )}
-            <button
-              className="btn-ghost text-xs"
-              onClick={async () => {
-                await api.generatePlan(projectId);
-                setPolling(true);
-              }}
-            >
-              Re-plan
-            </button>
           </div>
         </div>
         {project.shots.length === 0 ? (
@@ -179,6 +201,12 @@ function Inner() {
                 shot={s}
                 castAssets={castAssets}
                 onChange={refresh}
+                selected={selected.includes(s.id)}
+                onToggleSelect={() =>
+                  setSelected((cur) =>
+                    cur.includes(s.id) ? cur.filter((x) => x !== s.id) : [...cur, s.id]
+                  )
+                }
                 dragIndex={dragIndex}
                 onDragStart={() => setDragIndex(idx)}
                 onDragOver={(e) => e.preventDefault()}
@@ -237,6 +265,8 @@ function ShotRow({
   shot,
   castAssets,
   onChange,
+  selected,
+  onToggleSelect,
   dragIndex,
   onDragStart,
   onDragOver,
@@ -248,6 +278,8 @@ function ShotRow({
   shot: Shot;
   castAssets: Asset[];
   onChange: () => void;
+  selected: boolean;
+  onToggleSelect: () => void;
   dragIndex: number | null;
   onDragStart: () => void;
   onDragOver: (e: React.DragEvent) => void;
@@ -279,13 +311,24 @@ function ShotRow({
 
   return (
     <div
-      className={`card p-4 transition ${dragIndex === index ? "opacity-50" : ""}`}
+      className={`card p-4 transition ${dragIndex === index ? "opacity-50" : ""} ${
+        selected ? "border-accent" : ""
+      }`}
       onDragOver={onDragOver}
       onDrop={onDrop}
     >
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1">
           <div className="flex items-center gap-2 mb-2">
+            {shot.shot_type !== "end_card" && (
+              <input
+                type="checkbox"
+                checked={selected}
+                onChange={onToggleSelect}
+                title="Select for bulk re-roll"
+                className="accent-accent"
+              />
+            )}
             <span
               draggable
               onDragStart={onDragStart}

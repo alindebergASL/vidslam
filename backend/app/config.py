@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     elevenlabs_music_model_id: str = ""
     elevenlabs_base_url: str = "https://api.elevenlabs.io/v1"
 
+    # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
+    cost_chat_per_plan: float = 0.01
+    cost_image_per_item: float = 0.04
+    cost_video_per_second: float = 0.10
+    cost_tts_per_1k_chars: float = 0.20
+    cost_music_per_generation: float = 0.05
+
     @property
     def data_path(self) -> Path:
         p = Path(self.data_dir)

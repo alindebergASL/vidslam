@@ -1,74 +1,51 @@
-"use client";
-import { useEffect, useState } from "react";
-import { useParams } from "next/navigation";
-import { api } from "@/lib/api";
+import type { Metadata } from "next";
+import { SharePlayer } from "./SharePlayer";
 
-type Meta = { title: string; aspect_ratio: string; created_at: string; disclosure: string };
+// Server-side base for metadata fetch (inside the container the public base may
+// differ from the browser-facing one). Falls back to the public base.
+const PUBLIC_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+const INTERNAL_API_BASE = process.env.INTERNAL_API_BASE || PUBLIC_API_BASE;
 
-export default function SharePage() {
-  const params = useParams();
-  const token = String(params?.token || "");
-  const [meta, setMeta] = useState<Meta | null>(null);
-  const [error, setError] = useState<string | null>(null);
+type Props = { params: { token: string } };
 
-  useEffect(() => {
-    if (!token) return;
-    api
-      .publicRenderMeta(token)
-      .then(setMeta)
-      .catch(() => setError("This share link is invalid or the video is no longer available."));
-  }, [token]);
+export async function generateMetadata({ params }: Props): Promise<Metadata> {
+  const { token } = params;
+  const fallback: Metadata = {
+    title: "Shared video · AvatarVideoStudio",
+    description: "AI-generated virtual creator content.",
+  };
+  try {
+    const r = await fetch(`${INTERNAL_API_BASE}/api/public-renders/${token}/meta`, {
+      cache: "no-store",
+    });
+    if (!r.ok) return fallback;
+    const meta = (await r.json()) as { title: string; disclosure: string };
+    const thumb = `${PUBLIC_API_BASE}/api/public-renders/${token}/thumbnail`;
+    const videoUrl = `${PUBLIC_API_BASE}/api/public-renders/${token}`;
+    const title = `${meta.title} · AvatarVideoStudio`;
+    const description = meta.disclosure || "AI-generated virtual creator content.";
+    return {
+      title,
+      description,
+      openGraph: {
+        title,
+        description,
+        type: "video.other",
+        images: [{ url: thumb, width: 1080, height: 1920 }],
+        videos: [{ url: videoUrl, type: "video/mp4", width: 1080, height: 1920 }],
+      },
+      twitter: {
+        card: "summary_large_image",
+        title,
+        description,
+        images: [thumb],
+      },
+    };
+  } catch {
+    return fallback;
+  }
+}
 
-  return (
-    <div className="min-h-screen bg-ink-950 flex flex-col items-center px-4 py-10">
-      <div className="w-full max-w-md">
-        <div className="flex items-center justify-between mb-6">
-          <div className="text-lg font-semibold tracking-tight">AvatarVideoStudio</div>
-          <span className="text-xs text-ink-400">Shared video</span>
-        </div>
-
-        {error ? (
-          <div className="card p-8 text-center text-ink-300 text-sm">{error}</div>
-        ) : (
-          <>
-            <div className="card overflow-hidden bg-black mb-4">
-              <video
-                src={api.publicRender(token)}
-                poster={api.publicRenderThumb(token)}
-                controls
-                playsInline
-                autoPlay
-                muted
-                className="w-full max-h-[78vh] mx-auto"
-              />
-            </div>
-            <div className="px-1">
-              <h1 className="text-xl font-semibold">{meta?.title || "Loading…"}</h1>
-              <div className="flex items-center gap-2 mt-2 text-xs text-ink-400">
-                {meta && (
-                  <>
-                    <span className="chip text-[10px] py-0.5">{meta.disclosure}</span>
-                    <span>{new Date(meta.created_at).toLocaleDateString()}</span>
-                  </>
-                )}
-              </div>
-            </div>
-            <div className="mt-6 text-center">
-              <a
-                href={api.publicRender(token)}
-                download
-                className="btn-ghost text-xs"
-              >
-                Download MP4
-              </a>
-            </div>
-          </>
-        )}
-
-        <div className="mt-10 text-center text-[10px] text-ink-500">
-          Created with AvatarVideoStudio · AI-generated virtual creator content
-        </div>
-      </div>
-    </div>
-  );
+export default function SharePage({ params }: Props) {
+  return <SharePlayer token={params.token} />;
 }

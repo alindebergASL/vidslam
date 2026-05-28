@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
-import { api, PreflightCheck, PreflightResult } from "@/lib/api";
+import { api, CostEstimate, PreflightCheck, PreflightResult } from "@/lib/api";
 
 export function PreflightModal({
   projectId,
@@ -12,10 +12,12 @@ export function PreflightModal({
   onConfirm: (force: boolean) => void;
 }) {
   const [result, setResult] = useState<PreflightResult | null>(null);
+  const [cost, setCost] = useState<CostEstimate | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api.preflight(projectId).then(setResult).catch((e) => setError(e.message));
+    api.costEstimate(projectId).then(setCost).catch(() => setCost(null));
   }, [projectId]);
 
   return (
@@ -46,6 +48,26 @@ export function PreflightModal({
                 <CheckRow key={c.id} c={c} />
               ))}
             </div>
+
+            {cost && (
+              <details className="mb-4 rounded-md border border-ink-700 bg-ink-800/50 p-3">
+                <summary className="cursor-pointer text-sm flex items-center justify-between">
+                  <span className="text-ink-200">Estimated cost (real providers)</span>
+                  <span className="font-semibold text-ink-100">
+                    ~${cost.total.toFixed(2)} {cost.currency}
+                  </span>
+                </summary>
+                <div className="mt-2 space-y-1">
+                  {cost.lines.map((l, i) => (
+                    <div key={i} className="flex justify-between text-xs text-ink-300">
+                      <span>{l.item}</span>
+                      <span>${l.cost.toFixed(2)}</span>
+                    </div>
+                  ))}
+                  <div className="text-[10px] text-ink-500 pt-1">{cost.note}</div>
+                </div>
+              </details>
+            )}
 
             <div className="flex items-center justify-between pt-2 border-t border-ink-800">
               <div className="text-xs text-ink-300">

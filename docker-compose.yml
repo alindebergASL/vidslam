@@ -48,6 +48,8 @@ services:
     env_file: .env
     environment:
       NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
+      # Server-side (SSR) base so generateMetadata can reach the backend container.
+      INTERNAL_API_BASE: http://backend:8000
     volumes:
       - ./frontend:/app
       - /app/node_modules

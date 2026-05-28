@@ -200,6 +200,8 @@ class RenderOut(BaseModel):
     render_log: str
     error: str
     share_token: str
+    estimated_cost: float
+    actual_cost: float
     created_at: datetime
     updated_at: datetime
 

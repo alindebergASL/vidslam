@@ -87,6 +87,13 @@ function Inner() {
               poster={api.renderThumb(render.id)}
             />
           </div>
+          {(render.estimated_cost > 0 || render.actual_cost > 0) && (
+            <div className="text-xs text-ink-400 mb-3">
+              Cost: actual ${render.actual_cost.toFixed(2)} · estimated $
+              {render.estimated_cost.toFixed(2)}
+              {render.actual_cost === 0 && " (mock mode — nothing billed)"}
+            </div>
+          )}
           <div className="flex flex-wrap gap-3 items-center">
             <a
               href={api.renderDownload(render.id)}

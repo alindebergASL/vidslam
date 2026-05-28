@@ -11,11 +11,14 @@ from ..db import get_db
 from ..schemas import ProjectStatusOut, RenderOut, ShotOut
 from ..services.preflight import run_preflight
 from ..services.safety import UnsafeScriptError, validate_script
+from pydantic import BaseModel
+
 from ..workers.jobs import (
     generate_plan_job,
     generate_video_job,
     recompose_project_job,
     regenerate_shot_job,
+    regenerate_shots_bulk_job,
 )
 from ..workers.queue import enqueue
 from .auth import require_auth
@@ -81,6 +84,27 @@ def preflight(project_id: int, db: Session = Depends(get_db)) -> dict:
     return run_preflight(db, project)
 
 
+@router.get("/projects/{project_id}/cost-estimate")
+def cost_estimate(project_id: int, db: Session = Depends(get_db)) -> dict:
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    if not project.generated_plan_json:
+        raise HTTPException(409, "generate a storyboard plan first")
+    from ..schemas.storyboard import StoryboardPlan
+    from ..services.cost import estimate_plan_cost
+
+    plan = StoryboardPlan.model_validate(project.generated_plan_json)
+    project_dict = {
+        "voiceover_source": project.voiceover_source,
+        # If the project already has uploaded music, no generation cost; otherwise
+        # we can't know intent here, so treat music as already-handled (0) for the
+        # estimate. The Studio/AudioPanel surfaces music-gen cost separately.
+        "music_will_generate": False,
+    }
+    return estimate_plan_cost(project_dict, plan)
+
+
 @router.post("/projects/{project_id}/generate-video", status_code=202)
 def generate_video(
     project_id: int,
@@ -109,6 +133,30 @@ def recompose_video(project_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(409, "generate a storyboard plan first")
     job_id = enqueue(recompose_project_job, project_id)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
+
+
+class BulkRegenIn(BaseModel):
+    shot_ids: list[int]
+
+
+@router.post("/projects/{project_id}/shots/regenerate-bulk", status_code=202)
+def regenerate_shots_bulk(
+    project_id: int, body: BulkRegenIn, db: Session = Depends(get_db)
+) -> dict:
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    valid = {s.id for s in project.shots if s.shot_type != "end_card"}
+    targets = [sid for sid in body.shot_ids if sid in valid]
+    if not targets:
+        raise HTTPException(422, "no regenerable shots in the selection")
+    job_id = enqueue(regenerate_shots_bulk_job, project_id, targets)
+    return {
+        "project_id": project_id,
+        "job_id": job_id,
+        "status": "enqueued",
+        "shot_ids": targets,
+    }
 
 
 @router.get("/projects/{project_id}/status", response_model=ProjectStatusOut)

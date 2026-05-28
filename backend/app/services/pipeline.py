@@ -412,7 +412,18 @@ def render_project(db: Session, project_id: int) -> models.Render:
         raise ValueError("project has no storyboard plan yet")
 
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
-    render = models.Render(project_id=project.id, status="generating_audio")
+    from .cost import estimate_plan_cost
+
+    settings_local = get_settings()
+    estimate = estimate_plan_cost(
+        {"voiceover_source": project.voiceover_source, "music_will_generate": False},
+        plan,
+    )
+    render = models.Render(
+        project_id=project.id,
+        status="generating_audio",
+        estimated_cost=estimate["total"],
+    )
     db.add(render)
     db.commit()
     db.refresh(render)
@@ -469,6 +480,9 @@ def render_project(db: Session, project_id: int) -> models.Render:
         render.final_video_path = str(outputs.final_video_path)
         render.thumbnail_path = str(outputs.thumbnail_path)
         render.render_log = outputs.log
+        # Nothing is billed in mock mode; otherwise the actual matches the estimate
+        # (we don't get per-call billing back from the providers in the MVP).
+        render.actual_cost = 0.0 if settings_local.video_is_mocked() else render.estimated_cost
         render.status = "completed"
         project.status = "completed"
         db.commit()
@@ -502,6 +516,40 @@ def regenerate_shot(
         except Exception:  # noqa: BLE001
             log.exception("recompose after shot regen failed")
     return clip
+
+
+def regenerate_shots_bulk(
+    db: Session, project_id: int, shot_ids: list[int], *, recompose: bool = True
+) -> list[int]:
+    """Regenerate several shots' clips in one pass, then optionally re-compose once.
+
+    Returns the list of shot ids that were successfully regenerated. A shot that
+    fails is marked failed and skipped; the recompose still runs for the rest as
+    long as every body shot ends up with a clip on disk."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise ValueError(f"project {project_id} not found")
+    by_id = {s.id: s for s in project.shots}
+    regenerated: list[int] = []
+    for sid in shot_ids:
+        shot = by_id.get(sid)
+        if shot is None or shot.shot_type == "end_card":
+            continue
+        shot.clip_path = ""
+        shot.status = "pending"
+        shot.error = ""
+        db.commit()
+        try:
+            _ensure_clip_for_shot(db, project, shot)
+            regenerated.append(sid)
+        except Exception:  # noqa: BLE001
+            log.exception("bulk regen failed for shot %s", sid)
+    if recompose:
+        try:
+            recompose_project(db, project_id)
+        except Exception:  # noqa: BLE001
+            log.exception("recompose after bulk regen failed")
+    return regenerated
 
 
 def _latest_completed_audio(db: Session, project_id: int) -> Optional[Path]:
