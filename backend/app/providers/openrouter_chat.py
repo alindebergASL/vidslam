@@ -30,6 +30,8 @@ def _format_user_payload(project: dict, cast: CastContext) -> str:
                 "cta_text": project.get("cta_text"),
                 "caption_style": project.get("caption_style"),
                 "include_disclosure": project.get("include_disclosure"),
+                "disclosure_text": project.get("disclosure_text"),
+                "creative_direction": project.get("creative_direction"),
                 "original_script": project.get("original_script"),
             },
             "cast": {

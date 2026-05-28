@@ -70,8 +70,22 @@ def _project_dict(project: models.VideoProject) -> dict:
         "cta_text": project.cta_text,
         "caption_style": project.caption_style,
         "include_disclosure": project.include_disclosure,
+        "disclosure_text": project.disclosure_text,
+        "creative_direction": project.creative_direction,
         "original_script": project.original_script,
     }
+
+
+def _disclosure_for(project: models.VideoProject, plan: StoryboardPlan) -> Optional[str]:
+    """Burn-in disclosure precedence: project override → planner value → default.
+    Returns None when the project disables the overlay."""
+    if not project.include_disclosure:
+        return None
+    return (
+        (project.disclosure_text or "").strip()
+        or (plan.disclosure_text or "").strip()
+        or "AI-generated virtual creator"
+    )
 
 
 def _log_provider_call(
@@ -470,7 +484,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 audio_path=Path(render.audio_path) if render.audio_path else None,
                 caption_timings=timed,
                 caption_style=project.caption_style or "clean_white",
-                disclosure_text=plan.disclosure_text if project.include_disclosure else None,
+                disclosure_text=_disclosure_for(project, plan),
                 cta_text=project.cta_text or None,
                 aspect_ratio=project.aspect_ratio,
                 music_path=_music_path_if_any(project),
@@ -620,7 +634,7 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
                 audio_path=audio,
                 caption_timings=timed,
                 caption_style=project.caption_style or "clean_white",
-                disclosure_text=plan.disclosure_text if project.include_disclosure else None,
+                disclosure_text=_disclosure_for(project, plan),
                 cta_text=project.cta_text or None,
                 aspect_ratio=project.aspect_ratio,
                 music_path=_music_path_if_any(project),

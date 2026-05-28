@@ -69,6 +69,10 @@ def create_project(body: ProjectCreate, db: Session = Depends(get_db)) -> models
         cta_text=body.cta_text,
         caption_style=body.caption_style,
         include_disclosure=body.include_disclosure,
+        disclosure_text=body.disclosure_text,
+        creative_direction=body.creative_direction,
+        voiceover_source=body.voiceover_source,
+        music_volume=body.music_volume,
         primary_avatar_id=primary_id,
         status="draft",
     )

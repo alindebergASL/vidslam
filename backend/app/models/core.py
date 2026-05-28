@@ -138,6 +138,9 @@ class VideoProject(Base):
     cta_text: Mapped[str] = mapped_column(String(280), default="")
     caption_style: Mapped[str] = mapped_column(String(40), default="clean_white")
     include_disclosure: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Per-project overrides so the engine works for any vertical, not just social-creator content.
+    disclosure_text: Mapped[str] = mapped_column(String(200), default="")
+    creative_direction: Mapped[str] = mapped_column(Text, default="")
     voiceover_source: Mapped[str] = mapped_column(String(20), default="tts")
     # tts | upload | silent
     voiceover_upload_path: Mapped[str] = mapped_column(String(500), default="")

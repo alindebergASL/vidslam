@@ -123,6 +123,8 @@ export type Project = {
   cta_text: string;
   caption_style: string;
   include_disclosure: boolean;
+  disclosure_text: string;
+  creative_direction: string;
   voiceover_source: "tts" | "upload" | "silent";
   voiceover_upload_path: string;
   music_upload_path: string;

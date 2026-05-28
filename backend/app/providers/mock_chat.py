@@ -32,6 +32,8 @@ class MockChatProvider(ChatProvider):
         target_seconds = float(project.get("target_duration_seconds") or 25)
         mode = project.get("mode") or "reel_montage"
         include_disclosure = bool(project.get("include_disclosure", True))
+        disclosure_override = (project.get("disclosure_text") or "").strip()
+        direction = (project.get("creative_direction") or "").strip()
 
         # Build shot plan based on mode.
         avatars = cast.avatars or [{"name": "Avatar", "role": "host"}]
@@ -45,6 +47,9 @@ class MockChatProvider(ChatProvider):
         def _style_str() -> str:
             return f", {ing_style['name']} style" if ing_style else ""
 
+        def _direction_str() -> str:
+            return f" [{direction}]" if direction else ""
+
         body_duration = max(target_seconds - (3.0 if cta else 0.0), 6.0)
         shots: list[ShotPlan] = []
 
@@ -56,7 +61,8 @@ class MockChatProvider(ChatProvider):
                     duration_seconds=body_duration,
                     visual_prompt=(
                         f"{avatars[0]['name']} (AI-generated virtual creator) speaking to camera"
-                        f"{_scene_str()}{_style_str()}. Direct eye contact, natural expression."
+                        f"{_scene_str()}{_style_str()}{_direction_str()}. "
+                        f"Direct eye contact, natural expression."
                     ),
                     negative_prompt="blurry, distorted, low quality",
                     reference_strategy="frame_images",
@@ -74,7 +80,7 @@ class MockChatProvider(ChatProvider):
                     duration_seconds=body_duration,
                     visual_prompt=(
                         f"{avatars[0]['name']} (AI-generated virtual creator) hero portrait"
-                        f"{_scene_str()}{_style_str()}, subtle parallax zoom-in."
+                        f"{_scene_str()}{_style_str()}{_direction_str()}, subtle parallax zoom-in."
                     ),
                     negative_prompt="warping, jittery motion",
                     reference_strategy="static_motion",
@@ -98,7 +104,7 @@ class MockChatProvider(ChatProvider):
                         duration_seconds=round(per, 2),
                         visual_prompt=(
                             f"{a['name']} (AI-generated virtual creator)"
-                            f"{_scene_str()}{_style_str()}, "
+                            f"{_scene_str()}{_style_str()}{_direction_str()}, "
                             f"{'wide establishing shot' if i == 0 else 'mid b-roll moment'}, "
                             f"shot {i + 1} of {n}."
                         ),
@@ -141,7 +147,9 @@ class MockChatProvider(ChatProvider):
             estimated_duration_seconds=sum(s.duration_seconds for s in shots),
             content_warning_notes="",
             disclosure_text=(
-                "AI-generated virtual creator" if include_disclosure else ""
+                (disclosure_override or "AI-generated virtual creator")
+                if include_disclosure
+                else ""
             ),
             end_card_text=cta,
             caption_chunks=caption_chunks,

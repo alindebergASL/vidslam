@@ -133,6 +133,20 @@ function Inner() {
             })
           }
         />
+        <div className="label mt-4">Creative direction</div>
+        <textarea
+          className="input min-h-[60px]"
+          placeholder="Use case + tone for the planner (demo, tutorial, promo…). Re-plan to apply."
+          value={project.creative_direction}
+          onChange={(e) =>
+            setProject({ ...project, creative_direction: e.target.value })
+          }
+          onBlur={() =>
+            api.updateProject(projectId, {
+              creative_direction: project.creative_direction,
+            })
+          }
+        />
       </section>
 
       {project.generated_plan_json?.content_warning_notes && (

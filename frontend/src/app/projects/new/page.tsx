@@ -40,6 +40,8 @@ function Inner() {
   const [cta, setCta] = useState("");
   const [captionStyle, setCaptionStyle] = useState("clean_white");
   const [disclosure, setDisclosure] = useState(true);
+  const [disclosureText, setDisclosureText] = useState("");
+  const [creativeDirection, setCreativeDirection] = useState("");
   const [cast, setCast] = useState<CastMember[]>([]);
   const [primary, setPrimary] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -134,6 +136,8 @@ function Inner() {
         cta_text: cta,
         caption_style: captionStyle,
         include_disclosure: disclosure,
+        disclosure_text: disclosureText,
+        creative_direction: creativeDirection,
         primary_avatar_id: primary,
         cast,
       });
@@ -169,6 +173,20 @@ function Inner() {
           />
           <div className="text-xs text-ink-400 mt-2">
             The planner will tighten this into a short-form voiceover.
+          </div>
+        </div>
+
+        <div className="card p-4">
+          <label className="label">Creative direction (optional)</label>
+          <textarea
+            className="input min-h-[80px]"
+            value={creativeDirection}
+            onChange={(e) => setCreativeDirection(e.target.value)}
+            placeholder="Describe the use case + tone so the planner adapts — e.g. 'Calm product demo for a B2B SaaS dashboard, clean and trustworthy' or 'High-energy fitness hook, fast cuts'."
+          />
+          <div className="text-xs text-ink-400 mt-2">
+            Steers the storyboard for any vertical (demo, education, fitness, promo…),
+            not just social-creator content.
           </div>
         </div>
 
@@ -280,6 +298,17 @@ function Inner() {
               />
               Show disclosure overlay
             </label>
+            {disclosure && (
+              <div>
+                <label className="label">Disclosure text</label>
+                <input
+                  className="input"
+                  value={disclosureText}
+                  onChange={(e) => setDisclosureText(e.target.value)}
+                  placeholder="AI-generated virtual creator"
+                />
+              </div>
+            )}
           </div>
         </div>
 

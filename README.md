@@ -153,6 +153,25 @@ used in `MOCK_PROVIDERS` mode and tests) and `ElevenLabsMusicProvider`
 (real `POST /v1/music` adapter). Swap in Suno, Stable Audio, etc. by
 adding another implementation to the registry without touching the UI.
 
+### Not just one vertical
+
+The engine is domain-agnostic — the dating-app seed data (`Naina` / `Kissmet`)
+is only demo content. The Cast model (avatars + scene/style/object/prop
+ingredients), the three modes, the renderer, and the provider adapters know
+nothing about any particular use case. Two per-project fields let you target
+any vertical without code changes:
+
+- **`creative_direction`** — a free-text brief injected into the storyboard
+  planner ("Calm B2B SaaS product demo, clean and trustworthy"; "High-energy
+  fitness hook, fast cuts"; "Patient step-by-step tutorial"). The planner
+  adapts shot list, pacing, and language to it.
+- **`disclosure_text`** — overrides the burned-in overlay label (default
+  "AI-generated virtual creator"; set "AI-generated product demo",
+  "Virtual presenter", etc., or disable it entirely).
+
+Both are editable in the New Project form and the project editor (re-plan to
+apply a changed brief).
+
 ### Cost estimation
 
 `GET /api/projects/{id}/cost-estimate` returns a transparent rate-card
