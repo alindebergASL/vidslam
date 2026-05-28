@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { api, Asset, Avatar, Ingredient, StudioJob } from "@/lib/api";
@@ -37,6 +38,7 @@ type Tile = {
 };
 
 function Studio() {
+  const router = useRouter();
   const [filter, setFilter] = useState<Filter>("all");
   const [avatars, setAvatars] = useState<Avatar[]>([]);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
@@ -185,6 +187,25 @@ function Studio() {
                 selected={t.assetId ? selectedRefs.includes(t.assetId) : false}
                 onSelect={() => t.assetId && toggleRef(t.assetId)}
                 onSaved={reload}
+                onUseInProject={async (jobId) => {
+                  const job = jobs.find((j) => j.id === jobId);
+                  if (!job) return;
+                  // Save image results back to the cast first so the project
+                  // can pick them up as a reference; clip results stay in /studio.
+                  if (job.output_kind === "image" && job.status === "completed") {
+                    try {
+                      await api.saveStudioJob(job.id);
+                      await reload();
+                    } catch {
+                      /* already saved */
+                    }
+                  }
+                  const params = new URLSearchParams({
+                    owner_kind: job.owner_kind,
+                    owner_id: String(job.owner_id),
+                  });
+                  router.push(`/projects/new?${params.toString()}`);
+                }}
               />
             ))}
           </div>
@@ -210,11 +231,13 @@ function TileCard({
   selected,
   onSelect,
   onSaved,
+  onUseInProject,
 }: {
   tile: Tile;
   selected: boolean;
   onSelect: () => void;
   onSaved: () => void;
+  onUseInProject: (jobId: number) => void;
 }) {
   return (
     <div
@@ -264,16 +287,29 @@ function TileCard({
       )}
 
       {tile.kind === "job" && tile.status === "completed" && tile.jobId && (
-        <button
-          onClick={async () => {
-            await api.saveStudioJob(tile.jobId!);
-            onSaved();
-          }}
-          className="absolute top-2 right-2 chip text-xs py-1 opacity-0 group-hover:opacity-100 transition"
-          title="Save to cast"
-        >
-          Save
-        </button>
+        <div className="absolute top-2 right-2 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition">
+          <button
+            onClick={async () => {
+              try {
+                await api.saveStudioJob(tile.jobId!);
+              } catch {
+                /* already saved */
+              }
+              onSaved();
+            }}
+            className="chip text-xs py-1"
+            title="Save to cast"
+          >
+            Save
+          </button>
+          <button
+            onClick={() => onUseInProject(tile.jobId!)}
+            className="chip text-xs py-1"
+            title="Start a new project pre-loaded with this asset's owner"
+          >
+            New Project →
+          </button>
+        </div>
       )}
 
       {tile.kind === "job" && tile.status && !["completed", "saved"].includes(tile.status) && (

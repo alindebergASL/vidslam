@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { api, Avatar, CastMember, Ingredient } from "@/lib/api";
@@ -27,6 +27,10 @@ export default function NewProjectPage() {
 
 function Inner() {
   const router = useRouter();
+  const search = useSearchParams();
+  const seedOwnerKind = search?.get("owner_kind") as "avatar" | "ingredient" | null;
+  const seedOwnerId = search?.get("owner_id") ? Number(search.get("owner_id")) : null;
+
   const [avatars, setAvatars] = useState<Avatar[]>([]);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [title, setTitle] = useState("");
@@ -44,13 +48,47 @@ function Inner() {
   useEffect(() => {
     api.listAvatars().then((avs) => {
       setAvatars(avs);
-      if (avs[0]) {
+      // Seed from query params if present, else pick the first avatar.
+      if (seedOwnerKind === "avatar" && seedOwnerId) {
+        const av = avs.find((a) => a.id === seedOwnerId);
+        if (av) {
+          setPrimary(av.id);
+          setCast((cur) => {
+            if (cur.some((c) => c.member_kind === "avatar" && c.avatar_id === av.id))
+              return cur;
+            return [...cur, { member_kind: "avatar", avatar_id: av.id, role: "host" }];
+          });
+          return;
+        }
+      }
+      if (avs[0] && !seedOwnerKind) {
         setPrimary(avs[0].id);
         setCast([{ member_kind: "avatar", avatar_id: avs[0].id, role: "host" }]);
       }
     });
-    api.listIngredients().then(setIngredients);
-  }, []);
+    api.listIngredients().then((ings) => {
+      setIngredients(ings);
+      if (seedOwnerKind === "ingredient" && seedOwnerId) {
+        const ing = ings.find((i) => i.id === seedOwnerId);
+        if (ing) {
+          setCast((cur) => {
+            if (
+              cur.some((c) => c.member_kind === "ingredient" && c.ingredient_id === ing.id)
+            )
+              return cur;
+            return [
+              ...cur,
+              {
+                member_kind: "ingredient",
+                ingredient_id: ing.id,
+                role: ing.kind === "scene" ? "location" : ing.kind,
+              },
+            ];
+          });
+        }
+      }
+    });
+  }, [seedOwnerKind, seedOwnerId]);
 
   const toggleAvatar = (av: Avatar, role = "host") => {
     setCast((cur) => {

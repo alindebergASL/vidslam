@@ -266,6 +266,10 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(body),
     }),
+  castAssets: (projectId: number) =>
+    req<Asset[]>(`/api/projects/${projectId}/cast-assets`),
+  deleteProject: (id: number) =>
+    req<void>(`/api/projects/${id}`, { method: "DELETE" }),
   generatePlan: (id: number) =>
     req<any>(`/api/projects/${id}/generate-plan`, { method: "POST" }),
   preflight: (id: number) =>

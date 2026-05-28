@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { StatusBadge } from "@/components/StatusBadge";
 import { AuthGate } from "@/components/AuthGate";
 import { PreflightModal } from "@/components/PreflightModal";
-import { api, Project, Shot, Render } from "@/lib/api";
+import { api, Asset, Project, Shot, Render } from "@/lib/api";
 
 export default function ProjectEditorPage() {
   return (
@@ -20,6 +20,7 @@ function Inner() {
   const projectId = Number(params?.id);
   const [project, setProject] = useState<Project | null>(null);
   const [render, setRender] = useState<Render | null>(null);
+  const [castAssets, setCastAssets] = useState<Asset[]>([]);
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showPreflight, setShowPreflight] = useState(false);
@@ -32,6 +33,8 @@ function Inner() {
       setProject(p);
       const st = await api.projectStatus(projectId);
       setRender(st.latest_render);
+      const ca = await api.castAssets(projectId);
+      setCastAssets(ca);
       if (!["completed", "failed", "draft", "planned"].includes(st.project_status)) {
         setPolling(true);
       } else {
@@ -148,7 +151,13 @@ function Inner() {
         ) : (
           <div className="space-y-3">
             {project.shots.map((s) => (
-              <ShotRow key={s.id} projectId={projectId} shot={s} onChange={refresh} />
+              <ShotRow
+                key={s.id}
+                projectId={projectId}
+                shot={s}
+                castAssets={castAssets}
+                onChange={refresh}
+              />
             ))}
           </div>
         )}
@@ -197,14 +206,17 @@ function Inner() {
 function ShotRow({
   projectId,
   shot,
+  castAssets,
   onChange,
 }: {
   projectId: number;
   shot: Shot;
+  castAssets: Asset[];
   onChange: () => void;
 }) {
   const [prompt, setPrompt] = useState(shot.prompt);
   const [dur, setDur] = useState(shot.duration_seconds);
+  const [refs, setRefs] = useState<number[]>(shot.reference_asset_ids_json || []);
   const [regenBusy, setRegenBusy] = useState(false);
 
   const regenerate = async (recompose: boolean) => {
@@ -215,6 +227,14 @@ function ShotRow({
     } finally {
       setRegenBusy(false);
     }
+  };
+
+  const toggleRef = async (assetId: number) => {
+    const next = refs.includes(assetId)
+      ? refs.filter((x) => x !== assetId)
+      : [...refs, assetId];
+    setRefs(next);
+    await api.updateShot(projectId, shot.id, { reference_asset_ids_json: next });
   };
 
   return (
@@ -234,6 +254,45 @@ function ShotRow({
             }
             className="input min-h-[60px]"
           />
+          {castAssets.length > 0 && shot.shot_type !== "end_card" && (
+            <div className="mt-3">
+              <div className="label flex items-center gap-2">
+                <span>References</span>
+                {refs.length === 0 && (
+                  <span className="text-[10px] text-ink-400 normal-case tracking-normal">
+                    (auto: first 2 of each cast member)
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap gap-2 mt-1">
+                {castAssets.map((a) => {
+                  const on = refs.includes(a.id);
+                  const label =
+                    a.owner_kind === "avatar"
+                      ? `Char #${a.avatar_id}`
+                      : `Scene #${a.ingredient_id}`;
+                  return (
+                    <button
+                      key={a.id}
+                      onClick={() => toggleRef(a.id)}
+                      title={`${label} · ${a.asset_type}`}
+                      className={`w-12 h-12 rounded overflow-hidden border transition ${
+                        on
+                          ? "border-accent ring-2 ring-accent/60"
+                          : "border-ink-700 hover:border-ink-500 opacity-70"
+                      }`}
+                    >
+                      <img
+                        src={api.publicAsset(a.public_token)}
+                        alt={a.asset_type}
+                        className="w-full h-full object-cover"
+                      />
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
         <div className="w-44 space-y-2 text-xs">
           <label className="label">Duration</label>

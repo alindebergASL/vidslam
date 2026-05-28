@@ -15,12 +15,29 @@ export default function DashboardPage() {
 
 function Dashboard() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [thumbnails, setThumbnails] = useState<Record<number, number | null>>({});
   const [avatars, setAvatars] = useState<Avatar[]>([]);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
   const [providerStatus, setProviderStatus] = useState<Record<string, any> | null>(null);
 
   useEffect(() => {
-    api.listProjects().then(setProjects);
+    api.listProjects().then(async (ps) => {
+      setProjects(ps);
+      // Resolve latest render id (for thumbnail) for the first 6 projects in parallel.
+      const slice = ps.slice(0, 6);
+      const entries = await Promise.all(
+        slice.map(async (p) => {
+          if (p.status !== "completed") return [p.id, null] as const;
+          try {
+            const s = await api.projectStatus(p.id);
+            return [p.id, s.latest_render?.id ?? null] as const;
+          } catch {
+            return [p.id, null] as const;
+          }
+        })
+      );
+      setThumbnails(Object.fromEntries(entries));
+    });
     api.listAvatars().then(setAvatars);
     api.listIngredients().then(setIngredients);
     api.providerStatus().then(setProviderStatus);
@@ -89,19 +106,37 @@ function Dashboard() {
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {projects.slice(0, 6).map((p) => (
-              <Link
-                href={`/projects/${p.id}`}
-                key={p.id}
-                className="card p-4 hover:border-ink-600 transition"
-              >
-                <div className="text-sm font-medium">{p.title || "Untitled"}</div>
-                <div className="text-xs text-ink-300 mt-1">
-                  {p.mode} · {p.target_duration_seconds}s
-                </div>
-                <StatusBadge status={p.status} className="mt-3" />
-              </Link>
-            ))}
+            {projects.slice(0, 6).map((p) => {
+              const rid = thumbnails[p.id];
+              return (
+                <Link
+                  href={`/projects/${p.id}`}
+                  key={p.id}
+                  className="card overflow-hidden hover:border-ink-600 transition flex flex-col"
+                >
+                  <div className="aspect-[9/16] max-h-44 bg-ink-800 overflow-hidden">
+                    {rid ? (
+                      <img
+                        src={api.renderThumb(rid)}
+                        alt=""
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-ink-500 text-xs">
+                        no render yet
+                      </div>
+                    )}
+                  </div>
+                  <div className="p-4">
+                    <div className="text-sm font-medium">{p.title || "Untitled"}</div>
+                    <div className="text-xs text-ink-300 mt-1">
+                      {p.mode} · {p.target_duration_seconds}s
+                    </div>
+                    <StatusBadge status={p.status} className="mt-3" />
+                  </div>
+                </Link>
+              );
+            })}
           </div>
         )}
       </section>

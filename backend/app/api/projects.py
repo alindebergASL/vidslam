@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db
 from ..schemas import (
+    AssetOut,
     CastMemberIn,
     ProjectCreate,
     ProjectOut,
@@ -125,3 +126,28 @@ def update_shot(
     db.commit()
     db.refresh(s)
     return s
+
+
+@router.get("/projects/{project_id}/cast-assets", response_model=list[AssetOut])
+def cast_assets(project_id: int, db: Session = Depends(get_db)) -> list[models.Asset]:
+    """Flat list of every asset owned by any cast member of this project,
+    used to populate per-shot reference pickers in the UI."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    out: list[models.Asset] = []
+    for cm in project.cast_members:
+        if cm.member_kind == "avatar" and cm.avatar is not None:
+            out.extend(cm.avatar.assets)
+        elif cm.member_kind == "ingredient" and cm.ingredient is not None:
+            out.extend(cm.ingredient.assets)
+    return out
+
+
+@router.delete("/projects/{project_id}", status_code=204)
+def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
+    p = db.get(models.VideoProject, project_id)
+    if p is None:
+        raise HTTPException(404, "project not found")
+    db.delete(p)
+    db.commit()
