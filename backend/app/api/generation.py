@@ -22,6 +22,27 @@ from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
+# Public, token-gated router (no auth) for sharing finished renders.
+public_router = APIRouter()
+
+
+@public_router.get("/public-renders/{token}")
+def public_render(token: str, db: Session = Depends(get_db)) -> FileResponse:
+    r = db.query(models.Render).filter(models.Render.share_token == token).first()
+    if r is None or r.status != "completed" or not r.final_video_path:
+        raise HTTPException(404, "render not found")
+    if not Path(r.final_video_path).exists():
+        raise HTTPException(404, "render file missing")
+    return FileResponse(r.final_video_path, media_type="video/mp4")
+
+
+@public_router.get("/public-renders/{token}/thumbnail")
+def public_render_thumbnail(token: str, db: Session = Depends(get_db)) -> FileResponse:
+    r = db.query(models.Render).filter(models.Render.share_token == token).first()
+    if r is None or not r.thumbnail_path or not Path(r.thumbnail_path).exists():
+        raise HTTPException(404, "thumbnail not found")
+    return FileResponse(r.thumbnail_path, media_type="image/jpeg")
+
 
 @router.post("/projects/{project_id}/generate-plan", status_code=202)
 def generate_plan(project_id: int, db: Session = Depends(get_db)) -> dict:

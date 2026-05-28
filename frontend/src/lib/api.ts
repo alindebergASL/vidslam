@@ -106,6 +106,7 @@ export type Render = {
   thumbnail_path: string;
   render_log: string;
   error: string;
+  share_token: string;
   created_at: string;
   updated_at: string;
 };
@@ -169,6 +170,7 @@ export const api = {
   studioPreview: (jobId: number) => `${API_BASE}/api/studio/jobs/${jobId}/preview`,
   renderDownload: (id: number) => `${API_BASE}/api/renders/${id}/download`,
   renderThumb: (id: number) => `${API_BASE}/api/renders/${id}/thumbnail`,
+  publicRender: (token: string) => `${API_BASE}/api/public-renders/${token}`,
 
   // auth
   authStatus: () => req<{ authenticated: boolean }>("/api/auth/status"),

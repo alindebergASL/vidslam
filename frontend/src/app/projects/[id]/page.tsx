@@ -133,6 +133,17 @@ function Inner() {
         />
       </section>
 
+      {project.generated_plan_json?.content_warning_notes && (
+        <div className="card p-4 mb-6 border-amber-500/40 bg-amber-500/10">
+          <div className="text-sm font-medium text-amber-300 flex items-center gap-2">
+            <span>⚠</span> Content warning from the planner
+          </div>
+          <div className="text-xs text-amber-200/90 mt-1">
+            {project.generated_plan_json.content_warning_notes}
+          </div>
+        </div>
+      )}
+
       <AudioPanel project={project} onChange={(p) => setProject(p)} />
 
       <section className="mb-6">

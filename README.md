@@ -186,7 +186,8 @@ the whole pipeline.
 | Ingredients | mirror of avatars (`/api/ingredients`) |
 | Assets    | `GET /api/public-assets/{token}` · `DELETE /api/assets/{id}` |
 | Projects  | `GET/POST/PATCH /api/projects[/{id}]` · `PATCH /api/projects/{id}/cast` · `PATCH /api/projects/{id}/shots/{shot_id}` |
-| Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `GET /api/projects/{id}/status` · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `GET /api/renders/{id}/download` |
+| Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `GET /api/projects/{id}/status` · `GET /api/projects/{id}/renders` · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `GET /api/renders/{id}/download` |
+| Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` — **unauthenticated**, token-gated; lets you share a finished MP4 without exposing the app login |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
 | Providers | `GET /api/providers/status` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` |
 

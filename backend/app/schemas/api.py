@@ -199,6 +199,7 @@ class RenderOut(BaseModel):
     thumbnail_path: str
     render_log: str
     error: str
+    share_token: str
     created_at: datetime
     updated_at: datetime
 

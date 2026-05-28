@@ -20,6 +20,7 @@ api_router.include_router(assets.router, prefix="/api", tags=["assets"])
 api_router.include_router(projects.router, prefix="/api", tags=["projects"])
 api_router.include_router(project_audio.router, prefix="/api", tags=["project-audio"])
 api_router.include_router(generation.router, prefix="/api", tags=["generation"])
+api_router.include_router(generation.public_router, prefix="/api", tags=["public"])
 api_router.include_router(studio.router, prefix="/api/studio", tags=["studio"])
 api_router.include_router(providers.router, prefix="/api/providers", tags=["providers"])
 

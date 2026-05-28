@@ -224,6 +224,7 @@ class Render(Base):
     estimated_cost: Mapped[float] = mapped_column(Float, default=0.0)
     actual_cost: Mapped[float] = mapped_column(Float, default=0.0)
     error: Mapped[str] = mapped_column(Text, default="")
+    share_token: Mapped[str] = mapped_column(String(80), default=_token, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 

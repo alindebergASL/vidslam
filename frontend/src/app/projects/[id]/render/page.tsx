@@ -21,6 +21,7 @@ function Inner() {
   const [project, setProject] = useState<Project | null>(null);
   const [render, setRender] = useState<Render | null>(null);
   const [allRenders, setAllRenders] = useState<Render[]>([]);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     api.getProject(projectId).then(setProject);
@@ -86,7 +87,7 @@ function Inner() {
               poster={api.renderThumb(render.id)}
             />
           </div>
-          <div className="flex flex-wrap gap-3">
+          <div className="flex flex-wrap gap-3 items-center">
             <a
               href={api.renderDownload(render.id)}
               className="btn-primary"
@@ -94,6 +95,22 @@ function Inner() {
             >
               Download MP4
             </a>
+            <button
+              className="btn-ghost"
+              onClick={async () => {
+                const url = api.publicRender(render.share_token);
+                try {
+                  await navigator.clipboard.writeText(url);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 2000);
+                } catch {
+                  window.prompt("Copy this shareable link:", url);
+                }
+              }}
+              title="Anyone with this link can watch the MP4 without logging in"
+            >
+              {copied ? "Link copied ✓" : "Copy share link"}
+            </button>
             <Link href={`/projects/${projectId}`} className="btn-ghost">
               Edit shots
             </Link>
