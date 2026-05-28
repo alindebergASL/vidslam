@@ -120,6 +120,10 @@ export type Project = {
   cta_text: string;
   caption_style: string;
   include_disclosure: boolean;
+  voiceover_source: "tts" | "upload" | "silent";
+  voiceover_upload_path: string;
+  music_upload_path: string;
+  music_volume: number;
   status: string;
   primary_avatar_id: number | null;
   generated_plan_json: any;
@@ -270,6 +274,35 @@ export const api = {
     req<Asset[]>(`/api/projects/${projectId}/cast-assets`),
   deleteProject: (id: number) =>
     req<void>(`/api/projects/${id}`, { method: "DELETE" }),
+
+  voiceoverUrl: (id: number) => `${API_BASE}/api/projects/${id}/voiceover`,
+  musicUrl: (id: number) => `${API_BASE}/api/projects/${id}/music`,
+  uploadVoiceover: async (id: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch(`${API_BASE}/api/projects/${id}/voiceover`, {
+      method: "POST",
+      credentials: "include",
+      body: fd,
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return (await r.json()) as Project;
+  },
+  deleteVoiceover: (id: number) =>
+    req<Project>(`/api/projects/${id}/voiceover`, { method: "DELETE" }),
+  uploadMusic: async (id: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch(`${API_BASE}/api/projects/${id}/music`, {
+      method: "POST",
+      credentials: "include",
+      body: fd,
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return (await r.json()) as Project;
+  },
+  deleteMusic: (id: number) =>
+    req<Project>(`/api/projects/${id}/music`, { method: "DELETE" }),
   generatePlan: (id: number) =>
     req<any>(`/api/projects/${id}/generate-plan`, { method: "POST" }),
   preflight: (id: number) =>

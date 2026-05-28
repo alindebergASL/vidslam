@@ -282,6 +282,26 @@ def _ensure_clip_for_shot(db: Session, project: models.VideoProject, shot: model
 def generate_audio(
     db: Session, project: models.VideoProject, *, plan: StoryboardPlan
 ) -> Optional[Path]:
+    """Produce the project's voiceover track. Source is controlled by
+    `project.voiceover_source`:
+
+      - "upload": return the user-uploaded file from `voiceover_upload_path`.
+      - "silent": return None (renderer will skip the voice track).
+      - "tts" (default): call the TTS provider.
+    """
+    source = (project.voiceover_source or "tts").lower()
+    if source == "upload":
+        path = Path(project.voiceover_upload_path or "")
+        if path.exists():
+            return path
+        log.warning(
+            "voiceover_source=upload but file missing for project %s; falling back to TTS",
+            project.id,
+        )
+        source = "tts"
+    if source == "silent":
+        return None
+
     tts = get_tts()
     voice_id = ""
     primary = (
@@ -314,6 +334,11 @@ def generate_audio(
             status="error",
         )
         return None
+
+
+def _music_path_if_any(project: models.VideoProject) -> Optional[Path]:
+    p = Path(project.music_upload_path or "") if project.music_upload_path else None
+    return p if p and p.exists() else None
 
 
 def render_project(db: Session, project_id: int) -> models.Render:
@@ -374,6 +399,8 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 disclosure_text=plan.disclosure_text if project.include_disclosure else None,
                 cta_text=project.cta_text or None,
                 aspect_ratio=project.aspect_ratio,
+                music_path=_music_path_if_any(project),
+                music_volume=float(project.music_volume or 0.25),
             )
         )
         render.final_video_path = str(outputs.final_video_path)
@@ -485,6 +512,8 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
                 disclosure_text=plan.disclosure_text if project.include_disclosure else None,
                 cta_text=project.cta_text or None,
                 aspect_ratio=project.aspect_ratio,
+                music_path=_music_path_if_any(project),
+                music_volume=float(project.music_volume or 0.25),
             )
         )
         render.final_video_path = str(outputs.final_video_path)

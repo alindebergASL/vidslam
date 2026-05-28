@@ -138,6 +138,11 @@ class VideoProject(Base):
     cta_text: Mapped[str] = mapped_column(String(280), default="")
     caption_style: Mapped[str] = mapped_column(String(40), default="clean_white")
     include_disclosure: Mapped[bool] = mapped_column(Boolean, default=True)
+    voiceover_source: Mapped[str] = mapped_column(String(20), default="tts")
+    # tts | upload | silent
+    voiceover_upload_path: Mapped[str] = mapped_column(String(500), default="")
+    music_upload_path: Mapped[str] = mapped_column(String(500), default="")
+    music_volume: Mapped[float] = mapped_column(Float, default=0.25)
     status: Mapped[str] = mapped_column(String(40), default="draft")
     # draft|planning|planned|generating|completed|failed
     generated_plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)

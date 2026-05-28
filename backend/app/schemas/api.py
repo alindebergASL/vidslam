@@ -115,6 +115,8 @@ class ProjectCreate(BaseModel):
     cta_text: str = ""
     caption_style: str = "clean_white"
     include_disclosure: bool = True
+    voiceover_source: Literal["tts", "upload", "silent"] = "tts"
+    music_volume: float = 0.25
     primary_avatar_id: Optional[int] = None
     cast: list[CastMemberIn] = Field(default_factory=list)
 
@@ -128,6 +130,8 @@ class ProjectUpdate(BaseModel):
     cta_text: Optional[str] = None
     caption_style: Optional[str] = None
     include_disclosure: Optional[bool] = None
+    voiceover_source: Optional[Literal["tts", "upload", "silent"]] = None
+    music_volume: Optional[float] = None
     primary_avatar_id: Optional[int] = None
     generated_plan_json: Optional[dict] = None
 
@@ -172,6 +176,10 @@ class ProjectOut(BaseModel):
     cta_text: str
     caption_style: str
     include_disclosure: bool
+    voiceover_source: str
+    voiceover_upload_path: str
+    music_upload_path: str
+    music_volume: float
     status: str
     primary_avatar_id: Optional[int]
     generated_plan_json: Optional[dict]

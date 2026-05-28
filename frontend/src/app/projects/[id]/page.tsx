@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { StatusBadge } from "@/components/StatusBadge";
 import { AuthGate } from "@/components/AuthGate";
 import { PreflightModal } from "@/components/PreflightModal";
+import { AudioPanel } from "@/components/AudioPanel";
 import { api, Asset, Project, Shot, Render } from "@/lib/api";
 
 export default function ProjectEditorPage() {
@@ -130,6 +131,8 @@ function Inner() {
           }
         />
       </section>
+
+      <AudioPanel project={project} onChange={(p) => setProject(p)} />
 
       <section className="mb-6">
         <div className="flex items-baseline justify-between mb-3">

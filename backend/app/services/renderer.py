@@ -25,6 +25,8 @@ class RenderInputs:
     disclosure_text: Optional[str]
     cta_text: Optional[str]
     aspect_ratio: str = "9:16"
+    music_path: Optional[Path] = None
+    music_volume: float = 0.25
 
 
 @dataclass
@@ -135,13 +137,21 @@ def _mux_audio_captions_overlays(
     out: Path,
     *,
     audio_path: Optional[Path],
+    music_path: Optional[Path],
+    music_volume: float,
     ass_path: Optional[Path],
     disclosure_text: Optional[str],
 ) -> str:
-    """Burn captions + disclosure overlay + mix audio in one pass."""
+    """Burn captions + disclosure overlay + mix voiceover and optional music in one pass.
+
+    Audio mix rules:
+      - voiceover only         → voiceover (apad to video duration, AAC)
+      - voiceover + music      → amix; music attenuated by `music_volume` (default 0.25)
+      - music only             → music, looped to video duration
+      - neither                → -an
+    """
     vf_chain: list[str] = []
     if ass_path is not None:
-        # ffmpeg subtitles filter accepts ASS file directly. Escape colon for Windows-style paths.
         ass_str = str(ass_path).replace(":", r"\:").replace("'", r"\'")
         vf_chain.append(f"subtitles='{ass_str}'")
     if disclosure_text:
@@ -156,9 +166,15 @@ def _mux_audio_captions_overlays(
             "x=40:y=h-th-40:box=1:boxcolor=black@0.55:boxborderw=14"
         )
 
+    has_voice = audio_path is not None and audio_path.exists()
+    has_music = music_path is not None and music_path.exists()
+
     cmd: list[str] = ["ffmpeg", "-y", "-i", str(silent_in)]
-    if audio_path is not None and audio_path.exists():
+    if has_voice:
         cmd += ["-i", str(audio_path)]
+    if has_music:
+        # -stream_loop -1 loops the music file so it covers the full video duration.
+        cmd += ["-stream_loop", "-1", "-i", str(music_path)]
 
     if vf_chain:
         cmd += ["-vf", ",".join(vf_chain)]
@@ -167,15 +183,34 @@ def _mux_audio_captions_overlays(
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
         "-r", str(FPS),
     ]
-    if audio_path is not None and audio_path.exists():
-        # Pad audio with silence so it matches video duration, then end at the video's end.
-        # This keeps the full video visible whether audio is shorter (mock TTS) or longer
-        # (it gets trimmed by -t inferred from -map 0:v duration).
+
+    if has_voice and has_music:
+        vol = max(0.0, min(1.0, music_volume))
+        # 1:voice padded to video length; 2:music attenuated then mixed under voice.
+        # amix duration=longest then -shortest on the video map gives us the right end.
+        flt = (
+            f"[1:a]apad[v];"
+            f"[2:a]volume={vol:.3f}[m];"
+            f"[v][m]amix=inputs=2:duration=longest:dropout_transition=2[a]"
+        )
+        cmd += [
+            "-filter_complex", flt,
+            "-map", "0:v:0", "-map", "[a]",
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+        ]
+    elif has_voice:
         cmd += [
             "-c:a", "aac", "-b:a", "160k",
             "-af", "apad",
             "-map", "0:v:0", "-map", "1:a:0",
-            "-fflags", "+shortest", "-max_interleave_delta", "100M",
+            "-shortest",
+        ]
+    elif has_music:
+        cmd += [
+            "-c:a", "aac", "-b:a", "192k",
+            "-af", f"volume={max(0.0, min(1.0, music_volume)):.3f}",
+            "-map", "0:v:0", "-map", "1:a:0",
             "-shortest",
         ]
     else:
@@ -238,13 +273,15 @@ def compose(inputs: RenderInputs) -> RenderOutputs:
             height=height,
         )
 
-    # 5. Burn captions + disclosure + mix audio.
+    # 5. Burn captions + disclosure + mix audio (voiceover + optional music).
     final = inputs.out_dir / "final.mp4"
     log_parts.append(
         _mux_audio_captions_overlays(
             silent,
             final,
             audio_path=inputs.audio_path,
+            music_path=inputs.music_path,
+            music_volume=inputs.music_volume,
             ass_path=ass_path,
             disclosure_text=inputs.disclosure_text,
         )

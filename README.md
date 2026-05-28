@@ -118,6 +118,26 @@ If you want to swap multiple shots before re-stitching, call regenerate with
 `recompose=false` once per shot then `POST /api/projects/{id}/recompose` to
 produce the final video in a single FFmpeg pass.
 
+### Audio (voiceover + optional music bed)
+
+Every project has three audio surfaces:
+
+| Surface | Source | How |
+| --- | --- | --- |
+| **Voiceover** | `voiceover_source = "tts"` (default) | TTS provider (ElevenLabs if configured, mock silent otherwise) speaks `StoryboardPlan.cleaned_voice_script` |
+| **Voiceover** | `voiceover_source = "upload"` | `POST /api/projects/{id}/voiceover` (mp3/m4a/wav/aac, ≤50 MB) — pipeline reads the file instead of calling TTS |
+| **Voiceover** | `voiceover_source = "silent"` | renderer skips the voice track entirely |
+| **Background music** | `POST /api/projects/{id}/music` | optional; mp3/m4a/wav/aac, ≤50 MB. Loops to cover the full video, mixed under the voiceover at `music_volume` (0.0–1.0, default 0.25) via FFmpeg `amix` |
+
+The renderer auto-routes:
+- voice only → AAC voice with apad to video length
+- voice + music → FFmpeg `[1:a]apad[v];[2:a]volume=X[m];[v][m]amix=...`
+- music only → music at `music_volume` (handy when uploading a finished narration as the "music" track)
+- neither → silent video
+
+The editor's Audio panel exposes all three: voiceover source chips, audio
+preview, music attach/replace/remove, and a music volume slider.
+
 ### Cast model
 
 | Entity      | What it is                                                |
