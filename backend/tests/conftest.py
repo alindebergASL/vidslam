@@ -28,6 +28,13 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     _c.get_settings.cache_clear()
     _mv._singleton = None
 
+    # Rebind the engine + SessionLocal to this test's own SQLite file so tests are
+    # truly isolated (the engine is module-bound at import; without this every test
+    # in a process would share the first-resolved DB).
+    from app import db as _db
+
+    _db.reset_engine(f"sqlite:///{db}")
+
 
 @pytest.fixture
 def client():

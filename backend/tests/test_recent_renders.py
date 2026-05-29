@@ -2,10 +2,6 @@ from __future__ import annotations
 
 from .conftest import make_png_bytes
 
-# NOTE: the test harness shares one DB across a process (app.db binds the engine
-# at import), so these tests assert *relative* behavior (baseline → delta) rather
-# than global emptiness. The endpoint itself is global-across-projects by design.
-
 
 def _render_project(auth_client, title: str) -> int:
     aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]
@@ -28,43 +24,41 @@ def _render_project(auth_client, title: str) -> int:
     return pid
 
 
-def test_recent_renders_shape_and_newest_first(auth_client):
-    pid_a = _render_project(auth_client, "RecentAlpha")
-    pid_b = _render_project(auth_client, "RecentBeta")  # created after Alpha
+def test_recent_renders_empty_when_none(auth_client):
+    # Per-test DB isolation means this is genuinely empty.
+    assert auth_client.get("/api/renders/recent").json() == []
 
+
+def test_recent_renders_returns_completed_newest_first(auth_client):
+    _render_project(auth_client, "Alpha")
+    pid_b = _render_project(auth_client, "Beta")  # created after Alpha
     rows = auth_client.get("/api/renders/recent").json()
-    mine = [r for r in rows if r["project_id"] in (pid_a, pid_b)]
-    assert len(mine) == 2
-    # Beta was rendered after Alpha → appears earlier (newest first).
-    assert mine[0]["project_id"] == pid_b
-    assert mine[1]["project_id"] == pid_a
-    # Each row carries what the dashboard gallery needs.
-    for r in mine:
+    assert len(rows) == 2
+    assert rows[0]["project_id"] == pid_b  # newest first
+    assert {r["project_title"] for r in rows} == {"Alpha", "Beta"}
+    for r in rows:
         assert {"render_id", "project_id", "project_title", "share_token", "created_at"} <= set(r)
-    titles = {r["project_id"]: r["project_title"] for r in mine}
-    assert titles[pid_a] == "RecentAlpha" and titles[pid_b] == "RecentBeta"
 
 
-def test_recent_renders_only_completed(auth_client):
-    # A project with a plan but no render must not appear.
-    aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]
-    pid = auth_client.post(
+def test_recent_renders_excludes_unrendered_projects(auth_client):
+    _render_project(auth_client, "Rendered")
+    aid = auth_client.post("/api/avatars", json={"name": "Y"}).json()["id"]
+    auth_client.post(
         "/api/projects",
         json={
             "title": "NoRenderYet",
             "original_script": "hi there",
             "cast": [{"member_kind": "avatar", "avatar_id": aid, "role": "host"}],
         },
-    ).json()["id"]
-    auth_client.post(f"/api/projects/{pid}/generate-plan")
+    )
     rows = auth_client.get("/api/renders/recent").json()
-    assert all(r["project_id"] != pid for r in rows)
+    assert [r["project_title"] for r in rows] == ["Rendered"]
 
 
 def test_recent_renders_limit_and_route_ordering(auth_client):
-    _render_project(auth_client, "RecentGamma")
-    # limit honored
+    _render_project(auth_client, "One")
+    _render_project(auth_client, "Two")
     assert len(auth_client.get("/api/renders/recent?limit=1").json()) == 1
-    # The literal /recent route does not shadow /renders/{id}.
+    # The literal /recent route must not shadow /renders/{id}.
     rid = auth_client.get("/api/renders/recent?limit=1").json()[0]["render_id"]
     assert auth_client.get(f"/api/renders/{rid}").status_code == 200
