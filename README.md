@@ -296,6 +296,25 @@ smoke script — it exits non-zero on any failure, so it's CI/deploy-gate ready:
 cd backend && PYTHONPATH=. python -m scripts.smoke   # or: make smoke
 ```
 
+### Verifying a live deployment
+
+`scripts.smoke` runs the app in-process. To confirm an actually-running
+instance (local Compose, or a deployed EC2/Nginx host) works end-to-end over
+real HTTP — real auth cookie, async render polling, MP4 download with an
+`ftyp` sanity check, and the unauthenticated share link — run the deploy
+verifier. It creates a throwaway project, drives it to a finished video, then
+deletes it (use `--keep` to leave it):
+
+```bash
+make verify BASE_URL=https://avs.example.com MVP_PASSWORD=...
+# or directly:
+cd backend && python -m scripts.verify_deploy --base-url http://localhost:8000 --password changeme
+```
+
+It exits non-zero on any failure, so it can gate a deploy pipeline. It also
+fails fast if `ffmpeg` is missing on the host (a common deploy mistake) by
+checking `/api/system/info` before attempting a render.
+
 ### CI
 
 `.github/workflows/ci.yml` runs on every push/PR: a **backend** job (ruff lint

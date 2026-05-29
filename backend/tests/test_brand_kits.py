@@ -95,7 +95,9 @@ def test_brand_primary_color_drives_caption_color(auth_client):
     out_dir = Path(st["latest_render"]["final_video_path"]).parent
     ass = out_dir / "captions.ass"
     assert ass.exists()
-    style_line = next(l for l in ass.read_text().splitlines() if l.startswith("Style:"))
+    style_line = next(
+        line for line in ass.read_text().splitlines() if line.startswith("Style:")
+    )
     assert "8A5CFF" in style_line.upper()
 
 

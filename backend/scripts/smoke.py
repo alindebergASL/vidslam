@@ -15,9 +15,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import NoReturn
 
 
-def _fail(msg: str) -> "NoReturn":  # type: ignore[name-defined]
+def _fail(msg: str) -> NoReturn:
     print(f"SMOKE FAIL: {msg}", file=sys.stderr)
     sys.exit(1)
 
