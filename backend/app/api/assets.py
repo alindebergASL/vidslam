@@ -144,6 +144,17 @@ def delete_asset(asset_id: int, db: Session = Depends(get_db)) -> None:
         Path(a.file_path).unlink(missing_ok=True)
     except OSError:
         pass
+    # Strip this id from any shot's reference_asset_ids_json so the editor's
+    # reference strip + the renderer's lookup don't carry a dangling id.
+    shots_with_ref = (
+        db.query(models.VideoShot)
+        .filter(models.VideoShot.reference_asset_ids_json.is_not(None))
+        .all()
+    )
+    for shot in shots_with_ref:
+        refs = list(shot.reference_asset_ids_json or [])
+        if asset_id in refs:
+            shot.reference_asset_ids_json = [x for x in refs if x != asset_id]
     db.delete(a)
     db.commit()
 

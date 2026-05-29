@@ -215,8 +215,20 @@ def cast_assets(project_id: int, db: Session = Depends(get_db)) -> list[models.A
 
 @router.delete("/projects/{project_id}", status_code=204)
 def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
+    import shutil
+
+    from ..services import storage
+
     p = db.get(models.VideoProject, project_id)
     if p is None:
         raise HTTPException(404, "project not found")
     db.delete(p)
     db.commit()
+    # Drop the project's render directory (final MP4s, audio, per-shot clips,
+    # uploaded voiceover/music). The DB row is gone; the files would otherwise
+    # accumulate forever on disk.
+    render_dir = storage.render_subdir(project_id)
+    try:
+        shutil.rmtree(render_dir, ignore_errors=True)
+    except OSError:
+        pass
