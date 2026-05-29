@@ -52,5 +52,14 @@ def delete_avatar(avatar_id: int, db: Session = Depends(get_db)) -> None:
     a = db.get(models.Avatar, avatar_id)
     if a is None:
         raise HTTPException(404, "avatar not found")
+    # Clean up references so projects never point at a deleted avatar (SQLite
+    # doesn't enforce FKs, so these would otherwise dangle).
+    db.query(models.ProjectCastMember).filter(
+        models.ProjectCastMember.member_kind == "avatar",
+        models.ProjectCastMember.avatar_id == avatar_id,
+    ).delete(synchronize_session=False)
+    db.query(models.VideoProject).filter(
+        models.VideoProject.primary_avatar_id == avatar_id
+    ).update({models.VideoProject.primary_avatar_id: None}, synchronize_session=False)
     db.delete(a)
     db.commit()

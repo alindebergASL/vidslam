@@ -52,5 +52,11 @@ def delete_ingredient(ingredient_id: int, db: Session = Depends(get_db)) -> None
     i = db.get(models.Ingredient, ingredient_id)
     if i is None:
         raise HTTPException(404, "ingredient not found")
+    # Drop any project cast members that reference this ingredient so projects
+    # don't keep a dangling reference after deletion.
+    db.query(models.ProjectCastMember).filter(
+        models.ProjectCastMember.member_kind == "ingredient",
+        models.ProjectCastMember.ingredient_id == ingredient_id,
+    ).delete(synchronize_session=False)
     db.delete(i)
     db.commit()
