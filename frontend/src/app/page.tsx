@@ -24,8 +24,12 @@ function Dashboard() {
     results: { group: string; mode: string; ok: boolean; message: string; latency_ms?: number }[];
   } | null>(null);
   const [healthBusy, setHealthBusy] = useState(false);
+  const [recent, setRecent] = useState<
+    { render_id: number; project_id: number; project_title: string; created_at: string }[]
+  >([]);
 
   useEffect(() => {
+    api.recentRenders(12).then(setRecent).catch(() => setRecent([]));
     api.listProjects().then(async (ps) => {
       setProjects(ps);
       // Resolve latest render id (for thumbnail) for the first 6 projects in parallel.
@@ -110,6 +114,33 @@ function Dashboard() {
             </div>
           )}
         </div>
+      )}
+
+      {recent.length > 0 && (
+        <section className="mb-10">
+          <h2 className="text-lg font-medium mb-3">Recent videos</h2>
+          <div className="flex gap-3 overflow-x-auto pb-2 -mx-1 px-1">
+            {recent.map((r) => (
+              <Link
+                key={r.render_id}
+                href={`/projects/${r.project_id}/render?id=${r.render_id}`}
+                className="shrink-0 w-32 group"
+                title={r.project_title}
+              >
+                <div className="aspect-[9/16] rounded-lg overflow-hidden bg-ink-800 border border-ink-800 group-hover:border-ink-600 transition relative">
+                  <img
+                    src={api.renderThumb(r.render_id)}
+                    alt={r.project_title}
+                    className="w-full h-full object-cover"
+                  />
+                  <div className="absolute inset-x-0 bottom-0 p-1.5 bg-gradient-to-t from-black/85 to-transparent">
+                    <div className="text-[11px] text-white truncate">{r.project_title}</div>
+                  </div>
+                </div>
+              </Link>
+            ))}
+          </div>
+        </section>
       )}
 
       <section className="mb-10">

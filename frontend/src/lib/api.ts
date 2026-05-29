@@ -464,6 +464,16 @@ export const api = {
   recompose: (id: number) =>
     req<any>(`/api/projects/${id}/recompose`, { method: "POST" }),
   listRenders: (id: number) => req<Render[]>(`/api/projects/${id}/renders`),
+  recentRenders: (limit = 12) =>
+    req<
+      {
+        render_id: number;
+        project_id: number;
+        project_title: string;
+        share_token: string;
+        created_at: string;
+      }[]
+    >(`/api/renders/recent?limit=${limit}`),
   getRender: (id: number) => req<Render>(`/api/renders/${id}`),
   projectStatus: (id: number) =>
     req<{

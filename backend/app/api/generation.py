@@ -254,6 +254,32 @@ def export_renders(project_id: int, db: Session = Depends(get_db)) -> StreamingR
     return StreamingResponse(buf, media_type="application/zip", headers=headers)
 
 
+@router.get("/renders/recent")
+def recent_renders(limit: int = 12, db: Session = Depends(get_db)) -> list[dict]:
+    """Most-recent completed renders across all projects, for the dashboard gallery."""
+    limit = max(1, min(limit, 48))
+    rows = (
+        db.query(models.Render, models.VideoProject.title)
+        .join(models.VideoProject, models.Render.project_id == models.VideoProject.id)
+        .filter(models.Render.status == "completed", models.Render.final_video_path != "")
+        .order_by(models.Render.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    out: list[dict] = []
+    for r, title in rows:
+        if not (r.final_video_path and Path(r.final_video_path).exists()):
+            continue
+        out.append({
+            "render_id": r.id,
+            "project_id": r.project_id,
+            "project_title": title or "Untitled",
+            "share_token": r.share_token,
+            "created_at": r.created_at.isoformat(),
+        })
+    return out
+
+
 @router.get("/renders/{render_id}", response_model=RenderOut)
 def get_render(render_id: int, db: Session = Depends(get_db)) -> models.Render:
     r = db.get(models.Render, render_id)
