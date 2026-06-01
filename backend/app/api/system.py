@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -51,4 +51,28 @@ def system_info(db: Session = Depends(get_db)) -> dict:
             "projects": _count(models.VideoProject),
             "renders": _count(models.Render),
         },
+    }
+
+
+@router.post("/seed")
+def seed_demo_content(db: Session = Depends(get_db)) -> dict:
+    """Populate the demo cast + brand kit + sample project. Idempotent — re-running
+    on a non-empty install is a no-op rather than an error, so a fresh user can
+    click 'Load demo' on the dashboard and immediately have something to render."""
+    from .. import seed
+
+    before = db.query(func.count(models.Avatar.id)).scalar() or 0
+    try:
+        seed.run()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"seed failed: {e}") from e
+    # seed.run() commits via its own SessionLocal; expire our session so
+    # subsequent counts reflect the seeded rows, not cached pre-seed state.
+    db.expire_all()
+    after_avatars = db.query(func.count(models.Avatar.id)).scalar() or 0
+    after_projects = db.query(func.count(models.VideoProject.id)).scalar() or 0
+    return {
+        "ok": True,
+        "already_seeded": before > 0,
+        "counts": {"avatars": after_avatars, "projects": after_projects},
     }

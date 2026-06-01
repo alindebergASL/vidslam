@@ -28,29 +28,49 @@ function Dashboard() {
     { render_id: number; project_id: number; project_title: string; created_at: string }[]
   >([]);
 
-  useEffect(() => {
+  const [seeding, setSeeding] = useState(false);
+  const [seedError, setSeedError] = useState<string | null>(null);
+
+  const loadAll = async () => {
     api.recentRenders(12).then(setRecent).catch(() => setRecent([]));
-    api.listProjects().then(async (ps) => {
-      setProjects(ps);
-      // Resolve latest render id (for thumbnail) for the first 6 projects in parallel.
-      const slice = ps.slice(0, 6);
-      const entries = await Promise.all(
-        slice.map(async (p) => {
-          if (p.status !== "completed") return [p.id, null] as const;
-          try {
-            const s = await api.projectStatus(p.id);
-            return [p.id, s.latest_render?.id ?? null] as const;
-          } catch {
-            return [p.id, null] as const;
-          }
-        })
-      );
-      setThumbnails(Object.fromEntries(entries));
-    });
-    api.listAvatars().then(setAvatars);
-    api.listIngredients().then(setIngredients);
+    const ps = await api.listProjects();
+    setProjects(ps);
+    const slice = ps.slice(0, 6);
+    const entries = await Promise.all(
+      slice.map(async (p) => {
+        if (p.status !== "completed") return [p.id, null] as const;
+        try {
+          const s = await api.projectStatus(p.id);
+          return [p.id, s.latest_render?.id ?? null] as const;
+        } catch {
+          return [p.id, null] as const;
+        }
+      })
+    );
+    setThumbnails(Object.fromEntries(entries));
+    setAvatars(await api.listAvatars());
+    setIngredients(await api.listIngredients());
+  };
+
+  const seedDemo = async () => {
+    setSeeding(true);
+    setSeedError(null);
+    try {
+      await api.seedDemo();
+      await loadAll();
+    } catch (e: any) {
+      setSeedError(e.message || "Seed failed");
+    } finally {
+      setSeeding(false);
+    }
+  };
+
+  useEffect(() => {
+    loadAll();
     api.providerStatus().then(setProviderStatus);
   }, []);
+
+  const isEmpty = avatars.length === 0 && projects.length === 0 && ingredients.length === 0;
 
   return (
     <div className="p-8 max-w-6xl">
@@ -65,6 +85,30 @@ function Dashboard() {
           + New Project
         </Link>
       </header>
+
+      {isEmpty && (
+        <div className="card p-6 mb-8 border-accent/40 bg-gradient-to-br from-accent/10 via-ink-900 to-ink-900">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+            <div>
+              <div className="text-xl font-semibold">Get started in one click</div>
+              <p className="text-sm text-ink-300 mt-1 max-w-xl">
+                Your library is empty. Load the demo cast — two avatars (Naina + Arjun),
+                a rooftop scene + 35mm film style, a Kissmet brand kit, and a sample
+                project — to render a real video in mock mode without uploading anything.
+              </p>
+              {seedError && <div className="text-xs text-accent mt-2">{seedError}</div>}
+            </div>
+            <div className="flex flex-col sm:flex-row gap-2 shrink-0">
+              <button className="btn-primary" disabled={seeding} onClick={seedDemo}>
+                {seeding ? "Loading demo…" : "Load demo cast + project"}
+              </button>
+              <Link href="/cast" className="btn-ghost">
+                Or build your own
+              </Link>
+            </div>
+          </div>
+        </div>
+      )}
 
       {providerStatus && (
         <div className="card p-4 mb-8">
@@ -174,8 +218,8 @@ function Dashboard() {
         </div>
         {projects.length === 0 ? (
           <div className="card p-6 text-ink-300 text-sm">
-            No projects yet. Run <code className="text-ink-100">make seed</code> for a demo,
-            or click <em>New Project</em>.
+            No projects yet — click <em>New Project</em>{" "}
+            {isEmpty && "or use the one-click demo loader above"}.
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4">

@@ -271,6 +271,11 @@ export const api = {
       }[];
     }>("/api/providers/health-check", { method: "POST" }),
   systemInfo: () => req<SystemInfo>("/api/system/info"),
+  seedDemo: () =>
+    req<{ ok: boolean; already_seeded: boolean; counts: { avatars: number; projects: number } }>(
+      "/api/system/seed",
+      { method: "POST" }
+    ),
 
   // avatars
   listAvatars: () => req<Avatar[]>("/api/avatars"),
