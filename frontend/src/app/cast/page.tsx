@@ -132,8 +132,17 @@ function Grid({
 }) {
   if (items.length === 0) {
     return (
-      <div className="card p-8 text-ink-300 text-sm text-center">
-        Nothing here yet. Click <em>+ New</em> above.
+      <div className="card p-10 text-center">
+        <div className="text-3xl mb-2">☺</div>
+        <div className="text-base font-medium mb-1">Nothing here yet</div>
+        <div className="text-xs text-ink-300 max-w-sm mx-auto">
+          A cast member is a reusable visual reference — a Character with a hero
+          portrait, or an Ingredient (scene, style, object, prop). Add one, then
+          you can pull it into any project.
+        </div>
+        <div className="text-[11px] text-ink-400 mt-3">
+          Tip: click <em>+ New</em> at the top, or load the demo cast from the Dashboard.
+        </div>
       </div>
     );
   }

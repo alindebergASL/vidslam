@@ -36,8 +36,17 @@ function Inner() {
       </header>
 
       {kits.length === 0 ? (
-        <div className="card p-8 text-ink-300 text-sm text-center">
-          No brand kits yet. Create one, then select it when making a project.
+        <div className="card p-10 text-center">
+          <div className="text-3xl mb-2">◆</div>
+          <div className="text-base font-medium mb-1">No brand kits yet</div>
+          <div className="text-xs text-ink-300 max-w-md mx-auto">
+            A brand kit saves a logo + colors + default CTA/disclosure once and
+            applies them to a project&apos;s end card and caption color, so every
+            video on the same brand looks consistent.
+          </div>
+          <div className="text-[11px] text-ink-400 mt-3">
+            Click <em>+ New Brand Kit</em> at the top to build one.
+          </div>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

@@ -25,6 +25,11 @@ function Inner() {
   const [project, setProject] = useState<Project | null>(null);
   const [render, setRender] = useState<Render | null>(null);
   const [castAssets, setCastAssets] = useState<Asset[]>([]);
+  const [preflight, setPreflight] = useState<{
+    ok: boolean;
+    summary: "ok" | "warn" | "fail";
+    blockers: string[];
+  } | null>(null);
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showPreflight, setShowPreflight] = useState(false);
@@ -41,6 +46,25 @@ function Inner() {
       setRender(st.latest_render);
       const ca = await api.castAssets(projectId);
       setCastAssets(ca);
+      // Fetch a lightweight preflight summary so the editor can surface blockers
+      // before the user even clicks Generate Video. Skip while a render is
+      // actively in flight (cheap call, but pointless every 2s during polling).
+      const activeRender = st.latest_render &&
+        !["completed", "failed"].includes(st.latest_render.status);
+      if (!activeRender) {
+        try {
+          const pf = await api.preflight(projectId);
+          setPreflight({
+            ok: pf.ok,
+            summary: pf.summary,
+            blockers: pf.checks
+              .filter((c) => c.status === "fail")
+              .map((c) => `${c.label}: ${c.message}`),
+          });
+        } catch {
+          setPreflight(null);
+        }
+      }
       const renderActive =
         !!st.latest_render &&
         !["completed", "failed"].includes(st.latest_render.status);
@@ -152,6 +176,25 @@ function Inner() {
         </div>
         <div className="flex items-center gap-3">
           <StatusBadge status={project.status} />
+          {preflight && project.generated_plan_json && (
+            <button
+              className={`chip text-xs ${
+                preflight.summary === "fail"
+                  ? "bg-red-500/10 border-red-500/40 text-red-300"
+                  : preflight.summary === "warn"
+                  ? "bg-amber-500/10 border-amber-500/40 text-amber-300"
+                  : "bg-emerald-500/10 border-emerald-500/40 text-emerald-300"
+              }`}
+              onClick={() => setShowPreflight(true)}
+              title={
+                preflight.summary === "ok"
+                  ? "Preflight checks pass"
+                  : preflight.blockers.join(" · ") || "Click for details"
+              }
+            >
+              {preflight.summary === "ok" ? "Preflight ✓" : preflight.summary === "warn" ? "Preflight ⚠" : "Preflight ✕"}
+            </button>
+          )}
           {project.status === "planned" || project.status === "failed" ? (
             <button
               className="btn-primary"
@@ -223,6 +266,26 @@ function Inner() {
           </div>
           <div className="text-xs text-amber-200/90 mt-1">
             {project.generated_plan_json.content_warning_notes}
+          </div>
+        </div>
+      )}
+
+      {preflight && !preflight.ok && preflight.blockers.length > 0 && (
+        <div className="card p-4 mb-6 border-red-500/40 bg-red-500/10">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm font-medium text-red-300 flex items-center gap-2">
+                <span>✕</span> {preflight.blockers.length} blocker{preflight.blockers.length === 1 ? "" : "s"} before you can generate
+              </div>
+              <ul className="text-xs text-red-200/90 mt-1 list-disc pl-5 space-y-0.5">
+                {preflight.blockers.map((b, i) => (
+                  <li key={i}>{b}</li>
+                ))}
+              </ul>
+            </div>
+            <button className="btn-ghost text-xs whitespace-nowrap" onClick={() => setShowPreflight(true)}>
+              See all checks
+            </button>
           </div>
         </div>
       )}
