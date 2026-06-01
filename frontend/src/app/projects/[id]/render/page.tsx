@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
 import { AuthGate } from "@/components/AuthGate";
+import { useToast } from "@/components/Toaster";
 import { api, Project, Render } from "@/lib/api";
 
 export default function RenderPage() {
@@ -21,7 +22,7 @@ function Inner() {
   const [project, setProject] = useState<Project | null>(null);
   const [render, setRender] = useState<Render | null>(null);
   const [allRenders, setAllRenders] = useState<Render[]>([]);
-  const [copied, setCopied] = useState(false);
+  const toast = useToast();
 
   useEffect(() => {
     api.getProject(projectId).then(setProject);
@@ -108,15 +109,14 @@ function Inner() {
                 const url = `${window.location.origin}/share/${render.share_token}`;
                 try {
                   await navigator.clipboard.writeText(url);
-                  setCopied(true);
-                  setTimeout(() => setCopied(false), 2000);
+                  toast.success("Share link copied to clipboard");
                 } catch {
                   window.prompt("Copy this shareable link:", url);
                 }
               }}
               title="Anyone with this link can watch the video without logging in"
             >
-              {copied ? "Link copied ✓" : "Copy share link"}
+              Copy share link
             </button>
             <Link href={`/projects/${projectId}`} className="btn-ghost">
               Edit shots
@@ -124,19 +124,12 @@ function Inner() {
             <button
               className="btn-ghost"
               onClick={async () => {
-                const dup = await api.createProject({
-                  title: `${project.title} (copy)`,
-                  original_script: project.original_script,
-                  mode: project.mode,
-                  aspect_ratio: project.aspect_ratio,
-                  target_duration_seconds: project.target_duration_seconds,
-                  cta_text: project.cta_text,
-                  caption_style: project.caption_style,
-                  include_disclosure: project.include_disclosure,
-                  primary_avatar_id: project.primary_avatar_id,
-                  cast: project.cast_members,
-                });
-                window.location.href = `/projects/${dup.id}`;
+                try {
+                  const dup = await api.duplicateProject(project);
+                  window.location.href = `/projects/${dup.id}`;
+                } catch (e: any) {
+                  toast.error(e.message || "Duplicate failed");
+                }
               }}
             >
               Duplicate project

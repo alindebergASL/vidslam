@@ -8,6 +8,7 @@ import { PreflightModal } from "@/components/PreflightModal";
 import { AudioPanel } from "@/components/AudioPanel";
 import { RenderHistory } from "@/components/RenderHistory";
 import { GenerationProgress } from "@/components/GenerationProgress";
+import { useToast } from "@/components/Toaster";
 import { api, Asset, Project, Shot, Render } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 
@@ -25,6 +26,7 @@ function Inner() {
   const [project, setProject] = useState<Project | null>(null);
   const [render, setRender] = useState<Render | null>(null);
   const [castAssets, setCastAssets] = useState<Asset[]>([]);
+  const toast = useToast();
   const [preflight, setPreflight] = useState<{
     ok: boolean;
     summary: "ok" | "warn" | "fail";
@@ -210,8 +212,13 @@ function Inner() {
                 className="btn-ghost"
                 title="Re-run only the FFmpeg compose step using existing clips + audio"
                 onClick={async () => {
-                  await api.recompose(projectId);
-                  setPolling(true);
+                  try {
+                    await api.recompose(projectId);
+                    toast.info("Re-composing the video…");
+                    setPolling(true);
+                  } catch (e: any) {
+                    toast.error(e.message || "Re-compose failed");
+                  }
                 }}
               >
                 Re-compose
@@ -306,7 +313,13 @@ function Inner() {
                 <button
                   className="btn-primary text-xs"
                   onClick={async () => {
-                    await api.regenerateShotsBulk(projectId, selected);
+                    const count = selected.length;
+                    try {
+                      await api.regenerateShotsBulk(projectId, selected);
+                      toast.info(`Re-rolling ${count} shot${count === 1 ? "" : "s"}…`);
+                    } catch (e: any) {
+                      toast.error(e.message || "Bulk re-roll failed");
+                    }
                     setSelected([]);
                     setPolling(true);
                   }}
@@ -325,8 +338,13 @@ function Inner() {
                 <button
                   className="btn-ghost text-xs"
                   onClick={async () => {
-                    await api.generatePlan(projectId);
-                    setPolling(true);
+                    try {
+                      await api.generatePlan(projectId);
+                      toast.info("Re-planning the storyboard…");
+                      setPolling(true);
+                    } catch (e: any) {
+                      toast.error(e.message || "Re-plan failed");
+                    }
                   }}
                 >
                   Re-plan
@@ -464,14 +482,13 @@ function StoryboardScript({
   const [script, setScript] = useState<string>(plan.cleaned_voice_script || "");
   const [endCard, setEndCard] = useState<string>(plan.end_card_text || "");
   const [saving, setSaving] = useState(false);
-  const [savedNote, setSavedNote] = useState<string | null>(null);
+  const toast = useToast();
 
   const dirty =
     script !== (plan.cleaned_voice_script || "") || endCard !== (plan.end_card_text || "");
 
   const save = async (resync: boolean) => {
     setSaving(true);
-    setSavedNote(null);
     try {
       const updated = await api.editPlan(project.id, {
         cleaned_voice_script: script,
@@ -479,8 +496,9 @@ function StoryboardScript({
         resync_captions: resync,
       });
       onChange(updated);
-      setSavedNote(resync ? "Saved + captions resynced" : "Saved");
-      setTimeout(() => setSavedNote(null), 2500);
+      toast.success(resync ? "Saved · captions resynced" : "Saved");
+    } catch (e: any) {
+      toast.error(e.message || "Save failed");
     } finally {
       setSaving(false);
     }
@@ -529,7 +547,6 @@ function StoryboardScript({
         >
           Save + resync captions
         </button>
-        {savedNote && <span className="text-xs text-emerald-300">{savedNote}</span>}
       </div>
     </section>
   );
@@ -566,12 +583,20 @@ function ShotRow({
   const [dur, setDur] = useState(shot.duration_seconds);
   const [refs, setRefs] = useState<number[]>(shot.reference_asset_ids_json || []);
   const [regenBusy, setRegenBusy] = useState(false);
+  const toast = useToast();
 
   const regenerate = async (recompose: boolean) => {
     setRegenBusy(true);
     try {
       await api.regenerateShot(projectId, shot.id, recompose);
+      toast.info(
+        recompose
+          ? `Re-rolling shot ${shot.shot_order}, then recomposing`
+          : `Re-rolling shot ${shot.shot_order}`
+      );
       onChange();
+    } catch (e: any) {
+      toast.error(e.message || "Regenerate failed");
     } finally {
       setRegenBusy(false);
     }

@@ -3,6 +3,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
 import { StatusBadge } from "@/components/StatusBadge";
+import { useToast } from "@/components/Toaster";
 import { api, Avatar, Ingredient, Project } from "@/lib/api";
 
 export default function DashboardPage() {
@@ -29,7 +30,7 @@ function Dashboard() {
   >([]);
 
   const [seeding, setSeeding] = useState(false);
-  const [seedError, setSeedError] = useState<string | null>(null);
+  const toast = useToast();
 
   const loadAll = async () => {
     api.recentRenders(12).then(setRecent).catch(() => setRecent([]));
@@ -54,12 +55,16 @@ function Dashboard() {
 
   const seedDemo = async () => {
     setSeeding(true);
-    setSeedError(null);
     try {
-      await api.seedDemo();
+      const r = await api.seedDemo();
       await loadAll();
+      toast.success(
+        r.already_seeded
+          ? "Library already had content — nothing to add"
+          : "Demo cast + project loaded"
+      );
     } catch (e: any) {
-      setSeedError(e.message || "Seed failed");
+      toast.error(e.message || "Seed failed");
     } finally {
       setSeeding(false);
     }
@@ -96,7 +101,6 @@ function Dashboard() {
                 a rooftop scene + 35mm film style, a Kissmet brand kit, and a sample
                 project — to render a real video in mock mode without uploading anything.
               </p>
-              {seedError && <div className="text-xs text-accent mt-2">{seedError}</div>}
             </div>
             <div className="flex flex-col sm:flex-row gap-2 shrink-0">
               <button className="btn-primary" disabled={seeding} onClick={seedDemo}>

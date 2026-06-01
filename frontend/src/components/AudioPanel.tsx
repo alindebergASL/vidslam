@@ -1,6 +1,7 @@
 "use client";
 import { useRef, useState } from "react";
 import clsx from "clsx";
+import { useToast } from "@/components/Toaster";
 import { api, Project } from "@/lib/api";
 
 const MUSIC_PRESETS: { label: string; prompt: string }[] = [
@@ -20,7 +21,7 @@ export function AudioPanel({
   onChange: (next: Project) => void;
 }) {
   const [busy, setBusy] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const toast = useToast();
   const [musicTab, setMusicTab] = useState<"generate" | "upload">("generate");
   const [musicPrompt, setMusicPrompt] = useState("");
   const voiceInput = useRef<HTMLInputElement>(null);
@@ -29,19 +30,17 @@ export function AudioPanel({
   const generateMusic = async () => {
     if (!musicPrompt.trim()) return;
     setBusy("music");
-    setError(null);
     try {
       const next = await api.generateMusic(project.id, musicPrompt.trim());
       onChange(next);
     } catch (e: any) {
-      setError(e.message);
+      toast.error(e.message || "Action failed");
     } finally {
       setBusy(null);
     }
   };
 
   const setSource = async (src: "tts" | "upload" | "silent") => {
-    setError(null);
     try {
       if (src === "upload" && !project.voiceover_upload_path) {
         // No file yet — open the picker.
@@ -51,18 +50,17 @@ export function AudioPanel({
       const next = await api.updateProject(project.id, { voiceover_source: src });
       onChange(next);
     } catch (e: any) {
-      setError(e.message);
+      toast.error(e.message || "Action failed");
     }
   };
 
   const handleVoice = async (file: File) => {
     setBusy("voice");
-    setError(null);
     try {
       const next = await api.uploadVoiceover(project.id, file);
       onChange(next);
     } catch (e: any) {
-      setError(e.message);
+      toast.error(e.message || "Action failed");
     } finally {
       setBusy(null);
     }
@@ -70,12 +68,11 @@ export function AudioPanel({
 
   const handleMusic = async (file: File) => {
     setBusy("music");
-    setError(null);
     try {
       const next = await api.uploadMusic(project.id, file);
       onChange(next);
     } catch (e: any) {
-      setError(e.message);
+      toast.error(e.message || "Action failed");
     } finally {
       setBusy(null);
     }
@@ -283,8 +280,6 @@ export function AudioPanel({
           )}
         </div>
       </div>
-
-      {error && <div className="text-xs text-accent mt-3">{error}</div>}
     </section>
   );
 }

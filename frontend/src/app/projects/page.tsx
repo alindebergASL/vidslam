@@ -3,6 +3,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
 import { StatusBadge } from "@/components/StatusBadge";
+import { useToast } from "@/components/Toaster";
 import { api, Project } from "@/lib/api";
 
 export default function ProjectsPage() {
@@ -15,6 +16,7 @@ export default function ProjectsPage() {
 
 function Inner() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const toast = useToast();
   const reload = () => api.listProjects().then(setProjects);
   useEffect(() => {
     reload();
@@ -45,8 +47,12 @@ function Inner() {
                   className="text-ink-400 hover:text-ink-100 text-xs"
                   title="Duplicate project"
                   onClick={async () => {
-                    const dup = await api.duplicateProject(p);
-                    window.location.href = `/projects/${dup.id}`;
+                    try {
+                      const dup = await api.duplicateProject(p);
+                      window.location.href = `/projects/${dup.id}`;
+                    } catch (e: any) {
+                      toast.error(e.message || "Duplicate failed");
+                    }
                   }}
                 >
                   ⧉
@@ -61,8 +67,13 @@ function Inner() {
                       )
                     )
                       return;
-                    await api.deleteProject(p.id);
-                    reload();
+                    try {
+                      await api.deleteProject(p.id);
+                      toast.success(`Deleted "${p.title || "Untitled"}"`);
+                      reload();
+                    } catch (e: any) {
+                      toast.error(e.message || "Delete failed");
+                    }
                   }}
                 >
                   ✕
