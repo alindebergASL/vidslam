@@ -468,6 +468,13 @@ export const api = {
     ),
   recompose: (id: number) =>
     req<any>(`/api/projects/${id}/recompose`, { method: "POST" }),
+  retryRender: (id: number) =>
+    req<{
+      project_id: number;
+      job_id: string;
+      action: "recompose" | "resume";
+      status: string;
+    }>(`/api/projects/${id}/retry`, { method: "POST" }),
   listRenders: (id: number) => req<Render[]>(`/api/projects/${id}/renders`),
   recentRenders: (limit = 12) =>
     req<

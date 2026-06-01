@@ -1,5 +1,7 @@
 "use client";
-import { Render, Shot } from "@/lib/api";
+import { useState } from "react";
+import { api, Render, Shot } from "@/lib/api";
+import { useToast } from "@/components/Toaster";
 
 // Friendly, ordered stages mapped from Render.status. The renderer moves through
 // these in order; we show a stepper so a long mock/real render reads as progress
@@ -22,16 +24,39 @@ function stageIndex(status: string): number {
 export function GenerationProgress({
   render,
   shots,
+  projectId,
+  onRetry,
 }: {
   render: Render;
   shots: Shot[];
+  projectId: number;
+  onRetry?: () => void;
 }) {
   const failed = render.status === "failed";
   const current = stageIndex(render.status);
+  const toast = useToast();
+  const [retrying, setRetrying] = useState(false);
 
   const bodyShots = shots.filter((s) => s.shot_type !== "end_card");
   const doneShots = bodyShots.filter((s) => s.status === "completed").length;
   const shotsActive = render.status === "generating_shots" || render.status === "polling";
+
+  const retry = async () => {
+    setRetrying(true);
+    try {
+      const r = await api.retryRender(projectId);
+      toast.info(
+        r.action === "recompose"
+          ? "Retrying: all clips present, just re-composing"
+          : "Retrying: resuming generation for failed shots"
+      );
+      onRetry?.();
+    } catch (e: any) {
+      toast.error(e.message || "Retry failed");
+    } finally {
+      setRetrying(false);
+    }
+  };
 
   return (
     <section className="card p-4 mb-6">
@@ -100,10 +125,22 @@ export function GenerationProgress({
         </div>
       )}
 
-      {failed && render.error && (
-        <pre className="mt-3 p-3 bg-ink-800 text-xs text-accent whitespace-pre-wrap rounded">
-          {render.error}
-        </pre>
+      {failed && (
+        <div className="mt-3 space-y-2">
+          {render.error && (
+            <pre className="p-3 bg-ink-800 text-xs text-accent whitespace-pre-wrap rounded">
+              {render.error}
+            </pre>
+          )}
+          <div className="flex items-center gap-2">
+            <button className="btn-primary text-xs disabled:opacity-50" onClick={retry} disabled={retrying}>
+              {retrying ? "Retrying…" : "Retry"}
+            </button>
+            <span className="text-[11px] text-ink-400">
+              Reuses any clips that already rendered — only failed shots are regenerated.
+            </span>
+          </div>
+        </div>
       )}
     </section>
   );

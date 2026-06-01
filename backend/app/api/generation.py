@@ -137,6 +137,57 @@ def recompose_video(project_id: int, db: Session = Depends(get_db)) -> dict:
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
 
+@router.post("/projects/{project_id}/retry", status_code=202)
+def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """Smart retry after a failed render. Picks the cheapest viable path:
+
+      - If every body shot already has a clip on disk AND the last render's audio
+        file is intact → just recompose (no provider calls).
+      - Otherwise → resume the pipeline; render_project's _ensure_clip_for_shot
+        is idempotent on completed shots, so only the failed/missing ones get
+        regenerated. Failed shots are reset to 'pending' so they actually retry.
+    """
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    if not project.generated_plan_json:
+        raise HTTPException(409, "generate a storyboard plan first")
+
+    body_shots = [s for s in project.shots if s.shot_type != "end_card"]
+    if not body_shots:
+        raise HTTPException(409, "no body shots to render — re-plan the storyboard first")
+
+    # Reset any failed shots so the pipeline's idempotent check doesn't skip them.
+    for s in body_shots:
+        if s.status == "failed":
+            s.status = "pending"
+            s.clip_path = ""
+            s.error = ""
+    db.commit()
+
+    all_clips = all(s.clip_path and Path(s.clip_path).exists() for s in body_shots)
+    latest = (
+        db.query(models.Render)
+        .filter(models.Render.project_id == project_id)
+        .order_by(models.Render.created_at.desc())
+        .first()
+    )
+    have_audio = bool(latest and latest.audio_path and Path(latest.audio_path).exists())
+
+    if all_clips and have_audio:
+        job_id = enqueue(recompose_project_job, project_id)
+        action = "recompose"
+    else:
+        job_id = enqueue(generate_video_job, project_id)
+        action = "resume"
+    return {
+        "project_id": project_id,
+        "job_id": job_id,
+        "action": action,
+        "status": "enqueued",
+    }
+
+
 class BulkRegenIn(BaseModel):
     shot_ids: list[int]
 

@@ -234,7 +234,14 @@ function Inner() {
       {render &&
         ["pending", "planning", "generating_audio", "generating_shots", "polling", "rendering", "failed"].includes(
           render.status
-        ) && <GenerationProgress render={render} shots={project.shots} />}
+        ) && (
+          <GenerationProgress
+            render={render}
+            shots={project.shots}
+            projectId={projectId}
+            onRetry={() => setPolling(true)}
+          />
+        )}
 
       <section className="card p-4 mb-6">
         <div className="label">Voice script</div>
