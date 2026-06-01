@@ -9,6 +9,7 @@ import { AudioPanel } from "@/components/AudioPanel";
 import { RenderHistory } from "@/components/RenderHistory";
 import { GenerationProgress } from "@/components/GenerationProgress";
 import { api, Asset, Project, Shot, Render } from "@/lib/api";
+import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 
 export default function ProjectEditorPage() {
   return (
@@ -74,6 +75,63 @@ function Inner() {
     }
   }, [project, projectId]);
 
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  useKeyboardShortcuts(
+    [
+      {
+        key: "Enter",
+        meta: true,
+        label: "Generate video (with preflight)",
+        run: () => {
+          if (project && ["planned", "failed", "completed"].includes(project.status)) {
+            setShowPreflight(true);
+          }
+        },
+      },
+      {
+        key: "Enter",
+        ctrl: true,
+        label: "Generate video (with preflight)",
+        run: () => {
+          if (project && ["planned", "failed", "completed"].includes(project.status)) {
+            setShowPreflight(true);
+          }
+        },
+      },
+      {
+        key: "g",
+        label: "Re-plan storyboard",
+        run: () => {
+          api.generatePlan(projectId).then(() => setPolling(true)).catch((e) => setError(e.message));
+        },
+      },
+      {
+        key: "r",
+        label: "Re-compose latest render",
+        run: () => {
+          if (project?.status !== "completed") return;
+          api.recompose(projectId).then(() => setPolling(true)).catch((e) => setError(e.message));
+        },
+      },
+      {
+        key: "?",
+        shift: true,
+        label: "Show keyboard shortcuts",
+        run: () => setShowShortcuts((v) => !v),
+      },
+      {
+        key: "Escape",
+        label: "Close preflight / shortcuts overlay",
+        run: () => {
+          if (showShortcuts) setShowShortcuts(false);
+          else if (showPreflight) setShowPreflight(false);
+          else return false;  // let the browser handle it
+        },
+      },
+    ],
+    [project, projectId, showPreflight, showShortcuts]
+  );
+
   if (error)
     return <div className="p-8 text-accent">{error}</div>;
   if (!project) return <div className="p-8 text-ink-300">Loading…</div>;
@@ -98,6 +156,7 @@ function Inner() {
             <button
               className="btn-primary"
               onClick={() => setShowPreflight(true)}
+              title="Keyboard: ⌘/Ctrl + Enter"
             >
               Generate Video
             </button>
@@ -272,6 +331,61 @@ function Inner() {
       )}
 
       <RenderHistory projectId={projectId} />
+
+      <button
+        type="button"
+        onClick={() => setShowShortcuts(true)}
+        className="fixed bottom-4 right-4 chip text-[11px] py-1 opacity-60 hover:opacity-100"
+        title="Show keyboard shortcuts"
+      >
+        ? shortcuts
+      </button>
+
+      {showShortcuts && (
+        <div
+          className="fixed inset-0 z-30 bg-black/70 flex items-center justify-center p-4"
+          onClick={() => setShowShortcuts(false)}
+        >
+          <div
+            className="card w-full max-w-md p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-3">
+              <div className="text-lg font-semibold">Keyboard shortcuts</div>
+              <button className="text-ink-300 hover:text-white" onClick={() => setShowShortcuts(false)}>
+                ✕
+              </button>
+            </div>
+            <dl className="text-sm divide-y divide-ink-800">
+              {[
+                { keys: ["⌘", "Enter"], label: "Generate video (with preflight)" },
+                { keys: ["Ctrl", "Enter"], label: "Generate video (with preflight)" },
+                { keys: ["G"], label: "Re-plan storyboard" },
+                { keys: ["R"], label: "Re-compose latest render" },
+                { keys: ["?"], label: "Toggle this overlay" },
+                { keys: ["Esc"], label: "Close overlays" },
+              ].map((s, i) => (
+                <div key={i} className="flex items-center justify-between py-2">
+                  <span className="text-ink-200">{s.label}</span>
+                  <span className="flex gap-1">
+                    {s.keys.map((k) => (
+                      <kbd
+                        key={k}
+                        className="px-1.5 py-0.5 text-[10px] rounded bg-ink-800 border border-ink-700 text-ink-100 font-mono"
+                      >
+                        {k}
+                      </kbd>
+                    ))}
+                  </span>
+                </div>
+              ))}
+            </dl>
+            <div className="text-[10px] text-ink-400 mt-3">
+              Letter shortcuts don&apos;t fire while typing in a text field.
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
