@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import get_settings
+from ..db import SessionLocal
 from ..providers import get_chat, get_tts, get_video
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
@@ -365,6 +366,23 @@ def _music_path_if_any(project: models.VideoProject) -> Optional[Path]:
     return p if p and p.exists() else None
 
 
+class RenderCancelled(Exception):
+    """Raised by the pipeline when a cancel request flips the render to
+    status='cancelled' between cooperative checkpoints."""
+
+
+def _check_cancel(db: Session, render: models.Render) -> None:
+    """Cooperative cancel check. Reads the render's status from a fresh session so
+    a parallel HTTP request that wrote status='cancelled' is visible."""
+    probe = SessionLocal()
+    try:
+        fresh = probe.get(models.Render, render.id)
+        if fresh and fresh.status == "cancelled":
+            raise RenderCancelled()
+    finally:
+        probe.close()
+
+
 def generate_music_for_project(
     db: Session,
     project_id: int,
@@ -456,17 +474,20 @@ def render_project(db: Session, project_id: int) -> models.Render:
     db.refresh(render)
 
     try:
+        _check_cancel(db, render)
         # 1. audio
         audio_path = generate_audio(db, project, plan=plan)
         if audio_path:
             render.audio_path = str(audio_path)
         render.status = "generating_shots"
         db.commit()
+        _check_cancel(db, render)
 
         # 2. per-shot clips (skip end_card; we render the CTA card in compose)
         project = db.get(models.VideoProject, project.id)  # refresh
         clip_paths: list[Path] = []
         for shot in project.shots:
+            _check_cancel(db, render)
             if shot.shot_type == "end_card":
                 # End card rendered in compose() from cta_text. Skip provider call.
                 shot.status = "completed"
@@ -480,6 +501,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
 
         render.status = "rendering"
         db.commit()
+        _check_cancel(db, render)
 
         # 3. caption timings (over body duration only — end card is appended last)
         body_duration = sum(
@@ -519,6 +541,15 @@ def render_project(db: Session, project_id: int) -> models.Render:
         render.actual_cost = 0.0 if settings_local.video_is_mocked() else render.estimated_cost
         render.status = "completed"
         project.status = "completed"
+        db.commit()
+        return render
+    except RenderCancelled:
+        log.info("render %s cancelled by user", render.id)
+        # The render row was already flipped to 'cancelled' by the cancel endpoint;
+        # mirror it onto the project so the editor leaves polling and offers Retry.
+        render.status = "cancelled"
+        render.error = ""
+        project.status = "cancelled"
         db.commit()
         return render
     except Exception as e:  # noqa: BLE001
@@ -645,6 +676,7 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
             s.duration_seconds for s in project.shots if s.shot_type != "end_card"
         )
         timed = chunks_to_timed(plan.caption_chunks, max(body_duration, 1.0))
+        _check_cancel(db, render)
         brand = _brand_kit_for(db, project)
         out_dir = storage.render_subdir(project.id)
         outputs = compose(
@@ -673,6 +705,13 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
         render.render_log = outputs.log
         render.status = "completed"
         project.status = "completed"
+        db.commit()
+        return render
+    except RenderCancelled:
+        log.info("recompose %s cancelled by user", render.id)
+        render.status = "cancelled"
+        render.error = ""
+        project.status = "cancelled"
         db.commit()
         return render
     except Exception as e:  # noqa: BLE001

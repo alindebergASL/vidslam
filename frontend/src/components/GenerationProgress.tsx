@@ -36,10 +36,30 @@ export function GenerationProgress({
   const current = stageIndex(render.status);
   const toast = useToast();
   const [retrying, setRetrying] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   const bodyShots = shots.filter((s) => s.shot_type !== "end_card");
   const doneShots = bodyShots.filter((s) => s.status === "completed").length;
   const shotsActive = render.status === "generating_shots" || render.status === "polling";
+  const cancelled = render.status === "cancelled";
+  const active = !["completed", "failed", "cancelled"].includes(render.status);
+
+  const cancel = async () => {
+    if (!window.confirm("Cancel this render? Any work already done is kept; you can Retry to resume.")) return;
+    setCancelling(true);
+    try {
+      const r = await api.cancelRender(projectId);
+      if (r.action === "signalled") {
+        toast.info("Cancel signalled — stops at the next checkpoint");
+      } else {
+        toast.info("Nothing to cancel");
+      }
+    } catch (e: any) {
+      toast.error(e.message || "Cancel failed");
+    } finally {
+      setCancelling(false);
+    }
+  };
 
   const retry = async () => {
     setRetrying(true);
@@ -62,13 +82,31 @@ export function GenerationProgress({
     <section className="card p-4 mb-6">
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-medium">
-          {failed ? "Generation failed" : render.status === "completed" ? "Generation complete" : "Generating…"}
+          {failed
+            ? "Generation failed"
+            : cancelled
+            ? "Generation cancelled"
+            : render.status === "completed"
+            ? "Generation complete"
+            : "Generating…"}
         </h2>
-        {shotsActive && bodyShots.length > 0 && (
-          <span className="text-xs text-ink-300">
-            {doneShots} of {bodyShots.length} shots
-          </span>
-        )}
+        <div className="flex items-center gap-3">
+          {shotsActive && bodyShots.length > 0 && (
+            <span className="text-xs text-ink-300">
+              {doneShots} of {bodyShots.length} shots
+            </span>
+          )}
+          {active && (
+            <button
+              className="btn-ghost text-xs disabled:opacity-50"
+              onClick={cancel}
+              disabled={cancelling}
+              title="Stop at the next safe checkpoint; completed clips are kept."
+            >
+              {cancelling ? "Cancelling…" : "Cancel"}
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="flex items-center gap-1">
@@ -125,7 +163,7 @@ export function GenerationProgress({
         </div>
       )}
 
-      {failed && (
+      {(failed || cancelled) && (
         <div className="mt-3 space-y-2">
           {render.error && (
             <pre className="p-3 bg-ink-800 text-xs text-accent whitespace-pre-wrap rounded">
@@ -134,10 +172,12 @@ export function GenerationProgress({
           )}
           <div className="flex items-center gap-2">
             <button className="btn-primary text-xs disabled:opacity-50" onClick={retry} disabled={retrying}>
-              {retrying ? "Retrying…" : "Retry"}
+              {retrying ? "Retrying…" : cancelled ? "Resume" : "Retry"}
             </button>
             <span className="text-[11px] text-ink-400">
-              Reuses any clips that already rendered — only failed shots are regenerated.
+              {cancelled
+                ? "Picks up where the cancel landed — clips already rendered are kept."
+                : "Reuses any clips that already rendered — only failed shots are regenerated."}
             </span>
           </div>
         </div>

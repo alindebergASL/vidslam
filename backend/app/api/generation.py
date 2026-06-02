@@ -137,6 +137,36 @@ def recompose_video(project_id: int, db: Session = Depends(get_db)) -> dict:
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
 
+@router.post("/projects/{project_id}/cancel")
+def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """Signal the running pipeline to stop at the next cooperative checkpoint.
+
+    The pipeline checks the render's status between shots / before compose; on
+    seeing 'cancelled' it raises RenderCancelled, which the render path turns
+    into a terminal cancelled state on both the render row and the project.
+
+    Returns 200 with the latest render's state — the caller polls /status as
+    usual to see the cancellation land (may take up to one provider call to
+    propagate, e.g. one in-flight video poll cycle).
+    """
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    latest = (
+        db.query(models.Render)
+        .filter(models.Render.project_id == project_id)
+        .order_by(models.Render.created_at.desc())
+        .first()
+    )
+    if latest is None:
+        raise HTTPException(409, "no render in flight")
+    if latest.status in ("completed", "failed", "cancelled"):
+        return {"render_id": latest.id, "status": latest.status, "action": "noop"}
+    latest.status = "cancelled"
+    db.commit()
+    return {"render_id": latest.id, "status": "cancelled", "action": "signalled"}
+
+
 @router.post("/projects/{project_id}/retry", status_code=202)
 def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     """Smart retry after a failed render. Picks the cheapest viable path:

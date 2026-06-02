@@ -475,6 +475,11 @@ export const api = {
       action: "recompose" | "resume";
       status: string;
     }>(`/api/projects/${id}/retry`, { method: "POST" }),
+  cancelRender: (id: number) =>
+    req<{ render_id: number; status: string; action: "noop" | "signalled" }>(
+      `/api/projects/${id}/cancel`,
+      { method: "POST" }
+    ),
   listRenders: (id: number) => req<Render[]>(`/api/projects/${id}/renders`),
   recentRenders: (limit = 12) =>
     req<

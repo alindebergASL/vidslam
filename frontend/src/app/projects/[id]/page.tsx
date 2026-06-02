@@ -232,7 +232,7 @@ function Inner() {
       </header>
 
       {render &&
-        ["pending", "planning", "generating_audio", "generating_shots", "polling", "rendering", "failed"].includes(
+        ["pending", "planning", "generating_audio", "generating_shots", "polling", "rendering", "failed", "cancelled"].includes(
           render.status
         ) && (
           <GenerationProgress
