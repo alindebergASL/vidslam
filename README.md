@@ -315,6 +315,19 @@ It exits non-zero on any failure, so it can gate a deploy pipeline. It also
 fails fast if `ffmpeg` is missing on the host (a common deploy mistake) by
 checking `/api/system/info` before attempting a render.
 
+To answer the bigger question — *does this whole docker-compose stack actually
+deploy?* — `make verify-up` boots the stack ephemerally, waits for the host
+port to become reachable, runs the verifier *inside* the backend container, and
+tears everything down (with volumes) on the way out. It captures
+`docker compose logs` on failure and uses a randomized COMPOSE_PROJECT_NAME so
+it doesn't disturb a running `make up`. Refuses to run if a `.env` already
+exists at the repo root, so it can't clobber your local config.
+
+```bash
+make verify-up                           # full ephemeral boot + verify + teardown
+TIMEOUT=600 make verify-up               # extend the /health wait
+```
+
 ### CI
 
 `.github/workflows/ci.yml` runs on every push/PR: a **backend** job (ruff lint

@@ -1,4 +1,4 @@
-.PHONY: dev up down logs build seed test backend-test smoke verify backend-shell frontend-shell clean
+.PHONY: dev up down logs build seed test backend-test smoke verify verify-up backend-shell frontend-shell clean
 
 dev: up logs
 
@@ -31,6 +31,12 @@ BASE_URL ?= http://localhost:8000
 MVP_PASSWORD ?= changeme
 verify:
 	cd backend && BASE_URL=$(BASE_URL) MVP_PASSWORD=$(MVP_PASSWORD) python -m scripts.verify_deploy
+
+# Ephemeral deploy verifier: boot docker compose, run verify_deploy against
+# it, capture logs on failure, tear down. Single command to confirm the whole
+# compose stack actually deploys end-to-end.
+verify-up:
+	./scripts/verify_up.sh
 
 backend-shell:
 	docker compose exec backend bash
