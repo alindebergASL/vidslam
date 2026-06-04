@@ -25,6 +25,15 @@ services:
       redis:
         condition: service_healthy
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    # /healthz is the liveness probe (process up). Use /readyz instead if you
+    # want compose to wait until the DB + ffmpeg + data dir are all ready —
+    # at the cost of slower-to-go-healthy first boot.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
 
   worker:
     build:

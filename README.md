@@ -256,7 +256,18 @@ the whole pipeline.
 | Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |
 | System | `GET /api/system/info` — non-secret deployment overview (version, mock flag, ffmpeg availability, configured model ids, key-presence booleans, entity counts); backs the **Settings & Status** page |
 
-All routes except `GET /api/public-assets/{token}` and `/health` are gated by the MVP
+### Health probes
+
+| Route | What it proves | Use it for |
+| --- | --- | --- |
+| `GET /health` | Process up (back-compat alias) | scripts/legacy clients |
+| `GET /healthz` | Process up (liveness) | k8s `livenessProbe`, load-balancer health |
+| `GET /readyz` | DB reachable + ffmpeg present + data dir writable (readiness) | k8s `readinessProbe` — returns `503` with a per-check breakdown if any of them is broken so traffic is routed away from a degraded pod |
+
+`docker-compose.yml` wires the backend's compose healthcheck to `/healthz`, so
+`docker compose ps` reports the container as `unhealthy` when the process wedges.
+
+All routes except `GET /api/public-assets/{token}`, `/health`, `/healthz`, and `/readyz` are gated by the MVP
 password cookie.
 
 ---
