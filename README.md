@@ -256,6 +256,23 @@ the whole pipeline.
 | Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |
 | System | `GET /api/system/info` — non-secret deployment overview (version, mock flag, ffmpeg availability, configured model ids, key-presence booleans, entity counts); backs the **Settings & Status** page |
 
+### Request tracing & structured errors
+
+Every request gets an `X-Request-ID` (echoed on the response). An inbound id of
+8–64 ASCII chars is honoured so a load balancer / SDK can correlate calls
+across services; otherwise a fresh `uuid.hex` is minted. Every non-probe
+request emits a single structured access-log line —
+`method=... path=... status=... duration_ms=... request_id=...` — under the
+`avs.access` logger; the `/health`, `/healthz`, `/readyz` probes are skipped so
+the log stays signal-dense.
+
+Uncaught exceptions become a structured `500 {detail, request_id, error_type}`
+JSON response (instead of FastAPI's opaque `Internal Server Error`) plus a
+single `log.exception` line that ties the traceback to the same id. The
+frontend's `api.ts` reads `X-Request-ID` on failed responses and surfaces it in
+toast errors as `(req 1a2b3c4d…)`, so a user pasting their toast text into a
+support ticket gives the operator a direct log handle.
+
 ### Health probes
 
 | Route | What it proves | Use it for |

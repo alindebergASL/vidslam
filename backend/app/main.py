@@ -14,6 +14,7 @@ from sqlalchemy import text
 from .api import api_router
 from .config import get_settings
 from .db import SessionLocal, init_db
+from .middleware import install as install_middleware
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("avs.app")
@@ -31,13 +32,19 @@ def create_app() -> FastAPI:
         yield
 
     app = FastAPI(title="AvatarVideoStudio API", version="0.1.0", lifespan=lifespan)
+    # Order matters: Starlette runs middlewares in reverse-add order, so adding
+    # RequestId LAST means it's the OUTERMOST wrapper — it sees every response,
+    # including ones rewritten by CORS, and its access log captures the final
+    # status the client actually receives.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[settings.frontend_origin, "http://localhost:3000"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["X-Request-ID"],
     )
+    install_middleware(app)
 
     @app.get("/health")
     def health() -> dict:

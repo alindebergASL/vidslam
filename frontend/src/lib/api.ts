@@ -23,7 +23,19 @@ async function req<T>(
   });
   if (!r.ok) {
     const text = await r.text();
-    throw new Error(`${r.status} ${r.statusText}: ${text}`);
+    const rid = r.headers.get("X-Request-ID");
+    // Try to surface the backend's structured `detail` instead of dumping raw
+    // JSON at the user, and tag the request id so an error toast becomes
+    // copy-pasteable into a support ticket / log search.
+    let detail = text;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed?.detail) detail = typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail);
+    } catch {
+      /* not JSON; fall through with the raw text */
+    }
+    const suffix = rid ? ` (req ${rid.slice(0, 8)}…)` : "";
+    throw new Error(`${r.status}: ${detail}${suffix}`);
   }
   if (raw) return (await r.blob()) as unknown as T;
   if (r.status === 204) return undefined as unknown as T;
