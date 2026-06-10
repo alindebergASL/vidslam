@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     data_dir: str = "./data"
     redis_url: str = "redis://localhost:6379/0"
 
+    # rate limiting (budget-burning generation endpoints only)
+    rate_limit_enabled: bool = True
+    # Bucket capacity: how many generation calls a client can burst.
+    rate_limit_generation_burst: int = 10
+    # Steady-state refill: tokens added back per minute.
+    rate_limit_generation_per_minute: float = 10.0
+
     # uploads
     max_upload_bytes: int = 15 * 1024 * 1024
     allowed_image_mimes: tuple[str, ...] = (

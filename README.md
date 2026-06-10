@@ -256,6 +256,24 @@ the whole pipeline.
 | Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |
 | System | `GET /api/system/info` — non-secret deployment overview (version, mock flag, ffmpeg availability, configured model ids, key-presence booleans, entity counts); backs the **Settings & Status** page |
 
+### Rate limiting
+
+Generation routes call paid providers, so they share a per-client token bucket
+(default: burst of 10, refilling 10/minute — tune with
+`RATE_LIMIT_GENERATION_BURST` / `RATE_LIMIT_GENERATION_PER_MINUTE`, or disable
+with `RATE_LIMIT_ENABLED=false`). Throttled routes: `generate-plan`,
+`generate-video`, `recompose`, `retry`, `shots/regenerate`,
+`shots/regenerate-bulk`, `studio/generate-image`, `studio/generate-clip`, and
+`music/generate`. They all draw from **one** bucket, so alternating endpoints
+doesn't dodge the limit. `cancel` is deliberately exempt — it's the escape
+hatch for a runaway render. Over-limit calls get `429` with a `Retry-After`
+header and a human-readable `detail` (which the frontend's toast surfaces).
+
+Clients are keyed by a hash of the session cookie (IP fallback). The limiter is
+in-process behind a tiny `check()` surface (`app/services/ratelimit.py`); swap
+in a Redis-backed implementation for multi-process deploys without touching
+the route dependencies.
+
 ### Request tracing & structured errors
 
 Every request gets an `X-Request-ID` (echoed on the response). An inbound id of

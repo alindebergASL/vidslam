@@ -10,6 +10,7 @@ from .. import models
 from ..db import get_db
 from ..schemas import AssetOut, StudioJobOut, StudioRequest
 from ..services.pipeline import save_studio_result_as_asset
+from ..services.ratelimit import rate_limit
 from ..workers.jobs import generate_asset_job
 from ..workers.queue import enqueue
 from .auth import require_auth
@@ -25,7 +26,7 @@ def _owner_exists(db: Session, kind: str, owner_id: int) -> bool:
     return False
 
 
-@router.post("/generate-image", response_model=StudioJobOut, status_code=202)
+@router.post("/generate-image", response_model=StudioJobOut, status_code=202, dependencies=[Depends(rate_limit("generation"))])
 def generate_image(body: StudioRequest, db: Session = Depends(get_db)) -> models.AssetGenerationJob:
     if not _owner_exists(db, body.owner_kind, body.owner_id):
         raise HTTPException(404, "owner not found")
@@ -46,7 +47,7 @@ def generate_image(body: StudioRequest, db: Session = Depends(get_db)) -> models
     return job
 
 
-@router.post("/generate-clip", response_model=StudioJobOut, status_code=202)
+@router.post("/generate-clip", response_model=StudioJobOut, status_code=202, dependencies=[Depends(rate_limit("generation"))])
 def generate_clip(body: StudioRequest, db: Session = Depends(get_db)) -> models.AssetGenerationJob:
     if not _owner_exists(db, body.owner_kind, body.owner_id):
         raise HTTPException(404, "owner not found")

@@ -14,6 +14,7 @@ from .. import models
 from ..db import get_db
 from ..schemas import ProjectStatusOut, RenderOut, ShotOut
 from ..services.preflight import run_preflight
+from ..services.ratelimit import rate_limit
 from ..services.safety import UnsafeScriptError, validate_script
 from ..workers.jobs import (
     generate_plan_job,
@@ -65,7 +66,7 @@ def public_render_meta(token: str, db: Session = Depends(get_db)) -> dict:
     }
 
 
-@router.post("/projects/{project_id}/generate-plan", status_code=202)
+@router.post("/projects/{project_id}/generate-plan", status_code=202, dependencies=[Depends(rate_limit("generation"))])
 def generate_plan(project_id: int, db: Session = Depends(get_db)) -> dict:
     project = db.get(models.VideoProject, project_id)
     if project is None:
@@ -107,7 +108,7 @@ def cost_estimate(project_id: int, db: Session = Depends(get_db)) -> dict:
     return estimate_plan_cost(project_dict, plan)
 
 
-@router.post("/projects/{project_id}/generate-video", status_code=202)
+@router.post("/projects/{project_id}/generate-video", status_code=202, dependencies=[Depends(rate_limit("generation"))])
 def generate_video(
     project_id: int,
     force: bool = False,
@@ -126,7 +127,7 @@ def generate_video(
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
 
-@router.post("/projects/{project_id}/recompose", status_code=202)
+@router.post("/projects/{project_id}/recompose", status_code=202, dependencies=[Depends(rate_limit("generation"))])
 def recompose_video(project_id: int, db: Session = Depends(get_db)) -> dict:
     project = db.get(models.VideoProject, project_id)
     if project is None:
@@ -167,7 +168,7 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     return {"render_id": latest.id, "status": "cancelled", "action": "signalled"}
 
 
-@router.post("/projects/{project_id}/retry", status_code=202)
+@router.post("/projects/{project_id}/retry", status_code=202, dependencies=[Depends(rate_limit("generation"))])
 def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     """Smart retry after a failed render. Picks the cheapest viable path:
 
@@ -222,7 +223,7 @@ class BulkRegenIn(BaseModel):
     shot_ids: list[int]
 
 
-@router.post("/projects/{project_id}/shots/regenerate-bulk", status_code=202)
+@router.post("/projects/{project_id}/shots/regenerate-bulk", status_code=202, dependencies=[Depends(rate_limit("generation"))])
 def regenerate_shots_bulk(
     project_id: int, body: BulkRegenIn, db: Session = Depends(get_db)
 ) -> dict:
@@ -261,7 +262,7 @@ def project_status(project_id: int, db: Session = Depends(get_db)) -> ProjectSta
     )
 
 
-@router.post("/projects/{project_id}/shots/{shot_id}/regenerate", status_code=202)
+@router.post("/projects/{project_id}/shots/{shot_id}/regenerate", status_code=202, dependencies=[Depends(rate_limit("generation"))])
 def regenerate_shot(
     project_id: int,
     shot_id: int,

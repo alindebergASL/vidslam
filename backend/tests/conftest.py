@@ -19,12 +19,18 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MVP_PASSWORD", "test-pw")
     monkeypatch.setenv("SESSION_SECRET", "test-secret-please-change")
     monkeypatch.setenv("PUBLIC_BASE_URL", "http://test.local")
-    # Reset cached singletons (settings + mock video singleton).
+    # Generous rate-limit defaults so ordinary tests never trip the limiter;
+    # the dedicated rate-limit tests dial these down explicitly.
+    monkeypatch.setenv("RATE_LIMIT_GENERATION_BURST", "10000")
+    monkeypatch.setenv("RATE_LIMIT_GENERATION_PER_MINUTE", "10000")
+    # Reset cached singletons (settings + mock video + rate limiter).
     from app import config as _c
     from app.providers import mock_video as _mv
+    from app.services import ratelimit as _rl
 
     _c.get_settings.cache_clear()
     _mv._singleton = None
+    _rl._limiter = None
 
     # Rebind the engine + SessionLocal to this test's own SQLite file so tests are
     # truly isolated (the engine is module-bound at import; without this every test

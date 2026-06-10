@@ -12,6 +12,7 @@ from ..config import get_settings
 from ..db import get_db
 from ..schemas import ProjectOut
 from ..services import pipeline, storage
+from ..services.ratelimit import rate_limit
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -147,7 +148,7 @@ class MusicGenerateIn(BaseModel):
     duration_seconds: float | None = None
 
 
-@router.post("/projects/{project_id}/music/generate", response_model=ProjectOut)
+@router.post("/projects/{project_id}/music/generate", response_model=ProjectOut, dependencies=[Depends(rate_limit("generation"))])
 def generate_music(
     project_id: int,
     body: MusicGenerateIn,
