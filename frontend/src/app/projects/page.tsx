@@ -16,8 +16,13 @@ export default function ProjectsPage() {
 
 function Inner() {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const toast = useToast();
-  const reload = () => api.listProjects().then(setProjects);
+  const reload = () =>
+    api.listProjects().then((rows) => {
+      setProjects(rows);
+      setLoaded(true);
+    });
   useEffect(() => {
     reload();
   }, []);
@@ -29,7 +34,17 @@ function Inner() {
           + New Project
         </Link>
       </header>
-      {projects.length === 0 ? (
+      {!loaded ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" aria-hidden>
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="card p-4 space-y-3">
+              <div className="h-4 bg-ink-800 rounded animate-pulse w-2/3" />
+              <div className="h-3 bg-ink-800 rounded animate-pulse w-1/3" />
+              <div className="h-5 bg-ink-800 rounded animate-pulse w-20" />
+            </div>
+          ))}
+        </div>
+      ) : projects.length === 0 ? (
         <div className="card p-8 text-ink-300 text-sm text-center">No projects yet.</div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -42,10 +57,13 @@ function Inner() {
                 </div>
                 <StatusBadge status={p.status} className="mt-3" />
               </Link>
-              <div className="absolute top-2 right-2 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition">
+              {/* Always-visible icon buttons (touch-friendly); aria-labels
+                  give screen readers something to announce beyond the glyph. */}
+              <div className="absolute top-2 right-2 flex items-center gap-2 opacity-70 md:opacity-0 md:group-hover:opacity-100 focus-within:opacity-100 transition">
                 <button
                   className="text-ink-400 hover:text-ink-100 text-xs"
                   title="Duplicate project"
+                  aria-label={`Duplicate project "${p.title || "Untitled"}"`}
                   onClick={async () => {
                     try {
                       const dup = await api.duplicateProject(p);
@@ -60,6 +78,7 @@ function Inner() {
                 <button
                   className="text-ink-400 hover:text-accent text-xs"
                   title="Delete project"
+                  aria-label={`Delete project "${p.title || "Untitled"}"`}
                   onClick={async () => {
                     if (
                       !window.confirm(

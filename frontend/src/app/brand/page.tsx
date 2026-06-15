@@ -13,10 +13,15 @@ export default function BrandPage() {
 
 function Inner() {
   const [kits, setKits] = useState<BrandKit[]>([]);
+  const [loaded, setLoaded] = useState(false);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
 
-  const reload = () => api.listBrandKits().then(setKits);
+  const reload = () =>
+    api.listBrandKits().then((rows) => {
+      setKits(rows);
+      setLoaded(true);
+    });
   useEffect(() => {
     reload();
   }, []);
@@ -35,7 +40,17 @@ function Inner() {
         </button>
       </header>
 
-      {kits.length === 0 ? (
+      {!loaded ? (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4" aria-hidden>
+          {Array.from({ length: 2 }).map((_, i) => (
+            <div key={i} className="card p-4 space-y-3">
+              <div className="h-4 bg-ink-800 rounded animate-pulse w-1/3" />
+              <div className="aspect-[16/9] bg-ink-800 rounded animate-pulse" />
+              <div className="h-3 bg-ink-800 rounded animate-pulse w-1/2" />
+            </div>
+          ))}
+        </div>
+      ) : kits.length === 0 ? (
         <div className="card p-10 text-center">
           <div className="text-3xl mb-2">◆</div>
           <div className="text-base font-medium mb-1">No brand kits yet</div>
@@ -127,7 +142,7 @@ function BrandCard({ kit, onChange }: { kit: BrandKit; onChange: () => void }) {
         {k.logo_public_token && (
           <img
             src={`${api.brandLogoUrl(k.id)}?t=${k.logo_public_token}`}
-            alt="logo"
+            alt={`${k.name} logo`}
             className="max-h-12 object-contain"
           />
         )}

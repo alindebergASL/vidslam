@@ -30,6 +30,9 @@ function Dashboard() {
   >([]);
 
   const [seeding, setSeeding] = useState(false);
+  // `loaded` gates the empty-state card so it never flashes during the first
+  // fetch (when avatars/projects/ingredients are still empty arrays).
+  const [loaded, setLoaded] = useState(false);
   const toast = useToast();
 
   const loadAll = async () => {
@@ -51,6 +54,7 @@ function Dashboard() {
     setThumbnails(Object.fromEntries(entries));
     setAvatars(await api.listAvatars());
     setIngredients(await api.listIngredients());
+    setLoaded(true);
   };
 
   const seedDemo = async () => {
@@ -75,7 +79,7 @@ function Dashboard() {
     api.providerStatus().then(setProviderStatus);
   }, []);
 
-  const isEmpty = avatars.length === 0 && projects.length === 0 && ingredients.length === 0;
+  const isEmpty = loaded && avatars.length === 0 && projects.length === 0 && ingredients.length === 0;
 
   return (
     <div className="p-8 max-w-6xl">

@@ -160,7 +160,25 @@ function Inner() {
 
   if (error)
     return <div className="p-8 text-accent">{error}</div>;
-  if (!project) return <div className="p-8 text-ink-300">Loading…</div>;
+  if (!project)
+    return (
+      <div className="p-8 max-w-6xl space-y-6" aria-busy="true" aria-label="Loading project">
+        <div className="space-y-2">
+          <div className="h-3 bg-ink-800 rounded animate-pulse w-24" />
+          <div className="h-8 bg-ink-800 rounded animate-pulse w-2/3" />
+          <div className="h-3 bg-ink-800 rounded animate-pulse w-1/3" />
+        </div>
+        <div className="card p-4 space-y-2">
+          <div className="h-3 bg-ink-800 rounded animate-pulse w-20" />
+          <div className="h-24 bg-ink-800 rounded animate-pulse" />
+        </div>
+        <div className="space-y-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="card p-4 h-24 animate-pulse" />
+          ))}
+        </div>
+      </div>
+    );
 
   return (
     <div className="p-8 max-w-6xl">

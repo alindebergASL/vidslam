@@ -22,6 +22,12 @@ async function req<T>(
     ...init,
   });
   if (!r.ok) {
+    // Session expiry mid-flow: bounce back to the AuthGate so the user can
+    // re-authenticate instead of seeing a wall of 401 toasts. Skip for the
+    // auth/status probe itself (which is *expected* to 401 when signed out).
+    if (r.status === 401 && typeof window !== "undefined" && !path.startsWith("/api/auth/")) {
+      window.dispatchEvent(new CustomEvent("avs:unauthenticated"));
+    }
     const text = await r.text();
     const rid = r.headers.get("X-Request-ID");
     // Try to surface the backend's structured `detail` instead of dumping raw

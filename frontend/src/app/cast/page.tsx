@@ -21,10 +21,12 @@ function CastInner() {
   const [creating, setCreating] = useState(false);
   const [openId, setOpenId] = useState<number | null>(null);
   const [openKind, setOpenKind] = useState<"avatar" | "ingredient">("avatar");
+  const [loaded, setLoaded] = useState(false);
 
   const reload = async () => {
     setAvatars(await api.listAvatars());
     setIngredients(await api.listIngredients());
+    setLoaded(true);
   };
   useEffect(() => {
     reload();
@@ -60,6 +62,7 @@ function CastInner() {
 
       {tab === "characters" ? (
         <Grid
+          loaded={loaded}
           items={avatars.map((a) => ({
             id: a.id,
             kind: "avatar" as const,
@@ -77,6 +80,7 @@ function CastInner() {
         />
       ) : (
         <Grid
+          loaded={loaded}
           items={ingredients
             .filter((i) =>
               tabIngKind === "object" ? i.kind === "object" || i.kind === "prop" : i.kind === tabIngKind
@@ -123,13 +127,32 @@ function CastInner() {
   );
 }
 
+function GridSkeleton() {
+  return (
+    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3" aria-hidden>
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div key={i} className="card overflow-hidden">
+          <div className="aspect-[9/16] bg-ink-800 animate-pulse" />
+          <div className="p-3 space-y-2">
+            <div className="h-3 bg-ink-800 rounded animate-pulse w-3/4" />
+            <div className="h-2 bg-ink-800 rounded animate-pulse w-1/2" />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function Grid({
   items,
+  loaded,
   onOpen,
 }: {
   items: { id: number; kind: "avatar" | "ingredient"; title: string; sub: string; heroUrl?: string | null | false; count: number }[];
+  loaded: boolean;
   onOpen: (id: number) => void;
 }) {
+  if (!loaded) return <GridSkeleton />;
   if (items.length === 0) {
     return (
       <div className="card p-10 text-center">
@@ -194,8 +217,16 @@ function CreateModal({
           New {kind === "avatar" ? "Character" : "Ingredient"}
         </div>
         <div>
-          <label className="label">Name</label>
-          <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
+          <label className="label" htmlFor="cast-name">Name</label>
+          <input
+            id="cast-name"
+            className="input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            required
+            autoFocus
+            placeholder={kind === "avatar" ? "e.g. Naina" : "e.g. Brooklyn rooftop"}
+          />
         </div>
         {kind === "avatar" ? (
           <>

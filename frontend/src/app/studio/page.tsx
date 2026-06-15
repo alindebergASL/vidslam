@@ -274,11 +274,15 @@ function TileCard({
       {tile.kind === "asset" && tile.selectable && (
         <button
           onClick={onSelect}
+          aria-label={selected ? "Deselect reference" : "Use as reference"}
+          aria-pressed={selected}
           className={clsx(
             "absolute top-2 right-2 w-6 h-6 rounded-full border text-xs flex items-center justify-center",
             selected
               ? "bg-accent border-accent text-white"
-              : "bg-black/50 border-ink-300 text-ink-100 opacity-0 group-hover:opacity-100 transition"
+              // Touch devices have no hover; show at 60% so it's discoverable,
+              // then full opacity on hover for crisp desktop affordance.
+              : "bg-black/60 border-ink-300 text-ink-100 opacity-60 group-hover:opacity-100 transition"
           )}
           title={selected ? "Selected as reference" : "Use as reference"}
         >
@@ -287,7 +291,9 @@ function TileCard({
       )}
 
       {tile.kind === "job" && tile.status === "completed" && tile.jobId && (
-        <div className="absolute top-2 right-2 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition">
+        // Always visible (touch devices have no hover); a subtle scrim keeps
+        // them readable over the image.
+        <div className="absolute top-2 right-2 flex flex-col gap-1">
           <button
             onClick={async () => {
               try {
@@ -297,15 +303,17 @@ function TileCard({
               }
               onSaved();
             }}
-            className="chip text-xs py-1"
+            className="chip text-xs py-1 bg-ink-900/85 border-ink-700"
             title="Save to cast"
+            aria-label="Save this generation to the cast"
           >
             Save
           </button>
           <button
             onClick={() => onUseInProject(tile.jobId!)}
-            className="chip text-xs py-1"
+            className="chip text-xs py-1 bg-ink-900/85 border-ink-700"
             title="Start a new project pre-loaded with this asset's owner"
+            aria-label="Start a new project pre-loaded with this asset's owner"
           >
             New Project →
           </button>
