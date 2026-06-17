@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { Dropzone } from "@/components/Dropzone";
@@ -437,16 +438,25 @@ function DetailDrawer({
         className="ml-auto h-full w-full max-w-xl bg-ink-900 border-l border-ink-800 p-6 overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start justify-between mb-4">
-          <div>
-            <div className="text-xl font-semibold">{(entity as any).name}</div>
+        <div className="flex items-start justify-between mb-4 gap-3">
+          <div className="min-w-0">
+            <div className="text-xl font-semibold truncate">{(entity as any).name}</div>
             <div className="text-xs text-ink-400 mt-0.5">
               {kind === "avatar" ? "Character" : `${(entity as Ingredient).kind} ingredient`}
             </div>
           </div>
-          <button className="btn-ghost" onClick={onClose}>
-            Close
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            <Link
+              href={`/projects/new?owner_kind=${kind}&owner_id=${id}`}
+              className="btn-ghost text-xs"
+              title="Start a new project with this cast member pre-selected"
+            >
+              New project →
+            </Link>
+            <button className="btn-ghost" onClick={onClose}>
+              Close
+            </button>
+          </div>
         </div>
 
         <div className="card p-4 mb-4 space-y-3">
