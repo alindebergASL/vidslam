@@ -1,4 +1,4 @@
-.PHONY: dev up down logs build seed test backend-test smoke verify verify-up screenshots backend-shell frontend-shell clean
+.PHONY: dev up down logs build seed test backend-test smoke smoke-ui verify verify-up screenshots backend-shell frontend-shell clean
 
 dev: up logs
 
@@ -43,6 +43,12 @@ verify-up:
 # AVS_PASSWORD for a different deployment.
 screenshots:
 	node scripts/capture_screenshots.mjs
+
+# Headless UI smoke: walks every primary route after login, asserts HTTP 200,
+# a sentinel string, and zero runtime console/page errors. Exits non-zero on
+# any failure so CI can wire it in directly.
+smoke-ui:
+	node scripts/smoke_ui.mjs
 
 backend-shell:
 	docker compose exec backend bash
