@@ -23,6 +23,7 @@ function CastInner() {
   const [openId, setOpenId] = useState<number | null>(null);
   const [openKind, setOpenKind] = useState<"avatar" | "ingredient">("avatar");
   const [loaded, setLoaded] = useState(false);
+  const [query, setQuery] = useState("");
 
   const reload = async () => {
     setAvatars(await api.listAvatars());
@@ -34,6 +35,10 @@ function CastInner() {
   }, []);
 
   const tabIngKind = tab === "scenes" ? "scene" : tab === "styles" ? "style" : "object";
+
+  const q = query.trim().toLowerCase();
+  const matches = (haystack: string[]) =>
+    !q || haystack.some((s) => s && s.toLowerCase().includes(q));
 
   return (
     <div className="p-8 max-w-6xl">
@@ -49,7 +54,7 @@ function CastInner() {
         </button>
       </header>
 
-      <div className="flex flex-wrap gap-2 mb-6">
+      <div className="flex flex-wrap items-center gap-2 mb-6">
         {(["characters", "scenes", "styles", "objects"] as Tab[]).map((t) => (
           <button
             key={t}
@@ -59,21 +64,46 @@ function CastInner() {
             {t}
           </button>
         ))}
+        <div className="ml-auto relative">
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search…"
+            aria-label="Search cast"
+            className="input text-sm py-1.5 pl-8 pr-8 w-56"
+          />
+          <span aria-hidden className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-400 text-xs">
+            ⌕
+          </span>
+          {query && (
+            <button
+              type="button"
+              aria-label="Clear search"
+              onClick={() => setQuery("")}
+              className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-400 hover:text-ink-100 text-xs"
+            >
+              ✕
+            </button>
+          )}
+        </div>
       </div>
 
       {tab === "characters" ? (
         <Grid
           loaded={loaded}
-          items={avatars.map((a) => ({
-            id: a.id,
-            kind: "avatar" as const,
-            title: a.name,
-            sub: a.persona || a.brand || "—",
-            heroUrl:
-              a.assets.find((x) => x.asset_type === "hero")?.public_token &&
-              api.publicAsset(a.assets.find((x) => x.asset_type === "hero")!.public_token),
-            count: a.assets.length,
-          }))}
+          query={q}
+          items={avatars
+            .filter((a) => matches([a.name, a.persona, a.brand]))
+            .map((a) => ({
+              id: a.id,
+              kind: "avatar" as const,
+              title: a.name,
+              sub: a.persona || a.brand || "—",
+              heroUrl:
+                a.assets.find((x) => x.asset_type === "hero")?.public_token &&
+                api.publicAsset(a.assets.find((x) => x.asset_type === "hero")!.public_token),
+              count: a.assets.length,
+            }))}
           onOpen={(id) => {
             setOpenKind("avatar");
             setOpenId(id);
@@ -82,10 +112,12 @@ function CastInner() {
       ) : (
         <Grid
           loaded={loaded}
+          query={q}
           items={ingredients
             .filter((i) =>
               tabIngKind === "object" ? i.kind === "object" || i.kind === "prop" : i.kind === tabIngKind
             )
+            .filter((i) => matches([i.name, i.visual_identity, i.kind]))
             .map((i) => ({
               id: i.id,
               kind: "ingredient" as const,
@@ -147,14 +179,26 @@ function GridSkeleton() {
 function Grid({
   items,
   loaded,
+  query,
   onOpen,
 }: {
   items: { id: number; kind: "avatar" | "ingredient"; title: string; sub: string; heroUrl?: string | null | false; count: number }[];
   loaded: boolean;
+  query?: string;
   onOpen: (id: number) => void;
 }) {
   if (!loaded) return <GridSkeleton />;
   if (items.length === 0) {
+    if (query) {
+      return (
+        <div className="card p-10 text-center">
+          <div className="text-base font-medium mb-1">No matches for “{query}”</div>
+          <div className="text-xs text-ink-300">
+            Try a different name, persona, or visual-identity keyword.
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="card p-10 text-center">
         <div className="text-3xl mb-2">☺</div>
