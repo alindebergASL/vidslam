@@ -1,4 +1,4 @@
-.PHONY: dev up down logs build seed test backend-test smoke verify verify-up backend-shell frontend-shell clean
+.PHONY: dev up down logs build seed test backend-test smoke verify verify-up screenshots backend-shell frontend-shell clean
 
 dev: up logs
 
@@ -37,6 +37,12 @@ verify:
 # compose stack actually deploys end-to-end.
 verify-up:
 	./scripts/verify_up.sh
+
+# Capture polished-surface screenshots against a running stack.
+# Defaults assume `make up` + `make seed`. Override AVS_BASE_URL / AVS_API_URL /
+# AVS_PASSWORD for a different deployment.
+screenshots:
+	node scripts/capture_screenshots.mjs
 
 backend-shell:
 	docker compose exec backend bash
