@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { Dropzone } from "@/components/Dropzone";
-import { api, Asset, Avatar, Ingredient } from "@/lib/api";
+import { api, Asset, Avatar, Ingredient, Project } from "@/lib/api";
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
 
@@ -19,6 +19,7 @@ function CastInner() {
   const [tab, setTab] = useState<Tab>("characters");
   const [avatars, setAvatars] = useState<Avatar[]>([]);
   const [ingredients, setIngredients] = useState<Ingredient[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [creating, setCreating] = useState(false);
   const [openId, setOpenId] = useState<number | null>(null);
   const [openKind, setOpenKind] = useState<"avatar" | "ingredient">("avatar");
@@ -26,13 +27,46 @@ function CastInner() {
   const [query, setQuery] = useState("");
 
   const reload = async () => {
-    setAvatars(await api.listAvatars());
-    setIngredients(await api.listIngredients());
+    const [av, ing, ps] = await Promise.all([
+      api.listAvatars(),
+      api.listIngredients(),
+      api.listProjects(),
+    ]);
+    setAvatars(av);
+    setIngredients(ing);
+    setProjects(ps);
     setLoaded(true);
   };
   useEffect(() => {
     reload();
   }, []);
+
+  // Count how many projects reference each cast member by id+kind so the grid
+  // can surface "Used in N" — answers "is this character actually used?" without
+  // forcing the user to open each project.
+  const usage = (() => {
+    const av: Record<number, number> = {};
+    const ing: Record<number, number> = {};
+    for (const p of projects) {
+      const seenAv = new Set<number>();
+      const seenIng = new Set<number>();
+      for (const m of p.cast_members || []) {
+        if (m.member_kind === "avatar" && m.avatar_id != null && !seenAv.has(m.avatar_id)) {
+          av[m.avatar_id] = (av[m.avatar_id] || 0) + 1;
+          seenAv.add(m.avatar_id);
+        }
+        if (
+          m.member_kind === "ingredient" &&
+          m.ingredient_id != null &&
+          !seenIng.has(m.ingredient_id)
+        ) {
+          ing[m.ingredient_id] = (ing[m.ingredient_id] || 0) + 1;
+          seenIng.add(m.ingredient_id);
+        }
+      }
+    }
+    return { avatar: av, ingredient: ing };
+  })();
 
   const tabIngKind = tab === "scenes" ? "scene" : tab === "styles" ? "style" : "object";
 
@@ -103,6 +137,7 @@ function CastInner() {
                 a.assets.find((x) => x.asset_type === "hero")?.public_token &&
                 api.publicAsset(a.assets.find((x) => x.asset_type === "hero")!.public_token),
               count: a.assets.length,
+              usedInProjects: usage.avatar[a.id] || 0,
             }))}
           onOpen={(id) => {
             setOpenKind("avatar");
@@ -126,6 +161,7 @@ function CastInner() {
               heroUrl:
                 i.assets[0]?.public_token && api.publicAsset(i.assets[0].public_token),
               count: i.assets.length,
+              usedInProjects: usage.ingredient[i.id] || 0,
             }))}
           onOpen={(id) => {
             setOpenKind("ingredient");
@@ -182,7 +218,7 @@ function Grid({
   query,
   onOpen,
 }: {
-  items: { id: number; kind: "avatar" | "ingredient"; title: string; sub: string; heroUrl?: string | null | false; count: number }[];
+  items: { id: number; kind: "avatar" | "ingredient"; title: string; sub: string; heroUrl?: string | null | false; count: number; usedInProjects: number }[];
   loaded: boolean;
   query?: string;
   onOpen: (id: number) => void;
@@ -233,6 +269,11 @@ function Grid({
           <div className="p-3">
             <div className="text-sm font-medium truncate">{it.title}</div>
             <div className="text-xs text-ink-300 truncate mt-0.5">{it.sub}</div>
+            <div className="text-[10px] text-ink-400 mt-1">
+              {it.usedInProjects > 0
+                ? `Used in ${it.usedInProjects} project${it.usedInProjects === 1 ? "" : "s"}`
+                : "Not used yet"}
+            </div>
           </div>
         </button>
       ))}
