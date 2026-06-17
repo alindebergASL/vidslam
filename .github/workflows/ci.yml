@@ -56,3 +56,108 @@ jobs:
 
       - name: Type-check + build
         run: npm run build
+
+  ui-smoke:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # Backend ---
+      - name: Install backend
+        run: pip install -e ".[dev]"
+        working-directory: backend
+
+      # Frontend (build for production-mode start; faster + closer to real prod
+      # than next dev, no HMR noise that can confuse the smoke test) ---
+      - name: Install frontend
+        run: npm install --no-audit --no-fund
+        working-directory: frontend
+
+      - name: Build frontend
+        env:
+          NEXT_PUBLIC_API_BASE: http://localhost:8000
+        run: npm run build
+        working-directory: frontend
+
+      # Playwright chromium ---
+      - name: Install playwright + chromium
+        run: |
+          npm install --no-save --no-audit --no-fund playwright
+          npx playwright install --with-deps chromium
+
+      # Boot the stack ---
+      - name: Start backend
+        env:
+          MOCK_PROVIDERS: "true"
+          MVP_PASSWORD: smoke-pw
+          SESSION_SECRET: smoke-secret-32-chars-or-longer-please
+          DATABASE_URL: sqlite:////tmp/smoke.db
+          DATA_DIR: /tmp/smoke-data
+          PUBLIC_BASE_URL: http://localhost:8000
+          FRONTEND_ORIGIN: http://localhost:3000
+          RATE_LIMIT_ENABLED: "false"
+        run: |
+          mkdir -p /tmp/smoke-data
+          nohup python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/backend.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/healthz > /dev/null; then echo "backend up"; exit 0; fi
+            sleep 1
+          done
+          echo "backend never came up"; tail -50 /tmp/backend.log; exit 1
+        working-directory: backend
+
+      - name: Seed + render a project (so editor + render pages have real data)
+        run: |
+          curl -sf -c /tmp/cookies -X POST http://127.0.0.1:8000/api/auth/login \
+            -H "Content-Type: application/json" -d '{"password":"smoke-pw"}' > /dev/null
+          curl -sf -b /tmp/cookies -X POST http://127.0.0.1:8000/api/system/seed > /dev/null
+          curl -sf -b /tmp/cookies -X POST http://127.0.0.1:8000/api/projects/1/generate-plan > /dev/null
+          sleep 3
+          curl -sf -b /tmp/cookies -X POST http://127.0.0.1:8000/api/projects/1/generate-video > /dev/null
+          for i in $(seq 1 60); do
+            S=$(curl -sf -b /tmp/cookies http://127.0.0.1:8000/api/projects/1/status \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('latest_render'); print(d['project_status']+'/'+(r['status'] if r else 'none'))")
+            echo "  $S"
+            case "$S" in
+              completed/completed) exit 0 ;;
+              */failed) echo "render failed"; tail -50 /tmp/backend.log; exit 1 ;;
+            esac
+            sleep 2
+          done
+          echo "render never completed"; exit 1
+
+      - name: Start frontend
+        env:
+          NEXT_PUBLIC_API_BASE: http://localhost:8000
+        run: |
+          nohup npm run start -- --port 3000 > /tmp/frontend.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000 > /dev/null; then echo "frontend up"; exit 0; fi
+            sleep 1
+          done
+          echo "frontend never came up"; tail -50 /tmp/frontend.log; exit 1
+        working-directory: frontend
+
+      - name: UI smoke
+        env:
+          AVS_BASE_URL: http://localhost:3000
+          AVS_PASSWORD: smoke-pw
+        run: node scripts/smoke_ui.mjs
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "--- backend ---"; tail -200 /tmp/backend.log || true
+          echo "--- frontend ---"; tail -200 /tmp/frontend.log || true
