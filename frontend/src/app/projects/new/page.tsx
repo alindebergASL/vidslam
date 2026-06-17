@@ -284,6 +284,7 @@ function Inner() {
               const on = cast.some(
                 (c) => c.member_kind === "avatar" && c.avatar_id === av.id
               );
+              const hero = av.assets.find((a) => a.asset_type === "hero") || av.assets[0];
               return (
                 <button
                   key={av.id}
@@ -291,9 +292,24 @@ function Inner() {
                     toggleAvatar(av);
                     if (!primary || primary === av.id) setPrimary(av.id);
                   }}
-                  className={clsx("chip", on && "chip-active")}
+                  className={clsx("chip flex items-center gap-2 pl-1", on && "chip-active")}
+                  title={av.persona || av.name}
                 >
-                  {av.name}
+                  {hero ? (
+                    <img
+                      src={api.publicAsset(hero.public_token)}
+                      alt=""
+                      className="w-6 h-6 rounded-full object-cover border border-ink-700"
+                    />
+                  ) : (
+                    <span
+                      aria-hidden
+                      className="w-6 h-6 rounded-full bg-ink-700 text-[10px] flex items-center justify-center text-ink-300"
+                    >
+                      {av.name.slice(0, 1).toUpperCase()}
+                    </span>
+                  )}
+                  <span>{av.name}</span>
                 </button>
               );
             })}
@@ -307,14 +323,30 @@ function Inner() {
               const on = cast.some(
                 (c) => c.member_kind === "ingredient" && c.ingredient_id === ing.id
               );
+              const hero = ing.assets[0];
               return (
                 <button
                   key={ing.id}
                   onClick={() => toggleIngredient(ing)}
-                  className={clsx("chip", on && "chip-active")}
+                  className={clsx("chip flex items-center gap-2 pl-1", on && "chip-active")}
+                  title={ing.visual_identity || ing.name}
                 >
-                  {ing.name}
-                  <span className="text-[10px] text-ink-400 ml-1">{ing.kind}</span>
+                  {hero ? (
+                    <img
+                      src={api.publicAsset(hero.public_token)}
+                      alt=""
+                      className="w-6 h-6 rounded object-cover border border-ink-700"
+                    />
+                  ) : (
+                    <span
+                      aria-hidden
+                      className="w-6 h-6 rounded bg-ink-700 text-[10px] flex items-center justify-center text-ink-300"
+                    >
+                      {ing.kind.slice(0, 1).toUpperCase()}
+                    </span>
+                  )}
+                  <span>{ing.name}</span>
+                  <span className="text-[10px] text-ink-400">{ing.kind}</span>
                 </button>
               );
             })}
