@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
+import { Dropzone } from "@/components/Dropzone";
 import { api, Asset, Avatar, Ingredient } from "@/lib/api";
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
@@ -334,20 +335,13 @@ function DetailDrawer({
     reload();
   }, [id]);
 
+  // Uploads a single file; throws on failure so the Dropzone can flag it red.
+  // The Dropzone batches and calls onSettled to trigger a single reload.
   const upload = async (file: File) => {
-    if (!rights) {
-      setError("Please confirm you have rights to use this asset.");
-      return;
-    }
+    if (!rights) throw new Error("Please confirm you have rights first.");
     setError(null);
-    try {
-      if (kind === "avatar") await api.uploadAvatarAsset(id, file, assetType, true);
-      else await api.uploadIngredientAsset(id, file, assetType, true);
-      await reload();
-      onChange();
-    } catch (e: any) {
-      setError(e.message || "Upload failed");
-    }
+    if (kind === "avatar") await api.uploadAvatarAsset(id, file, assetType, true);
+    else await api.uploadIngredientAsset(id, file, assetType, true);
   };
 
   if (!entity) return null;
@@ -378,11 +372,12 @@ function DetailDrawer({
               checked={rights}
               onChange={(e) => setRights(e.target.checked)}
             />
-            I own or have rights to use these avatar assets.
+            I own or have rights to use these {kind === "avatar" ? "avatar" : "ingredient"} assets.
           </label>
-          <div className="flex gap-2 items-center">
+          <div>
+            <label className="label">Asset type</label>
             <select
-              className="input flex-1"
+              className="input"
               value={assetType}
               onChange={(e) => setAssetType(e.target.value)}
             >
@@ -395,16 +390,20 @@ function DetailDrawer({
                 </option>
               ))}
             </select>
-            <label className="btn-primary cursor-pointer">
-              <input
-                type="file"
-                hidden
-                accept="image/png,image/jpeg,image/webp"
-                onChange={(e) => e.target.files && upload(e.target.files[0])}
-              />
-              Upload
-            </label>
           </div>
+          <Dropzone
+            disabled={!rights}
+            hint={
+              rights
+                ? "PNG, JPEG, or WEBP up to 15 MB each. EXIF is stripped on upload."
+                : "Confirm rights above to enable uploads."
+            }
+            onUpload={(file) => upload(file)}
+            onSettled={() => {
+              reload();
+              onChange();
+            }}
+          />
           {error && <div className="text-xs text-accent">{error}</div>}
         </div>
 
