@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
+import { OnboardingChecklist } from "@/components/OnboardingChecklist";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useToast } from "@/components/Toaster";
 import { api, Avatar, Ingredient, Project } from "@/lib/api";
@@ -94,6 +95,8 @@ function Dashboard() {
           + New Project
         </Link>
       </header>
+
+      <OnboardingChecklist />
 
       {isEmpty && (
         <div className="card p-6 mb-8 border-accent/40 bg-gradient-to-br from-accent/10 via-ink-900 to-ink-900">
