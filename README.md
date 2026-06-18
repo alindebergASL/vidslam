@@ -502,10 +502,43 @@ sed -i "s/^SESSION_SECRET=.*/SESSION_SECRET=${SESSION_SECRET}/" .env
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
+### Optional: S3-backed asset delivery
+
+When `S3_BUCKET` is set, uploaded assets are mirrored to S3 and the
+public-asset URL (which providers fetch from for reference images) 302s
+to a presigned S3 URL instead of streaming through the app. This
+off-loads provider-fetch bandwidth and lets a CDN front it. The local
+filesystem stays the source of truth for app-side reads.
+
+```bash
+# In .env on the EC2 host:
+S3_BUCKET=my-avs-assets
+S3_REGION=us-east-1
+S3_PREFIX=assets
+S3_PRESIGN_TTL_SECONDS=3600
+
+# Install boto3 (optional extra):
+docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+  build --build-arg PIP_EXTRA=".[s3]" backend worker
+```
+
+Boto3 picks credentials from the standard chain (env, ~/.aws,
+instance profile, ECS task role). The instance profile needs
+`s3:PutObject` + `s3:GetObject` on the bucket. Verify via the
+[real-provider runbook](scripts/test_real_providers.md#6-s3-backed-asset-delivery-optional).
+If boto3 isn't installed or `S3_BUCKET` is empty, the app silently falls
+back to local-fs delivery — no migration needed.
+
+### Verifying real providers + S3
+
+`scripts/test_real_providers.md` is a step-by-step manual runbook for
+flipping `MOCK_PROVIDERS=false` and confirming the real OpenRouter /
+ElevenLabs / S3 paths end-to-end. The CI suite doesn't exercise these
+(they cost money and need keys) — the runbook is the gate before a
+production deploy.
+
 ### Production considerations still on the roadmap
 
-- S3-backed `Asset.public_token` URLs instead of local filesystem (the
-  current code keeps tokens unguessable but reads off-disk).
 - Real auth (OAuth / magic links) replacing the shared MVP password.
 - Sentry or similar to alert on `ProviderLog.status == 'error'`.
 - Move rate-limit token buckets from in-process to Redis so multi-worker /

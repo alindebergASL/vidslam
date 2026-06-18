@@ -168,11 +168,29 @@ def asset_preview(asset_id: int, db: Session = Depends(get_db)) -> FileResponse:
 
 
 @router.get("/public-assets/{token}")
-def public_asset(token: str, db: Session = Depends(get_db)) -> FileResponse:
-    """Tokenized, unauthenticated public asset URL exposed to providers as reference images."""
+def public_asset(token: str, db: Session = Depends(get_db)):
+    """Tokenized, unauthenticated public asset URL exposed to providers as
+    reference images.
+
+    When S3 is configured (`s3_bucket` set + boto3 installed), redirect to
+    a presigned S3 URL so the provider fetches off S3/CDN instead of
+    through this app — saves bandwidth and decouples render throughput
+    from app worker count. When S3 isn't configured this falls back to
+    streaming the local file directly, which is the MVP behavior."""
     a = db.query(models.Asset).filter(models.Asset.public_token == token).first()
     if a is None:
         raise HTTPException(404, "asset not found")
+
+    from fastapi.responses import RedirectResponse
+
+    from ..services.s3 import presigned_url_for
+
+    presigned = presigned_url_for(Path(a.file_path), content_type=a.mime_type)
+    if presigned is not None:
+        # 302 keeps the redirect uncached; the next request will re-presign
+        # with a fresh TTL. Provider HTTP clients follow 302 by default.
+        return RedirectResponse(url=presigned, status_code=302)
+
     if not Path(a.file_path).exists():
         raise HTTPException(404, "asset file missing")
     return FileResponse(a.file_path, media_type=a.mime_type)

@@ -52,6 +52,19 @@ class Settings(BaseSettings):
     elevenlabs_music_model_id: str = ""
     elevenlabs_base_url: str = "https://api.elevenlabs.io/v1"
 
+    # S3-backed object storage (optional, for production deploys). When
+    # s3_bucket is set, uploaded asset files are mirrored to S3 and
+    # `public_url_for_token()` returns a time-limited presigned URL instead
+    # of a route through this app — useful for offloading bandwidth.
+    # Reads from disk still work; S3 is the public delivery channel.
+    # Empty bucket = local-fs only (the MVP default).
+    s3_bucket: str = ""
+    s3_region: str = "us-east-1"
+    s3_prefix: str = "assets"
+    s3_presign_ttl_seconds: int = 3600
+    # boto3 picks credentials from the standard chain (env, ~/.aws,
+    # instance profile, ECS task role). No need to surface them here.
+
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01
     cost_image_per_item: float = 0.04

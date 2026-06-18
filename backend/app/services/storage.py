@@ -75,6 +75,12 @@ def save_uploaded_image(
     out_path = subdir / filename
     out_path.write_bytes(cleaned)
 
+    # Best-effort S3 mirror when configured. Never raises into the upload
+    # path; an S3 outage just means the local-fs delivery URL is used.
+    from .s3 import mirror_to_s3
+
+    mirror_to_s3(out_path, content_type=mime_type)
+
     return {
         "file_path": str(out_path),
         "original_filename": original_filename,
@@ -96,6 +102,14 @@ def save_generated_bytes(
     subdir.mkdir(parents=True, exist_ok=True)
     path = subdir / f"{uuid.uuid4().hex}.{extension.lstrip('.')}"
     path.write_bytes(raw)
+    # Best-effort S3 mirror — see save_uploaded_image for the contract.
+    from .s3 import mirror_to_s3
+
+    mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "webp": "image/webp", "mp4": "video/mp4"}.get(
+        extension.lstrip(".").lower(), "application/octet-stream"
+    )
+    mirror_to_s3(path, content_type=mime)
     return path
 
 

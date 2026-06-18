@@ -26,6 +26,12 @@ dev = [
   "respx>=0.21",
   "ruff>=0.5",
 ]
+# Only required when S3-backed asset delivery is enabled. Install via
+# `pip install -e ".[s3]"` on production deploys that configure s3_bucket;
+# the local-fs path doesn't import boto3 and works without it.
+s3 = [
+  "boto3>=1.35",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
