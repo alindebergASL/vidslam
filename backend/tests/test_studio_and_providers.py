@@ -71,6 +71,9 @@ def test_provider_status_endpoint(auth_client):
         "video": "mock",
         "tts": "mock",
         "music": "mock",
+        # The lipsync slot is a Protocol with only a mock impl for now —
+        # surfaced in status so a future real adapter is observable.
+        "lipsync": "mock",
     }
 
 

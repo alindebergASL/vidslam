@@ -113,6 +113,64 @@ def test_replan_preserve_edits_keeps_user_fields(auth_client):
     )
 
 
+def test_replan_preserve_edits_keeps_reference_ids_and_duration(auth_client):
+    """The user's per-shot reference selection + caption + duration must
+    survive a preserve-edits replan, not just the prompt text."""
+    pid = _planned(auth_client)
+    aid = (
+        auth_client.get(f"/api/projects/{pid}").json()["cast_members"][0]["avatar_id"]
+    )
+    asset_id = auth_client.get(f"/api/avatars/{aid}").json()["assets"][0]["id"]
+
+    shots = auth_client.get(f"/api/projects/{pid}").json()["shots"]
+    sid = shots[0]["id"]
+    auth_client.patch(
+        f"/api/projects/{pid}/shots/{sid}",
+        json={
+            "reference_asset_ids_json": [asset_id],
+            "duration_seconds": 9.5,
+            "caption_text": "USER CAPTION",
+        },
+    )
+
+    r = auth_client.post(f"/api/projects/{pid}/generate-plan?preserve_edits=true")
+    assert r.status_code == 202
+    survived = next(
+        s for s in auth_client.get(f"/api/projects/{pid}").json()["shots"] if s["id"] == sid
+    )
+    assert survived["reference_asset_ids_json"] == [asset_id]
+    assert survived["duration_seconds"] == 9.5
+    assert survived["caption_text"] == "USER CAPTION"
+
+
+def test_replan_preserve_edits_drops_extra_shots_when_new_plan_is_shorter(auth_client, monkeypatch):
+    """If the new plan has fewer shots than the existing list, the extras
+    must be dropped — not kept as orphan rows."""
+    pid = _planned(auth_client)
+    existing = auth_client.get(f"/api/projects/{pid}").json()["shots"]
+    assert len(existing) >= 2, "mock planner should produce at least 2 shots"
+
+    # Patch the mock planner to emit a single shot so the new plan is
+    # strictly shorter than the existing list.
+    from app.providers import mock_chat
+
+    real = mock_chat.MockChatProvider.generate_storyboard
+
+    def shorter(self, *, project, cast):  # type: ignore[no-untyped-def]
+        plan = real(self, project=project, cast=cast)
+        plan.shots = plan.shots[:1]
+        return plan
+
+    monkeypatch.setattr(mock_chat.MockChatProvider, "generate_storyboard", shorter)
+
+    r = auth_client.post(f"/api/projects/{pid}/generate-plan?preserve_edits=true")
+    assert r.status_code == 202
+    after = auth_client.get(f"/api/projects/{pid}").json()["shots"]
+    assert len(after) == 1, f"shorter replan should leave 1 shot, got {len(after)}"
+    # The surviving shot must be the same row (preserve-edits merges by order).
+    assert after[0]["id"] == existing[0]["id"]
+
+
 def test_edit_plan_409_without_plan(auth_client):
     aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]
     pid = auth_client.post(

@@ -450,6 +450,10 @@ unpublishes the 8000/3000 ports so only Nginx can reach them.
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 
+# Apply schema migrations. Safe on a fresh install (just creates everything)
+# and idempotent on an existing one (no-op when up to date).
+make db-upgrade
+
 # One-shot demo cast + sample project — skip if you want a blank slate.
 docker compose exec backend python -m app.seed
 ```
@@ -503,7 +507,6 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 - S3-backed `Asset.public_token` URLs instead of local filesystem (the
   current code keeps tokens unguessable but reads off-disk).
 - Real auth (OAuth / magic links) replacing the shared MVP password.
-- Alembic migrations once the schema needs to evolve safely in prod.
 - Sentry or similar to alert on `ProviderLog.status == 'error'`.
 - Move rate-limit token buckets from in-process to Redis so multi-worker /
   multi-host deployments share one budget per client.

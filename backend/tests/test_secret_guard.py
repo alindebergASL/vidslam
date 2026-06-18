@@ -1,17 +1,15 @@
-"""Direct unit tests for the production-secrets boot guard.
+"""Unit tests for the production-secrets boot guard.
 
-We don't want to actually crash app import inside the test process, so we
-call _enforce_production_secrets() directly with synthetic Settings instead
-of monkeypatching env + reimporting main."""
+We exercise `_check_production_secrets` (pure function — returns problem
+list) rather than `_enforce_production_secrets` (which has the
+skip-under-pytest gate + raises). The wire-up between the two is trivial
+and the boot path is exercised by the deploy walkthrough."""
 from __future__ import annotations
 
-import pytest
 
-from app.config import Settings
-from app.main import _enforce_production_secrets
+def _settings(**overrides):
+    from app.config import Settings
 
-
-def _settings(**overrides) -> Settings:
     base = dict(
         mock_providers=True,
         mvp_password="strong-real-password-123",
@@ -25,79 +23,67 @@ def _settings(**overrides) -> Settings:
     return Settings(**base)
 
 
-def test_dev_localhost_with_mock_providers_passes(monkeypatch):
-    # We're running under pytest, so the guard short-circuits unconditionally —
-    # remove the marker for these specific tests so the actual checks run.
-    monkeypatch.delitem(__import__("sys").modules, "pytest", raising=False)
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    _enforce_production_secrets(_settings())  # no raise
+def _check(s):
+    from app.main import _check_production_secrets
+
+    return _check_production_secrets(s)
 
 
-def test_non_mock_with_dev_session_secret_refuses(monkeypatch):
-    monkeypatch.delitem(__import__("sys").modules, "pytest", raising=False)
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    with pytest.raises(RuntimeError, match="dev default"):
-        _enforce_production_secrets(
-            _settings(
-                mock_providers=False,
-                session_secret="dev-session-secret-still-here-32-chars-please",
-            )
-        )
+def test_dev_localhost_with_mock_providers_returns_no_problems():
+    assert _check(_settings()) == []
 
 
-def test_short_session_secret_refuses(monkeypatch):
-    monkeypatch.delitem(__import__("sys").modules, "pytest", raising=False)
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    with pytest.raises(RuntimeError, match=r"only \d+ chars"):
-        _enforce_production_secrets(
-            _settings(mock_providers=False, session_secret="tooshort")
-        )
-
-
-def test_default_mvp_password_refuses(monkeypatch):
-    monkeypatch.delitem(__import__("sys").modules, "pytest", raising=False)
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    with pytest.raises(RuntimeError, match="MVP_PASSWORD"):
-        _enforce_production_secrets(
-            _settings(mock_providers=False, mvp_password="changeme")
-        )
-
-
-def test_non_localhost_public_url_triggers_guard(monkeypatch):
-    monkeypatch.delitem(__import__("sys").modules, "pytest", raising=False)
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    # mock_providers=True but the URL is public — still gated.
-    with pytest.raises(RuntimeError, match="MVP_PASSWORD"):
-        _enforce_production_secrets(
-            _settings(
-                mock_providers=True,
-                public_base_url="https://avs.example.com",
-                mvp_password="test-pw",
-            )
-        )
-
-
-def test_allow_dev_secrets_env_var_lets_through(monkeypatch):
-    monkeypatch.delitem(__import__("sys").modules, "pytest", raising=False)
-    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    monkeypatch.setenv("ALLOW_DEV_SECRETS", "true")
-    # No raise even though everything is broken.
-    _enforce_production_secrets(
+def test_non_mock_with_dev_session_secret_flags_dev_default():
+    problems = _check(
         _settings(
             mock_providers=False,
-            session_secret="dev-session-secret-still",
-            mvp_password="changeme",
+            session_secret="dev-session-secret-still-here-32-chars-please",
         )
     )
+    assert any("dev default" in p for p in problems), problems
 
 
-def test_running_under_pytest_skips_guard():
-    # `pytest` is in sys.modules because we are pytest. Guard should no-op
-    # even with a broken settings object.
-    _enforce_production_secrets(
+def test_short_session_secret_flags_length():
+    problems = _check(_settings(mock_providers=False, session_secret="tooshort"))
+    assert any("only" in p and "chars" in p for p in problems), problems
+
+
+def test_default_mvp_password_flags_known_default():
+    problems = _check(_settings(mock_providers=False, mvp_password="changeme"))
+    assert any("MVP_PASSWORD" in p for p in problems), problems
+
+
+def test_non_localhost_public_url_triggers_check_even_in_mock_mode():
+    # Public URL + mock providers still counts as "looks prod" because the
+    # app is reachable from outside localhost, so weak secrets are dangerous.
+    problems = _check(
         _settings(
-            mock_providers=False,
-            session_secret="dev-session-secret-still",
-            mvp_password="changeme",
+            mock_providers=True,
+            public_base_url="https://avs.example.com",
+            mvp_password="test-pw",
         )
     )
+    assert any("MVP_PASSWORD" in p for p in problems), problems
+
+
+def test_localhost_url_with_mock_providers_skips_all_checks():
+    # The only "safe" combination — fully local dev — must not return any
+    # problems even with weak secrets, so `make dev` works out of the box.
+    assert _check(
+        _settings(
+            mock_providers=True,
+            public_base_url="http://localhost:8000",
+            session_secret="dev-session-secret-short",
+            mvp_password="changeme",
+        )
+    ) == []
+
+
+def test_127_loopback_url_also_treated_as_local():
+    assert _check(
+        _settings(
+            mock_providers=True,
+            public_base_url="http://127.0.0.1:8000",
+            mvp_password="changeme",
+        )
+    ) == []

@@ -1,4 +1,4 @@
-.PHONY: dev up down logs build seed test backend-test smoke smoke-ui smoke-ui-ephemeral verify verify-up screenshots backend-shell frontend-shell clean
+.PHONY: dev up down logs build seed test backend-test smoke smoke-ui smoke-ui-ephemeral verify verify-up screenshots backend-shell frontend-shell clean db-upgrade db-revision db-history
 
 dev: up logs
 
@@ -16,6 +16,22 @@ build:
 
 seed:
 	docker compose exec backend python -m app.seed
+
+# Database schema migrations (Alembic). Runs inside the backend container so
+# it picks up the compose-time DATABASE_URL automatically.
+#
+#   make db-upgrade            # apply all pending migrations
+#   make db-revision MSG="add foo column"   # generate a new revision
+#   make db-history            # show applied vs. pending
+db-upgrade:
+	docker compose exec backend alembic upgrade head
+
+db-revision:
+	@test -n "$(MSG)" || { echo "Pass MSG=... to describe the migration"; exit 1; }
+	docker compose exec backend alembic revision --autogenerate -m "$(MSG)"
+
+db-history:
+	docker compose exec backend alembic history --verbose
 
 test: backend-test
 

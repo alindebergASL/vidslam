@@ -26,16 +26,10 @@ settings = get_settings()
 # MVP_PASSWORD still in place. The dev defaults exist so `make dev` works out
 # of the box; the moment someone points the app at a non-mock provider or a
 # non-localhost public URL, we must require real secrets.
-def _enforce_production_secrets(s) -> None:
-    import os
-    import sys
-
-    # Test runs have their own fixture secrets + a non-localhost test URL that
-    # would otherwise trip this guard. Detect by either the pytest module
-    # being loaded *or* the per-test env var pytest sets, so both
-    # `pytest` and `python -m pytest` paths skip cleanly.
-    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
-        return
+def _check_production_secrets(s) -> list[str]:
+    """Pure checker — returns a list of problem messages without raising.
+    Split out from the boot path so test_secret_guard.py can exercise every
+    branch directly without bouncing through the pytest-skip logic."""
     looks_prod = (
         not s.mock_providers
         or (
@@ -45,7 +39,7 @@ def _enforce_production_secrets(s) -> None:
         )
     )
     if not looks_prod:
-        return
+        return []
     problems: list[str] = []
     if s.session_secret.startswith("dev-session-secret"):
         problems.append("SESSION_SECRET is still the dev default — set a random 32+ char value")
@@ -55,20 +49,33 @@ def _enforce_production_secrets(s) -> None:
         )
     if s.mvp_password in {"changeme", "test-pw", "smoke-pw", ""}:
         problems.append(f"MVP_PASSWORD is a known-default ({s.mvp_password!r}) — set a real password")
-    if problems:
-        msg = (
-            "Refusing to boot: production-flavored config (MOCK_PROVIDERS=false or non-localhost "
-            "PUBLIC_BASE_URL) detected with dev secrets still in place.\n  - "
-            + "\n  - ".join(problems)
-            + "\n\nFix in .env (or your secret store) then restart. To intentionally run in this "
-            "mode for debugging, set ALLOW_DEV_SECRETS=true."
-        )
-        import os
+    return problems
 
-        if os.environ.get("ALLOW_DEV_SECRETS") == "true":
-            log.warning("ALLOW_DEV_SECRETS=true — booting with dev secrets in prod-flavored mode")
-            return
-        raise RuntimeError(msg)
+
+def _enforce_production_secrets(s) -> None:
+    """Boot guard: refuse to start when config looks production-flavored but
+    dev secrets are still in place. Always skipped under pytest — the
+    suite has its own fixture-strength secrets, and the guard itself is
+    unit-tested via _check_production_secrets() directly."""
+    import os
+    import sys
+
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    problems = _check_production_secrets(s)
+    if not problems:
+        return
+    if os.environ.get("ALLOW_DEV_SECRETS") == "true":
+        log.warning("ALLOW_DEV_SECRETS=true — booting with dev secrets in prod-flavored mode")
+        return
+    msg = (
+        "Refusing to boot: production-flavored config (MOCK_PROVIDERS=false or non-localhost "
+        "PUBLIC_BASE_URL) detected with dev secrets still in place.\n  - "
+        + "\n  - ".join(problems)
+        + "\n\nFix in .env (or your secret store) then restart. To intentionally run in this "
+        "mode for debugging, set ALLOW_DEV_SECRETS=true."
+    )
+    raise RuntimeError(msg)
 
 
 _enforce_production_secrets(settings)

@@ -16,6 +16,7 @@ dependencies = [
   "redis>=5.0",
   "itsdangerous>=2.2",
   "python-slugify>=8.0",
+  "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
