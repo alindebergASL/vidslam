@@ -1,4 +1,4 @@
-.PHONY: dev up down logs build seed test backend-test smoke smoke-ui verify verify-up screenshots backend-shell frontend-shell clean
+.PHONY: dev up down logs build seed test backend-test smoke smoke-ui smoke-ui-ephemeral verify verify-up screenshots backend-shell frontend-shell clean
 
 dev: up logs
 
@@ -49,6 +49,13 @@ screenshots:
 # any failure so CI can wire it in directly.
 smoke-ui:
 	node scripts/smoke_ui.mjs
+
+# Same as smoke-ui but boots an ephemeral backend + frontend on temp ports,
+# seeds + renders, runs the walk, and tears everything down on exit. Lets a
+# developer verify the full UI flow without keeping `make up` running and
+# without conflicting with a long-running dev stack on the default ports.
+smoke-ui-ephemeral:
+	./scripts/smoke_ui_ephemeral.sh
 
 backend-shell:
 	docker compose exec backend bash
