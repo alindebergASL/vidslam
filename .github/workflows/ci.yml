@@ -118,25 +118,27 @@ jobs:
           echo "backend never came up"; tail -50 /tmp/backend.log; exit 1
         working-directory: backend
 
-      - name: Seed + render a project (so editor + render pages have real data)
+      - name: Seed + render twice (compare-sync test needs two versions)
         run: |
           curl -sf -c /tmp/cookies -X POST http://127.0.0.1:8000/api/auth/login \
             -H "Content-Type: application/json" -d '{"password":"smoke-pw"}' > /dev/null
           curl -sf -b /tmp/cookies -X POST http://127.0.0.1:8000/api/system/seed > /dev/null
           curl -sf -b /tmp/cookies -X POST http://127.0.0.1:8000/api/projects/1/generate-plan > /dev/null
           sleep 3
-          curl -sf -b /tmp/cookies -X POST http://127.0.0.1:8000/api/projects/1/generate-video > /dev/null
-          for i in $(seq 1 60); do
-            S=$(curl -sf -b /tmp/cookies http://127.0.0.1:8000/api/projects/1/status \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('latest_render'); print(d['project_status']+'/'+(r['status'] if r else 'none'))")
-            echo "  $S"
-            case "$S" in
-              completed/completed) exit 0 ;;
-              */failed) echo "render failed"; tail -50 /tmp/backend.log; exit 1 ;;
-            esac
-            sleep 2
+          for n in 1 2; do
+            curl -sf -b /tmp/cookies -X POST http://127.0.0.1:8000/api/projects/1/generate-video > /dev/null
+            for i in $(seq 1 60); do
+              S=$(curl -sf -b /tmp/cookies http://127.0.0.1:8000/api/projects/1/status \
+                | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('latest_render'); print(d['project_status']+'/'+(r['status'] if r else 'none'))")
+              echo "  render #${n}: $S"
+              case "$S" in
+                completed/completed) break ;;
+                */failed) echo "render failed"; tail -50 /tmp/backend.log; exit 1 ;;
+              esac
+              sleep 2
+              if [ "$i" -eq 60 ]; then echo "render never completed"; exit 1; fi
+            done
           done
-          echo "render never completed"; exit 1
 
       - name: Start frontend
         env:
@@ -150,11 +152,18 @@ jobs:
           echo "frontend never came up"; tail -50 /tmp/frontend.log; exit 1
         working-directory: frontend
 
-      - name: UI smoke
+      - name: UI smoke (route walk)
         env:
           AVS_BASE_URL: http://localhost:3000
           AVS_PASSWORD: smoke-pw
         run: node scripts/smoke_ui.mjs
+
+      - name: UI test (compare-sync)
+        env:
+          AVS_BASE_URL: http://localhost:3000
+          AVS_API_BASE: http://localhost:8000
+          AVS_PASSWORD: smoke-pw
+        run: node frontend/tests/compare_sync.mjs
 
       - name: Dump logs on failure
         if: failure()

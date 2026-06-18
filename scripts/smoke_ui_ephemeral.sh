@@ -82,23 +82,32 @@ echo "→ booting frontend on :${FE_PORT}"
 FE_PID=$!
 wait_for "http://127.0.0.1:${FE_PORT}" frontend
 
-echo "→ seeding demo + driving a render"
+echo "→ seeding demo + driving renders (need 2 for the compare test)"
 curl -sf -c "$COOKIES" -X POST "http://127.0.0.1:${BE_PORT}/api/auth/login" \
   -H "Content-Type: application/json" -d '{"password":"smoke-pw"}' > /dev/null
 curl -sf -b "$COOKIES" -X POST "http://127.0.0.1:${BE_PORT}/api/system/seed" > /dev/null
 curl -sf -b "$COOKIES" -X POST "http://127.0.0.1:${BE_PORT}/api/projects/1/generate-plan" > /dev/null
 sleep 3
-curl -sf -b "$COOKIES" -X POST "http://127.0.0.1:${BE_PORT}/api/projects/1/generate-video" > /dev/null
-for _ in $(seq 1 60); do
-  S=$(curl -sf -b "$COOKIES" "http://127.0.0.1:${BE_PORT}/api/projects/1/status" \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('latest_render'); print(d['project_status']+'/'+(r['status'] if r else 'none'))")
-  echo "  $S"
-  case "$S" in
-    completed/completed) break ;;
-    */failed) echo "render failed"; exit 1 ;;
-  esac
-  sleep 2
+
+# Two renders so the compare-sync test has versions to A/B.
+for n in 1 2; do
+  curl -sf -b "$COOKIES" -X POST "http://127.0.0.1:${BE_PORT}/api/projects/1/generate-video" > /dev/null
+  for _ in $(seq 1 60); do
+    S=$(curl -sf -b "$COOKIES" "http://127.0.0.1:${BE_PORT}/api/projects/1/status" \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('latest_render'); print(d['project_status']+'/'+(r['status'] if r else 'none'))")
+    case "$S" in
+      completed/completed) echo "  render #${n}: $S"; break ;;
+      */failed) echo "render #${n} failed"; exit 1 ;;
+    esac
+    sleep 2
+  done
 done
 
-echo "→ running UI smoke"
+echo "→ running UI smoke (route walk)"
 AVS_BASE_URL="http://localhost:${FE_PORT}" AVS_PASSWORD=smoke-pw node scripts/smoke_ui.mjs
+
+echo "→ running compare-sync test"
+AVS_BASE_URL="http://localhost:${FE_PORT}" \
+  AVS_API_BASE="http://localhost:${BE_PORT}" \
+  AVS_PASSWORD=smoke-pw \
+  node frontend/tests/compare_sync.mjs
