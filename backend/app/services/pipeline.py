@@ -166,7 +166,9 @@ def _resolve_references_for_shot(
 # ---------- public entry points ----------
 
 
-def generate_plan(db: Session, project_id: int) -> StoryboardPlan:
+def generate_plan(
+    db: Session, project_id: int, *, preserve_edits: bool = False
+) -> StoryboardPlan:
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise ValueError(f"project {project_id} not found")
@@ -194,25 +196,69 @@ def generate_plan(db: Session, project_id: int) -> StoryboardPlan:
     project.generated_plan_json = plan.model_dump()
     project.status = "planned"
 
-    # Replace previous shots with the new plan's shots.
-    for s in list(project.shots):
-        db.delete(s)
-    db.flush()
-    for s in plan.shots:
-        db.add(
-            models.VideoShot(
-                project_id=project.id,
-                shot_order=s.order,
-                shot_type=s.shot_type,
-                prompt=s.visual_prompt,
-                negative_prompt=s.negative_prompt,
-                duration_seconds=s.duration_seconds,
-                reference_strategy=s.reference_strategy,
-                caption_text=s.caption_text,
-                camera_direction=s.camera_direction,
-                reference_asset_ids_json=[],
+    # Reconcile shots against the new plan.
+    #
+    # When `preserve_edits` is set we keep user-editable fields (prompt,
+    # duration, references, caption) on shots that match an existing order,
+    # only refreshing fields the planner is authoritative for. New plan
+    # entries get added; existing shots whose order isn't in the new plan
+    # get dropped. This lets a creator iterate on the script and re-plan
+    # without losing the per-shot tweaks they've already made.
+    #
+    # When unset (default), wipe and recreate — the legacy behavior, so
+    # callers that *want* a clean slate (e.g. the very first plan) still
+    # work without an extra flag.
+    if preserve_edits and project.shots:
+        existing = {s.shot_order: s for s in project.shots}
+        new_orders = {s.order for s in plan.shots}
+        for s in plan.shots:
+            if s.order in existing:
+                shot = existing[s.order]
+                # Planner-authoritative fields refresh; user-editable fields
+                # (prompt, duration_seconds, reference_asset_ids_json,
+                # caption_text) stay untouched.
+                shot.shot_type = s.shot_type
+                shot.negative_prompt = s.negative_prompt
+                shot.reference_strategy = s.reference_strategy
+                shot.camera_direction = s.camera_direction
+            else:
+                db.add(
+                    models.VideoShot(
+                        project_id=project.id,
+                        shot_order=s.order,
+                        shot_type=s.shot_type,
+                        prompt=s.visual_prompt,
+                        negative_prompt=s.negative_prompt,
+                        duration_seconds=s.duration_seconds,
+                        reference_strategy=s.reference_strategy,
+                        caption_text=s.caption_text,
+                        camera_direction=s.camera_direction,
+                        reference_asset_ids_json=[],
+                    )
+                )
+        # Drop shots the new plan no longer includes.
+        for order, shot in existing.items():
+            if order not in new_orders:
+                db.delete(shot)
+    else:
+        for s in list(project.shots):
+            db.delete(s)
+        db.flush()
+        for s in plan.shots:
+            db.add(
+                models.VideoShot(
+                    project_id=project.id,
+                    shot_order=s.order,
+                    shot_type=s.shot_type,
+                    prompt=s.visual_prompt,
+                    negative_prompt=s.negative_prompt,
+                    duration_seconds=s.duration_seconds,
+                    reference_strategy=s.reference_strategy,
+                    caption_text=s.caption_text,
+                    camera_direction=s.camera_direction,
+                    reference_asset_ids_json=[],
+                )
             )
-        )
     db.commit()
 
     _log_provider_call(

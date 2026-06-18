@@ -13,10 +13,10 @@ from ..services import pipeline
 log = logging.getLogger("avs.jobs")
 
 
-def generate_plan_job(project_id: int) -> None:
+def generate_plan_job(project_id: int, preserve_edits: bool = False) -> None:
     db = SessionLocal()
     try:
-        pipeline.generate_plan(db, project_id)
+        pipeline.generate_plan(db, project_id, preserve_edits=preserve_edits)
     finally:
         db.close()
 

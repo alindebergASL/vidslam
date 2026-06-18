@@ -67,7 +67,11 @@ def public_render_meta(token: str, db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/projects/{project_id}/generate-plan", status_code=202, dependencies=[Depends(rate_limit("generation"))])
-def generate_plan(project_id: int, db: Session = Depends(get_db)) -> dict:
+def generate_plan(
+    project_id: int,
+    preserve_edits: bool = False,
+    db: Session = Depends(get_db),
+) -> dict:
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
@@ -75,7 +79,7 @@ def generate_plan(project_id: int, db: Session = Depends(get_db)) -> dict:
         validate_script(project.original_script or "")
     except UnsafeScriptError as e:
         raise HTTPException(422, str(e)) from e
-    job_id = enqueue(generate_plan_job, project_id)
+    job_id = enqueue(generate_plan_job, project_id, preserve_edits=preserve_edits)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
 

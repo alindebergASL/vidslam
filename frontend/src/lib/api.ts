@@ -459,8 +459,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ prompt, duration_seconds }),
     }),
-  generatePlan: (id: number) =>
-    req<any>(`/api/projects/${id}/generate-plan`, { method: "POST" }),
+  generatePlan: (id: number, opts: { preserveEdits?: boolean } = {}) =>
+    req<any>(
+      `/api/projects/${id}/generate-plan${opts.preserveEdits ? "?preserve_edits=true" : ""}`,
+      { method: "POST" }
+    ),
   editPlan: (
     id: number,
     body: {

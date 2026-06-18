@@ -126,9 +126,12 @@ function Inner() {
       },
       {
         key: "g",
-        label: "Re-plan storyboard",
+        label: "Re-plan storyboard (keeps per-shot edits)",
         run: () => {
-          api.generatePlan(projectId).then(() => setPolling(true)).catch((e) => setError(e.message));
+          api
+            .generatePlan(projectId, { preserveEdits: true })
+            .then(() => setPolling(true))
+            .catch((e) => setError(e.message));
         },
       },
       {
@@ -362,13 +365,20 @@ function Inner() {
                 )}
                 <button
                   className="btn-ghost text-xs"
-                  onClick={async () => {
+                  title="Re-plan keeping your per-shot edits (prompt, duration, references). Hold Shift to discard them."
+                  onClick={async (e) => {
+                    // Default: preserve edits. Shift-click = fresh slate.
+                    const preserve = !e.shiftKey;
                     try {
-                      await api.generatePlan(projectId);
-                      toast.info("Re-planning the storyboard…");
+                      await api.generatePlan(projectId, { preserveEdits: preserve });
+                      toast.info(
+                        preserve
+                          ? "Re-planning — your per-shot edits will be kept"
+                          : "Re-planning from scratch — per-shot edits cleared"
+                      );
                       setPolling(true);
-                    } catch (e: any) {
-                      toast.error(e.message || "Re-plan failed");
+                    } catch (err: any) {
+                      toast.error(err.message || "Re-plan failed");
                     }
                   }}
                 >
