@@ -119,3 +119,33 @@ class MusicProvider(Protocol):
         ...
 
     def list_models(self) -> list[ModelInfo]: ...
+
+
+@dataclass
+class LipSyncJob:
+    """Result of a lip-sync render: a path to a new video clip where the
+    speaker's mouth tracks the supplied audio. Producer is responsible for
+    cleaning up; consumer should treat the file as ephemeral."""
+
+    video_bytes: bytes
+    duration_seconds: float
+
+
+class LipSyncProvider(Protocol):
+    """Adapter slot for a future lip-sync model (Wav2Lip, SadTalker, HeyGen,
+    D-ID, etc.). Wired into the shot pipeline as an opt-in
+    `ShotPlan.reference_strategy = "lip_sync"`; when set, the shot's video
+    clip is post-processed by a provider implementing this protocol instead
+    of being used directly. No real implementation yet — the slot exists so
+    a future drop-in doesn't need an API/schema migration."""
+
+    def list_models(self) -> list[ModelInfo]: ...
+
+    def render(
+        self,
+        *,
+        model: str,
+        source_video: bytes,
+        target_audio: bytes,
+        settings: dict | None = None,
+    ) -> LipSyncJob: ...

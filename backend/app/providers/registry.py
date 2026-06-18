@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 from ..config import get_settings
-from .base import ChatProvider, ImageProvider, MusicProvider, TTSProvider, VideoProvider
+from .base import (
+    ChatProvider,
+    ImageProvider,
+    LipSyncProvider,
+    MusicProvider,
+    TTSProvider,
+    VideoProvider,
+)
 
 _settings = get_settings()
 
@@ -56,6 +63,14 @@ def get_music() -> MusicProvider:
     return ElevenLabsMusicProvider()
 
 
+def get_lipsync() -> LipSyncProvider:
+    # No real provider yet; the slot exists so a drop-in (Wav2Lip / D-ID /
+    # HeyGen) only has to implement LipSyncProvider + flip a feature flag.
+    from .mock_lipsync import MockLipSyncProvider
+
+    return MockLipSyncProvider()
+
+
 def provider_status() -> dict:
     return {
         "mock_providers_env": _settings.mock_providers,
@@ -64,4 +79,5 @@ def provider_status() -> dict:
         "video": "mock" if _settings.video_is_mocked() else "openrouter",
         "tts": "mock" if _settings.tts_is_mocked() else "elevenlabs",
         "music": "mock" if _settings.music_is_mocked() else "elevenlabs",
+        "lipsync": "mock",
     }
