@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
+import { Dropzone } from "@/components/Dropzone";
 import { api, Asset, Avatar, Ingredient, StudioJob } from "@/lib/api";
 
 type Filter = "all" | "images" | "videos" | "characters" | "scenes" | "uploads";
@@ -221,6 +222,10 @@ function Studio() {
           setJobs((prev) => [j, ...prev]);
           setPendingJobIds((prev) => [...prev, j.id]);
         }}
+        onAddRefs={(ids) =>
+          setSelectedRefs((cur) => Array.from(new Set([...cur, ...ids])))
+        }
+        onReload={reload}
       />
     </div>
   );
@@ -335,12 +340,16 @@ function PromptBar({
   selectedRefs,
   selectedAssets,
   onCreated,
+  onAddRefs,
+  onReload,
 }: {
   avatars: Avatar[];
   ingredients: Ingredient[];
   selectedRefs: number[];
   selectedAssets: Asset[];
   onCreated: (j: StudioJob) => void;
+  onAddRefs: (assetIds: number[]) => void;
+  onReload: () => Promise<void> | void;
 }) {
   const [outputKind, setOutputKind] = useState<"image" | "video_clip">("image");
   const [prompt, setPrompt] = useState("");
@@ -349,6 +358,31 @@ function PromptBar({
   const [imageModels, setImageModels] = useState<{ id: string; name: string }[]>([]);
   const [videoModels, setVideoModels] = useState<{ id: string; name: string }[]>([]);
   const [model, setModel] = useState<string>("");
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const [uploadOwner, setUploadOwner] = useState<string>("");
+
+  // Default upload target = first selected character → first selected
+  // ingredient → first avatar → first ingredient. Re-derived as the cast
+  // loads and as the user's reference selection changes — but only when
+  // the user hasn't already picked a target manually.
+  useEffect(() => {
+    if (uploadOwner) return;
+    const pick = () => {
+      for (const a of selectedAssets) {
+        if (a.owner_kind === "avatar" && a.avatar_id)
+          return `avatar:${a.avatar_id}`;
+      }
+      for (const a of selectedAssets) {
+        if (a.owner_kind === "ingredient" && a.ingredient_id)
+          return `ingredient:${a.ingredient_id}`;
+      }
+      if (avatars[0]) return `avatar:${avatars[0].id}`;
+      if (ingredients[0]) return `ingredient:${ingredients[0].id}`;
+      return "";
+    };
+    const next = pick();
+    if (next) setUploadOwner(next);
+  }, [avatars, ingredients, selectedAssets, uploadOwner]);
 
   useEffect(() => {
     api.imageModels().then(setImageModels).catch(() => setImageModels([]));
@@ -420,6 +454,21 @@ function PromptBar({
     }
   };
 
+  // Uploads a single file to the chosen owner. Throws on failure so the
+  // Dropzone can flag it red. Auto-selects the resulting asset as a reference
+  // via `onAddRefs` so the user can immediately hit Generate.
+  const uploadRef = async (file: File): Promise<Asset> => {
+    if (!uploadOwner) throw new Error("Pick a cast member to attach uploads to");
+    const [kind, idStr] = uploadOwner.split(":");
+    const id = Number(idStr);
+    const asset =
+      kind === "avatar"
+        ? await api.uploadAvatarAsset(id, file, "reference_sheet", true)
+        : await api.uploadIngredientAsset(id, file, "reference", true);
+    onAddRefs([asset.id]);
+    return asset;
+  };
+
   return (
     <div className="fixed bottom-0 left-0 md:left-56 right-0 z-10 bg-ink-900/95 border-t border-ink-800 backdrop-blur">
       <div className="max-w-5xl mx-auto px-6 py-3">
@@ -433,6 +482,56 @@ function PromptBar({
             ))}
           </div>
         )}
+
+        {uploadOpen && (
+          <div className="card p-3 mb-2 space-y-2">
+            <div className="flex items-center gap-2 text-xs text-ink-300">
+              <span className="font-medium text-ink-200">Upload references to</span>
+              <select
+                className="input text-xs py-1 flex-1 max-w-xs"
+                value={uploadOwner}
+                onChange={(e) => setUploadOwner(e.target.value)}
+              >
+                <option value="" disabled>
+                  — pick a cast member —
+                </option>
+                {avatars.length > 0 && <optgroup label="Characters">
+                  {avatars.map((a) => (
+                    <option key={`av-${a.id}`} value={`avatar:${a.id}`}>{a.name}</option>
+                  ))}
+                </optgroup>}
+                {ingredients.length > 0 && <optgroup label="Ingredients">
+                  {ingredients.map((i) => (
+                    <option key={`ing-${i.id}`} value={`ingredient:${i.id}`}>
+                      {i.name} ({i.kind})
+                    </option>
+                  ))}
+                </optgroup>}
+              </select>
+              <button
+                type="button"
+                onClick={() => setUploadOpen(false)}
+                className="text-ink-400 hover:text-ink-100 text-xs"
+                aria-label="Close upload tray"
+              >
+                ✕
+              </button>
+            </div>
+            <Dropzone
+              disabled={!uploadOwner}
+              hint={
+                uploadOwner
+                  ? "PNG/JPEG/WEBP up to 15MB. Uploaded assets auto-attach as references for your next generation."
+                  : avatars.length + ingredients.length === 0
+                  ? "Create a cast member first (Cast → New)."
+                  : "Pick a target above."
+              }
+              onUpload={uploadRef}
+              onSettled={() => onReload()}
+            />
+          </div>
+        )}
+
         <div className="card flex items-center gap-2 p-2">
           <button
             onClick={() => setOutputKind(outputKind === "image" ? "video_clip" : "image")}
@@ -455,6 +554,16 @@ function PromptBar({
               ))}
             </select>
           )}
+          <button
+            type="button"
+            onClick={() => setUploadOpen((v) => !v)}
+            className="chip text-xs"
+            title="Upload reference images and auto-attach them to this generation"
+            aria-pressed={uploadOpen}
+            aria-label="Upload reference images"
+          >
+            📎
+          </button>
           <input
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
