@@ -118,6 +118,7 @@ function BrandCard({ kit, onChange }: { kit: BrandKit; onChange: () => void }) {
       <div className="flex items-start justify-between mb-3">
         <input
           className="input max-w-[60%] font-medium"
+          aria-label="Brand kit name"
           value={k.name}
           onChange={(e) => setK({ ...k, name: e.target.value })}
           onBlur={() => save({ name: k.name })}
@@ -159,8 +160,10 @@ function BrandCard({ kit, onChange }: { kit: BrandKit; onChange: () => void }) {
 
       <div className="space-y-2">
         <div>
-          <label className="label">Default CTA</label>
+          <label className="label" htmlFor={`bk-${k.id}-cta`}>Default CTA</label>
           <input
+            id={`bk-${k.id}-cta`}
+            aria-label="Default CTA"
             className="input"
             value={k.default_cta_text}
             onChange={(e) => setK({ ...k, default_cta_text: e.target.value })}
@@ -168,8 +171,10 @@ function BrandCard({ kit, onChange }: { kit: BrandKit; onChange: () => void }) {
           />
         </div>
         <div>
-          <label className="label">Default disclosure</label>
+          <label className="label" htmlFor={`bk-${k.id}-disclosure`}>Default disclosure</label>
           <input
+            id={`bk-${k.id}-disclosure`}
+            aria-label="Default disclosure"
             className="input"
             value={k.default_disclosure_text}
             onChange={(e) => setK({ ...k, default_disclosure_text: e.target.value })}
@@ -208,9 +213,11 @@ function ColorField({
 }) {
   return (
     <div>
-      <label className="label">{label}</label>
+      <label className="label" htmlFor={`color-${label.replace(/\s+/g, "-").toLowerCase()}`}>{label}</label>
       <div className="flex items-center gap-1">
         <input
+          id={`color-${label.replace(/\s+/g, "-").toLowerCase()}`}
+          aria-label={`${label} color`}
           type="color"
           value={value}
           onChange={(e) => onChange(e.target.value)}

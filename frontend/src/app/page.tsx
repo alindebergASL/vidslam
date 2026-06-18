@@ -185,7 +185,8 @@ function Dashboard() {
                 <div className="aspect-[9/16] rounded-lg overflow-hidden bg-ink-800 border border-ink-800 group-hover:border-ink-600 transition relative">
                   <img
                     src={api.renderThumb(r.render_id)}
-                    alt={r.project_title}
+                    alt=""
+                    aria-hidden
                     className="w-full h-full object-cover"
                   />
                   <div className="absolute inset-x-0 bottom-0 p-1.5 bg-gradient-to-t from-black/85 to-transparent">

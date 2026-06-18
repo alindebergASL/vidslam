@@ -12,7 +12,12 @@ const config: Config = {
           700: "#1A1E27",
           600: "#252A36",
           500: "#3A4050",
-          400: "#5E6678",
+          // ink-400 was #5E6678 which renders at 2.9:1 on ink-900 — fails
+          // WCAG AA for normal text. Brightened to 4.6:1 so the "muted
+          // small text" pattern (footer timestamps, hint copy, label tags)
+          // is still recognizably secondary but readable. ink-300 stays the
+          // brighter "secondary body" tier.
+          400: "#7E869B",
           300: "#8B92A4",
           200: "#B5BAC8",
           100: "#E7E9EE",

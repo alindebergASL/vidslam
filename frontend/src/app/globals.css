@@ -21,8 +21,11 @@ body {
   .btn {
     @apply inline-flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition;
   }
+  /* text-white on the accent pink (#FF5C8A) was 2.6:1 — fails WCAG AA.
+     Near-black text on the accent reads at >7:1 and keeps the brand pink
+     intact for the surface itself. */
   .btn-primary {
-    @apply btn bg-accent text-white hover:bg-accent/90;
+    @apply btn bg-accent text-ink-950 hover:bg-accent/90;
   }
   .btn-ghost {
     @apply btn bg-ink-800 border border-ink-700 hover:bg-ink-700 text-ink-100;

@@ -265,8 +265,10 @@ function Inner() {
         )}
 
       <section className="card p-4 mb-6">
-        <div className="label">Voice script</div>
+        <label className="label" htmlFor="proj-voice-script">Voice script</label>
         <textarea
+          id="proj-voice-script"
+          aria-label="Voice script"
           className="input min-h-[100px]"
           value={project.original_script}
           onChange={(e) =>
@@ -278,8 +280,10 @@ function Inner() {
             })
           }
         />
-        <div className="label mt-4">Creative direction</div>
+        <label className="label mt-4 block" htmlFor="proj-creative-direction">Creative direction</label>
         <textarea
+          id="proj-creative-direction"
+          aria-label="Creative direction"
           className="input min-h-[60px]"
           placeholder="Use case + tone for the planner (demo, tutorial, promo…). Re-plan to apply."
           value={project.creative_direction}
@@ -451,8 +455,9 @@ function Inner() {
       <button
         type="button"
         onClick={() => setShowShortcuts(true)}
-        className="fixed bottom-4 right-4 chip text-[11px] py-1 opacity-60 hover:opacity-100"
+        className="fixed bottom-4 right-4 chip text-[11px] py-1"
         title="Show keyboard shortcuts"
+        aria-label="Show keyboard shortcuts"
       >
         ? shortcuts
       </button>
@@ -549,16 +554,24 @@ function StoryboardScript({
           What&apos;s actually spoken (TTS) and shown on screen — edits apply on the next render.
         </span>
       </div>
-      <label className="label">Spoken script</label>
+      <label className="label" htmlFor="proj-spoken-script">Spoken script</label>
       <textarea
+        id="proj-spoken-script"
+        aria-label="Spoken script"
         className="input min-h-[90px]"
         value={script}
         onChange={(e) => setScript(e.target.value)}
       />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
         <div>
-          <label className="label">End-card text</label>
-          <input className="input" value={endCard} onChange={(e) => setEndCard(e.target.value)} />
+          <label className="label" htmlFor="proj-end-card-text">End-card text</label>
+          <input
+            id="proj-end-card-text"
+            aria-label="End-card text"
+            className="input"
+            value={endCard}
+            onChange={(e) => setEndCard(e.target.value)}
+          />
         </div>
         <div className="flex items-end">
           <span className="text-xs text-ink-400">
@@ -662,6 +675,7 @@ function ShotRow({
                 checked={selected}
                 onChange={onToggleSelect}
                 title="Select for bulk re-roll"
+                aria-label={`Select shot ${shot.shot_order} for bulk re-roll`}
                 className="accent-accent"
               />
             )}
@@ -702,6 +716,7 @@ function ShotRow({
               onBlur={() =>
                 api.updateShot(projectId, shot.id, { prompt }).then(onChange)
               }
+              aria-label={`Shot ${shot.shot_order} prompt`}
               className="input min-h-[60px] flex-1"
             />
           </div>
@@ -746,8 +761,10 @@ function ShotRow({
           )}
         </div>
         <div className="w-44 space-y-2 text-xs">
-          <label className="label">Duration</label>
+          <label className="label" htmlFor={`shot-${shot.id}-duration`}>Duration</label>
           <input
+            id={`shot-${shot.id}-duration`}
+            aria-label={`Shot ${shot.shot_order} duration in seconds`}
             type="number"
             className="input"
             value={dur}

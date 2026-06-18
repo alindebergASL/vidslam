@@ -68,7 +68,7 @@ export function RenderHistory({ projectId }: { projectId: number }) {
                     </div>
                   )}
                   {isLatest && (
-                    <span className="absolute top-2 left-2 chip text-[10px] py-0.5 bg-accent border-accent text-white">
+                    <span className="absolute top-2 left-2 chip text-[10px] py-0.5 bg-accent border-accent text-ink-950">
                       Latest
                     </span>
                   )}
