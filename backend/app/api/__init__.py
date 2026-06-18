@@ -12,6 +12,7 @@ from . import (
     providers,
     studio,
     system,
+    training,
 )
 
 api_router = APIRouter()
@@ -27,5 +28,6 @@ api_router.include_router(generation.public_router, prefix="/api", tags=["public
 api_router.include_router(studio.router, prefix="/api/studio", tags=["studio"])
 api_router.include_router(providers.router, prefix="/api/providers", tags=["providers"])
 api_router.include_router(system.router, prefix="/api/system", tags=["system"])
+api_router.include_router(training.router, prefix="/api", tags=["training"])
 
 __all__ = ["api_router"]

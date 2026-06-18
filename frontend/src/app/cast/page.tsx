@@ -4,6 +4,7 @@ import Link from "next/link";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { Dropzone } from "@/components/Dropzone";
+import { TrainPanel } from "@/components/TrainPanel";
 import { api, Asset, Avatar, Ingredient, Project } from "@/lib/api";
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
@@ -525,6 +526,19 @@ function DetailDrawer({
                     {v.name} ({v.voice_id.slice(0, 8)}…)
                   </option>
                 ))}
+                {/* Surface the avatar's currently-bound voice as a tagged
+                    option when it isn't in the catalog — covers cloned
+                    voices auto-written by a completed voice_clone training
+                    job, or voices added in the ElevenLabs UI after page
+                    load. Without this the dropdown would silently
+                    "reset" to "no voice" because the value doesn't match
+                    any option. */}
+                {(entity as Avatar).elevenlabs_voice_id &&
+                  !voices.find((v) => v.voice_id === (entity as Avatar).elevenlabs_voice_id) && (
+                    <option value={(entity as Avatar).elevenlabs_voice_id}>
+                      Custom clone ({(entity as Avatar).elevenlabs_voice_id.slice(0, 8)}…)
+                    </option>
+                  )}
               </select>
             </div>
             <div className="text-[10px] text-ink-400">
@@ -534,6 +548,8 @@ function DetailDrawer({
             </div>
           </div>
         )}
+
+        <TrainPanel kind={kind} id={id} assets={(entity as any).assets} />
 
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
           {(entity as any).assets.map((a: Asset) => (

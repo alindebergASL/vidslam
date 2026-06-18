@@ -281,6 +281,50 @@ class AssetGenerationJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
+class CustomModel(Base):
+    """A custom model / adapter trained off a cast member's reference assets.
+
+    Three flavors today:
+      - `character_lora`: LoRA fine-tune on an image model. 10-50 reference
+        images of one character, conditions every future image+video gen
+        for tighter identity than reference-image conditioning gives.
+      - `style_lora`: same mechanic, trained on a cast member's existing
+        *renders* to capture brand/look. Applied alongside character LoRA.
+      - `voice_clone`: ElevenLabs Voice Lab clone. Upload voice samples
+        (audio assets on an Avatar), get back an elevenlabs voice_id we
+        store in `provider_model_id`. The Avatar's `elevenlabs_voice_id`
+        is set when the job completes so the existing TTS path uses it.
+
+    `training_asset_ids_json` is the list of Asset rows feeding the
+    training; `config_json` carries per-provider knobs (rank, steps,
+    learning rate for LoRA; emotional range for voice). `provider_model_id`
+    is what we hand the inference adapter to use the trained model at
+    generation time."""
+
+    __tablename__ = "custom_models"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), default="")
+    kind: Mapped[str] = mapped_column(String(40), default="character_lora")
+    # character_lora|style_lora|voice_clone
+    owner_kind: Mapped[str] = mapped_column(String(20), default="avatar")
+    # avatar|ingredient
+    owner_id: Mapped[int] = mapped_column(Integer)
+    training_asset_ids_json: Mapped[list | None] = mapped_column(JSON, default=list)
+    config_json: Mapped[dict | None] = mapped_column(JSON, default=dict)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    provider_model_id: Mapped[str] = mapped_column(String(300), default="")
+    provider_job_id: Mapped[str] = mapped_column(String(200), default="")
+    status: Mapped[str] = mapped_column(String(40), default="pending")
+    # pending|training|completed|failed|cancelled
+    progress: Mapped[float] = mapped_column(Float, default=0.0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 # --- Provider call audit log ---
 
 

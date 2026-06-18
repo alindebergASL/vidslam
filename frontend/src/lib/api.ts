@@ -241,6 +241,26 @@ export type StudioJob = {
   updated_at: string;
 };
 
+export type CustomModel = {
+  id: number;
+  name: string;
+  kind: "character_lora" | "style_lora" | "voice_clone";
+  owner_kind: "avatar" | "ingredient";
+  owner_id: number;
+  training_asset_ids_json: number[];
+  config_json: Record<string, unknown>;
+  provider: string;
+  provider_model_id: string;
+  provider_job_id: string;
+  status: "pending" | "training" | "completed" | "failed" | "cancelled";
+  progress: number;
+  error: string;
+  cost_usd: number;
+  created_at: string;
+  updated_at: string;
+  completed_at?: string | null;
+};
+
 export const api = {
   base: API_BASE,
   publicAsset: (token: string) => `${API_BASE}/api/public-assets/${token}`,
@@ -525,6 +545,39 @@ export const api = {
       `/api/projects/${projectId}/shots/${shotId}/regenerate?recompose=${recompose}`,
       { method: "POST" }
     ),
+
+  // custom model training
+  startTraining: (
+    ownerKind: "avatar" | "ingredient",
+    ownerId: number,
+    body: {
+      name: string;
+      kind: CustomModel["kind"];
+      training_asset_ids: number[];
+      config?: Record<string, unknown>;
+    }
+  ) =>
+    req<CustomModel>(`/api/cast/${ownerKind}/${ownerId}/train`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  listTrainingJobs: (q?: {
+    owner_kind?: "avatar" | "ingredient";
+    owner_id?: number;
+    kind?: CustomModel["kind"];
+  }) => {
+    const params = new URLSearchParams();
+    if (q?.owner_kind) params.set("owner_kind", q.owner_kind);
+    if (q?.owner_id != null) params.set("owner_id", String(q.owner_id));
+    if (q?.kind) params.set("kind", q.kind);
+    const qs = params.toString();
+    return req<CustomModel[]>(`/api/training-jobs${qs ? `?${qs}` : ""}`);
+  },
+  getTrainingJob: (id: number) => req<CustomModel>(`/api/training-jobs/${id}`),
+  cancelTraining: (id: number) =>
+    req<CustomModel>(`/api/training-jobs/${id}/cancel`, { method: "POST" }),
+  deleteTraining: (id: number) =>
+    req<void>(`/api/training-jobs/${id}`, { method: "DELETE" }),
 
   // studio
   listStudioJobs: () => req<StudioJob[]>("/api/studio/jobs"),

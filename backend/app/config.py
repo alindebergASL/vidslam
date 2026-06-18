@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     # boto3 picks credentials from the standard chain (env, ~/.aws,
     # instance profile, ECS task role). No need to surface them here.
 
+    # custom model training (LoRA + voice clone). Replicate handles the
+    # image/video LoRA path; voice clones piggyback on the existing
+    # ELEVENLABS_API_KEY. Leave Replicate empty to keep that surface
+    # mocked even with MOCK_PROVIDERS=false.
+    replicate_api_token: str = ""
+    replicate_base_url: str = "https://api.replicate.com/v1"
+    # Default LoRA trainer model (Replicate "owner/model:version"). The
+    # SDXL LoRA trainer is the most battle-tested for character flavors.
+    replicate_lora_trainer: str = "ostris/flux-dev-lora-trainer:b6af14222e6bd9be257cbc1ea4afda3cd0503e1133083b9d1de0364d8568e6ef"
+
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01
     cost_image_per_item: float = 0.04

@@ -221,3 +221,78 @@ with SessionLocal() as s:
 | **Total**                 |       | **~$2.90** |
 
 Run on a budget-capped key if you can.
+
+## 8. Custom model training (optional)
+
+Two real adapters: Replicate for image/video LoRA, ElevenLabs Voice Lab
+for voice clones. Both reuse the keys you already configured for
+chat/image/video and TTS respectively (no new credentials).
+
+### Character LoRA via Replicate
+
+```bash
+# Confirm the LoRA trainer model is available.
+curl -fsS -H "Authorization: Bearer $REPLICATE_API_TOKEN" \
+  https://api.replicate.com/v1/models/ostris/flux-dev-lora-trainer | jq .name
+
+# Kick off a training run against the seeded Naina character.
+AID=$(curl -sS -b /tmp/avs.cookies https://staging.avs.example.com/api/avatars \
+  | jq '.[] | select(.name=="Naina") | .id')
+ASSETS=$(curl -sS -b /tmp/avs.cookies https://staging.avs.example.com/api/avatars/$AID \
+  | jq -c '[.assets[].id]')
+curl -fsS -b /tmp/avs.cookies -X POST \
+  "https://staging.avs.example.com/api/cast/avatar/$AID/train" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Naina LoRA v1\",\"kind\":\"character_lora\",\"training_asset_ids\":$ASSETS,\"config\":{\"steps\":1000}}"
+```
+
+**Expected:** the job stays in `training` for ~10-20 minutes (real LoRA
+training time), then transitions to `completed` with `provider_model_id`
+set to the trained adapter URL on Replicate's CDN. Cost: ~$2-5 at
+default steps.
+
+**Common failure modes:**
+
+- `payment_required` — your Replicate account has no GPU credit.
+- Status stays `queued` for an hour — Replicate's queue is backed up;
+  not actionable on our side.
+- `succeeded` but the LoRA produces generic faces — too few input
+  images, or the trigger_word collides with a base-model concept.
+  Re-train with `config.trigger_word="NAINATOK"` (a nonce string).
+
+### Voice clone via ElevenLabs
+
+```bash
+# Upload 2-3 short audio samples as Avatar assets first (via the UI or):
+# curl ... POST /api/avatars/{id}/assets with audio file.
+# Then:
+curl -fsS -b /tmp/avs.cookies -X POST \
+  "https://staging.avs.example.com/api/cast/avatar/$AID/train" \
+  -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Naina warm voice\",\"kind\":\"voice_clone\",\"training_asset_ids\":$AUDIO_ASSETS}"
+```
+
+**Expected:** the job completes synchronously (Voice Lab instant clone),
+returning `provider_model_id` = the new ElevenLabs voice id. The
+avatar's `elevenlabs_voice_id` and `default_voice_provider` are
+auto-updated, so the next render's TTS uses the cloned voice.
+
+**Common failure modes:**
+
+- `voice_limit_reached` — your ElevenLabs tier has hit the custom voice
+  cap. Free tier = 0 custom voices; Starter = 10; etc.
+- Audio assets that don't exist on the cast member — backend rejects
+  with `doesn't belong` 422.
+- Clone succeeds but voice sounds wrong — Voice Lab is sensitive to
+  background noise. Re-record samples in a quiet room.
+
+### Verify trained models surface in Studio / Voice picker
+
+After both trainings complete:
+
+- Cast → Naina → Voice section should show "Custom clone (xxxxxxxx…)"
+  selected automatically.
+- Trigger a render of any project that uses Naina as host — the audio
+  should be the cloned voice, not the default.
+- (Future) Studio's model picker will list "Naina LoRA v1" alongside
+  base image models; pick it and generate to confirm character fidelity.

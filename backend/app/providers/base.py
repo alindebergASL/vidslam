@@ -131,6 +131,66 @@ class LipSyncJob:
     duration_seconds: float
 
 
+@dataclass
+class TrainingAsset:
+    """One file feeding a custom-model training job. Local path + mime so the
+    adapter can multipart-upload to the training provider without going
+    through the public-asset route."""
+
+    local_path: str
+    mime_type: str
+    asset_id: int
+
+
+@dataclass
+class TrainingSubmit:
+    provider: str
+    provider_job_id: str  # e.g. Replicate prediction id, ElevenLabs voice id
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class TrainingStatus:
+    state: Literal["queued", "training", "succeeded", "failed"]
+    progress: float = 0.0
+    provider_model_id: str = ""
+    """The id the inference adapter will reference to *use* the trained
+    model — Replicate version hash, ElevenLabs voice_id, etc. Populated on
+    succeeded; empty otherwise."""
+    error: Optional[str] = None
+    cost_usd: float = 0.0
+
+
+class TrainingProvider(Protocol):
+    """Adapter for training a custom model / adapter off a cast member's
+    assets. Three concrete implementations (Mock + Replicate-style LoRA +
+    ElevenLabs Voice Lab) share this surface. The pipeline submits, polls
+    until terminal, and writes the resulting provider_model_id back onto
+    the CustomModel row + (for voice clones) the owning Avatar."""
+
+    def list_kinds(self) -> list[str]:
+        """Which CustomModel.kind values this provider can train. Lets the
+        registry route a request to the right adapter."""
+        ...
+
+    def submit(
+        self,
+        *,
+        kind: str,
+        name: str,
+        assets: list[TrainingAsset],
+        config: dict,
+    ) -> TrainingSubmit: ...
+
+    def poll(self, job: TrainingSubmit) -> TrainingStatus: ...
+
+    def cancel(self, job: TrainingSubmit) -> bool:
+        """Best-effort cancel. Returns True if the provider accepted the
+        cancel request; False if the job already finished or the provider
+        doesn't support mid-flight cancel."""
+        ...
+
+
 class LipSyncProvider(Protocol):
     """Adapter slot for a future lip-sync model (Wav2Lip, SadTalker, HeyGen,
     D-ID, etc.). Wired into the shot pipeline as an opt-in

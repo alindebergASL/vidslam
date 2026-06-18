@@ -74,6 +74,11 @@ def test_provider_status_endpoint(auth_client):
         # The lipsync slot is a Protocol with only a mock impl for now —
         # surfaced in status so a future real adapter is observable.
         "lipsync": "mock",
+        # Custom-model training routes by kind: voice clones go through
+        # ElevenLabs when the key is set, LoRAs through Replicate.
+        # Both default to the mock training provider in tests.
+        "training_lora": "mock",
+        "training_voice": "mock",
     }
 
 

@@ -875,3 +875,113 @@ def save_studio_result_as_asset(
     job.updated_at = datetime.utcnow()
     db.commit()
     return asset
+
+
+# --- Custom model training ---
+
+
+def run_training_job(db: Session, job_id: int) -> None:
+    """Drive a CustomModel row through submit → poll → terminal.
+
+    Picks the right TrainingProvider based on `kind` via the registry,
+    so a `voice_clone` against a configured ElevenLabs key hits Voice
+    Lab, `character_lora` against Replicate hits Replicate, everything
+    else falls back to the mock provider that's deterministic + instant.
+
+    Side effects on success:
+      - cm.status = 'completed', cm.provider_model_id = trained id
+      - For voice clones, the owning Avatar's `elevenlabs_voice_id` is
+        set to the cloned voice so the existing TTS path uses it.
+    """
+    from time import sleep
+
+    from ..providers import get_training
+    from ..providers.base import TrainingAsset
+
+    cm = db.get(models.CustomModel, job_id)
+    if cm is None:
+        raise ValueError(f"custom_model {job_id} not found")
+
+    cm.status = "training"
+    db.commit()
+
+    try:
+        provider = get_training(cm.kind)
+        assets = (
+            db.query(models.Asset)
+            .filter(models.Asset.id.in_(cm.training_asset_ids_json or []))
+            .all()
+        )
+        if not assets:
+            raise ValueError("no training assets resolved")
+        ta = [
+            TrainingAsset(
+                local_path=a.file_path, mime_type=a.mime_type, asset_id=a.id
+            )
+            for a in assets
+        ]
+        submitted = provider.submit(
+            kind=cm.kind, name=cm.name or "untitled", assets=ta, config=cm.config_json or {}
+        )
+        cm.provider = submitted.provider
+        cm.provider_job_id = submitted.provider_job_id
+        db.commit()
+
+        # Poll until terminal. Mock returns succeeded on the 2nd call;
+        # real providers take minutes/hours.
+        deadline = 60 * 60 * 2  # 2 hours
+        elapsed = 0
+        while True:
+            st = provider.poll(submitted)
+            cm.progress = max(cm.progress, st.progress)
+            db.commit()
+            if st.state == "succeeded":
+                cm.status = "completed"
+                cm.provider_model_id = st.provider_model_id
+                cm.progress = 1.0
+                cm.cost_usd = st.cost_usd
+                cm.completed_at = datetime.utcnow()
+                # Voice clones: write the voice id back onto the avatar so
+                # the existing TTS rendering path uses the cloned voice.
+                if cm.kind == "voice_clone" and cm.owner_kind == "avatar":
+                    av = db.get(models.Avatar, cm.owner_id)
+                    if av is not None:
+                        av.elevenlabs_voice_id = st.provider_model_id
+                        av.default_voice_provider = "elevenlabs"
+                db.commit()
+                _log_provider_call(
+                    db,
+                    project_id=0,
+                    provider=type(provider).__name__,
+                    endpoint="training.complete",
+                    request_summary={"kind": cm.kind, "asset_ids": cm.training_asset_ids_json},
+                    response_summary={"model_id": cm.provider_model_id, "cost": cm.cost_usd},
+                )
+                return
+            if st.state == "failed":
+                cm.status = "failed"
+                cm.error = st.error or "training failed"
+                db.commit()
+                _log_provider_call(
+                    db,
+                    project_id=0,
+                    provider=type(provider).__name__,
+                    endpoint="training.failed",
+                    request_summary={"kind": cm.kind},
+                    response_summary={"error": cm.error},
+                    status="error",
+                )
+                return
+            if elapsed > deadline:
+                cm.status = "failed"
+                cm.error = f"polling timed out after {deadline}s"
+                db.commit()
+                return
+            sleep(2)
+            elapsed += 2
+
+    except Exception as e:  # noqa: BLE001
+        cm.status = "failed"
+        cm.error = str(e)[:500]
+        db.commit()
+        raise

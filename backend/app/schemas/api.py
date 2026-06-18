@@ -299,3 +299,38 @@ class StudioJobOut(BaseModel):
     error: str
     created_at: datetime
     updated_at: datetime
+
+
+# --- Custom model training ---
+
+
+class CustomModelTrainRequest(BaseModel):
+    """Body for POST /api/cast/{kind}/{id}/train. The cast member is in the
+    URL path; this body carries everything else."""
+    name: str = ""
+    kind: Literal["character_lora", "style_lora", "voice_clone"]
+    training_asset_ids: list[int] = Field(default_factory=list)
+    # Free-form provider knobs (LoRA rank/steps, voice tone tags). Validated
+    # by the chosen provider, not here.
+    config: dict = Field(default_factory=dict)
+
+
+class CustomModelOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    kind: str
+    owner_kind: str
+    owner_id: int
+    training_asset_ids_json: list[int] = Field(default_factory=list)
+    config_json: dict = Field(default_factory=dict)
+    provider: str
+    provider_model_id: str
+    provider_job_id: str
+    status: str
+    progress: float
+    error: str
+    cost_usd: float
+    created_at: datetime
+    updated_at: datetime
+    completed_at: Optional[datetime] = None

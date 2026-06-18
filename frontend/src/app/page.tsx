@@ -251,7 +251,7 @@ function Dashboard() {
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      <div className="w-full h-full flex items-center justify-center text-ink-500 text-xs">
+                      <div className="w-full h-full flex items-center justify-center text-ink-300 text-xs">
                         no render yet
                       </div>
                     )}

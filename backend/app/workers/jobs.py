@@ -59,3 +59,11 @@ def generate_asset_job(job_id: int) -> None:
         pipeline.run_studio_job(db, job_id)
     finally:
         db.close()
+
+
+def train_custom_model_job(job_id: int) -> None:
+    db = SessionLocal()
+    try:
+        pipeline.run_training_job(db, job_id)
+    finally:
+        db.close()
