@@ -1,0 +1,54 @@
+# Production-mode overlay for docker-compose. Applies on top of
+# docker-compose.yml so dev defaults remain the obvious path.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# What changes vs. dev:
+#   - Frontend is built (Next.js production bundle) and runs `next start` —
+#     no HMR, no source volume mount, no `.next` tmpfs.
+#   - Backend drops --reload and binds workers=2 so a stuck request can't pin
+#     the only worker.
+#   - The :8000 / :3000 ports are not published; only nginx (or whatever you
+#     put in front) talks to them, so the prod stack is intended to sit
+#     behind nginx/avatarvideostudio.conf on a single EC2 host.
+#   - No bind-mount of code into the containers — the image *is* the artifact.
+#
+# Env required at runtime (set in .env or the host environment):
+#   MVP_PASSWORD            — the shared password
+#   SESSION_SECRET          — at least 32 random chars; rotate => log everyone out
+#   PUBLIC_BASE_URL         — public origin nginx serves (e.g. https://avs.example.com)
+#   FRONTEND_ORIGIN         — same value; used for CORS
+#   NEXT_PUBLIC_API_BASE    — what the *browser* hits (e.g. https://avs.example.com)
+#   OPENROUTER_API_KEY      — optional; mocks otherwise
+#   ELEVENLABS_API_KEY      — optional; mocks otherwise
+
+services:
+  backend:
+    build:
+      context: ./backend
+    volumes:
+      - ./data:/data
+    ports: !reset []
+    expose:
+      - "8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+
+  worker:
+    build:
+      context: ./backend
+    volumes:
+      - ./data:/data
+
+  frontend:
+    build:
+      context: ./frontend
+      target: prod
+      args:
+        # Inline the public API base at build time so the browser's fetch
+        # targets the externally-reachable origin, not the in-cluster name.
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
+    volumes: !reset []
+    ports: !reset []
+    expose:
+      - "3000"
+    command: npm run start

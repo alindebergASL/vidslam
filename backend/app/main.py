@@ -22,6 +22,58 @@ log = logging.getLogger("avs.app")
 settings = get_settings()
 
 
+# Refuse to boot in production-flavored deploys with the dev SESSION_SECRET or
+# MVP_PASSWORD still in place. The dev defaults exist so `make dev` works out
+# of the box; the moment someone points the app at a non-mock provider or a
+# non-localhost public URL, we must require real secrets.
+def _enforce_production_secrets(s) -> None:
+    import os
+    import sys
+
+    # Test runs have their own fixture secrets + a non-localhost test URL that
+    # would otherwise trip this guard. Detect by either the pytest module
+    # being loaded *or* the per-test env var pytest sets, so both
+    # `pytest` and `python -m pytest` paths skip cleanly.
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+        return
+    looks_prod = (
+        not s.mock_providers
+        or (
+            s.public_base_url
+            and not s.public_base_url.startswith("http://localhost")
+            and not s.public_base_url.startswith("http://127.")
+        )
+    )
+    if not looks_prod:
+        return
+    problems: list[str] = []
+    if s.session_secret.startswith("dev-session-secret"):
+        problems.append("SESSION_SECRET is still the dev default — set a random 32+ char value")
+    if len(s.session_secret) < 32:
+        problems.append(
+            f"SESSION_SECRET is only {len(s.session_secret)} chars — needs ≥32 random bytes"
+        )
+    if s.mvp_password in {"changeme", "test-pw", "smoke-pw", ""}:
+        problems.append(f"MVP_PASSWORD is a known-default ({s.mvp_password!r}) — set a real password")
+    if problems:
+        msg = (
+            "Refusing to boot: production-flavored config (MOCK_PROVIDERS=false or non-localhost "
+            "PUBLIC_BASE_URL) detected with dev secrets still in place.\n  - "
+            + "\n  - ".join(problems)
+            + "\n\nFix in .env (or your secret store) then restart. To intentionally run in this "
+            "mode for debugging, set ALLOW_DEV_SECRETS=true."
+        )
+        import os
+
+        if os.environ.get("ALLOW_DEV_SECRETS") == "true":
+            log.warning("ALLOW_DEV_SECRETS=true — booting with dev secrets in prod-flavored mode")
+            return
+        raise RuntimeError(msg)
+
+
+_enforce_production_secrets(settings)
+
+
 def create_app() -> FastAPI:
     from contextlib import asynccontextmanager
 

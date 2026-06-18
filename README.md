@@ -385,25 +385,128 @@ no provider secrets are needed in CI.
 
 ## Deploying to EC2
 
-Minimal recipe:
+Full single-host recipe — works on Ubuntu 22.04 / 24.04, t3.large or bigger
+(FFmpeg + Next.js build want ≥4 GB RAM, 20 GB disk for `data/` to start).
 
-1. Provision an EC2 instance with Docker + Docker Compose.
-2. `git clone` this repo, copy `.env.example` → `.env`, set `MVP_PASSWORD`,
-   `SESSION_SECRET`, and `PUBLIC_BASE_URL` to your domain (e.g. `https://avs.example.com`).
-3. Install Nginx and copy `nginx/avatarvideostudio.conf` into
-   `/etc/nginx/sites-enabled/`, then `certbot --nginx` for TLS.
-4. `make up` and `make seed`.
+### 1. Pick an instance + DNS
 
-The `data/` volume is the source of truth for uploads, generated assets, and final
-MP4s — back it up.
+```bash
+# Security group: 80/443 from 0.0.0.0/0, 22 from your IP only.
+# Allocate an Elastic IP and point an A record at it.
+DOMAIN=avs.example.com
+```
 
-### Production considerations (out of scope for this MVP)
+### 2. Install Docker + Nginx + certbot on the host
 
-- Replace local-fs storage with S3 presigned URLs for `Asset.public_token`.
-- Replace `MVP_PASSWORD` with real auth (OAuth, magic links, etc.).
-- Add Alembic migrations once the schema needs to evolve in production.
-- Add Sentry or similar for `ProviderLog` failures.
-- Add rate limiting in front of `/api/studio/*` and `/api/projects/*/generate-*`.
+```bash
+sudo apt update
+sudo apt install -y docker.io docker-compose-plugin nginx certbot python3-certbot-nginx git
+sudo usermod -aG docker $USER  # log out + back in so docker works without sudo
+```
+
+### 3. Clone + configure secrets
+
+```bash
+git clone https://github.com/alindebergasl/vidslam.git
+cd vidslam
+cp .env.example .env
+
+# Generate a real session secret (≥32 random bytes — the boot guard refuses
+# the dev default in production-flavored config).
+SESSION_SECRET=$(openssl rand -hex 32)
+MVP_PASSWORD=$(openssl rand -hex 16)
+
+cat > .env <<EOF
+MOCK_PROVIDERS=false
+MVP_PASSWORD=${MVP_PASSWORD}
+SESSION_SECRET=${SESSION_SECRET}
+PUBLIC_BASE_URL=https://${DOMAIN}
+FRONTEND_ORIGIN=https://${DOMAIN}
+NEXT_PUBLIC_API_BASE=https://${DOMAIN}
+
+# Provider keys — leave blank to keep that surface mocked even with
+# MOCK_PROVIDERS=false. Real chat/image/video planning needs OPENROUTER;
+# real voiceover needs ELEVENLABS.
+OPENROUTER_API_KEY=
+ELEVENLABS_API_KEY=
+ELEVENLABS_DEFAULT_VOICE_ID=
+
+DATA_DIR=/data
+DATABASE_URL=sqlite:////data/app.db
+EOF
+chmod 600 .env  # secrets — owner-read only
+
+# Note: $MVP_PASSWORD is what creators type to sign in — save it somewhere
+# safe; this is the only time it's printed.
+echo "Sign-in password: ${MVP_PASSWORD}"
+```
+
+### 4. Boot the prod stack
+
+The prod compose overlay swaps the frontend from `next dev` (HMR, source
+mounted) to a built `next start`, drops `--reload` on the backend, and
+unpublishes the 8000/3000 ports so only Nginx can reach them.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+
+# One-shot demo cast + sample project — skip if you want a blank slate.
+docker compose exec backend python -m app.seed
+```
+
+### 5. Put Nginx + TLS in front
+
+```bash
+sudo cp nginx/avatarvideostudio.conf /etc/nginx/sites-available/${DOMAIN}
+sudo ln -s /etc/nginx/sites-available/${DOMAIN} /etc/nginx/sites-enabled/
+# Edit server_name in the conf to match your $DOMAIN.
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos -m you@example.com
+```
+
+### 6. Verify
+
+```bash
+curl -sf https://${DOMAIN}/api/healthz   # {"status":"ok"}
+curl -sf https://${DOMAIN}/api/readyz    # 200 + per-check breakdown
+# Browser: https://${DOMAIN}/ → sign in with the password from step 3.
+```
+
+### 7. Backups
+
+The `./data` host volume holds all uploads, generated assets, the SQLite DB,
+and final MP4s. Nothing else is durable.
+
+```bash
+# Snapshot before maintenance:
+sudo tar czf "/tmp/avs-backup-$(date +%F).tar.gz" -C /var/lib/docker/volumes data
+# Or simpler if you bind-mounted to ./data:
+sudo tar czf "/tmp/avs-backup-$(date +%F).tar.gz" ./data
+
+# Cron a daily snapshot to S3:
+0 4 * * * tar czf - ./data | aws s3 cp - s3://my-avs-backups/$(date +\%F).tar.gz
+```
+
+### Rotating SESSION_SECRET
+
+Rotating the secret invalidates every signed cookie → every signed-in user
+gets bounced to the login form on their next request. No DB cleanup needed.
+
+```bash
+SESSION_SECRET=$(openssl rand -hex 32)
+sed -i "s/^SESSION_SECRET=.*/SESSION_SECRET=${SESSION_SECRET}/" .env
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+### Production considerations still on the roadmap
+
+- S3-backed `Asset.public_token` URLs instead of local filesystem (the
+  current code keeps tokens unguessable but reads off-disk).
+- Real auth (OAuth / magic links) replacing the shared MVP password.
+- Alembic migrations once the schema needs to evolve safely in prod.
+- Sentry or similar to alert on `ProviderLog.status == 'error'`.
+- Move rate-limit token buckets from in-process to Redis so multi-worker /
+  multi-host deployments share one budget per client.
 
 ---
 
