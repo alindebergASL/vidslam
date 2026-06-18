@@ -102,6 +102,14 @@ function Inner() {
   }, [project, projectId]);
 
   const [showShortcuts, setShowShortcuts] = useState(false);
+  // Lazy-render the shot list past ~12. Most projects emit 3–5 shots so
+  // this only matters when a user has heavily tweaked + re-planned, but
+  // when it matters (40+ shots) react re-renders + textarea autosize
+  // adds up. The expander reveals everything atomically; no incremental
+  // window or scroll-anchoring trickery — just enough to keep the editor
+  // snappy at the upper end.
+  const SHOTS_BEFORE_EXPAND = 12;
+  const [shotsExpanded, setShotsExpanded] = useState(false);
   useKeyboardShortcuts(
     [
       {
@@ -398,7 +406,10 @@ function Inner() {
           </div>
         ) : (
           <div className="space-y-3">
-            {project.shots.map((s, idx) => (
+            {(shotsExpanded
+              ? project.shots
+              : project.shots.slice(0, SHOTS_BEFORE_EXPAND)
+            ).map((s, idx) => (
               <ShotRow
                 key={s.id}
                 index={idx}
@@ -430,6 +441,17 @@ function Inner() {
                 onDragEnd={() => setDragIndex(null)}
               />
             ))}
+            {!shotsExpanded && project.shots.length > SHOTS_BEFORE_EXPAND && (
+              <button
+                type="button"
+                onClick={() => setShotsExpanded(true)}
+                className="btn-ghost w-full text-sm"
+                aria-label={`Show the remaining ${project.shots.length - SHOTS_BEFORE_EXPAND} shots`}
+              >
+                Show {project.shots.length - SHOTS_BEFORE_EXPAND} more shot
+                {project.shots.length - SHOTS_BEFORE_EXPAND === 1 ? "" : "s"}
+              </button>
+            )}
           </div>
         )}
       </section>
