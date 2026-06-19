@@ -184,3 +184,67 @@ def test_cancel_completed_job_is_noop(auth_client):
     # state, not raise.
     final = auth_client.post(f"/api/training-jobs/{job_id}/cancel").json()
     assert final["status"] == "completed"
+
+
+def test_completed_lora_appears_in_image_models_listing(auth_client):
+    aid, asset_ids = _avatar_with_assets(auth_client, n=2)
+    auth_client.post(
+        f"/api/cast/avatar/{aid}/train",
+        json={"name": "Naina LoRA v1", "kind": "character_lora", "training_asset_ids": asset_ids},
+    )
+    models_list = auth_client.get("/api/providers/openrouter/image-models").json()
+    # Custom trained adapter should be at the top of the list.
+    assert models_list[0]["id"].startswith("custom:")
+    assert models_list[0]["name"] == "Naina LoRA v1"
+    assert "Character Lora" in models_list[0]["description"]
+    # Base mock model is still present below.
+    assert any(m["id"] == "mock/image-default" for m in models_list[1:])
+
+
+def test_studio_generate_with_trained_lora_uses_resolved_adapter_id(auth_client):
+    aid, asset_ids = _avatar_with_assets(auth_client, n=2)
+    train_resp = auth_client.post(
+        f"/api/cast/avatar/{aid}/train",
+        json={"name": "Naina LoRA v1", "kind": "character_lora", "training_asset_ids": asset_ids},
+    ).json()
+    trained_model_id = train_resp["provider_model_id"]
+    assert trained_model_id.startswith("mock/"), train_resp
+
+    # Generate an image picking the trained LoRA via the custom:<id> selector
+    # the picker surfaces.
+    job = auth_client.post(
+        "/api/studio/generate-image",
+        json={
+            "owner_kind": "avatar",
+            "owner_id": aid,
+            "prompt": "wide hero portrait",
+            "model": f"custom:{train_resp['id']}",
+            "reference_asset_ids": [],
+        },
+    ).json()
+    final = auth_client.get(f"/api/studio/jobs/{job['id']}").json()
+    assert final["status"] == "completed"
+    # The job row reflects the *resolved* adapter id, not the custom:<id>
+    # selector — proves the pipeline expanded the trained-model reference
+    # before handing it to the provider.
+    assert final["provider_model"] == trained_model_id
+
+
+def test_unresolvable_custom_selector_falls_through_unchanged(auth_client):
+    aid, asset_ids = _avatar_with_assets(auth_client, n=1)
+    # No training run — custom:999 doesn't exist.
+    job = auth_client.post(
+        "/api/studio/generate-image",
+        json={
+            "owner_kind": "avatar",
+            "owner_id": aid,
+            "prompt": "x",
+            "model": "custom:999",
+            "reference_asset_ids": [],
+        },
+    ).json()
+    final = auth_client.get(f"/api/studio/jobs/{job['id']}").json()
+    # The unresolved string is what the provider got — mock ignores it
+    # but a real provider would 404. The studio job still completes
+    # because mock doesn't validate model ids.
+    assert final["provider_model"] == "custom:999"

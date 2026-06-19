@@ -5,7 +5,11 @@ import time
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 
+from sqlalchemy.orm import Session
+
+from .. import models as models_pkg
 from ..config import get_settings
+from ..db import get_db
 from ..providers import get_image, get_video, provider_status
 from ..providers.base import ModelInfo
 from .auth import require_auth
@@ -32,11 +36,42 @@ def video_models() -> list[dict]:
 
 
 @router.get("/openrouter/image-models")
-def image_models() -> list[dict]:
+def image_models(db: Session = Depends(get_db)) -> list[dict]:
+    """Base image models from the provider, plus the user's completed
+    character/style LoRA adapters. Trained models are surfaced inline so
+    the Studio picker shows "Naina LoRA v1" alongside the catalog without
+    needing a second dropdown — pick it and the next generate-image call
+    passes the adapter id through.
+    """
     try:
-        return _to_dict(get_image().list_models())
+        base = _to_dict(get_image().list_models())
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"failed to list image models: {e}") from e
+
+    trained = (
+        db.query(models_pkg.CustomModel)
+        .filter(
+            models_pkg.CustomModel.status == "completed",
+            models_pkg.CustomModel.kind.in_(("character_lora", "style_lora")),
+        )
+        .order_by(models_pkg.CustomModel.completed_at.desc())
+        .all()
+    )
+    custom = [
+        {
+            "id": f"custom:{cm.id}",
+            "name": cm.name or f"#{cm.id}",
+            "description": (
+                f"{cm.kind.replace('_', ' ').title()} · "
+                f"trained {cm.completed_at.date().isoformat() if cm.completed_at else 'recently'} · "
+                f"{cm.provider or 'mock'}"
+            ),
+        }
+        for cm in trained
+    ]
+    # Custom adapters surface first since users almost always want their
+    # own model over the base when they've trained one.
+    return custom + base
 
 
 @router.get("/caption-styles")

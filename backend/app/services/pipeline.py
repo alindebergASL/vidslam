@@ -122,6 +122,28 @@ def _log_provider_call(
     db.commit()
 
 
+def _resolve_model(db: Session, model: str) -> str:
+    """Expand a `custom:<id>` selector to the trained model's
+    `provider_model_id`. Studio + (eventually) shot pipelines surface user-
+    trained LoRAs as `custom:<CustomModel.id>` in their dropdowns; the
+    underlying provider needs the real adapter id (a Replicate version
+    hash or, in mock mode, a deterministic `mock/<digest>`). Untrained
+    model strings pass through unchanged."""
+    if not model.startswith("custom:"):
+        return model
+    try:
+        cm_id = int(model.split(":", 1)[1])
+    except (IndexError, ValueError):
+        return model
+    cm = db.get(models.CustomModel, cm_id)
+    if cm is None or cm.status != "completed" or not cm.provider_model_id:
+        # Caller asked for a trained model that no longer applies; fall
+        # back to the unresolved string so the provider raises a clean
+        # error instead of silently using the wrong adapter.
+        return model
+    return cm.provider_model_id
+
+
 def _resolve_references_for_shot(
     db: Session, project: models.VideoProject, shot: models.VideoShot
 ) -> list[ImageRef]:
@@ -792,7 +814,10 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             from ..providers import get_image
 
             image = get_image()
-            model = job.provider_model or settings.openrouter_image_model or "mock/image-default"
+            model = _resolve_model(
+                db,
+                job.provider_model or settings.openrouter_image_model or "mock/image-default",
+            )
             job.provider = "mock" if settings.image_is_mocked() else "openrouter"
             job.provider_model = model
             db.commit()
@@ -803,7 +828,10 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             job.status = "completed"
         else:  # video_clip
             video = get_video()
-            model = job.provider_model or settings.openrouter_video_model or "mock/video-default"
+            model = _resolve_model(
+                db,
+                job.provider_model or settings.openrouter_video_model or "mock/video-default",
+            )
             job.provider = "mock" if settings.video_is_mocked() else "openrouter"
             job.provider_model = model
             db.commit()
