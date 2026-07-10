@@ -20,6 +20,15 @@ const KIND_HELP: Record<Kind, string> = {
     "Short audio samples (3-10 minutes of clean speech). Returns an ElevenLabs voice_id auto-bound to this avatar.",
 };
 
+// Rough cost + wall-clock expectations per kind so nobody is surprised when
+// they flip to real providers. Mirrors the estimates documented in
+// scripts/test_real_providers.md §8; mock mode is always free + instant.
+const KIND_COST: Record<Kind, { cost: string; time: string }> = {
+  character_lora: { cost: "$2–5", time: "10–20 min" },
+  style_lora: { cost: "$2–5", time: "10–20 min" },
+  voice_clone: { cost: "free on paid tiers", time: "instant" },
+};
+
 const ALLOWED_KINDS: Record<"avatar" | "ingredient", Kind[]> = {
   avatar: ["character_lora", "style_lora", "voice_clone"],
   ingredient: ["style_lora"],
@@ -143,7 +152,7 @@ export function TrainPanel({
                     aria-valuemax={100}
                   >
                     <div
-                      className="h-full bg-accent transition-all"
+                      className="h-full grad transition-all"
                       style={{ width: `${Math.round(j.progress * 100)}%` }}
                     />
                   </div>
@@ -281,6 +290,14 @@ function TrainModal({
           </div>
           <div className="text-[11px] text-ink-400 mt-1.5">
             {KIND_HELP[trainKind]}
+          </div>
+          <div className="text-[11px] text-ink-300 mt-1 flex items-center gap-3">
+            <span title="Estimated cost when running against the real provider; mock mode is free">
+              ≈ {KIND_COST[trainKind].cost}
+            </span>
+            <span title="Typical wall-clock time on the real provider">
+              ⏱ {KIND_COST[trainKind].time}
+            </span>
           </div>
         </div>
 

@@ -44,9 +44,9 @@ function Inner() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4" aria-hidden>
           {Array.from({ length: 2 }).map((_, i) => (
             <div key={i} className="card p-4 space-y-3">
-              <div className="h-4 bg-ink-800 rounded animate-pulse w-1/3" />
-              <div className="aspect-[16/9] bg-ink-800 rounded animate-pulse" />
-              <div className="h-3 bg-ink-800 rounded animate-pulse w-1/2" />
+              <div className="h-4 skeleton w-1/3" />
+              <div className="aspect-[16/9] skeleton" />
+              <div className="h-3 skeleton w-1/2" />
             </div>
           ))}
         </div>

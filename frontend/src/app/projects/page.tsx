@@ -109,9 +109,9 @@ function Inner() {
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4" aria-hidden>
           {Array.from({ length: 3 }).map((_, i) => (
             <div key={i} className="card p-4 space-y-3">
-              <div className="h-4 bg-ink-800 rounded animate-pulse w-2/3" />
-              <div className="h-3 bg-ink-800 rounded animate-pulse w-1/3" />
-              <div className="h-5 bg-ink-800 rounded animate-pulse w-20" />
+              <div className="h-4 skeleton w-2/3" />
+              <div className="h-3 skeleton w-1/3" />
+              <div className="h-5 skeleton w-20" />
             </div>
           ))}
         </div>
@@ -131,7 +131,7 @@ function Inner() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filtered.map((p) => (
-            <div key={p.id} className="card p-4 hover:border-ink-600 transition group relative">
+            <div key={p.id} className="card p-4 card-hover group relative">
               <Link href={`/projects/${p.id}`} className="block">
                 <div className="text-sm font-medium pr-6">{p.title || "Untitled"}</div>
                 <div className="text-xs text-ink-300 mt-1">
