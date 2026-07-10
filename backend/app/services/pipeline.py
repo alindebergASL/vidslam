@@ -302,7 +302,12 @@ def _ensure_clip_for_shot(db: Session, project: models.VideoProject, shot: model
     video = get_video()
     refs = _resolve_references_for_shot(db, project, shot)
     settings_local = get_settings()
-    model = settings_local.openrouter_video_model or "mock/video-default"
+    # Per-shot override (raw id or custom:<id> trained-LoRA selector) wins
+    # over the deployment-wide default.
+    model = _resolve_model(
+        db,
+        shot.model_override or settings_local.openrouter_video_model or "mock/video-default",
+    )
 
     shot.status = "submitted"
     shot.provider = "mock" if settings_local.video_is_mocked() else "openrouter"
