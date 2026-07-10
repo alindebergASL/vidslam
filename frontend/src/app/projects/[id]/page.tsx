@@ -37,8 +37,17 @@ function Inner() {
   const [showPreflight, setShowPreflight] = useState(false);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
+  const [videoModels, setVideoModels] = useState<
+    { id: string; name: string; description: string }[]
+  >([]);
   const router = useRouter();
   const timer = useRef<NodeJS.Timeout | null>(null);
+
+  // Models list (base + trained LoRAs) is stable during a session — fetch
+  // once, not per poll.
+  useEffect(() => {
+    api.videoModels().then(setVideoModels).catch(() => setVideoModels([]));
+  }, []);
 
   const refresh = async () => {
     try {
@@ -175,17 +184,17 @@ function Inner() {
     return (
       <div className="p-8 max-w-6xl space-y-6" aria-busy="true" aria-label="Loading project">
         <div className="space-y-2">
-          <div className="h-3 bg-ink-800 rounded animate-pulse w-24" />
-          <div className="h-8 bg-ink-800 rounded animate-pulse w-2/3" />
-          <div className="h-3 bg-ink-800 rounded animate-pulse w-1/3" />
+          <div className="h-3 skeleton w-24" />
+          <div className="h-8 skeleton w-2/3" />
+          <div className="h-3 skeleton w-1/3" />
         </div>
         <div className="card p-4 space-y-2">
-          <div className="h-3 bg-ink-800 rounded animate-pulse w-20" />
-          <div className="h-24 bg-ink-800 rounded animate-pulse" />
+          <div className="h-3 skeleton w-20" />
+          <div className="h-24 skeleton" />
         </div>
         <div className="space-y-3">
           {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="card p-4 h-24 animate-pulse" />
+            <div key={i} className="card p-4 h-24 skeleton" />
           ))}
         </div>
       </div>
@@ -416,6 +425,7 @@ function Inner() {
                 projectId={projectId}
                 shot={s}
                 castAssets={castAssets}
+                videoModels={videoModels}
                 onChange={refresh}
                 selected={selected.includes(s.id)}
                 onToggleSelect={() =>
@@ -627,6 +637,7 @@ function ShotRow({
   projectId,
   shot,
   castAssets,
+  videoModels,
   onChange,
   selected,
   onToggleSelect,
@@ -640,6 +651,7 @@ function ShotRow({
   projectId: number;
   shot: Shot;
   castAssets: Asset[];
+  videoModels: { id: string; name: string; description: string }[];
   onChange: () => void;
   selected: boolean;
   onToggleSelect: () => void;
@@ -652,6 +664,7 @@ function ShotRow({
   const [prompt, setPrompt] = useState(shot.prompt);
   const [dur, setDur] = useState(shot.duration_seconds);
   const [refs, setRefs] = useState<number[]>(shot.reference_asset_ids_json || []);
+  const [modelOverride, setModelOverride] = useState(shot.model_override || "");
   const [regenBusy, setRegenBusy] = useState(false);
   const toast = useToast();
 
@@ -815,6 +828,45 @@ function ShotRow({
           >
             Regenerate clip only
           </button>
+          {shot.shot_type !== "end_card" && videoModels.length > 0 && (
+            <div>
+              <label className="label" htmlFor={`shot-${shot.id}-model`}>
+                Model
+              </label>
+              <select
+                id={`shot-${shot.id}-model`}
+                aria-label={`Shot ${shot.shot_order} model override`}
+                className="input text-xs"
+                value={modelOverride}
+                onChange={async (e) => {
+                  const next = e.target.value;
+                  setModelOverride(next);
+                  try {
+                    await api.updateShot(projectId, shot.id, { model_override: next });
+                    toast.info(
+                      next
+                        ? "Model set — applies on the next re-roll of this shot"
+                        : "Model override cleared — back to the default"
+                    );
+                  } catch (err: any) {
+                    toast.error(err.message || "Failed to set model");
+                  }
+                }}
+              >
+                <option value="">Default model</option>
+                {videoModels.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.id.startsWith("custom:") ? `★ ${m.name}` : m.name}
+                  </option>
+                ))}
+              </select>
+              {modelOverride.startsWith("custom:") && (
+                <div className="text-[10px] text-ink-400 mt-1">
+                  Trained adapter — applied on the next regenerate.
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
       {shot.error && (
