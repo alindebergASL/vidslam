@@ -221,6 +221,10 @@ class VideoShot(Base):
     # frame_images|input_references|static_motion
     caption_text: Mapped[str] = mapped_column(Text, default="")
     camera_direction: Mapped[str] = mapped_column(String(120), default="")
+    # User-chosen model for this shot's clip. Accepts a raw provider model id
+    # or a `custom:<CustomModel.id>` selector for a trained LoRA; empty means
+    # "use the provider default". Resolved by pipeline._resolve_model.
+    model_override: Mapped[str] = mapped_column(String(300), default="")
     provider: Mapped[str] = mapped_column(String(40), default="")
     provider_model: Mapped[str] = mapped_column(String(120), default="")
     provider_job_id: Mapped[str] = mapped_column(String(200), default="")

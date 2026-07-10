@@ -50,6 +50,10 @@ class AssetOut(BaseModel):
     height: int
     public_token: str
     source: str
+    # Provenance: for generated assets, the AssetGenerationJob that produced
+    # this file. Join through it to see the prompt + resolved model/adapter
+    # (including trained LoRAs) that made the image. None for uploads.
+    generation_job_id: Optional[int] = None
     created_at: datetime
 
 
@@ -186,6 +190,7 @@ class ShotOut(BaseModel):
     reference_strategy: str
     caption_text: str
     camera_direction: str
+    model_override: str
     provider: str
     provider_model: str
     status: str
@@ -201,6 +206,9 @@ class ShotUpdate(BaseModel):
     reference_strategy: Optional[str] = None
     caption_text: Optional[str] = None
     camera_direction: Optional[str] = None
+    # Raw provider model id or `custom:<id>` trained-LoRA selector; empty
+    # string clears the override back to the provider default.
+    model_override: Optional[str] = None
 
 
 class PlanEditIn(BaseModel):
