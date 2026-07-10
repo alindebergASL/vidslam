@@ -284,7 +284,7 @@ function TileCard({
           className={clsx(
             "absolute top-2 right-2 w-6 h-6 rounded-full border text-xs flex items-center justify-center",
             selected
-              ? "bg-accent border-accent text-ink-950"
+              ? "grad border-transparent text-ink-950"
               // Touch devices have no hover; show at 60% so it's discoverable,
               // then full opacity on hover for crisp desktop affordance.
               : "bg-black/60 border-ink-300 text-ink-100 opacity-60 group-hover:opacity-100 transition"
