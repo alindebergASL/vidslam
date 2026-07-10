@@ -46,7 +46,7 @@ export function SideNav() {
   return (
     <>
       {/* Mobile top bar (hidden on md+). Stays in-flow so content sits below. */}
-      <div className="md:hidden sticky top-0 z-20 flex items-center justify-between bg-ink-900 border-b border-ink-800 px-4 h-12">
+      <div className="md:hidden sticky top-0 z-20 flex items-center justify-between bg-ink-900/80 backdrop-blur-md border-b border-ink-800 px-4 h-12">
         <button
           type="button"
           aria-label="Open navigation menu"
@@ -56,7 +56,7 @@ export function SideNav() {
         >
           ☰
         </button>
-        <div className="text-sm font-semibold">AvatarVideoStudio</div>
+        <div className="text-sm font-bold text-grad">AvatarVideoStudio</div>
         <div className="w-6" aria-hidden />
       </div>
 
@@ -118,34 +118,51 @@ export function SideNav() {
       {/* Desktop side nav (≥md) */}
       <aside
         aria-label="Primary"
-        className="w-56 shrink-0 border-r border-ink-800 bg-ink-900 p-4 hidden md:flex md:flex-col"
+        className="w-56 shrink-0 border-r border-ink-800 bg-ink-900/60 backdrop-blur-md p-4 hidden md:flex md:flex-col"
       >
         <div className="px-2 py-3 mb-4">
-          <div className="text-lg font-semibold tracking-tight">AvatarVideoStudio</div>
+          <div className="text-base font-bold tracking-tight text-grad whitespace-nowrap">
+            AvatarVideoStudio
+          </div>
           <div className="text-xs text-ink-400 mt-0.5">Cast → Studio → Video</div>
         </div>
         <nav className="flex flex-col gap-1">
-          {items.map((it) => (
-            <Link
-              key={it.href}
-              href={it.href}
-              aria-current={isActive(path, it.href) ? "page" : undefined}
-              className={clsx(
-                "flex items-center gap-3 px-3 py-2 rounded-md text-sm transition",
-                isActive(path, it.href)
-                  ? "bg-ink-700 text-white"
-                  : "text-ink-200 hover:bg-ink-800"
-              )}
-            >
-              <span className="w-5 text-center text-ink-400" aria-hidden>{it.icon}</span>
-              <span>{it.label}</span>
-            </Link>
-          ))}
+          {items.map((it) => {
+            const active = isActive(path, it.href);
+            return (
+              <Link
+                key={it.href}
+                href={it.href}
+                aria-current={active ? "page" : undefined}
+                className={clsx(
+                  "relative flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition",
+                  active
+                    ? "bg-ink-800 text-white shadow-glow"
+                    : "text-ink-200 hover:bg-ink-800/70 hover:text-ink-100"
+                )}
+              >
+                {/* Gradient rail marks the active section. */}
+                {active && (
+                  <span
+                    aria-hidden
+                    className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full grad"
+                  />
+                )}
+                <span
+                  className={clsx("w-5 text-center", active ? "text-iris-soft" : "text-ink-400")}
+                  aria-hidden
+                >
+                  {it.icon}
+                </span>
+                <span>{it.label}</span>
+              </Link>
+            );
+          })}
         </nav>
         <div className="mt-auto pt-3 border-t border-ink-800 space-y-2">
           <button
             type="button"
-            className="w-full text-left px-3 py-2 text-sm rounded-md text-ink-300 hover:text-white hover:bg-ink-800"
+            className="w-full text-left px-3 py-2 text-sm rounded-lg text-ink-300 hover:text-white hover:bg-ink-800/70 transition"
             onClick={() => doLogout(router)}
           >
             Sign out

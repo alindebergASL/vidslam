@@ -2,41 +2,147 @@
 @tailwind components;
 @tailwind utilities;
 
-html, body {
-  background: #06070A;
-  color: #E7E9EE;
+/* ---------------------------------------------------------------------------
+   AvatarVideoStudio visual system — "cinema dark"
+
+   One signature: the iris→accent (violet→pink) gradient. It appears on the
+   wordmark, primary actions, active nav, focus rings, and progress. Every
+   other surface is a near-black layer separated by borders + ambient glow
+   rather than drop shadows, so the UI reads like a color-graded edit bay.
+--------------------------------------------------------------------------- */
+
+html,
+body {
+  background: #05060b;
+  color: #e9eaf2;
+}
+
+/* Ambient stage light: two fixed radial washes, violet top-left and pink
+   bottom-right, at very low alpha. Gives the black canvas depth without
+   patterned noise. pointer-events pass through. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background:
+    radial-gradient(52rem 36rem at 12% -8%, rgba(124, 92, 255, 0.13), transparent 60%),
+    radial-gradient(44rem 32rem at 105% 110%, rgba(255, 92, 138, 0.09), transparent 55%);
+  pointer-events: none;
 }
 
 body {
   font-feature-settings: "ss01", "cv01";
 }
 
+::selection {
+  background: rgba(124, 92, 255, 0.45);
+  color: #fff;
+}
+
+/* Dark scrollbars so the chrome doesn't break the canvas. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #272b3f transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #272b3f;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* One consistent, visible keyboard-focus treatment everywhere. */
+:focus-visible {
+  outline: 2px solid #7c5cff;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
 @layer components {
+  /* Signature gradient as reusable utilities. */
+  .grad {
+    @apply bg-gradient-to-r from-iris to-accent;
+  }
+  .text-grad {
+    @apply bg-gradient-to-r from-iris-soft via-iris to-accent bg-clip-text text-transparent;
+  }
+
   .chip {
-    @apply inline-flex items-center gap-2 rounded-full bg-ink-800 border border-ink-700 px-3 py-1.5 text-sm text-ink-200 hover:bg-ink-700 transition;
+    @apply inline-flex items-center gap-2 rounded-full bg-ink-800/80 border border-ink-700 px-3 py-1.5 text-sm text-ink-200 transition;
+  }
+  .chip:hover {
+    @apply border-ink-500 text-ink-100;
   }
   .chip-active {
-    @apply bg-ink-100 border-ink-100 text-ink-950;
+    @apply bg-ink-100 border-ink-100 text-ink-950 shadow-glow;
   }
+
   .btn {
-    @apply inline-flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm font-medium transition;
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition active:scale-[0.98];
   }
-  /* text-white on the accent pink (#FF5C8A) was 2.6:1 — fails WCAG AA.
-     Near-black text on the accent reads at >7:1 and keeps the brand pink
-     intact for the surface itself. */
+  /* Primary = the signature gradient. Dark text keeps >7:1 contrast on both
+     gradient stops (iris and accent are both bright). */
   .btn-primary {
-    @apply btn bg-accent text-ink-950 hover:bg-accent/90;
+    @apply btn grad text-ink-950 hover:brightness-110 shadow-glow-pink;
   }
   .btn-ghost {
-    @apply btn bg-ink-800 border border-ink-700 hover:bg-ink-700 text-ink-100;
+    @apply btn bg-ink-800/70 border border-ink-700 hover:border-ink-500 hover:bg-ink-700 text-ink-100;
   }
+
+  /* Cards are glass layers: translucent fill + blur + a whisper of top-edge
+     highlight. Hover lifts with the violet glow instead of a shadow. */
   .card {
-    @apply bg-ink-900 border border-ink-800 rounded-xl;
+    @apply rounded-xl border border-ink-800 bg-ink-900/70 backdrop-blur-md;
+    background-image: linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0.025),
+      transparent 30%
+    );
   }
+  .card-hover {
+    @apply transition duration-200 hover:border-iris/40 hover:shadow-glow;
+  }
+
   .input {
-    @apply w-full bg-ink-900 border border-ink-700 rounded-md px-3 py-2 text-sm placeholder:text-ink-400 focus:outline-none focus:border-ink-500;
+    @apply w-full bg-ink-900/80 border border-ink-700 rounded-lg px-3 py-2 text-sm placeholder:text-ink-400 transition;
   }
+  .input:focus {
+    @apply outline-none border-iris/60;
+    box-shadow: 0 0 0 3px rgba(124, 92, 255, 0.18);
+  }
+
   .label {
     @apply block text-xs uppercase tracking-wider text-ink-300 mb-1;
+  }
+
+  /* Loading skeletons pick up a slow shimmer instead of a flat pulse. */
+  .skeleton {
+    @apply rounded bg-ink-800;
+    background-image: linear-gradient(
+      100deg,
+      transparent 30%,
+      rgba(124, 92, 255, 0.08) 50%,
+      transparent 70%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 2.2s linear infinite;
   }
 }

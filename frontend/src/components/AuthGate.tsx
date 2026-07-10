@@ -29,7 +29,18 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 
   if (state === "out") {
     return (
-      <div className="min-h-screen flex items-center justify-center p-8">
+      // Full-viewport stage that sits over the sidebar so the sign-in is a
+      // clean first impression rather than a form beside dead app chrome.
+      // Re-declares the ambient washes because the opaque layer would
+      // otherwise hide the body-level ones.
+      <div
+        className="fixed inset-0 z-40 bg-ink-950 flex items-center justify-center p-8"
+        style={{
+          backgroundImage:
+            "radial-gradient(52rem 36rem at 12% -8%, rgba(124,92,255,0.13), transparent 60%)," +
+            "radial-gradient(44rem 32rem at 105% 110%, rgba(255,92,138,0.09), transparent 55%)",
+        }}
+      >
         <form
           onSubmit={async (e) => {
             e.preventDefault();
@@ -41,11 +52,16 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
               setError(err.message || "Invalid password");
             }
           }}
-          className="w-full max-w-sm card p-6 space-y-4"
+          className="w-full max-w-sm card p-8 space-y-5 animate-fade-up shadow-lift"
         >
           <div>
-            <div className="text-xl font-semibold">AvatarVideoStudio</div>
-            <div className="text-sm text-ink-300 mt-1">
+            <div className="text-2xl font-bold tracking-tight text-grad">
+              AvatarVideoStudio
+            </div>
+            <div className="text-xs text-ink-400 mt-1 uppercase tracking-widest">
+              Cast → Studio → Video
+            </div>
+            <div className="text-sm text-ink-300 mt-3">
               {bouncedFromSession
                 ? "Your session expired — please sign in again."
                 : "Enter the shared MVP password to continue."}
