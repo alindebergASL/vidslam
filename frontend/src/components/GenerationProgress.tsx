@@ -123,7 +123,7 @@ export function GenerationProgress({
                   isFailedHere
                     ? "bg-red-500"
                     : reached || render.status === "completed"
-                    ? "bg-accent"
+                    ? "grad"
                     : "bg-ink-700"
                 } ${isCurrent ? "animate-pulse" : ""}`}
               />

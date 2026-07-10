@@ -126,7 +126,7 @@ export function OnboardingChecklist() {
         aria-label="Onboarding progress"
       >
         <div
-          className="h-full bg-accent transition-all"
+          className="h-full grad transition-all"
           style={{ width: `${(doneCount / steps.length) * 100}%` }}
         />
       </div>

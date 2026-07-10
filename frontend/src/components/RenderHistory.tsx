@@ -49,7 +49,7 @@ export function RenderHistory({ projectId }: { projectId: number }) {
           return (
             <div
               key={r.id}
-              className="card overflow-hidden hover:border-ink-600 transition flex flex-col relative"
+              className="card overflow-hidden card-hover flex flex-col relative"
             >
               <Link
                 href={`/projects/${projectId}/render?id=${r.id}`}
@@ -68,7 +68,7 @@ export function RenderHistory({ projectId }: { projectId: number }) {
                     </div>
                   )}
                   {isLatest && (
-                    <span className="absolute top-2 left-2 chip text-[10px] py-0.5 bg-accent border-accent text-ink-950">
+                    <span className="absolute top-2 left-2 chip text-[10px] py-0.5 grad border-transparent text-ink-950">
                       Latest
                     </span>
                   )}
