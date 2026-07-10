@@ -248,3 +248,54 @@ def test_unresolvable_custom_selector_falls_through_unchanged(auth_client):
     # but a real provider would 404. The studio job still completes
     # because mock doesn't validate model ids.
     assert final["provider_model"] == "custom:999"
+
+
+def test_shot_model_override_with_trained_lora_resolves_on_render(auth_client):
+    """Per-shot LoRA: set model_override to custom:<id> on a shot, render,
+    and assert the shot's provider_model reflects the trained adapter."""
+    aid, asset_ids = _avatar_with_assets(auth_client, n=2)
+    train = auth_client.post(
+        f"/api/cast/avatar/{aid}/train",
+        json={"name": "ShotLoRA", "kind": "character_lora", "training_asset_ids": asset_ids},
+    ).json()
+
+    pid = auth_client.post(
+        "/api/projects",
+        json={
+            "title": "T",
+            "original_script": "one two three four five six seven eight",
+            "cast": [{"member_kind": "avatar", "avatar_id": aid, "role": "host"}],
+        },
+    ).json()["id"]
+    auth_client.post(f"/api/projects/{pid}/generate-plan")
+    shots = auth_client.get(f"/api/projects/{pid}").json()["shots"]
+    target = next(s for s in shots if s["shot_type"] != "end_card")
+
+    # Set the per-shot override to the trained adapter.
+    r = auth_client.patch(
+        f"/api/projects/{pid}/shots/{target['id']}",
+        json={"model_override": f"custom:{train['id']}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["model_override"] == f"custom:{train['id']}"
+
+    auth_client.post(f"/api/projects/{pid}/generate-video")
+    after = auth_client.get(f"/api/projects/{pid}").json()["shots"]
+    rendered = next(s for s in after if s["id"] == target["id"])
+    assert rendered["status"] == "completed"
+    # provider_model records the *resolved* adapter id.
+    assert rendered["provider_model"] == train["provider_model_id"]
+    # Other shots used the default model, not the LoRA.
+    others = [s for s in after if s["id"] != target["id"] and s["shot_type"] != "end_card"]
+    assert all(s["provider_model"] != train["provider_model_id"] for s in others)
+
+
+def test_trained_lora_appears_in_video_models_listing(auth_client):
+    aid, asset_ids = _avatar_with_assets(auth_client, n=1)
+    auth_client.post(
+        f"/api/cast/avatar/{aid}/train",
+        json={"name": "VidLoRA", "kind": "character_lora", "training_asset_ids": asset_ids},
+    )
+    listing = auth_client.get("/api/providers/openrouter/video-models").json()
+    assert listing[0]["id"].startswith("custom:")
+    assert listing[0]["name"] == "VidLoRA"

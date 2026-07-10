@@ -146,6 +146,7 @@ export type Shot = {
   reference_strategy: string;
   caption_text: string;
   camera_direction: string;
+  model_override: string;
   provider: string;
   provider_model: string;
   status: string;
