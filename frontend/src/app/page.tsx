@@ -182,7 +182,7 @@ function Dashboard() {
                 className="shrink-0 w-32 group"
                 title={r.project_title}
               >
-                <div className="aspect-[9/16] rounded-lg overflow-hidden bg-ink-800 border border-ink-800 group-hover:border-ink-600 transition relative">
+                <div className="aspect-[9/16] rounded-lg overflow-hidden bg-ink-800 border border-ink-800 transition group-hover:border-iris/40 group-hover:shadow-glow relative">
                   <img
                     src={api.renderThumb(r.render_id)}
                     alt=""
@@ -241,7 +241,7 @@ function Dashboard() {
                 <Link
                   href={`/projects/${p.id}`}
                   key={p.id}
-                  className="card overflow-hidden hover:border-ink-600 transition flex flex-col"
+                  className="card overflow-hidden card-hover flex flex-col"
                 >
                   <div className="aspect-[9/16] max-h-44 bg-ink-800 overflow-hidden">
                     {rid ? (
@@ -275,7 +275,7 @@ function Dashboard() {
 
 function Tile({ href, label, count }: { href: string; label: string; count: number }) {
   return (
-    <Link href={href} className="card p-4 hover:border-ink-600 transition">
+    <Link href={href} className="card p-4 card-hover">
       <div className="text-2xl font-semibold">{count}</div>
       <div className="text-sm text-ink-300 mt-1">{label}</div>
     </Link>
