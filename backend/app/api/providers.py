@@ -27,12 +27,40 @@ def status() -> dict:
     return provider_status()
 
 
+def _trained_lora_entries(db: Session) -> list[dict]:
+    """The user's completed character/style LoRA adapters as picker entries.
+    Shared by the image- and video-model listings so a trained identity
+    adapter is selectable in the Studio AND per-shot in the editor."""
+    trained = (
+        db.query(models_pkg.CustomModel)
+        .filter(
+            models_pkg.CustomModel.status == "completed",
+            models_pkg.CustomModel.kind.in_(("character_lora", "style_lora")),
+        )
+        .order_by(models_pkg.CustomModel.completed_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": f"custom:{cm.id}",
+            "name": cm.name or f"#{cm.id}",
+            "description": (
+                f"{cm.kind.replace('_', ' ').title()} · "
+                f"trained {cm.completed_at.date().isoformat() if cm.completed_at else 'recently'} · "
+                f"{cm.provider or 'mock'}"
+            ),
+        }
+        for cm in trained
+    ]
+
+
 @router.get("/openrouter/video-models")
-def video_models() -> list[dict]:
+def video_models(db: Session = Depends(get_db)) -> list[dict]:
     try:
-        return _to_dict(get_video().list_models())
+        base = _to_dict(get_video().list_models())
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"failed to list video models: {e}") from e
+    return _trained_lora_entries(db) + base
 
 
 @router.get("/openrouter/image-models")
@@ -47,31 +75,9 @@ def image_models(db: Session = Depends(get_db)) -> list[dict]:
         base = _to_dict(get_image().list_models())
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"failed to list image models: {e}") from e
-
-    trained = (
-        db.query(models_pkg.CustomModel)
-        .filter(
-            models_pkg.CustomModel.status == "completed",
-            models_pkg.CustomModel.kind.in_(("character_lora", "style_lora")),
-        )
-        .order_by(models_pkg.CustomModel.completed_at.desc())
-        .all()
-    )
-    custom = [
-        {
-            "id": f"custom:{cm.id}",
-            "name": cm.name or f"#{cm.id}",
-            "description": (
-                f"{cm.kind.replace('_', ' ').title()} · "
-                f"trained {cm.completed_at.date().isoformat() if cm.completed_at else 'recently'} · "
-                f"{cm.provider or 'mock'}"
-            ),
-        }
-        for cm in trained
-    ]
     # Custom adapters surface first since users almost always want their
     # own model over the base when they've trained one.
-    return custom + base
+    return _trained_lora_entries(db) + base
 
 
 @router.get("/caption-styles")

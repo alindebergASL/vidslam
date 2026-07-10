@@ -19,6 +19,12 @@ dependencies = [
   "alembic>=1.13",
 ]
 
+# The alembic `migrations/` directory sits next to `app/` and would trip
+# setuptools' flat-layout auto-discovery ("multiple top-level packages").
+# Only `app` is the installable package; migrations ride along as files.
+[tool.setuptools.packages.find]
+include = ["app*"]
+
 [project.optional-dependencies]
 dev = [
   "pytest>=8.2",
