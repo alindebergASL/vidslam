@@ -103,7 +103,10 @@ jobs:
       - name: Install
         run: npm install --no-audit --no-fund
 
-      - name: Type-check + build
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Build
         run: npm run build
 
   ui-smoke:
