@@ -153,7 +153,7 @@ class VideoProject(Base):
     title: Mapped[str] = mapped_column(String(200), default="")
     original_script: Mapped[str] = mapped_column(Text, default="")
     mode: Mapped[str] = mapped_column(String(40), default="reel_montage")
-    # reel_montage | talking_head_beta | static_motion
+    # reel_montage | talking_head_beta | static_motion | ambient_loop
     aspect_ratio: Mapped[str] = mapped_column(String(10), default="9:16")
     target_duration_seconds: Mapped[int] = mapped_column(Integer, default=25)
     cta_text: Mapped[str] = mapped_column(String(280), default="")
@@ -170,6 +170,11 @@ class VideoProject(Base):
     status: Mapped[str] = mapped_column(String(40), default="draft")
     # draft|planning|planned|generating|completed|failed
     generated_plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Settings for mode="ambient_loop" (scene prompt, loop length, music mood,
+    # crossfade…). Validated by schemas.ambient.AmbientConfig; None for every
+    # other mode. Kept as JSON because these knobs evolve faster than the
+    # storyboard pipeline's columns and never need to be queried individually.
+    ambient_config_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     primary_avatar_id: Mapped[Optional[int]] = mapped_column(ForeignKey("avatars.id"))
     brand_kit_id: Mapped[Optional[int]] = mapped_column(ForeignKey("brand_kits.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)

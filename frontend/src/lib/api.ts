@@ -174,7 +174,7 @@ export type Project = {
   id: number;
   title: string;
   original_script: string;
-  mode: "reel_montage" | "talking_head_beta" | "static_motion";
+  mode: "reel_montage" | "talking_head_beta" | "static_motion" | "ambient_loop";
   aspect_ratio: string;
   target_duration_seconds: number;
   cta_text: string;
@@ -262,8 +262,109 @@ export type CustomModel = {
   completed_at?: string | null;
 };
 
+// --- Ambient (hour-long seamless-loop scenes) ---
+
+export type AmbientSource = "video" | "image_drift";
+
+export type AmbientConfig = {
+  scene_preset: string;
+  scene_prompt: string;
+  source: AmbientSource;
+  loop_seconds: number;
+  total_seconds: number;
+  crossfade_seconds: number;
+  slow_factor: number;
+  fade_seconds: number;
+  music_mood: string;
+  music_prompt: string;
+  music_volume: number;
+  model_override: string;
+};
+
+export type ScenePreset = {
+  id: string;
+  label: string;
+  emoji: string;
+  tagline: string;
+  prompt: string;
+  music_mood: string;
+  palette: [string, string];
+};
+
+export type MusicMood = { id: string; label: string; prompt: string };
+
+export type AmbientPresets = {
+  scenes: ScenePreset[];
+  music_moods: MusicMood[];
+  loop_options: number[];
+  total_options: number[];
+  aspect_options: string[];
+};
+
+export type AmbientScene = {
+  id: number;
+  title: string;
+  status: string; // draft | generating | planned | completed | failed | cancelled
+  aspect_ratio: string;
+  total_seconds: number;
+  config: AmbientConfig;
+  loop_status: string; // pending | submitted | polling | completed | failed
+  loop_error: string;
+  loop_shot: Shot | null;
+  music_ready: boolean;
+  repeats: number;
+  latest_render: Render | null;
+  render_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
+  scene_preset: "waterfall",
+  scene_prompt: "",
+  source: "video",
+  loop_seconds: 30,
+  total_seconds: 3600,
+  crossfade_seconds: 2,
+  slow_factor: 1,
+  fade_seconds: 4,
+  music_mood: "spa",
+  music_prompt: "",
+  music_volume: 0.7,
+  model_override: "",
+};
+
 export const api = {
   base: API_BASE,
+
+  // ambient
+  ambientPresets: () => req<AmbientPresets>("/api/ambient/presets"),
+  ambientEstimate: (config: AmbientConfig) =>
+    req<CostEstimate>("/api/ambient/estimate", {
+      method: "POST",
+      body: JSON.stringify({ config }),
+    }),
+  listAmbient: () => req<AmbientScene[]>("/api/ambient"),
+  getAmbient: (id: number) => req<AmbientScene>(`/api/ambient/${id}`),
+  createAmbient: (body: {
+    title?: string;
+    aspect_ratio?: string;
+    config: AmbientConfig;
+    generate?: boolean;
+  }) => req<AmbientScene>("/api/ambient", { method: "POST", body: JSON.stringify(body) }),
+  updateAmbient: (
+    id: number,
+    body: { title?: string; aspect_ratio?: string; config?: AmbientConfig }
+  ) => req<AmbientScene>(`/api/ambient/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  generateAmbientLoop: (id: number, regenerateMusic = true) =>
+    req<{ scene_id: number; job_id: string; status: string }>(
+      `/api/ambient/${id}/generate-loop?regenerate_music=${regenerateMusic}`,
+      { method: "POST" }
+    ),
+  renderAmbient: (id: number) =>
+    req<{ scene_id: number; job_id: string; status: string }>(`/api/ambient/${id}/render`, {
+      method: "POST",
+    }),
   publicAsset: (token: string) => `${API_BASE}/api/public-assets/${token}`,
   studioPreview: (jobId: number) => `${API_BASE}/api/studio/jobs/${jobId}/preview`,
   renderDownload: (id: number) => `${API_BASE}/api/renders/${id}/download`,

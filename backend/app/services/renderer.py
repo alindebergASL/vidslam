@@ -273,6 +273,300 @@ def _make_thumbnail(src: Path, dst: Path) -> str:
     return log
 
 
+# ---------------------------------------------------------------------------
+# Ambient loop compositing
+#
+# Goal: an hour of "barely moving" scenery from one short clip, with no
+# visible seam and no hour-long encode. Three ideas make that work:
+#
+#   1. Seamless loop unit. Crossfade the clip's tail into its own head
+#      (xfade of the clip against a copy of itself at offset L-cf), then trim
+#      [cf, L). The unit now *ends* on the same blended frame it *starts* on,
+#      so unit→unit joins are invisible. Cost: one short encode.
+#   2. Stream-copy tiling. Repeat the unit N = ceil(T / U) times with the
+#      concat demuxer and `-c:v copy`. Identical encoder params on every
+#      piece make this a byte-level splice — an hour tiles in seconds.
+#   3. Fades live in the first/last piece only. Head = unit with a fade-in,
+#      tail = unit with a fade-out; the middle pieces are untouched copies.
+#      No full-length re-encode is ever needed.
+#
+# Audio gets the same treatment: the music bed is crossfaded against itself
+# into a seamless audio unit, `-stream_loop -1`'d under the video, then faded
+# at the ends and cut at T. AAC for an hour is ~15s of CPU.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AmbientRenderInputs:
+    project_id: int
+    out_dir: Path
+    clip_path: Path
+    total_seconds: float
+    aspect_ratio: str = "16:9"
+    crossfade_seconds: float = 2.0
+    slow_factor: float = 1.0
+    fade_seconds: float = 4.0
+    music_path: Optional[Path] = None
+    music_volume: float = 0.7
+    # When the clip is already periodic (image_drift), skip the video
+    # crossfade: it would only soften a seam that doesn't exist.
+    clip_is_periodic: bool = False
+
+
+@dataclass
+class AmbientRenderOutputs:
+    final_video_path: Path
+    thumbnail_path: Path
+    unit_path: Path
+    unit_seconds: float
+    repeats: int
+    log: str
+
+
+# Shared x264 settings so every tiled piece is bit-compatible for `-c copy`.
+_X264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20"]
+
+
+def _encode_normalized(
+    src: Path, dst: Path, *, width: int, height: int, slow_factor: float
+) -> str:
+    vf = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+    )
+    if slow_factor and abs(slow_factor - 1.0) > 1e-3:
+        # Slow the clip down; fps= re-samples so the output stays constant-rate.
+        vf += f",setpts={slow_factor:.4f}*PTS"
+    vf += f",fps={FPS}"
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-an", *_X264, "-r", str(FPS), str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg ambient normalize failed: {log[-2000:]}")
+    return log
+
+
+def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: float) -> str:
+    """Crossfade the tail of `norm` into its own head and trim so the result
+    loops without a visible cut. Output length = length - crossfade."""
+    flt = (
+        f"[0:v][1:v]xfade=transition=fade:duration={crossfade:.3f}:offset={length - crossfade:.3f},"
+        f"trim=start={crossfade:.3f}:end={length:.3f},setpts=PTS-STARTPTS[v]"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", str(norm), "-i", str(norm),
+        "-filter_complex", flt, "-map", "[v]", "-an",
+        *_X264, "-r", str(FPS), str(unit),
+    ]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg loop-unit failed: {log[-2000:]}")
+    return log
+
+
+def _faded_copy(unit: Path, dst: Path, *, unit_len: float, fade_in: float, fade_out: float) -> str:
+    parts: list[str] = []
+    if fade_in > 0:
+        parts.append(f"fade=t=in:st=0:d={fade_in:.3f}")
+    if fade_out > 0:
+        parts.append(f"fade=t=out:st={max(0.0, unit_len - fade_out):.3f}:d={fade_out:.3f}")
+    cmd = ["ffmpeg", "-y", "-i", str(unit)]
+    if parts:
+        cmd += ["-vf", ",".join(parts)]
+    cmd += ["-an", *_X264, "-r", str(FPS), str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg fade piece failed: {log[-2000:]}")
+    return log
+
+
+def _make_seamless_audio_unit(music: Path, dst: Path, *, crossfade: float) -> tuple[str, float]:
+    """Same trick for audio: acrossfade the bed against itself, trim the
+    overlap so the file loops cleanly. Returns (log, unit_seconds)."""
+    length = _probe_duration(music)
+    if length <= 0:
+        raise RuntimeError("music bed has no readable duration")
+    cf = min(crossfade, max(0.0, length / 3.0))
+    if cf < 0.05:
+        # Too short to crossfade meaningfully — just transcode as-is.
+        cmd = ["ffmpeg", "-y", "-i", str(music), "-vn", "-c:a", "aac", "-b:a", "192k", str(dst)]
+        rc, log = _run(cmd)
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg audio unit failed: {log[-2000:]}")
+        return log, _probe_duration(dst) or length
+    flt = (
+        f"[0:a][1:a]acrossfade=d={cf:.3f}:c1=tri:c2=tri,"
+        f"atrim=start={cf:.3f}:end={length:.3f},asetpts=PTS-STARTPTS[a]"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", str(music), "-i", str(music),
+        "-filter_complex", flt, "-map", "[a]",
+        "-c:a", "aac", "-b:a", "192k", str(dst),
+    ]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg audio unit failed: {log[-2000:]}")
+    return log, _probe_duration(dst) or (length - cf)
+
+
+def _tile_and_mux(
+    pieces: list[Path],
+    out: Path,
+    *,
+    total: float,
+    music_unit: Optional[Path],
+    music_volume: float,
+    fade: float,
+) -> str:
+    listfile = out.parent / "ambient_concat.txt"
+    listfile.write_text(
+        "\n".join(f"file '{p.as_posix()}'" for p in pieces) + "\n", encoding="utf-8"
+    )
+    cmd: list[str] = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile)]
+    if music_unit is not None:
+        cmd += ["-stream_loop", "-1", "-i", str(music_unit)]
+        vol = max(0.0, min(1.0, music_volume))
+        af = [f"volume={vol:.3f}"]
+        if fade > 0:
+            af.append(f"afade=t=in:st=0:d={fade:.3f}")
+            af.append(f"afade=t=out:st={max(0.0, total - fade):.3f}:d={fade:.3f}")
+        cmd += [
+            "-filter_complex", f"[1:a]{','.join(af)}[a]",
+            "-map", "0:v:0", "-map", "[a]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        ]
+    else:
+        cmd += ["-map", "0:v:0", "-c:v", "copy", "-an"]
+    cmd += ["-t", f"{total:.3f}", "-movflags", "+faststart", str(out)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg ambient mux failed: {log[-2000:]}")
+    return log
+
+
+def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg binary not found on PATH")
+    if inputs.total_seconds <= 0:
+        raise ValueError("total_seconds must be positive")
+
+    width, height = _dims_for_aspect(inputs.aspect_ratio)
+    out = inputs.out_dir
+    out.mkdir(parents=True, exist_ok=True)
+    logs: list[str] = []
+
+    # 1. Normalize (size/fps/codec, optional slow-down).
+    norm = out / "ambient_norm.mp4"
+    logs.append(_encode_normalized(
+        inputs.clip_path, norm, width=width, height=height, slow_factor=inputs.slow_factor
+    ))
+    length = _probe_duration(norm)
+    if length <= 0.5:
+        raise RuntimeError("normalized loop clip is empty or unreadable")
+
+    # 2. Seamless unit. Need room for the overlap on both sides of the trim.
+    cf = 0.0 if inputs.clip_is_periodic else max(0.0, inputs.crossfade_seconds)
+    unit = out / "ambient_unit.mp4"
+    if cf > 0 and length > (2 * cf + 0.5):
+        logs.append(_make_seamless_unit(norm, unit, length=length, crossfade=cf))
+    else:
+        shutil.copyfile(norm, unit)
+    unit_len = _probe_duration(unit) or (length - cf)
+
+    # 3. Tile plan. Fades are clamped so a single short unit still works.
+    total = float(inputs.total_seconds)
+    repeats = max(1, int(-(-total // unit_len)))  # ceil without importing math
+    fade = max(0.0, min(inputs.fade_seconds, unit_len / 2.5))
+    pieces: list[Path]
+    if fade <= 0:
+        pieces = [unit] * repeats
+    elif repeats == 1:
+        single = out / "ambient_single.mp4"
+        logs.append(_faded_copy(unit, single, unit_len=unit_len, fade_in=fade, fade_out=fade))
+        pieces = [single]
+    else:
+        head = out / "ambient_head.mp4"
+        tail = out / "ambient_tail.mp4"
+        logs.append(_faded_copy(unit, head, unit_len=unit_len, fade_in=fade, fade_out=0.0))
+        logs.append(_faded_copy(unit, tail, unit_len=unit_len, fade_in=0.0, fade_out=fade))
+        pieces = [head, *([unit] * (repeats - 2)), tail]
+
+    # 4. Music unit (optional).
+    music_unit: Optional[Path] = None
+    if inputs.music_path is not None and inputs.music_path.exists():
+        music_unit = out / "ambient_music_unit.m4a"
+        mlog, _ = _make_seamless_audio_unit(
+            inputs.music_path, music_unit, crossfade=max(1.0, inputs.crossfade_seconds)
+        )
+        logs.append(mlog)
+
+    # 5. Tile + mux. The tail piece's fade-out lands at the end of the last
+    #    repeat; -t trims any overshoot past `total` (stream-copy cuts land
+    #    on packet boundaries, so expect ≤1 frame of slack).
+    final = out / "final.mp4"
+    logs.append(_tile_and_mux(
+        pieces, final,
+        total=total,
+        music_unit=music_unit,
+        music_volume=inputs.music_volume,
+        fade=fade,
+    ))
+
+    # 6. Thumbnail — sample past the fade-in so it isn't a black frame.
+    thumb = out / "thumb.jpg"
+    rc, tlog = _run([
+        "ffmpeg", "-y", "-ss", f"{min(fade + 1.0, max(0.0, total - 0.5)):.2f}",
+        "-i", str(final), "-frames:v", "1", "-q:v", "3", str(thumb),
+    ])
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg thumbnail failed: {tlog[-2000:]}")
+    logs.append(tlog)
+
+    return AmbientRenderOutputs(
+        final_video_path=final,
+        thumbnail_path=thumb,
+        unit_path=unit,
+        unit_seconds=unit_len,
+        repeats=repeats,
+        log="\n".join(logs)[-8000:],
+    )
+
+
+def render_image_drift_clip(
+    image: Path,
+    dst: Path,
+    *,
+    seconds: float,
+    width: int,
+    height: int,
+    zoom_amount: float = 0.06,
+) -> str:
+    """Turn a still into a slow, *periodic* push-in/pull-out. The zoom follows
+    1 + a·(1-cos(2πt/T))/2, which returns exactly to its start at t=T, so the
+    clip loops with zero seam and needs no crossfade. A faint horizontal drift
+    rides on the same period so the motion isn't a pure zoom."""
+    frames = max(2, int(round(seconds * FPS)))
+    # Upscale first so zoompan has sub-pixel headroom (avoids jitter).
+    big_w, big_h = width * 2, height * 2
+    z = f"1+{zoom_amount:.4f}*(1-cos(2*PI*on/{frames}))/2"
+    x = f"iw/2-(iw/zoom/2)+(iw*0.01)*sin(2*PI*on/{frames})"
+    y = "ih/2-(ih/zoom/2)"
+    vf = (
+        f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase,"
+        f"crop={big_w}:{big_h},"
+        f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={width}x{height}:fps={FPS},"
+        "setsar=1"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-loop", "1", "-i", str(image),
+        "-vf", vf, "-frames:v", str(frames), "-an",
+        *_X264, "-r", str(FPS), str(dst),
+    ]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg image-drift failed: {log[-2000:]}")
+    return log
+
+
 def compose(inputs: RenderInputs) -> RenderOutputs:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg binary not found on PATH")

@@ -286,6 +286,48 @@ auto-updated, so the next render's TTS uses the cloned voice.
 - Clone succeeds but voice sounds wrong — Voice Lab is sensitive to
   background noise. Re-record samples in a quiet room.
 
+## 9. Ambient loop (optional, ~$3)
+
+Exercises the video model on a *long* single clip plus the music model, then
+the local seamless-loop compositor. Nothing after the loop touches a provider.
+
+```bash
+# Create a 10-minute ocean scene and generate the loop + music right away.
+SID=$(curl -fsS -b /tmp/avs.cookies -X POST https://staging.avs.example.com/api/ambient \
+  -H 'Content-Type: application/json' \
+  -d '{"aspect_ratio":"16:9","config":{"scene_preset":"ocean","loop_seconds":30,"total_seconds":600,"music_mood":"zen"},"generate":true}' \
+  | jq .id)
+
+# Wait for loop_status=completed and music_ready=true.
+watch -n 5 "curl -sS -b /tmp/avs.cookies https://staging.avs.example.com/api/ambient/$SID | jq '{status,loop_status,music_ready}'"
+
+# Tile it. Should complete in well under a minute regardless of total_seconds.
+curl -fsS -b /tmp/avs.cookies -X POST https://staging.avs.example.com/api/ambient/$SID/render
+```
+
+**Expected:** `status` reaches `planned` after the clip (1–5 min on real
+video models — note most cap single clips at 5–10 s; the compositor loops
+whatever length comes back, so `repeats` will be higher than the UI
+predicted). After `/render`, `latest_render.render_log` starts with
+`ambient: unit=…s repeats=… total=600s`.
+
+**Verify visually:** scrub the download across a unit boundary (every
+`unit` seconds). There should be no visible cut; if there is, bump
+`crossfade_seconds` (Settings → Crossfade) and re-render — no provider call.
+If the motion looks jittery or "pulses", the model ignored the static-camera
+directive; switch the scene to **Still + drift** for a guaranteed-smooth
+result at image-model prices.
+
+**Common failure modes:**
+
+- Clip `failed` with a duration error — the model rejects 30 s requests.
+  Set `loop_seconds` to the model's cap (the error usually states it).
+- Music bed present but the hour is silent — `music_mood` was `none` at
+  render time; set a mood in Settings, **Generate music**, re-render.
+- Render takes minutes, not seconds — `-c:v copy` concat fell back to a
+  re-encode; check `render_log` for "concat" errors (mismatched encoder
+  params between pieces, usually a custom ffmpeg build).
+
 ### Verify trained models surface in Studio / Voice picker
 
 After both trainings complete:

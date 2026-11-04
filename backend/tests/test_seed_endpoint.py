@@ -26,7 +26,9 @@ def test_seed_endpoint_populates_demo_content(auth_client):
     # generate-plan immediately.
     projects = auth_client.get("/api/projects").json()
     assert projects, "seed should produce at least one project"
-    p = projects[0]
+    # The seed also creates an ambient scene (no cast by design); check the
+    # storyboard project specifically.
+    p = next(x for x in projects if x["mode"] != "ambient_loop")
     assert len(p["cast_members"]) >= 1
     assert p["brand_kit_id"] is not None
 

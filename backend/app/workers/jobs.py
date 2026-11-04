@@ -67,3 +67,23 @@ def train_custom_model_job(job_id: int) -> None:
         pipeline.run_training_job(db, job_id)
     finally:
         db.close()
+
+
+def generate_ambient_loop_job(project_id: int, regenerate_music: bool = True) -> None:
+    from ..services import ambient
+
+    db = SessionLocal()
+    try:
+        ambient.generate_loop(db, project_id, regenerate_music=regenerate_music)
+    finally:
+        db.close()
+
+
+def render_ambient_job(project_id: int) -> None:
+    from ..services import ambient
+
+    db = SessionLocal()
+    try:
+        ambient.render_scene(db, project_id)
+    finally:
+        db.close()

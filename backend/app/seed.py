@@ -181,6 +181,36 @@ def run() -> None:
             ])
             log.info("seed: created demo project id=%s", project.id)
 
+        # One draft ambient scene so the Ambient section isn't empty on first
+        # visit. Left un-generated: the user clicks "Generate loop" to see the
+        # (mock) pipeline run end-to-end.
+        if db.query(models.VideoProject).filter_by(mode="ambient_loop").count() == 0:
+            from .schemas.ambient import AmbientConfig
+            from .services import ambient as ambient_svc
+
+            cfg = AmbientConfig(
+                scene_preset="fireplace",
+                loop_seconds=30,
+                total_seconds=3600,
+                music_mood="piano",
+                music_volume=0.7,
+            )
+            scene = models.VideoProject(
+                title="Fireplace — 1h",
+                mode="ambient_loop",
+                aspect_ratio="16:9",
+                target_duration_seconds=cfg.total_seconds,
+                include_disclosure=False,
+                voiceover_source="silent",
+                music_volume=cfg.music_volume,
+                ambient_config_json=cfg.model_dump(),
+                status="draft",
+            )
+            db.add(scene)
+            db.flush()
+            ambient_svc._ensure_loop_shot(db, scene, cfg)
+            log.info("seed: created demo ambient scene id=%s", scene.id)
+
         db.commit()
         log.info("seed: done")
     finally:

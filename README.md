@@ -90,6 +90,26 @@ missing — partial configs work fine. `GET /api/providers/status` reflects what
        └───────┘
 ```
 
+### Ambient scenes (hour-long loops)
+
+The **Ambient** section builds calm / landscape / spa videos — a waterfall,
+fireplace, ocean, snowfall… — that run for 10 minutes to 3 hours from a
+single 25/30/60-second clip that barely moves, under a spa-style music bed.
+The cost is the loop, not the hour:
+
+| Step | What happens | Who pays |
+| --- | --- | --- |
+| Loop clip | Video provider generates one slow-motion clip (or, with **Still + drift**, the image provider makes one still that FFmpeg pushes in/out on a perfect period) | provider, once |
+| Music bed | 45–90 s of spa / zen / piano / singing-bowl music from the music provider | provider, once |
+| Seamless unit | `renderer.compose_ambient` crossfades the clip's tail into its own head (`xfade` of the clip against itself, then trim) so the unit ends on the frame it starts on | FFmpeg, seconds |
+| Tiling | The unit is repeated with the concat demuxer and `-c:v copy`; only the first/last pieces are re-encoded for the fade in/out. Music gets the same `acrossfade`-against-itself treatment and loops under the video | FFmpeg, seconds |
+
+A 1-hour 1080p30 render from a 30 s loop (28 s unit × 129) takes ~25 s of
+video work on a 4-core box; with a music bed the AAC encode of the full hour
+dominates (≈2–3 min total). Nothing in that time touches a provider. Scenes live in the same `VideoProject`/`Render` tables as
+storyboard projects (`mode=ambient_loop`, config in `ambient_config_json`), so
+render history, share links, export and S3 delivery all apply unchanged.
+
 ### Quality control
 
 Before kicking off a real-provider video job (which spends money), the editor
@@ -253,6 +273,7 @@ the whole pipeline.
 | Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `GET /api/projects/{id}/cost-estimate` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `POST /api/projects/{id}/retry` (smart retry after a failed render — recomposes when all clips+audio survived, otherwise resumes) · `GET /api/projects/{id}/status` · `GET /api/projects/{id}/renders` · `GET /api/projects/{id}/renders/export` (zip of all completed renders) · `GET /api/renders/recent` (latest completed across all projects) · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `POST /api/projects/{id}/shots/regenerate-bulk` · `GET /api/renders/{id}/download` |
 | Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` · `GET /api/public-renders/{token}/meta` — **unauthenticated**, token-gated; backs the branded `/share/{token}` landing page so a finished video can be shared without exposing the app login |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
+| Ambient   | `GET /api/ambient/presets` · `POST /api/ambient/estimate` · `GET/POST /api/ambient` · `GET/PATCH /api/ambient/{id}` · `POST /api/ambient/{id}/generate-loop[?regenerate_music=false]` · `POST /api/ambient/{id}/render` — scenes are `VideoProject`s with `mode=ambient_loop`, so delete / cancel / renders / share / music preview reuse the project endpoints |
 | Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |
 | System | `GET /api/system/info` — non-secret deployment overview (version, mock flag, ffmpeg availability, configured model ids, key-presence booleans, entity counts); backs the **Settings & Status** page |
 

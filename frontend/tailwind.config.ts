@@ -49,10 +49,17 @@ const config: Config = {
           "0%": { backgroundPosition: "-200% 0" },
           "100%": { backgroundPosition: "200% 0" },
         },
+        // The Ambient section's "barely moves" signature: a very slow
+        // scale/drift on scene art, the same motion the rendered loops have.
+        breathe: {
+          "0%, 100%": { transform: "scale(1) translate(0, 0)" },
+          "50%": { transform: "scale(1.06) translate(-1%, 1%)" },
+        },
       },
       animation: {
         "fade-up": "fade-up 0.35s cubic-bezier(0.16, 1, 0.3, 1) both",
         shimmer: "shimmer 2.2s linear infinite",
+        breathe: "breathe 14s ease-in-out infinite",
       },
     },
   },

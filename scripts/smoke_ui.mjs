@@ -19,6 +19,8 @@ const require = createRequire(import.meta.url);
 
 const BASE = process.env.AVS_BASE_URL || 'http://localhost:3000';
 const PW = process.env.AVS_PASSWORD || 'test-pw';
+// The seed creates one storyboard project (id 1) and one ambient scene (id 2).
+const AMBIENT_ID = process.env.AVS_AMBIENT_ID || '2';
 
 let chromium;
 try {
@@ -34,6 +36,9 @@ const ROUTES = [
   { path: '/projects',               expect: /Projects/ },
   { path: '/projects/1',             expect: /Voice script|Voiceover/i },
   { path: '/projects/1/render?id=1', expect: /Render/ },
+  { path: '/ambient',                expect: /Ambient/ },
+  { path: '/ambient/new',            expect: /New ambient scene/ },
+  { path: `/ambient/${AMBIENT_ID}`,  expect: /Loop clip/ },
   { path: '/brand',                  expect: /Brand Kits/ },
   { path: '/settings',               expect: /Settings/ },
 ];
