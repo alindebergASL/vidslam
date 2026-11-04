@@ -418,6 +418,26 @@ def _faded_copy(unit: Path, dst: Path, *, unit_len: float, fade_in: float, fade_
     return log
 
 
+def _end_piece(unit: Path, dst: Path, *, unit_len: float, length: float,
+               fade_in: float, fade_out: float) -> str:
+    """The last `length` seconds of the tiled video, i.e. the unit (twice
+    over if needed) cut to `length`, with the fade-out ending exactly at its
+    end."""
+    loops = 1 if length <= unit_len + 1e-3 else 2
+    flt = (f"[0:v][1:v]concat=n=2:v=1:a=0," if loops == 2 else "[0:v]")
+    flt += f"trim=duration={length:.3f},setpts=PTS-STARTPTS"
+    if fade_in > 0:
+        flt += f",fade=t=in:st=0:d={fade_in:.3f}"
+    if fade_out > 0:
+        flt += f",fade=t=out:st={max(0.0, length - fade_out):.3f}:d={fade_out:.3f}"
+    cmd = ["ffmpeg", "-y", "-i", str(unit)] + (["-i", str(unit)] if loops == 2 else [])
+    cmd += ["-filter_complex", flt + "[v]", "-map", "[v]", "-an", *_X264, "-r", str(FPS), str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg end piece failed: {log[-2000:]}")
+    return log
+
+
 def _make_seamless_audio_unit(music: Path, dst: Path, *, crossfade: float) -> tuple[str, float]:
     """Same trick for audio: acrossfade the bed against itself, trim the
     overlap so the file loops cleanly. Returns (log, unit_seconds)."""
@@ -511,23 +531,34 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         shutil.copyfile(norm, unit)
     unit_len = _probe_duration(unit) or (length - cf)
 
-    # 3. Tile plan. Fades are clamped so a single short unit still works.
+    # 3. Tile plan. The pieces cover exactly `total`: head (fade-in), plain
+    #    units, and an end piece cut to the remaining time whose fade-out
+    #    ends at `total`. (Fading the last full unit instead got cut off
+    #    whenever repeats × unit overshot total.)
     total = float(inputs.total_seconds)
-    repeats = max(1, int(-(-total // unit_len)))  # ceil without importing math
-    fade = max(0.0, min(inputs.fade_seconds, unit_len / 2.5))
+    fade = max(0.0, min(inputs.fade_seconds, unit_len / 2.5, total / 2.5))
+    full = int(total // unit_len)
+    remainder = total - full * unit_len
+    if remainder < 0.05:  # lands on a unit boundary
+        full, remainder = full - 1, unit_len
+    if full >= 1 and remainder < fade + 0.5:
+        # Too little left for a full fade: the end piece absorbs one unit.
+        full, remainder = full - 1, remainder + unit_len
+    repeats = full + 1
     pieces: list[Path]
-    if fade <= 0:
-        pieces = [unit] * repeats
-    elif repeats == 1:
+    if full == 0:
         single = out / "ambient_single.mp4"
-        logs.append(_faded_copy(unit, single, unit_len=unit_len, fade_in=fade, fade_out=fade))
+        logs.append(_end_piece(unit, single, unit_len=unit_len, length=remainder, fade_in=fade, fade_out=fade))
         pieces = [single]
     else:
-        head = out / "ambient_head.mp4"
-        tail = out / "ambient_tail.mp4"
-        logs.append(_faded_copy(unit, head, unit_len=unit_len, fade_in=fade, fade_out=0.0))
-        logs.append(_faded_copy(unit, tail, unit_len=unit_len, fade_in=0.0, fade_out=fade))
-        pieces = [head, *([unit] * (repeats - 2)), tail]
+        end = out / "ambient_tail.mp4"
+        logs.append(_end_piece(unit, end, unit_len=unit_len, length=remainder, fade_in=0.0, fade_out=fade))
+        if fade > 0:
+            head = out / "ambient_head.mp4"
+            logs.append(_faded_copy(unit, head, unit_len=unit_len, fade_in=fade, fade_out=0.0))
+            pieces = [head, *([unit] * (full - 1)), end]
+        else:
+            pieces = [*([unit] * full), end]
 
     # 4. Music unit (optional).
     music_unit: Optional[Path] = None
@@ -655,6 +686,24 @@ def join_segments(
     if rc != 0:
         raise RuntimeError(f"ffmpeg segment join failed: {log[-2000:]}")
     return dst, _probe_duration(dst)
+
+
+def slice_audio(src: Path, dst: Path, *, start: float, duration: float) -> Path:
+    """Cut [start, start+duration) out of an audio file (AAC)."""
+    rc, log = _run(["ffmpeg", "-y", "-ss", f"{max(0.0, start):.3f}", "-t", f"{duration:.3f}", "-i", str(src),
+                    "-vn", "-c:a", "aac", "-b:a", "160k", str(dst)])
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg audio slice failed: {log[-1000:]}")
+    return dst
+
+
+def trim_clip(src: Path, dst: Path, *, duration: float) -> Path:
+    """Re-encode the first `duration` seconds of a clip (frame-accurate)."""
+    rc, log = _run(["ffmpeg", "-y", "-i", str(src), "-t", f"{duration:.3f}", "-an", *_X264,
+                    "-r", str(FPS), str(dst)])
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg trim failed: {log[-1000:]}")
+    return dst
 
 
 def join_audio(parts: list[Path], dst: Path, *, crossfade: float = 6.0) -> tuple[Path, float]:

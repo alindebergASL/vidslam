@@ -51,7 +51,16 @@ CHUNK = 8 * 1024 * 1024  # 32 × 256 KiB
 CREDS_KEY = "youtube.credentials"
 STATE_KEY = "youtube.oauth_state"
 
-_access: dict = {}  # in-process access-token cache {token, expires}
+# In-process access-token cache {token, expires, key}. `key` fingerprints the
+# stored (sealed) refresh token, so a disconnect / reconnect to another
+# channel — done in the API process — invalidates the worker's cache too.
+_access: dict = {}
+
+
+def _creds_key(creds: dict) -> str:
+    import hashlib
+
+    return hashlib.sha256((creds.get("refresh_token") or "").encode()).hexdigest()[:16]
 
 
 class YouTubeError(RuntimeError):
@@ -117,7 +126,6 @@ def handle_callback(code: str, state: str, *, client: Optional[httpx.Client] = N
         if not refresh:
             raise YouTubeError("Google returned no refresh token — remove the app's access in your "
                                "Google account and connect again")
-        _access.update(token=tok["access_token"], expires=time.time() + int(tok.get("expires_in", 3600)) - 60)
         channel = None
         ch = client.get(f"{API}/channels", params={"part": "snippet", "mine": "true"},
                         headers={"Authorization": f"Bearer {tok['access_token']}"})
@@ -128,11 +136,15 @@ def handle_callback(code: str, state: str, *, client: Optional[httpx.Client] = N
     finally:
         if own:
             client.close()
-    store.put_setting(CREDS_KEY, {
+    creds = {
         "refresh_token": secret_box.seal(refresh),
         "channel": channel,
         "connected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    })
+    }
+    store.put_setting(CREDS_KEY, creds)
+    _access.clear()
+    _access.update(token=tok["access_token"], key=_creds_key(creds),
+                   expires=time.time() + int(tok.get("expires_in", 3600)) - 60)
     return status()
 
 
@@ -149,9 +161,10 @@ def disconnect() -> None:
 
 
 def access_token(client: httpx.Client) -> str:
-    if _access.get("token") and time.time() < _access.get("expires", 0):
-        return _access["token"]
     creds = store.get_setting(CREDS_KEY) or {}
+    key = _creds_key(creds)
+    if _access.get("token") and _access.get("key") == key and time.time() < _access.get("expires", 0):
+        return _access["token"]
     refresh = secret_box.open_(creds.get("refresh_token", "")) if creds else None
     if not refresh:
         raise YouTubeError("YouTube isn't connected (or SESSION_SECRET changed) — connect in Settings")
@@ -163,7 +176,8 @@ def access_token(client: httpx.Client) -> str:
     if r.status_code >= 400:
         raise YouTubeError(f"token refresh failed ({r.status_code}): {r.text[:200]} — reconnect YouTube")
     tok = r.json()
-    _access.update(token=tok["access_token"], expires=time.time() + int(tok.get("expires_in", 3600)) - 60)
+    _access.clear()
+    _access.update(token=tok["access_token"], key=key, expires=time.time() + int(tok.get("expires_in", 3600)) - 60)
     return _access["token"]
 
 

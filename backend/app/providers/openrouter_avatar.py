@@ -43,7 +43,10 @@ class OpenRouterAvatarProvider:
     def animate(
         self, *, portrait_url: str, audio_url: str | None, script: str,
         aspect_ratio: str = "9:16", voice_id: str = "", motion_prompt: str = "",
+        duration_seconds: float | None = None,  # length follows the audio; the
+        # pipeline trims the result to the shot, so this isn't sent.
         poll_seconds: float = 5.0, timeout_seconds: float = 900.0,
+        **_: object,
     ) -> bytes:
         refs = [{"type": "image_url", "image_url": {"url": portrait_url}}]
         if audio_url:

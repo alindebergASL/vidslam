@@ -11,7 +11,7 @@ POST /api/publish-jobs/{id}/retry        resume a failed upload
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlencode
@@ -142,8 +142,12 @@ def retry(job_id: int, db: Session = Depends(get_db)) -> models.PublishJob:
     job = db.get(models.PublishJob, job_id)
     if job is None:
         raise HTTPException(404, "publish job not found")
-    if job.status not in ("failed", "queued"):
-        raise HTTPException(409, f"job is {job.status}")
+    # failed → retry. uploading with no progress for 15 min → the worker died
+    # mid-upload; the saved session URI lets it resume. queued is refused so
+    # a job can't be enqueued twice (two workers = two YouTube videos).
+    stale = job.status == "uploading" and job.updated_at < datetime.utcnow() - timedelta(minutes=15)
+    if job.status != "failed" and not stale:
+        raise HTTPException(409, f"job is {job.status}" + ("" if job.status != "uploading" else " (still active)"))
     job.status, job.error = "queued", ""
     db.commit()
     enqueue(publish_youtube_job, job.id)

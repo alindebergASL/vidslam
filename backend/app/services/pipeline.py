@@ -408,9 +408,21 @@ def _hero_portrait(db: Session, project: models.VideoProject) -> Optional[models
     return (heroes or avatar.assets)[0]
 
 
+def _shot_start(project: models.VideoProject, shot: models.VideoShot) -> float:
+    """Where `shot` starts in the voiceover: the summed length of the body
+    shots before it (end cards are appended after the voice)."""
+    t = 0.0
+    for s in project.shots:
+        if s.id == shot.id:
+            break
+        if s.shot_type != "end_card":
+            t += float(s.duration_seconds or 0)
+    return t
+
+
 def _talking_head_clip(
     db: Session, project: models.VideoProject, shot: models.VideoShot,
-    *, plan: StoryboardPlan, audio_path: str,
+    *, plan: StoryboardPlan, audio_path: str, start: float = 0.0,
 ) -> Optional[Path]:
     """Lip-synced talking-head clip from the avatar's portrait + voiceover,
     when a lip-sync model is active. Returns None (→ regular video clip)
@@ -432,19 +444,32 @@ def _talking_head_clip(
     shot.provider_model = getattr(avatar, "model", "")
     db.commit()
     try:
+        from .renderer import slice_audio, trim_clip
+
+        out_dir = storage.render_subdir(project.id)
+        dur = float(shot.duration_seconds or 5.0)
+        body = [s for s in project.shots if s.shot_type != "end_card"]
+        only_shot = len(body) == 1
         audio_url = None
         if audio_path and Path(audio_path).exists():
-            audio_url = public_media.publish(Path(audio_path), Path(audio_path).suffix.lstrip(".") or "m4a")
+            # Each talking-head shot speaks only its own part of the voiceover,
+            # so lips, captions and the voice track stay aligned.
+            seg = slice_audio(Path(audio_path), out_dir / f"voice_shot_{shot.id}.m4a", start=start, duration=dur)
+            audio_url = public_media.publish(seg, "m4a")
+        script = (plan.cleaned_voice_script if only_shot else "") or shot.caption_text or plan.cleaned_voice_script or shot.prompt
         data = avatar.animate(
             portrait_url=storage.public_url_for_token(portrait.public_token),
             audio_url=audio_url,
-            script=plan.cleaned_voice_script or shot.caption_text or shot.prompt,
+            script=script,
             aspect_ratio=project.aspect_ratio,
             motion_prompt=shot.camera_direction or "",
-            duration_seconds=shot.duration_seconds or 5.0,
+            duration_seconds=dur,
         )
-        out = storage.render_subdir(project.id) / f"shot_{shot.shot_order:02d}_{shot.id}.mp4"
-        out.write_bytes(data)
+        raw = out_dir / f"shot_{shot.shot_order:02d}_{shot.id}.raw.mp4"
+        raw.write_bytes(data)
+        out = out_dir / f"shot_{shot.shot_order:02d}_{shot.id}.mp4"
+        trim_clip(raw, out, duration=dur)  # avatar models size the clip to their audio/script
+        raw.unlink(missing_ok=True)
         shot.clip_path = str(out)
         shot.status = "completed"
         db.commit()
@@ -657,7 +682,8 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 continue
             clip = None
             if shot.shot_type == "talking_head":
-                clip = _talking_head_clip(db, project, shot, plan=plan, audio_path=render.audio_path)
+                clip = _talking_head_clip(db, project, shot, plan=plan, audio_path=render.audio_path,
+                                          start=_shot_start(project, shot))
             if clip is None:
                 clip = _ensure_clip_for_shot(db, project, shot)
             clip_paths.append(clip)

@@ -50,7 +50,8 @@ def finalize(db: Session, render: models.Render, final_path: Path, thumb_path: O
                 p.unlink()
             except OSError:
                 pass
-    s3.mirror_to_s3(video, content_type="video/mp4")
+    if not s3.mirror_to_s3(video, content_type="video/mp4") and get_settings().s3_bucket:
+        log.warning("render %s not mirrored to S3; it will be served from local disk", render.id)
     if render.thumbnail_path:
         s3.mirror_to_s3(Path(render.thumbnail_path), content_type="image/jpeg")
     db.commit()
@@ -69,8 +70,14 @@ def prune(db: Session, project_id: int) -> int:
         .order_by(models.Render.created_at.desc(), models.Render.id.desc())
         .all()
     )
+    busy = {
+        rid for (rid,) in db.query(models.PublishJob.render_id)
+        .filter(models.PublishJob.status.in_(("queued", "uploading"))).all()
+    }
     expired = 0
     for r in rows[keep:]:
+        if r.id in busy:
+            continue  # an upload is reading this file; prune it next time
         for attr in ("final_video_path", "thumbnail_path"):
             path = getattr(r, attr)
             if not path:
@@ -94,8 +101,9 @@ def prune(db: Session, project_id: int) -> int:
     return expired
 
 
-def delivery_url(path: str, content_type: str) -> Optional[str]:
-    """Presigned S3 URL for a render file, or None → serve locally."""
-    if not path:
+def delivery_url(path: str, content_type: str, download_name: Optional[str] = None) -> Optional[str]:
+    """Presigned S3 URL for a render file that is actually in the bucket,
+    or None → serve the local file."""
+    if not path or not s3.object_exists(Path(path)):
         return None
-    return s3.presigned_url_for(Path(path), content_type=content_type)
+    return s3.presigned_url_for(Path(path), content_type=content_type, download_name=download_name)

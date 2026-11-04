@@ -118,22 +118,28 @@ def extract_json(text: str) -> dict:
             except ValueError:
                 continue
     start = text.find("{")
-    depth, in_str, esc = 0, False, False
-    for i in range(start, len(text)) if start >= 0 else []:
-        c = text[i]
-        if in_str:
-            esc = (c == "\\") and not esc
-            if c == '"' and not esc:
-                in_str = False
-            elif c != "\\":
-                esc = False
-            continue
-        if c == '"':
-            in_str = True
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(text[start:i + 1])
+    while start >= 0:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            c = text[i]
+            if in_str:
+                if esc:
+                    esc = False          # this char is escaped (\", \\, …)
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+                continue
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except ValueError:
+                        break  # not JSON after all; try the next "{"
+        start = text.find("{", start + 1)
     raise ValueError(f"no JSON object in model reply: {text[:200]!r}")

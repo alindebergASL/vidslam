@@ -126,9 +126,23 @@ def publish_youtube_job(job_id: int) -> None:
 
     db = SessionLocal()
     try:
-        job = db.get(models.PublishJob, job_id)
-        if job is None:
+        # Claim the job atomically: only a queued/failed/stale job moves to
+        # "uploading", so a duplicate enqueue can't start a second upload.
+        from datetime import datetime, timedelta
+
+        stale = datetime.utcnow() - timedelta(minutes=15)
+        claimed = (
+            db.query(models.PublishJob)
+            .filter(models.PublishJob.id == job_id)
+            .filter((models.PublishJob.status.in_(("queued", "failed")))
+                    | ((models.PublishJob.status == "uploading") & (models.PublishJob.updated_at < stale)))
+            .update({"status": "uploading", "updated_at": datetime.utcnow()}, synchronize_session=False)
+        )
+        db.commit()
+        if not claimed:
+            log.info("publish job %s already handled or in progress; skipping", job_id)
             return
+        job = db.get(models.PublishJob, job_id)
         try:
             youtube.upload(db, job)
         except Exception as e:  # noqa: BLE001

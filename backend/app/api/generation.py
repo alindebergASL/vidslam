@@ -386,7 +386,7 @@ def download_render(render_id: int, db: Session = Depends(get_db)) -> FileRespon
     r = db.get(models.Render, render_id)
     if r is None or not r.final_video_path or not Path(r.final_video_path).exists():
         raise HTTPException(404, "render not ready")
-    url = render_files.delivery_url(r.final_video_path, "video/mp4")
+    url = render_files.delivery_url(r.final_video_path, "video/mp4", download_name=f"avatar-video-{render_id}.mp4")
     if url:
         # Hour-long MP4s are 50–500 MB; let S3 (or a CDN in front) serve them.
         return RedirectResponse(url, status_code=302)

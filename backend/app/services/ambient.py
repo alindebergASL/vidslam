@@ -572,8 +572,18 @@ def create_scene(db: Session, body: AmbientCreate) -> models.VideoProject:
 def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate) -> models.VideoProject:
     if body.title is not None:
         project.title = body.title.strip()
+    aspect_changed = body.aspect_ratio is not None and body.aspect_ratio != project.aspect_ratio
     if body.aspect_ratio is not None:
         project.aspect_ratio = body.aspect_ratio
+    if aspect_changed:
+        # The clip was generated (and drift stills rendered) for the old
+        # aspect; reusing it would letterbox it into the new frame.
+        shot = _loop_shot(project)
+        if shot is not None and shot.clip_path:
+            shot.status, shot.clip_path, shot.error = "pending", "", ""
+            data = dict(project.ambient_config_json or {})
+            data.pop(_GENERATED_KEY, None)
+            project.ambient_config_json = data
     if body.config is not None:
         cfg = body.config
         resolve_scene_prompt(cfg)
@@ -779,6 +789,9 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
         else:
             generated = _generate_video_chain(db, project, shot, cfg, plan)
 
+        # Record what this generation cost once, here, not on every render.
+        generated["estimated_cost"] = estimate_ambient_cost(cfg, plan)["total"]
+        generated["billed"] = 0.0 if settings.video_is_mocked() else generated["estimated_cost"]
         data = dict(project.ambient_config_json or {})
         data[_GENERATED_KEY] = generated
         project.ambient_config_json = data
@@ -831,11 +844,9 @@ def render_scene(db: Session, project_id: int) -> models.Render:
     closed = bool(gen.get("closed"))
 
     settings = get_settings()
-    render = models.Render(
-        project_id=project.id,
-        status="rendering",
-        estimated_cost=estimate_ambient_cost(cfg)["total"],
-    )
+    # Tiling is local FFmpeg work: nothing is billed at render time. The
+    # provider spend was incurred (and recorded) when the loop was generated.
+    render = models.Render(project_id=project.id, status="rendering", estimated_cost=0.0)
     db.add(render)
     project.status = "generating"
     db.commit()
@@ -880,8 +891,7 @@ def render_scene(db: Session, project_id: int) -> models.Render:
             f"res={cfg.output_resolution} "
             f"seam={'closed' if closed else 'crossfade'}\n" + outputs.log[-7000:]
         )
-        # Nothing is billed at render time — providers were paid in generate_loop.
-        render.actual_cost = 0.0 if settings.video_is_mocked() else render.estimated_cost
+        render.actual_cost = 0.0
         render.status = "completed"
         project.status = "completed"
         db.commit()
