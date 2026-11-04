@@ -78,28 +78,16 @@ def _alembic_config():
 
 
 def migrate() -> str:
-    """Bring a non-SQLite database to the latest Alembic revision.
-
-    - Fresh database             → `alembic upgrade head` (creates everything)
-    - Already under Alembic      → `alembic upgrade head` (applies new revisions)
-    - Tables but no version table (created by an older build's create_all)
-                                 → create any missing tables, then stamp head
-    Returns what happened, for the boot log."""
+    """Bring a Postgres database to the latest Alembic revision. Several
+    processes (web workers, the RQ worker) boot at once, so this holds a
+    Postgres advisory lock: one migrates, the others wait and find it done."""
     from alembic import command
-    from sqlalchemy import inspect, text
-
-    from . import models  # noqa: F401
+    from sqlalchemy import text
 
     cfg = _alembic_config()
     with engine.connect() as conn:
         conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _MIGRATION_LOCK_ID})
         try:
-            tables = set(inspect(conn).get_table_names())
-            if tables and "alembic_version" not in tables:
-                Base.metadata.create_all(bind=conn)
-                conn.commit()
-                command.stamp(cfg, "head")
-                return "stamped existing schema at head"
             command.upgrade(cfg, "head")
             return "upgraded to head"
         finally:

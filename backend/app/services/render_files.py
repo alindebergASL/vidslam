@@ -83,10 +83,6 @@ def prune(db: Session, project_id: int) -> int:
             if not path:
                 continue
             p = Path(path)
-            # Never delete a file a newer render still points at (legacy
-            # rows from before versioning all share final.mp4).
-            if any(getattr(k, attr) == path for k in rows[:keep]):
-                continue
             s3.delete_from_s3(p)
             try:
                 p.unlink(missing_ok=True)

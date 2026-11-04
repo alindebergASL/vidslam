@@ -6,7 +6,6 @@ from ..config import get_settings
 from .base import (
     ChatProvider,
     ImageProvider,
-    LipSyncProvider,
     MusicProvider,
     TrainingProvider,
     TTSProvider,
@@ -120,14 +119,6 @@ def get_music() -> MusicProvider:
 
     # "elevenlabs" = configured default model; "elevenlabs/<model_id>" pins one.
     return ElevenLabsMusicProvider(model_id=model.split("/", 1)[1] if model.startswith("elevenlabs/") else None)
-
-
-def get_lipsync() -> LipSyncProvider:
-    # Kept for the legacy render(source_video, target_audio) slot; the
-    # talking-head path uses get_avatar() below.
-    from .mock_lipsync import MockLipSyncProvider
-
-    return MockLipSyncProvider()
 
 
 def get_avatar():

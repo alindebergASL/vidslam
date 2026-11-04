@@ -37,7 +37,7 @@ services:
   # Production database. SQLite (the dev default) is shared by several
   # processes here — web workers, the RQ worker, the catalog poller — and
   # serializes every write; Postgres doesn't. Migrations run at backend boot
-  # (advisory-locked). Moving existing data: see docs/postgres.md.
+  # (advisory-locked). See docs/postgres.md.
   postgres:
     image: postgres:17-alpine
     restart: unless-stopped
