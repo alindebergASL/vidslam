@@ -97,7 +97,7 @@ export type SystemInfo = {
   data_dir: string;
   public_base_url: string;
   redis_configured: boolean;
-  keys: { openrouter: boolean; elevenlabs: boolean };
+  keys: { openrouter: boolean; elevenlabs: boolean; gemini?: boolean };
   models: {
     chat: string | null;
     image: string | null;
@@ -357,8 +357,66 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   chain_segments: true,
 };
 
+// --- Model catalog + runtime switching ---
+
+export type ModelKind = "chat" | "image" | "video" | "tts" | "music" | "lipsync";
+
+export type CatalogEntry = {
+  id: string;
+  kind: ModelKind;
+  name: string;
+  provider: "openrouter" | "gemini" | "elevenlabs";
+  description: string;
+  usable: boolean;
+  new: boolean;
+  active?: boolean;
+  created?: number | null;
+  context_length?: number | null;
+  pricing?: Record<string, number>;
+  supported_parameters?: string[];
+  supported_voices?: string[];
+  output_modalities?: string[];
+  durations?: number[];
+  max_seconds?: number | null;
+  frame_images?: string[];
+  resolutions?: string[];
+  pricing_skus?: Record<string, string>;
+};
+
+export type ActiveModel = {
+  model: string;
+  provider: string;
+  default: string;
+  is_default: boolean;
+  options: Record<string, string>;
+};
+
+export type ModelCatalog = {
+  fetched_at: string | null;
+  entries: CatalogEntry[];
+  errors: Record<string, string>;
+  counts: Partial<Record<ModelKind, number>>;
+  new_count: number;
+  active: Record<ModelKind, ActiveModel>;
+};
+
 export const api = {
   base: API_BASE,
+
+  // model catalog
+  modelCatalog: (kind?: ModelKind) =>
+    req<ModelCatalog>(`/api/models/catalog${kind ? `?kind=${kind}` : ""}`),
+  refreshModels: () => req<ModelCatalog>("/api/models/refresh", { method: "POST" }),
+  activeModels: () => req<Record<ModelKind, ActiveModel>>("/api/models/active"),
+  setActiveModel: (
+    kind: ModelKind,
+    model: string | null,
+    opts: { allow_unlisted?: boolean; options?: Record<string, string> } = {}
+  ) =>
+    req<Record<ModelKind, ActiveModel>>("/api/models/active", {
+      method: "PUT",
+      body: JSON.stringify({ kind, model, allow_unlisted: !!opts.allow_unlisted, options: opts.options }),
+    }),
 
   // ambient
   ambientPresets: () => req<AmbientPresets>("/api/ambient/presets"),

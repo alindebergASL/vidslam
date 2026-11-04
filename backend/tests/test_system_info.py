@@ -12,7 +12,7 @@ def test_system_info_reports_mock_and_counts(auth_client):
     assert info["mock_providers"] is True
     assert info["ffmpeg_available"] is True  # installed in the test env
     # In mock mode, keys are absent and that's fine.
-    assert info["keys"] == {"openrouter": False, "elevenlabs": False}
+    assert info["keys"] == {"openrouter": False, "elevenlabs": False, "gemini": False}
     assert info["counts"]["avatars"] >= 1
     assert info["counts"]["brand_kits"] >= 1
     # Never leak secret values — only model ids / booleans.

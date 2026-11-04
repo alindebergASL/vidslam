@@ -14,6 +14,7 @@ from ..providers import get_chat, get_tts, get_video
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
 from . import storage
+from .model_registry import active_model as _active_model
 from .captions import chunks_to_timed
 from .renderer import RenderInputs, compose
 
@@ -315,7 +316,7 @@ def _ensure_clip_for_shot(
     # over the deployment-wide default.
     model = _resolve_model(
         db,
-        shot.model_override or settings_local.openrouter_video_model or "mock/video-default",
+        shot.model_override or _active_model("video"),
     )
 
     shot.status = "submitted"
@@ -388,6 +389,79 @@ def _ensure_clip_for_shot(
             status="error",
         )
         raise
+
+
+def _hero_portrait(db: Session, project: models.VideoProject) -> Optional[models.Asset]:
+    """The primary avatar's hero image (or first image) — the face a
+    talking-head model animates."""
+    avatar = db.get(models.Avatar, project.primary_avatar_id) if project.primary_avatar_id else None
+    if avatar is None:
+        for cm in project.cast_members:
+            if cm.member_kind == "avatar" and cm.avatar is not None:
+                avatar = cm.avatar
+                break
+    if avatar is None or not avatar.assets:
+        return None
+    heroes = [a for a in avatar.assets if a.asset_type == "hero"]
+    return (heroes or avatar.assets)[0]
+
+
+def _talking_head_clip(
+    db: Session, project: models.VideoProject, shot: models.VideoShot,
+    *, plan: StoryboardPlan, audio_path: str,
+) -> Optional[Path]:
+    """Lip-synced talking-head clip from the avatar's portrait + voiceover,
+    when a lip-sync model is active. Returns None (→ regular video clip)
+    when lip-sync is off, there's no portrait, or the provider fails."""
+    from ..providers import get_avatar
+    from . import public_media
+
+    if shot.clip_path and Path(shot.clip_path).exists() and shot.status == "completed":
+        return Path(shot.clip_path)
+    avatar = get_avatar()
+    if avatar is None:
+        return None
+    portrait = _hero_portrait(db, project)
+    if portrait is None:
+        log.info("talking-head lip-sync skipped for shot %s: no avatar image", shot.id)
+        return None
+    shot.status = "submitted"
+    shot.provider = "lipsync"
+    shot.provider_model = getattr(avatar, "model", "")
+    db.commit()
+    try:
+        audio_url = None
+        if audio_path and Path(audio_path).exists():
+            audio_url = public_media.publish(Path(audio_path), Path(audio_path).suffix.lstrip(".") or "m4a")
+        data = avatar.animate(
+            portrait_url=storage.public_url_for_token(portrait.public_token),
+            audio_url=audio_url,
+            script=plan.cleaned_voice_script or shot.caption_text or shot.prompt,
+            aspect_ratio=project.aspect_ratio,
+            motion_prompt=shot.camera_direction or "",
+            duration_seconds=shot.duration_seconds or 5.0,
+        )
+        out = storage.render_subdir(project.id) / f"shot_{shot.shot_order:02d}_{shot.id}.mp4"
+        out.write_bytes(data)
+        shot.clip_path = str(out)
+        shot.status = "completed"
+        db.commit()
+        _log_provider_call(
+            db, project_id=project.id, provider=type(avatar).__name__, endpoint="avatar.animate",
+            request_summary={"model": shot.provider_model, "shot": shot.id, "audio": bool(audio_url)},
+            response_summary={"bytes": len(data)},
+        )
+        return out
+    except Exception as e:  # noqa: BLE001
+        log.warning("talking-head lip-sync failed for shot %s, falling back: %s", shot.id, e)
+        _log_provider_call(
+            db, project_id=project.id, provider=type(avatar).__name__, endpoint="avatar.animate",
+            request_summary={"shot": shot.id}, response_summary={"error": str(e)[:500]}, status="error",
+        )
+        shot.status = "pending"
+        shot.error = f"lip-sync failed, used video model instead: {str(e)[:300]}"
+        db.commit()
+        return None
 
 
 def generate_audio(
@@ -579,7 +653,11 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 shot.status = "completed"
                 db.commit()
                 continue
-            clip = _ensure_clip_for_shot(db, project, shot)
+            clip = None
+            if shot.shot_type == "talking_head":
+                clip = _talking_head_clip(db, project, shot, plan=plan, audio_path=render.audio_path)
+            if clip is None:
+                clip = _ensure_clip_for_shot(db, project, shot)
             clip_paths.append(clip)
 
         if not clip_paths:
@@ -834,7 +912,7 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             image = get_image()
             model = _resolve_model(
                 db,
-                job.provider_model or settings.openrouter_image_model or "mock/image-default",
+                job.provider_model or _active_model("image"),
             )
             job.provider = "mock" if settings.image_is_mocked() else "openrouter"
             job.provider_model = model
@@ -848,7 +926,7 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             video = get_video()
             model = _resolve_model(
                 db,
-                job.provider_model or settings.openrouter_video_model or "mock/video-default",
+                job.provider_model or _active_model("video"),
             )
             job.provider = "mock" if settings.video_is_mocked() else "openrouter"
             job.provider_model = model

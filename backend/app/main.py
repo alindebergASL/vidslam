@@ -88,7 +88,18 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         log.info("initializing database at %s", settings.database_url)
         init_db()
+        # Keep the model catalog fresh in the background (skipped under
+        # pytest so tests never make network calls).
+        import sys
+
+        from .services import model_catalog
+
+        started = False
+        if "pytest" not in sys.modules:
+            started = model_catalog.start_poller()
         yield
+        if started:
+            model_catalog.stop_poller()
 
     app = FastAPI(title="AvatarVideoStudio API", version="0.1.0", lifespan=lifespan)
     # Order matters: Starlette runs middlewares in reverse-add order, so adding

@@ -69,6 +69,25 @@ month's OpenRouter image catalogue, so choose from its image-model listing.
 | Mubert API | not integrated | Built for long-form generative ambient; worth adding if a 90s bed repeats too audibly over an hour. |
 | Stable Audio | not integrated | Alternatives behind the same `MusicProvider` interface. |
 
+## Switching models (Settings → Models)
+
+The **Models** panel lists what's available *right now*, polled from
+OpenRouter (`/models`, `/images/models`, `/videos/models`) and, with a
+Gemini key, Google's model list. It refreshes every
+`MODEL_CATALOG_REFRESH_HOURS` (default 6) and on **Refresh now**; models that
+appeared since the previous poll get a **new** badge. Pick one per kind and
+it applies to the next job, no restart needed. `.env` values are the
+defaults that **Reset to default** returns to.
+
+| Kind | Options |
+| --- | --- |
+| Planner | Any OpenRouter text model, Claude included. JSON mode is used only where the model advertises `response_format`; otherwise the reply's JSON is extracted from plain text. |
+| Image | OpenRouter Image API models (`POST /images`). |
+| Video | Any OpenRouter video generator; loop planning uses each model's limits. |
+| Voice | **ElevenLabs** (per-avatar voices), OpenRouter **speech** models (`/audio/speech`: gpt-4o-mini-tts, Gemini TTS, HeyGen Voice, …), or **gpt-audio** models (streamed chat audio). The voice is chosen in the panel. |
+| Music | **ElevenLabs** or **Google Lyria** (`lyria-3.5`: full tracks of a couple of minutes; `lyria-3-clip-preview`: 30s). |
+| Lip-sync | Off, or **heygen/avatar-iv**: Talking Head shots are made from the avatar's hero photo plus the voiceover. **Experimental**: OpenRouter doesn't document how Avatar IV receives speech, so the app sends the portrait, the voiceover (as an audio reference) and the script, and falls back to the regular video model if the job fails. |
+
 ## Settings
 
 ```bash
@@ -76,7 +95,8 @@ MOCK_PROVIDERS=false
 OPENROUTER_API_KEY=sk-or-...
 OPENROUTER_VIDEO_MODEL=alibaba/wan-3.0      # or per scene: Advanced → Video model
 OPENROUTER_IMAGE_MODEL=<image model id>     # anchor stills + Still+drift
-ELEVENLABS_API_KEY=...                      # music bed
+ELEVENLABS_API_KEY=...                      # ElevenLabs voices / music
+GEMINI_API_KEY=...                          # Google Lyria music
 PUBLIC_BASE_URL=https://your-host           # providers fetch anchor/first frames from here
 AMBIENT_DEFAULT_MAX_CLIP_SECONDS=10         # only used if a model's limits can't be read
 ```

@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
+import { ModelsPanel } from "@/components/ModelsPanel";
 import { api, SystemInfo } from "@/lib/api";
 
 export default function SettingsPage() {
@@ -41,7 +42,7 @@ function Inner() {
     <div className="p-8 max-w-4xl">
       <header className="mb-6">
         <h1 className="text-3xl font-semibold tracking-tight">Settings & Status</h1>
-        <p className="text-ink-300 mt-1">Deployment overview and provider connectivity.</p>
+        <p className="text-ink-300 mt-1">Models, provider connectivity and deployment overview.</p>
       </header>
 
       {error && <div className="text-sm text-accent mb-4">{error}</div>}
@@ -80,6 +81,8 @@ function Inner() {
         )}
       </section>
 
+      <ModelsPanel />
+
       {info && (
         <>
           <section className="card p-4 mb-6">
@@ -106,13 +109,13 @@ function Inner() {
               <KeyRow
                 name="OPENROUTER_API_KEY"
                 set={info.keys.openrouter}
-                surface="chat / image / video planning"
+                surface="planner, image, video, OpenRouter voices, Avatar IV lip-sync"
                 warn={!info.keys.openrouter && !info.mock_providers}
               />
               <KeyRow
                 name="ELEVENLABS_API_KEY"
                 set={info.keys.elevenlabs}
-                surface="voiceover (TTS) / music"
+                surface="ElevenLabs voices / ElevenLabs music"
                 warn={false}
                 note={
                   info.keys.elevenlabs
@@ -120,18 +123,13 @@ function Inner() {
                     : "Voiceover falls back to silent mock; music to a mock generator."
                 }
               />
+              <KeyRow
+                name="GEMINI_API_KEY"
+                set={!!info.keys.gemini}
+                surface="Google Lyria music"
+                warn={false}
+              />
             </div>
-          </section>
-
-          <section className="card p-4 mb-6">
-            <h2 className="text-lg font-medium mb-3">Configured models</h2>
-            <dl className="grid grid-cols-2 md:grid-cols-3 gap-y-3 gap-x-4 text-sm">
-              <Row label="Chat" value={info.models.chat || "—"} />
-              <Row label="Image" value={info.models.image || "auto"} />
-              <Row label="Video" value={info.models.video || "auto"} />
-              <Row label="TTS" value={info.models.tts || "—"} />
-              <Row label="Music" value={info.models.music || "default"} />
-            </dl>
           </section>
 
           <section className="card p-4">

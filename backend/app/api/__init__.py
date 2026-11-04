@@ -8,6 +8,7 @@ from . import (
     brand_kits,
     generation,
     ingredients,
+    models_api,
     project_audio,
     projects,
     providers,
@@ -31,6 +32,7 @@ api_router.include_router(providers.router, prefix="/api/providers", tags=["prov
 api_router.include_router(system.router, prefix="/api/system", tags=["system"])
 api_router.include_router(training.router, prefix="/api", tags=["training"])
 api_router.include_router(ambient.router, prefix="/api/ambient", tags=["ambient"])
+api_router.include_router(models_api.router, prefix="/api/models", tags=["models"])
 api_router.include_router(ambient.public_router, prefix="/api", tags=["public"])
 
 __all__ = ["api_router"]

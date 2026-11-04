@@ -1,4 +1,5 @@
 from .registry import (
+    get_avatar,
     get_chat,
     get_image,
     get_lipsync,
@@ -11,6 +12,7 @@ from .registry import (
 )
 
 __all__ = [
+    "get_avatar",
     "get_chat",
     "get_image",
     "get_lipsync",

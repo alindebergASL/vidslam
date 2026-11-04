@@ -43,9 +43,23 @@ def _format_user_payload(project: dict, cast: CastContext) -> str:
 
 
 class OpenRouterChatProvider(ChatProvider):
-    def __init__(self, *, api_key: str | None = None, model: str | None = None) -> None:
+    def __init__(self, *, api_key: str | None = None, model: str | None = None,
+                 json_mode: bool | None = None) -> None:
         self.api_key = api_key or settings.openrouter_api_key
         self.model = model or settings.openrouter_chat_model
+        # None = decide from the catalog entry's supported_parameters
+        # (unknown model → assume JSON mode, the historic behavior, except
+        # for Anthropic models where support is unverified).
+        if json_mode is None:
+            from ..services.model_catalog import find
+
+            entry = find("chat", self.model) or {}
+            params = entry.get("supported_parameters")
+            if params:
+                json_mode = "response_format" in params
+            else:
+                json_mode = not self.model.startswith("anthropic/")
+        self.json_mode = json_mode
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY missing for real chat provider")
 
@@ -58,20 +72,68 @@ class OpenRouterChatProvider(ChatProvider):
         }
 
     def generate_storyboard(self, *, project: dict, cast: CastContext) -> StoryboardPlan:
-        body = {
+        body: dict = {
             "model": self.model,
-            "response_format": {"type": "json_object"},
             "temperature": 0.4,
             "messages": [
                 {"role": "system", "content": _load_system_prompt()},
                 {"role": "user", "content": _format_user_payload(project, cast)},
             ],
         }
+        # JSON mode only where the model advertises it (OpenRouter
+        # supported_parameters); Claude and others get plain prompting and
+        # the reply is parsed leniently. A 400 naming response_format also
+        # falls back to plain prompting.
+        if self.json_mode:
+            body["response_format"] = {"type": "json_object"}
         url = f"{settings.openrouter_base_url.rstrip('/')}/chat/completions"
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=180.0) as client:
             r = client.post(url, headers=self._headers(), json=body)
+            if r.status_code == 400 and "response_format" in body and "response_format" in r.text:
+                body.pop("response_format")
+                r = client.post(url, headers=self._headers(), json=body)
             r.raise_for_status()
             data = r.json()
         content = data["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-        return StoryboardPlan.model_validate(parsed)
+        if isinstance(content, list):  # content-parts shape
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        return StoryboardPlan.model_validate(extract_json(content))
+
+
+def extract_json(text: str) -> dict:
+    """Parse a JSON object out of a model reply: bare JSON, a ```json fenced
+    block, or the first balanced {...} span amid prose."""
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    if "```" in text:
+        for part in text.split("```")[1::2]:
+            part = part.strip()
+            if part.lower().startswith("json"):
+                part = part[4:].strip()
+            try:
+                return json.loads(part)
+            except ValueError:
+                continue
+    start = text.find("{")
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)) if start >= 0 else []:
+        c = text[i]
+        if in_str:
+            esc = (c == "\\") and not esc
+            if c == '"' and not esc:
+                in_str = False
+            elif c != "\\":
+                esc = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError(f"no JSON object in model reply: {text[:200]!r}")

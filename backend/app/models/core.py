@@ -351,3 +351,15 @@ class ProviderLog(Base):
     cost: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(40), default="ok")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class AppSetting(Base):
+    """Small key/value store for runtime settings the UI can change without a
+    redeploy — chiefly the active model per capability ("model.video" →
+    "alibaba/wan-3.0") and the last polled model catalog snapshot."""
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

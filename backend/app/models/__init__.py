@@ -1,4 +1,5 @@
 from .core import (
+    AppSetting,
     Asset,
     AssetGenerationJob,
     Avatar,
@@ -15,6 +16,7 @@ from .core import (
 )
 
 __all__ = [
+    "AppSetting",
     "Asset",
     "AssetGenerationJob",
     "Avatar",

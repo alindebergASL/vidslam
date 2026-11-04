@@ -36,6 +36,16 @@ router = APIRouter(dependencies=[Depends(require_auth)])
 public_router = APIRouter()
 
 
+@public_router.get("/public-media/{name}")
+def public_media_file(name: str) -> FileResponse:
+    from ..services import public_media
+
+    hit = public_media.resolve(name)
+    if hit is None:
+        raise HTTPException(404, "not found")
+    return FileResponse(hit[0], media_type=hit[1])
+
+
 @public_router.get("/public-ambient-frames/{token}")
 def public_frame(token: str) -> FileResponse:
     path = svc.frame_path_for_token(token)

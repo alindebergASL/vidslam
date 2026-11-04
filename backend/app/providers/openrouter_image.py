@@ -13,10 +13,8 @@ settings = get_settings()
 class OpenRouterImageProvider(ImageProvider):
     """Thin adapter for OpenRouter's image generation endpoint.
 
-    OpenRouter exposes image models behind an OpenAI-compatible `/images/generations`-style
-    surface; we keep this generic so it works with any image model exposed via OpenRouter
-    (or a custom OPENROUTER_IMAGE_MODEL slug). If the response shape differs, only the
-    parsing here needs to change — the rest of the app is unaffected.
+    Uses OpenRouter's Image API (docs/guides/overview/multimodal/image-generation):
+    POST /images → base64 in data[].b64_json; models listed at GET /images/models.
     """
 
     def __init__(self, *, api_key: str | None = None, model: str | None = None) -> None:
@@ -34,24 +32,17 @@ class OpenRouterImageProvider(ImageProvider):
         }
 
     def list_models(self) -> list[ModelInfo]:
-        url = f"{settings.openrouter_base_url.rstrip('/')}/models"
+        # Dedicated listing for the Image API (GET /images/models).
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/images/models"
         with httpx.Client(timeout=30.0) as client:
             r = client.get(url, headers=self._headers())
             r.raise_for_status()
             data = r.json()
-        out: list[ModelInfo] = []
-        for m in data.get("data", []):
-            modality = (m.get("architecture", {}) or {}).get("modality", "")
-            if "image" in (modality or "").lower():
-                out.append(
-                    ModelInfo(
-                        id=m.get("id", ""),
-                        name=m.get("name", m.get("id", "")),
-                        modality="image",
-                        description=m.get("description", "") or "",
-                    )
-                )
-        return out
+        return [
+            ModelInfo(id=m.get("id", ""), name=m.get("name", m.get("id", "")), modality="image",
+                      description=m.get("description", "") or "")
+            for m in data.get("data", []) if m.get("id")
+        ]
 
     def generate(
         self,
@@ -62,17 +53,19 @@ class OpenRouterImageProvider(ImageProvider):
         negative_prompt: str = "",
         settings: dict | None = None,
     ) -> bytes:
-        url = f"{get_settings().openrouter_base_url.rstrip('/')}/images/generations"
+        # Image API: POST /images {model, prompt, aspect_ratio?, n,
+        # input_references?} → {data: [{b64_json, media_type}]}.
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/images"
         body: dict = {
             "model": model or self.model,
-            "prompt": prompt,
+            "prompt": prompt if not negative_prompt else f"{prompt}\nAvoid: {negative_prompt}",
             "n": 1,
         }
-        if negative_prompt:
-            body["negative_prompt"] = negative_prompt
         if references:
-            # Pass tokenized public URLs the provider can fetch.
-            body["input_references"] = [{"url": r.url, "role": r.role} for r in references]
+            # Tokenized public URLs the provider can fetch.
+            body["input_references"] = [
+                {"type": "image_url", "image_url": {"url": r.url}} for r in references
+            ]
         if settings:
             body.update(settings)
         with httpx.Client(timeout=180.0) as client:

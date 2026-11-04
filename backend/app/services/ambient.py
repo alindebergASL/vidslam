@@ -36,6 +36,7 @@ from ..schemas.ambient import (
 )
 from ..schemas.api import RenderOut, ShotOut
 from . import storage
+from .model_registry import active_model as _active_model
 from .renderer import (
     AmbientRenderInputs,
     _dims_for_aspect,
@@ -211,7 +212,7 @@ CLOSED_SEAM_CROSSFADE = 0.5
 
 def _video_model_for(cfg: AmbientConfig) -> str:
     s = get_settings()
-    return cfg.model_override or s.openrouter_video_model or "mock/video-default"
+    return cfg.model_override or _active_model("video")
 
 
 def _segments_for(target: int, caps: VideoCapabilities) -> list[int]:
@@ -235,7 +236,7 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
         loop = float(cfg.loop_seconds)
         repeats = max(1, math.ceil(cfg.total_seconds / loop))
         return LoopPlanOut(
-            model=cfg.model_override or get_settings().openrouter_image_model or "mock/image-default",
+            model=cfg.model_override or _active_model("image"),
             max_clip_seconds=cfg.loop_seconds, caps_known=True, supports_last_frame=False,
             strategy="drift", segments=[cfg.loop_seconds], anchored=False, closed=True,
             join_crossfade=0.0, seam_crossfade=0.0, loop_seconds=loop, unit_seconds=loop,
@@ -566,7 +567,7 @@ def _generate_video_chain(
     anchor_url: Optional[str] = None
     if plan.anchored:
         image = get_image()
-        img_model = _resolve_model(db, settings.openrouter_image_model or "mock/image-default")
+        img_model = _resolve_model(db, _active_model("image"))
         still_prompt = (cfg.scene_prompt.strip() or (_PRESET_BY_ID.get(cfg.scene_preset).prompt
                         if _PRESET_BY_ID.get(cfg.scene_preset) else "")) + \
             " Wide establishing shot, no people, no text, photorealistic, highly detailed."
@@ -650,7 +651,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
         if cfg.source == "image_drift":
             image = get_image()
             model = _resolve_model(
-                db, cfg.model_override or settings.openrouter_image_model or "mock/image-default"
+                db, cfg.model_override or _active_model("image")
             )
             shot.status = "submitted"
             shot.provider = "mock" if settings.image_is_mocked() else "openrouter"

@@ -49,6 +49,16 @@ class Settings(BaseSettings):
     # Ambient loops longer than this are built from chained segments.
     ambient_default_max_clip_seconds: int = 10
 
+    # Google Gemini API (Lyria music). Optional; enables google/lyria-* music
+    # models in the catalog.
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_api_revision: str = "2026-05-20"
+
+    # Model catalog: how often the background poller refreshes the list of
+    # available models from OpenRouter (and Gemini). 0 disables polling.
+    model_catalog_refresh_hours: float = 6.0
+
     # elevenlabs
     elevenlabs_api_key: str = ""
     elevenlabs_default_voice_id: str = ""

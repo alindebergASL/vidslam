@@ -64,6 +64,8 @@ def test_provider_status_endpoint(auth_client):
     assert r.status_code == 200
     body = r.json()
     # All channels should be mocked in tests.
+    models = body.pop("models")
+    assert models["video"] == "mock/video-default" and models["lipsync"] == ""
     assert body == {
         "mock_providers_env": True,
         "chat": "mock",
@@ -71,9 +73,8 @@ def test_provider_status_endpoint(auth_client):
         "video": "mock",
         "tts": "mock",
         "music": "mock",
-        # The lipsync slot is a Protocol with only a mock impl for now —
-        # surfaced in status so a future real adapter is observable.
-        "lipsync": "mock",
+        # Lip-sync is off until a model (e.g. heygen/avatar-iv) is selected.
+        "lipsync": "off",
         # Custom-model training routes by kind: voice clones go through
         # ElevenLabs when the key is set, LoRAs through Replicate.
         # Both default to the mock training provider in tests.

@@ -14,34 +14,46 @@ from .base import (
 _settings = get_settings()
 
 
+def _active(kind: str) -> tuple[str, str]:
+    """(model, provider) for `kind`, read at call time so a switch in the
+    Settings page applies to the next job without a restart."""
+    from ..services import model_registry as reg
+
+    model = reg.active_model(kind)
+    return model, reg.provider_for(kind, model)
+
+
 def get_chat() -> ChatProvider:
-    if _settings.chat_is_mocked():
+    model, provider = _active("chat")
+    if provider == "mock":
         from .mock_chat import MockChatProvider
 
         return MockChatProvider()
     from .openrouter_chat import OpenRouterChatProvider
 
-    return OpenRouterChatProvider()
+    return OpenRouterChatProvider(model=model)
 
 
 def get_image() -> ImageProvider:
-    if _settings.image_is_mocked():
+    model, provider = _active("image")
+    if provider == "mock":
         from .mock_image import MockImageProvider
 
         return MockImageProvider()
     from .openrouter_image import OpenRouterImageProvider
 
-    return OpenRouterImageProvider()
+    return OpenRouterImageProvider(model=model)
 
 
 def get_video() -> VideoProvider:
-    if _settings.video_is_mocked():
+    model, provider = _active("video")
+    if provider == "mock":
         from .mock_video import get_singleton
 
         return get_singleton()
     from .openrouter_video import OpenRouterVideoProvider
 
-    return OpenRouterVideoProvider()
+    return OpenRouterVideoProvider(model=model)
 
 
 def video_capabilities(model: str = "") -> "VideoCapabilities":
@@ -61,31 +73,65 @@ def video_capabilities(model: str = "") -> "VideoCapabilities":
 
 
 def get_tts() -> TTSProvider:
-    if _settings.tts_is_mocked():
+    from ..services import model_catalog
+    from ..services import model_registry as reg
+
+    model, provider = _active("tts")
+    if provider == "mock":
         from .mock_tts import MockTTSProvider
 
         return MockTTSProvider()
+    if provider == "openrouter":
+        from .openrouter_tts import OpenRouterTTSProvider
+
+        entry = model_catalog.find("tts", model) or {}
+        outs = entry.get("output_modalities") or []
+        return OpenRouterTTSProvider(
+            model=model,
+            voice=reg.active_options("tts").get("voice", ""),
+            voices=entry.get("supported_voices") or [],
+            chat_audio=("audio" in outs and "speech" not in outs) if outs else None,
+        )
     from .elevenlabs_tts import ElevenLabsTTSProvider
 
     return ElevenLabsTTSProvider()
 
 
 def get_music() -> MusicProvider:
-    if _settings.music_is_mocked():
+    model, provider = _active("music")
+    if provider == "mock":
         from .mock_music import MockMusicProvider
 
         return MockMusicProvider()
+    if provider == "gemini":
+        from .lyria_music import LyriaMusicProvider
+
+        return LyriaMusicProvider(model=model)
     from .elevenlabs_music import ElevenLabsMusicProvider
 
     return ElevenLabsMusicProvider()
 
 
 def get_lipsync() -> LipSyncProvider:
-    # No real provider yet; the slot exists so a drop-in (Wav2Lip / D-ID /
-    # HeyGen) only has to implement LipSyncProvider + flip a feature flag.
+    # Kept for the legacy render(source_video, target_audio) slot; the
+    # talking-head path uses get_avatar() below.
     from .mock_lipsync import MockLipSyncProvider
 
     return MockLipSyncProvider()
+
+
+def get_avatar():
+    """Portrait → talking-head clip provider, or None when lip-sync is off."""
+    model, provider = _active("lipsync")
+    if provider == "off":
+        return None
+    if provider == "mock":
+        from .mock_avatar import MockAvatarProvider
+
+        return MockAvatarProvider(model=model)
+    from .openrouter_avatar import OpenRouterAvatarProvider
+
+    return OpenRouterAvatarProvider(model=model)
 
 
 # Module-level singleton so the mock training provider's per-job poll
@@ -120,7 +166,10 @@ def get_training(kind: str | None = None) -> TrainingProvider:
 
 
 def provider_status() -> dict:
+    from ..services import model_registry as reg
+
     s = _settings
+    snap = reg.snapshot()
     training_lora = (
         "replicate"
         if (not s.mock_providers and s.replicate_api_token)
@@ -129,12 +178,13 @@ def provider_status() -> dict:
     training_voice = "elevenlabs" if not s.tts_is_mocked() else "mock"
     return {
         "mock_providers_env": s.mock_providers,
-        "chat": "mock" if s.chat_is_mocked() else "openrouter",
-        "image": "mock" if s.image_is_mocked() else "openrouter",
-        "video": "mock" if s.video_is_mocked() else "openrouter",
-        "tts": "mock" if s.tts_is_mocked() else "elevenlabs",
-        "music": "mock" if s.music_is_mocked() else "elevenlabs",
-        "lipsync": "mock",
+        "chat": snap["chat"]["provider"],
+        "image": snap["image"]["provider"],
+        "video": snap["video"]["provider"],
+        "tts": snap["tts"]["provider"],
+        "music": snap["music"]["provider"],
+        "lipsync": snap["lipsync"]["provider"],
         "training_lora": training_lora,
         "training_voice": training_voice,
+        "models": {k: v["model"] for k, v in snap.items()},
     }
