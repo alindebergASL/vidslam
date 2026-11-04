@@ -1,11 +1,11 @@
 "use client";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { useToast } from "@/components/Toaster";
-import { ChipRow, SceneArt, fmtDuration, loopMath, presetFor } from "@/components/ambient/shared";
+import { ChipRow, PlanSummary, SceneArt, fmtDuration, presetFor } from "@/components/ambient/shared";
 import {
   api,
   AmbientConfig,
@@ -69,7 +69,7 @@ function Inner() {
 
   const preset = presetFor(presets?.scenes ?? null, cfg.scene_preset);
   const mood = presets?.music_moods.find((m) => m.id === cfg.music_mood);
-  const math = useMemo(() => loopMath(cfg), [cfg]);
+  const plan = estimate?.plan;
   const set = <K extends keyof AmbientConfig>(k: K, v: AmbientConfig[K]) =>
     setCfg((c) => ({ ...c, [k]: v }));
 
@@ -191,7 +191,7 @@ function Inner() {
                 active={cfg.source === "video"}
                 onClick={() => set("source", "video")}
                 title="Video clip"
-                desc="Ask the video model for a slow-moving clip. Real motion (water, flames); crossfaded at the seam."
+                desc="Real motion (water, flames). Long loops are chained clips; they close on an anchor frame when the model supports it."
                 badge="Best look"
               />
               <SourceOption
@@ -217,9 +217,41 @@ function Inner() {
                   onChange={(v) => set("loop_seconds", v)}
                   render={(v) => `${v}s`}
                 />
-                <p className="text-xs text-ink-400 mt-2">
-                  Providers cap single clips; we loop whatever length comes back.
-                </p>
+                {plan && cfg.source === "video" && plan.max_clip_seconds < cfg.loop_seconds ? (
+                  <div className="mt-2 space-y-2">
+                    <p className="text-xs text-ink-400">
+                      This model makes up to {plan.max_clip_seconds}s per clip.
+                    </p>
+                    <div role="radiogroup" aria-label="When the loop is longer than one clip" className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={cfg.chain_segments}
+                        onClick={() => set("chain_segments", true)}
+                        className={clsx("chip text-xs", cfg.chain_segments && "chip-active")}
+                        title="Each clip starts on the previous one's last frame"
+                      >
+                        Chain {Math.ceil(cfg.loop_seconds / plan.max_clip_seconds)} clips
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={!cfg.chain_segments}
+                        onClick={() => set("chain_segments", false)}
+                        className={clsx("chip text-xs", !cfg.chain_segments && "chip-active")}
+                        title="Cheaper; the scene repeats more often"
+                      >
+                        One {plan.max_clip_seconds}s clip
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-xs text-ink-400 mt-2">
+                    {plan && cfg.source === "video"
+                      ? `Fits in one clip on this model (max ${plan.max_clip_seconds}s).`
+                      : "Longer loops repeat less often."}
+                  </p>
+                )}
               </div>
               <div>
                 <div className="label">Total video</div>
@@ -419,15 +451,8 @@ function Inner() {
               </div>
 
               <div className="rounded-lg bg-ink-800/60 border border-ink-700 p-3 text-xs">
-                <div className="text-ink-300 uppercase tracking-wider text-[10px] mb-1.5">Loop math</div>
-                <div className="flex items-baseline gap-1.5 flex-wrap text-ink-100">
-                  <span className="font-semibold text-base">{cfg.loop_seconds}s</span>
-                  <span className="text-ink-400">clip →</span>
-                  <span className="font-semibold text-base">{math.unit.toFixed(math.unit % 1 ? 1 : 0)}s</span>
-                  <span className="text-ink-400">seamless unit ×</span>
-                  <span className="font-semibold text-base text-grad">{math.repeats}</span>
-                  <span className="text-ink-400">= {fmtDuration(cfg.total_seconds)}</span>
-                </div>
+                <div className="text-ink-300 uppercase tracking-wider text-[10px] mb-2">Loop recipe</div>
+                <PlanSummary plan={plan} total={cfg.total_seconds} />
               </div>
 
               <div>
@@ -450,7 +475,7 @@ function Inner() {
                   </ul>
                 )}
                 <p className="text-[11px] text-ink-400 mt-2">
-                  Same price for 10 minutes or 3 hours — only the loop and music hit a provider.
+                  Same price for 10 minutes or 3 hours — only the loop clips and music hit a provider.
                 </p>
               </div>
 

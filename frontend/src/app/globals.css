@@ -91,7 +91,10 @@ body {
   .chip:hover {
     @apply border-ink-500 text-ink-100;
   }
-  .chip-active {
+  /* Listed with :hover so the generic .chip:hover (light text) can't win
+     on a selected chip and leave light-on-light, unreadable text. */
+  .chip-active,
+  .chip-active:hover {
     @apply bg-ink-100 border-ink-100 text-ink-950 shadow-glow;
   }
 

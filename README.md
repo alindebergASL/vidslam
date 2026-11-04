@@ -99,7 +99,7 @@ The cost is the loop, not the hour:
 
 | Step | What happens | Who pays |
 | --- | --- | --- |
-| Loop clip | Video provider generates one slow-motion clip (or, with **Still + drift**, the image provider makes one still that FFmpeg pushes in/out on a perfect period) | provider, once |
+| Loop clip | Video provider generates the loop — in one call if the model allows the full length, otherwise as **chained clips** (each starts on the previous clip's last frame). Models with last-frame support get an **anchor still** as clip 1's first frame and the final clip's last frame, so the loop closes natively. Or, with **Still + drift**, one image FFmpeg pushes in/out on a perfect period | provider, once per clip |
 | Music bed | 45–90 s of spa / zen / piano / singing-bowl music from the music provider | provider, once |
 | Seamless unit | `renderer.compose_ambient` crossfades the clip's tail into its own head (`xfade` of the clip against itself, then trim) so the unit ends on the frame it starts on | FFmpeg, seconds |
 | Tiling | The unit is repeated with the concat demuxer and `-c:v copy`; only the first/last pieces are re-encoded for the fade in/out. Music gets the same `acrossfade`-against-itself treatment and loops under the video | FFmpeg, seconds |
@@ -109,6 +109,9 @@ video work on a 4-core box; with a music bed the AAC encode of the full hour
 dominates (≈2–3 min total). Nothing in that time touches a provider. Scenes live in the same `VideoProject`/`Render` tables as
 storyboard projects (`mode=ambient_loop`, config in `ambient_config_json`), so
 render history, share links, export and S3 delivery all apply unchanged.
+
+Which video models go past 10s, which can close a loop, and which to pick:
+[`docs/ambient_providers.md`](docs/ambient_providers.md).
 
 ### Quality control
 

@@ -44,6 +44,22 @@ def get_video() -> VideoProvider:
     return OpenRouterVideoProvider()
 
 
+def video_capabilities(model: str = "") -> "VideoCapabilities":
+    """Capabilities of `model` on the active video provider, falling back to
+    the configured default cap when the provider can't say."""
+    from .base import VideoCapabilities
+
+    provider = get_video()
+    fn = getattr(provider, "capabilities", None)
+    if callable(fn):
+        try:
+            return fn(model)
+        except Exception:  # noqa: BLE001
+            pass
+    cap = max(5, _settings.ambient_default_max_clip_seconds)
+    return VideoCapabilities(durations=sorted({5, cap}), first_frame=True, known=False)
+
+
 def get_tts() -> TTSProvider:
     if _settings.tts_is_mocked():
         from .mock_tts import MockTTSProvider

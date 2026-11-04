@@ -7,6 +7,7 @@ from .registry import (
     get_tts,
     get_video,
     provider_status,
+    video_capabilities,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "get_tts",
     "get_video",
     "provider_status",
+    "video_capabilities",
 ]

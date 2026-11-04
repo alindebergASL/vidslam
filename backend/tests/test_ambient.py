@@ -67,7 +67,7 @@ def test_presets_lists_core_scenes_and_moods(auth_client):
     ids = {s["id"] for s in body["scenes"]}
     assert {"waterfall", "fireplace", "ocean", "custom"} <= ids
     assert {"spa", "zen", "none"} <= {m["id"] for m in body["music_moods"]}
-    assert body["loop_options"] == [25, 30, 60]
+    assert body["loop_options"] == [10, 25, 30, 60]
     assert 3600 in body["total_options"]
     for s in body["scenes"]:
         assert len(s["palette"]) == 2
@@ -86,8 +86,16 @@ def test_estimate_is_independent_of_total_duration(auth_client):
     # The tiling line is explicit and free.
     tiling = [l for l in one_hour["lines"] if l["unit"] == "repeat"]
     assert tiling and tiling[0]["cost"] == 0.0
-    # 30s loop − 2s crossfade = 28s unit → ceil(3600/28) = 129 repeats.
-    assert tiling[0]["qty"] == 129
+    # Mock model caps clips at 10s with first+last frame support:
+    # 3 × 10s chained (−2 × 0.5s joins) = 29s, closed loop → 0.5s seam
+    # → 28.5s unit → ceil(3600/28.5) = 127 repeats.
+    assert tiling[0]["qty"] == 127
+    plan = one_hour["plan"]
+    assert plan["segments"] == [10, 10, 10]
+    assert plan["strategy"] == "chain" and plan["closed"] and plan["anchored"]
+    assert plan["provider_calls"] == 4  # anchor still + 3 clips
+    assert any("Anchor still" in l["item"] for l in one_hour["lines"])
+    assert any("3 × 10s = 30s" in l["item"] for l in one_hour["lines"])
 
 
 def test_estimate_image_drift_cheaper_and_no_music_drops_line(auth_client):
@@ -215,7 +223,8 @@ def test_update_scene_prompt_invalidates_clip_but_fade_does_not(auth_client):
     assert r.status_code == 200, r.text
     assert r.json()["loop_status"] == "completed"
     assert r.json()["total_seconds"] == 40
-    assert r.json()["repeats"] == 10
+    # 5s closed loop → 4.5s unit → ceil(40/4.5) = 9.
+    assert r.json()["repeats"] == 9
 
     # Scene change → clip must be regenerated.
     r = auth_client.patch(
@@ -306,3 +315,248 @@ def test_compose_ambient_rejects_bad_total(tmp_path: Path):
         compose_ambient(AmbientRenderInputs(
             project_id=0, out_dir=tmp_path, clip_path=tmp_path / "x.mp4", total_seconds=0,
         ))
+
+
+# ---------- loop planning against model limits ----------
+
+
+def _caps(durations, first=True, last=True):
+    from app.providers.base import VideoCapabilities
+
+    return VideoCapabilities(durations=list(durations), first_frame=first, last_frame=last)
+
+
+@pytest.mark.parametrize(
+    "durations,target,expected",
+    [
+        ([5, 10], 30, [10, 10, 10]),
+        ([5, 10], 25, [10, 10, 5]),
+        ([5, 10], 10, [10]),
+        ([4, 6, 8], 30, [8, 8, 8, 6]),  # Veo 3.1
+        ([4, 6, 8], 60, [8] * 7 + [4]),
+        (range(2, 31), 30, [30]),  # Wan 3.0 / Seedance 2.5
+        (range(2, 31), 60, [30, 30]),
+        (range(3, 16), 25, [15, 10]),  # Kling 3.0
+    ],
+)
+def test_segments_fit_model_caps(durations, target, expected):
+    from app.services.ambient import _segments_for
+
+    assert _segments_for(target, _caps(durations)) == expected
+
+
+def test_plan_open_loop_when_model_has_no_last_frame():
+    from app.schemas.ambient import AmbientConfig
+    from app.services.ambient import plan_loop
+
+    cfg = AmbientConfig(loop_seconds=30, crossfade_seconds=2.0, total_seconds=3600)
+    plan = plan_loop(cfg, _caps([2, 5, 10], first=True, last=False))  # Runway Gen-4.5
+    assert plan.segments == [10, 10, 10]
+    assert plan.anchored is False and plan.closed is False
+    assert plan.seam_crossfade == 2.0
+    assert plan.provider_calls == 3
+
+
+def test_plan_single_clip_when_model_cannot_chain():
+    from app.schemas.ambient import AmbientConfig
+    from app.services.ambient import plan_loop
+
+    cfg = AmbientConfig(loop_seconds=30)
+    plan = plan_loop(cfg, _caps([5, 10], first=False, last=False))
+    assert plan.segments == [10] and plan.strategy == "single"
+    assert any("can't start from a given frame" in n for n in plan.notes)
+
+
+def test_plan_single_clip_when_chaining_disabled():
+    from app.schemas.ambient import AmbientConfig
+    from app.services.ambient import plan_loop
+
+    cfg = AmbientConfig(loop_seconds=30, chain_segments=False)
+    plan = plan_loop(cfg, _caps([5, 10]))
+    assert plan.segments == [10]
+    assert plan.closed  # still anchored: one clip whose first == last frame
+
+
+def test_chained_30s_loop_pins_first_and_last_frames(auth_client, monkeypatch):
+    """End-to-end on the mock (10s cap): 30s loop → anchor still + 3 clips,
+    each starting on the previous clip's last frame, the last one ending on
+    the anchor, all frame images fetchable from the public frame route."""
+    from app.providers import mock_video
+
+    calls = []
+    real_submit = mock_video.MockVideoProvider.submit
+
+    def spy(self, **kw):
+        calls.append(kw)
+        return real_submit(self, **kw)
+
+    monkeypatch.setattr(mock_video.MockVideoProvider, "submit", spy)
+
+    cfg = {**SHORT, "loop_seconds": 30, "total_seconds": 120}
+    scene = auth_client.post("/api/ambient", json={"config": cfg, "generate": True}).json()
+    assert scene["loop_status"] == "completed", scene
+    assert scene["plan"]["segments"] == [10, 10, 10]
+    assert len(calls) == 3
+    assert all(c["duration_seconds"] == 10 for c in calls)
+    assert all(c["reference_strategy"] == "frame_images" for c in calls)
+    assert all(c["settings"]["aspect_ratio"] == "16:9" for c in calls)
+    assert all(c["settings"]["generate_audio"] is False for c in calls)
+
+    first_urls = [c["references"][0].url for c in calls]
+    assert [r.frame_type for r in calls[0]["references"]] == ["first_frame"]
+    assert [r.frame_type for r in calls[1]["references"]] == ["first_frame"]
+    assert [r.frame_type for r in calls[2]["references"]] == ["first_frame", "last_frame"]
+    anchor = first_urls[0]
+    assert calls[2]["references"][1].url == anchor  # closes on the anchor
+    assert len(set(first_urls)) == 3  # each segment starts from a new frame
+
+    # Frame images are public (providers fetch them) and real PNGs.
+    for url in first_urls:
+        path = url.split("http://test.local", 1)[1]
+        r = auth_client.get(path)
+        assert r.status_code == 200 and r.content[:4] == b"\x89PNG"
+    assert auth_client.get("/api/public-ambient-frames/" + "x" * 40).status_code == 404
+
+    # 3 × 10s joined with 0.5s crossfades ≈ 29s loop clip.
+    clip = Path(scene["loop_shot"]["clip_path"])
+    assert 28.5 <= _duration(clip) <= 29.6
+    p = auth_client.get(f"/api/projects/{scene['id']}").json()
+    segs = [s for s in p["shots"] if s["shot_type"] == "ambient_segment"]
+    assert len(segs) == 3 and all(s["status"] == "completed" for s in segs)
+    assert p["ambient_config_json"]["_generated"]["closed"] is True
+
+    assert auth_client.post(f"/api/ambient/{scene['id']}/render").status_code == 202
+    scene = auth_client.get(f"/api/ambient/{scene['id']}").json()
+    log = scene["latest_render"]["render_log"]
+    assert scene["latest_render"]["status"] == "completed", log[:400]
+    assert "clips=3" in log and "seam=closed" in log
+    assert 119.0 <= _duration(Path(scene["latest_render"]["final_video_path"])) <= 121.0
+
+    # Regenerating with fewer segments leaves no stale segment shots.
+    r = auth_client.patch(f"/api/ambient/{scene['id']}", json={"config": {**cfg, "loop_seconds": 10}})
+    assert r.json()["loop_status"] == "pending"
+    auth_client.post(f"/api/ambient/{scene['id']}/generate-loop")
+    p = auth_client.get(f"/api/projects/{scene['id']}").json()
+    assert len([s for s in p["shots"] if s["shot_type"] == "ambient_segment"]) == 1
+
+
+def _frame_deltas(video: Path) -> list[float]:
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(video), "-vf",
+         "scale=320:-1,tblend=all_mode=difference,signalstats,"
+         "metadata=print:key=lavfi.signalstats.YAVG:file=-", "-f", "null", "-"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    return [float(l.split("=")[1]) for l in out.splitlines() if "YAVG" in l]
+
+
+def _slow_drift_clip(path: Path, *, seconds: int, start: float) -> None:
+    """Smooth, slowly moving footage (like a calm scene): a soft gradient
+    image with a gentle push-in. `start` offsets the motion so chained
+    segments continue each other."""
+    grad = path.with_suffix(".png")
+    Image.radial_gradient("L").resize((640, 360)).convert("RGB").save(grad)
+    frames = seconds * 30
+    subprocess.run(
+        ["ffmpeg", "-y", "-loop", "1", "-framerate", "30", "-i", str(grad), "-vf",
+         f"scale=1280:720,zoompan=z='1.0+0.15*(on+{start * 30})/600':d={frames}:s=320x180:fps=30",
+         "-frames:v", str(frames), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "16", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+
+
+def _raw_deltas(inputs: list[Path], graph: str, out: str) -> list[float]:
+    """Frame-to-frame mean luma delta of a filter graph's output, measured
+    on decoded frames (no re-encode), so encoder keyframes can't mask or
+    fake a step."""
+    cmd = ["ffmpeg", "-v", "error"]
+    for p in inputs:
+        cmd += ["-i", str(p)]
+    graph += (f";[{out}]scale=320:-1,tblend=all_mode=difference,signalstats,"
+              "metadata=print:key=lavfi.signalstats.YAVG:file=-[m]")
+    res = subprocess.run(cmd + ["-filter_complex", graph, "-map", "[m]", "-f", "null", "-"],
+                         capture_output=True, text=True, check=True).stdout
+    return [float(l.split("=")[1]) for l in res.splitlines() if "YAVG" in l]
+
+
+def _raw_yavg(inputs: list[Path], graph: str, out: str) -> list[float]:
+    """Mean luma of every decoded frame a filter graph produces (no encode)."""
+    cmd = ["ffmpeg", "-v", "error"]
+    for p in inputs:
+        cmd += ["-i", str(p)]
+    graph += f";[{out}]signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-[m]"
+    res = subprocess.run(cmd + ["-filter_complex", graph, "-map", "[m]", "-f", "null", "-"],
+                         capture_output=True, text=True, check=True).stdout
+    return [float(l.split("=")[1]) for l in res.splitlines() if "YAVG" in l]
+
+
+def _assert_linear_dissolve(got: list[float], a: list[float], b: list[float], label: str) -> None:
+    """Every dissolve frame's mean luma must equal the weighted mix of its
+    two sources; weight runs 0 → exactly 1 across the dissolve. Truncating
+    blends sit ~0.5 low on every mixed frame; a weight that stops short of 1
+    leaves the last frame off B."""
+    n = len(got)
+    assert n == len(a) == len(b) and n > 2, (n, len(a), len(b))
+    for k in range(n):
+        w = k / (n - 1)
+        expected = (1 - w) * a[k] + w * b[k]
+        assert abs(got[k] - expected) < 0.2, (
+            f"{label}: frame {k}/{n - 1} mean luma {got[k]:.2f}, expected {expected:.2f}"
+        )
+
+
+def test_dissolves_are_unbiased_and_complete(tmp_path: Path):
+    """Regression for a one-frame brightness tick at every loop seam (≈120×
+    per hour): ffmpeg's xfade, and an unrounded blend, truncate mixed pixels
+    (~0.85 step at dissolve start vs ~0.03 normal motion)."""
+    from app.services.renderer import _probe_duration, join_graph, seamless_unit_graph
+
+    fps, cf = 30, 1.5
+    clip = tmp_path / "drift.mp4"
+    _slow_drift_clip(clip, seconds=6, start=0)
+    src = _raw_yavg([clip], "[0:v]null[o]", "o")
+    L = _probe_duration(clip)
+    unit = _raw_yavg([clip], seamless_unit_graph(length=L, crossfade=cf, out="o"), "o")
+    k_cf, k_l = int(cf * fps), len(src)
+    assert len(unit) == k_l - k_cf
+    # unit = src[cf : L-cf] ++ dissolve(src[L-cf : L] → src[0 : cf])
+    mid = k_l - 2 * k_cf
+    assert all(abs(unit[i] - src[k_cf + i]) < 0.05 for i in range(mid))
+    _assert_linear_dissolve(unit[mid:], src[k_l - k_cf:], src[:k_cf], "loop unit")
+    # The wrap lands on src[cf]: the frame after the unit's last (= src[cf-1]).
+    assert abs(unit[-1] - src[k_cf - 1]) < 0.2 and abs(unit[0] - src[k_cf]) < 0.05
+
+    segs, lengths, ys = [], [], []
+    for k in range(3):
+        p = tmp_path / f"seg{k}.mp4"
+        _slow_drift_clip(p, seconds=3, start=3 * k)
+        segs.append(p)
+        lengths.append(_probe_duration(p))
+        ys.append(_raw_yavg([p], "[0:v]scale=320:180,setsar=1[o]", "o"))
+    jcf = 0.5
+    joined = _raw_yavg(segs, join_graph(lengths, crossfade=jcf, width=320, height=180), "out")
+    kj, n0 = int(jcf * fps), len(ys[0])
+    assert len(joined) == sum(len(y) for y in ys) - 2 * kj
+    _assert_linear_dissolve(joined[n0 - kj:n0], ys[0][n0 - kj:], ys[1][:kj], "join 1")
+
+
+def test_truncating_dissolve_is_caught(tmp_path: Path):
+    """Guard the guard: the old unrounded expression fails the same check."""
+    from app.services.renderer import _probe_duration
+
+    fps, cf = 30, 1.5
+    clip = tmp_path / "drift.mp4"
+    _slow_drift_clip(clip, seconds=6, start=0)
+    src = _raw_yavg([clip], "[0:v]null[o]", "o")
+    L, k_cf = _probe_duration(clip), int(cf * fps)
+    span = cf - 1 / fps
+    bad = (
+        f"[0:v]split=3[a][b][c];[a]trim=start={cf}:end={L - cf},setpts=PTS-STARTPTS[mid];"
+        f"[b]trim=start={L - cf}:end={L},setpts=PTS-STARTPTS[tl];[c]trim=start=0:end={cf},setpts=PTS-STARTPTS[hd];"
+        f"[tl][hd]blend=all_expr='A*(1-min(T/{span}\\,1))+B*min(T/{span}\\,1)':shortest=1[x];"
+        "[mid][x]concat=n=2:v=1:a=0[o]"
+    )
+    unit = _raw_yavg([clip], bad, "o")
+    mid = len(src) - 2 * k_cf
+    with pytest.raises(AssertionError):
+        _assert_linear_dissolve(unit[mid:], src[len(src) - k_cf:], src[:k_cf], "truncating")

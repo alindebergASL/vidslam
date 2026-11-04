@@ -294,13 +294,22 @@ def generate_plan(
     return plan
 
 
-def _ensure_clip_for_shot(db: Session, project: models.VideoProject, shot: models.VideoShot) -> Path:
-    """Submit + poll + download a shot's clip if it doesn't have one yet."""
+def _ensure_clip_for_shot(
+    db: Session,
+    project: models.VideoProject,
+    shot: models.VideoShot,
+    *,
+    references: Optional[list[ImageRef]] = None,
+) -> Path:
+    """Submit + poll + download a shot's clip if it doesn't have one yet.
+
+    `references` overrides the cast-asset lookup — the ambient chain uses it
+    to pin first/last-frame images that aren't cast Assets."""
     if shot.clip_path and Path(shot.clip_path).exists() and shot.status == "completed":
         return Path(shot.clip_path)
 
     video = get_video()
-    refs = _resolve_references_for_shot(db, project, shot)
+    refs = references if references is not None else _resolve_references_for_shot(db, project, shot)
     settings_local = get_settings()
     # Per-shot override (raw id or custom:<id> trained-LoRA selector) wins
     # over the deployment-wide default.
@@ -322,6 +331,10 @@ def _ensure_clip_for_shot(db: Session, project: models.VideoProject, shot: model
             negative_prompt=shot.negative_prompt or "",
             reference_strategy=shot.reference_strategy or "input_references",
             duration_seconds=shot.duration_seconds or 5.0,
+            # generate_audio defaults to true on audio-capable models (Veo…);
+            # the renderer strips clip audio and lays in voice/music itself,
+            # so native audio would be paid for and discarded.
+            settings={"aspect_ratio": project.aspect_ratio or None, "generate_audio": False},
         )
         shot.provider_job_id = submitted.job_id
         shot.polling_url = submitted.polling_url

@@ -17,9 +17,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .api import RenderOut, ShotOut
 
 # Loop lengths the UI offers. Anything 4..60 is accepted by the API so tests
-# can use short clips; real providers cap single-clip length well below 60s,
-# so the renderer tiles whatever length comes back.
-LOOP_OPTIONS = (25, 30, 60)
+# can use short clips. Most video models cap a single call at 8–15s (a few
+# reach 20–30s), so loops longer than the model's cap are built from
+# chained segments — see services.ambient.plan_loop.
+LOOP_OPTIONS = (10, 25, 30, 60)
 # Total output lengths offered in the UI, in seconds (10m, 30m, 1h, 2h, 3h).
 TOTAL_OPTIONS = (600, 1800, 3600, 7200, 10800)
 
@@ -50,6 +51,11 @@ class AmbientConfig(BaseModel):
     music_volume: float = Field(default=0.7, ge=0.0, le=1.0)
     # Optional provider model id (or custom:<id>) for the loop clip / still.
     model_override: str = Field(default="", max_length=300)
+    # When loop_seconds exceeds the model's per-call cap: True = chain
+    # several clips (each starting on the previous one's last frame) to
+    # reach the full loop length; False = one clip at the model's max and
+    # loop that (cheaper, but the scene repeats more often).
+    chain_segments: bool = True
 
     @field_validator("scene_prompt", "music_prompt", "scene_preset", "music_mood", "model_override")
     @classmethod
@@ -100,6 +106,29 @@ class AmbientPresetsOut(BaseModel):
     aspect_options: list[str]
 
 
+class LoopPlanOut(BaseModel):
+    """How a loop will be (or was) produced on the current model."""
+
+    model: str
+    max_clip_seconds: int
+    caps_known: bool  # False = model limits not discoverable; used the default cap
+    supports_last_frame: bool
+    # "single" one clip · "chain" N clips joined · "drift" still + periodic motion
+    strategy: Literal["single", "chain", "drift"]
+    segments: list[int]  # per-call clip durations, seconds
+    # Anchor still pinned as first frame of clip 1 and last frame of clip N,
+    # so the loop closes natively instead of relying on a long crossfade.
+    anchored: bool
+    closed: bool
+    join_crossfade: float  # between chained segments
+    seam_crossfade: float  # loop-end → loop-start
+    loop_seconds: float  # actual loop clip length after joins + slow-down
+    unit_seconds: float  # seamless unit that gets tiled
+    repeats: int
+    provider_calls: int
+    notes: list[str] = Field(default_factory=list)
+
+
 class AmbientOut(BaseModel):
     """Ambient scene = VideoProject(mode=ambient_loop) + its single loop shot
     + latest render, flattened so the UI never has to understand storyboards."""
@@ -120,6 +149,7 @@ class AmbientOut(BaseModel):
     music_ready: bool
     # How many times the loop unit tiles into the total output.
     repeats: int
+    plan: LoopPlanOut
     latest_render: Optional[RenderOut] = None
     render_count: int = 0
     created_at: datetime

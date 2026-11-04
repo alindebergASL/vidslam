@@ -345,15 +345,49 @@ def _encode_normalized(
     return log
 
 
-def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: float) -> str:
-    """Crossfade the tail of `norm` into its own head and trim so the result
-    loops without a visible cut. Output length = length - crossfade."""
-    flt = (
-        f"[0:v][1:v]xfade=transition=fade:duration={crossfade:.3f}:offset={length - crossfade:.3f},"
-        f"trim=start={crossfade:.3f}:end={length:.3f},setpts=PTS-STARTPTS[v]"
+def _dissolve_expr(cf: float) -> str:
+    """`blend` expression for a linear A→B dissolve over `cf` seconds.
+
+    - Weight hits exactly 1 on the *last* dissolve frame (divide by
+      cf − 1 frame), so what follows the dissolve continues B with no
+      residue of A. Dividing by cf left ~2% of A on the final frame — a
+      visible tick at the loop wrap.
+    - +0.5 rounds: blend stores float results by truncation, which made
+      every mixed frame ~0.5 luma darker than the pure frames around it.
+    """
+    span = max(1.0 / FPS, cf - 1.0 / FPS)
+    w = f"min(T/{span:.5f}\\,1)"
+    return f"A*(1-{w})+B*{w}+0.5"
+
+
+def seamless_unit_graph(*, length: float, crossfade: float, src: str = "0:v", out: str = "v") -> str:
+    """filter_complex text for the seamless loop unit (see _make_seamless_unit).
+    Separate from the encode so tests can verify the dissolve on decoded
+    frames, without encoder keyframes muddying the measurement."""
+    cf = crossfade
+    return (
+        f"[{src}]split=3[a][b][c];"
+        f"[a]trim=start={cf:.4f}:end={length - cf:.4f},setpts=PTS-STARTPTS[mid];"
+        f"[b]trim=start={length - cf:.4f}:end={length:.4f},setpts=PTS-STARTPTS[tl];"
+        f"[c]trim=start=0:end={cf:.4f},setpts=PTS-STARTPTS[hd];"
+        f"[tl][hd]blend=all_expr='{_dissolve_expr(cf)}':shortest=1[x];"
+        f"[mid][x]concat=n=2:v=1:a=0,format=yuv420p[{out}]"
     )
+
+
+def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: float) -> str:
+    """Make `norm` loop without a visible cut. Output length = length - crossfade.
+
+    unit = clip[cf, L-cf)  ++  blend(clip[L-cf, L) → clip[0, cf))
+    The tail is cross-dissolved into the head with an explicit per-frame
+    weight, so the unit ends on (almost exactly) clip[cf) — the frame it
+    starts on — and wraps continuously. Uses trims + `blend` with explicit
+    rounding rather than `xfade`, whose fade truncates mixed pixels and left
+    a one-frame brightness step at the start of every dissolve (measured:
+    0.85 vs ~0.03 typical frame-to-frame luma delta)."""
+    flt = seamless_unit_graph(length=length, crossfade=crossfade)
     cmd = [
-        "ffmpeg", "-y", "-i", str(norm), "-i", str(norm),
+        "ffmpeg", "-y", "-i", str(norm),
         "-filter_complex", flt, "-map", "[v]", "-an",
         *_X264, "-r", str(FPS), str(unit),
     ]
@@ -529,6 +563,93 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         repeats=repeats,
         log="\n".join(logs)[-8000:],
     )
+
+
+def extract_frame(src: Path, dst: Path, *, last: bool) -> Path:
+    """Write the first or last decoded frame of `src` as a PNG. The last frame
+    is what the next chained segment starts from."""
+    if last:
+        dur = _probe_duration(src)
+        cmd = ["ffmpeg", "-y", "-ss", f"{max(0.0, dur - 0.08):.3f}", "-i", str(src),
+               "-frames:v", "1", "-update", "1", str(dst)]
+    else:
+        cmd = ["ffmpeg", "-y", "-i", str(src), "-frames:v", "1", "-update", "1", str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0 or not dst.exists():
+        raise RuntimeError(f"ffmpeg frame extract failed: {log[-1500:]}")
+    return dst
+
+
+def join_graph(lengths: list[float], *, crossfade: float, width: int, height: int) -> str:
+    """filter_complex text joining len(lengths) inputs with rounded linear
+    dissolves of `crossfade` seconds; output label [out]."""
+    cf = crossfade
+    norm = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={FPS},format=yuv420p"
+    )
+    n = len(lengths)
+    parts: list[str] = []
+    order: list[str] = []
+    for i in range(n):
+        L = lengths[i]
+        head_in = cf if (i > 0 and cf > 0) else 0.0  # covered by the previous dissolve
+        tail_out = cf if (i < n - 1 and cf > 0) else 0.0  # dissolved into the next
+        outs = ["b"] + (["h"] if head_in else []) + (["t"] if tail_out else [])
+        labels = "".join(f"[{o}{i}]" for o in outs)
+        parts.append(f"[{i}:v]{norm},split={len(outs)}{labels}" if len(outs) > 1 else f"[{i}:v]{norm}[b{i}]")
+        parts[-1] = parts[-1].replace(f"[b{i}]", f"[bb{i}]")
+        parts.append(f"[bb{i}]trim=start={head_in:.4f}:end={L - tail_out:.4f},setpts=PTS-STARTPTS[body{i}]")
+        if head_in:
+            parts.append(f"[h{i}]trim=start=0:end={cf:.4f},setpts=PTS-STARTPTS[head{i}]")
+        if tail_out:
+            parts.append(f"[t{i}]trim=start={L - cf:.4f}:end={L:.4f},setpts=PTS-STARTPTS[tail{i}]")
+    for i in range(n):
+        order.append(f"[body{i}]")
+        if i < n - 1 and cf > 0:
+            # Same rounded linear dissolve as _make_seamless_unit (see there).
+            parts.append(
+                f"[tail{i}][head{i + 1}]blend=all_expr='{_dissolve_expr(cf)}'"
+                f":shortest=1[x{i}]"
+            )
+            order.append(f"[x{i}]")
+    parts.append(f"{''.join(order)}concat=n={len(order)}:v=1:a=0,format=yuv420p[out]")
+    return ";".join(parts)
+
+
+def join_segments(
+    segments: list[Path],
+    dst: Path,
+    *,
+    aspect_ratio: str,
+    crossfade: float = 0.5,
+) -> tuple[Path, float]:
+    """Join chained clips into one loop clip with short crossfades.
+
+    Each segment already *starts* on the previous one's last frame, so the
+    joins are near-continuous; the brief xfade only absorbs the small colour
+    / motion jump image-to-video models introduce on their first frames.
+    Segments are normalized inside the graph (size/fps/SAR/pix_fmt) because
+    xfade requires identical streams. Returns (path, duration)."""
+    if not segments:
+        raise ValueError("no segments to join")
+    width, height = _dims_for_aspect(aspect_ratio)
+    if len(segments) == 1:
+        _encode_normalized(segments[0], dst, width=width, height=height, slow_factor=1.0)
+        return dst, _probe_duration(dst)
+    lengths = [_probe_duration(p) for p in segments]
+    cf = max(0.0, min(crossfade, min(lengths) / 3.0))
+    graph = join_graph(lengths, crossfade=cf, width=width, height=height)
+    prev = "out"
+    cmd = ["ffmpeg", "-y"]
+    for p in segments:
+        cmd += ["-i", str(p)]
+    cmd += ["-filter_complex", graph, "-map", f"[{prev}]", "-an",
+            *_X264, "-r", str(FPS), str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg segment join failed: {log[-2000:]}")
+    return dst, _probe_duration(dst)
 
 
 def render_image_drift_clip(

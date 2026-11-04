@@ -224,6 +224,26 @@ export type CostEstimate = {
   lines: CostLine[];
   is_estimate: boolean;
   note: string;
+  plan?: LoopPlan; // ambient estimates only
+};
+
+/** How an ambient loop is produced on the configured video model. */
+export type LoopPlan = {
+  model: string;
+  max_clip_seconds: number;
+  caps_known: boolean;
+  supports_last_frame: boolean;
+  strategy: "single" | "chain" | "drift";
+  segments: number[];
+  anchored: boolean;
+  closed: boolean;
+  join_crossfade: number;
+  seam_crossfade: number;
+  loop_seconds: number;
+  unit_seconds: number;
+  repeats: number;
+  provider_calls: number;
+  notes: string[];
 };
 
 export type StudioJob = {
@@ -279,6 +299,7 @@ export type AmbientConfig = {
   music_prompt: string;
   music_volume: number;
   model_override: string;
+  chain_segments: boolean;
 };
 
 export type ScenePreset = {
@@ -313,6 +334,7 @@ export type AmbientScene = {
   loop_shot: Shot | null;
   music_ready: boolean;
   repeats: number;
+  plan: LoopPlan;
   latest_render: Render | null;
   render_count: number;
   created_at: string;
@@ -332,6 +354,7 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   music_prompt: "",
   music_volume: 0.7,
   model_override: "",
+  chain_segments: true,
 };
 
 export const api = {

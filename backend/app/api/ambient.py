@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -28,6 +29,19 @@ from ..workers.queue import enqueue
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
+
+# Unauthenticated, random-token route: video providers fetch first/last-frame
+# images for chained ambient clips from here, the same way they fetch cast
+# assets from /api/public-assets/{token}.
+public_router = APIRouter()
+
+
+@public_router.get("/public-ambient-frames/{token}")
+def public_frame(token: str) -> FileResponse:
+    path = svc.frame_path_for_token(token)
+    if path is None:
+        raise HTTPException(404, "not found")
+    return FileResponse(path, media_type="image/png")
 
 
 def _get_scene(db: Session, scene_id: int) -> models.VideoProject:

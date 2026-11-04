@@ -11,6 +11,9 @@ class ImageRef:
     url: str  # tokenized public URL the provider can fetch
     role: Literal["character", "scene", "style", "object"] = "character"
     name: str = ""
+    # For reference_strategy="frame_images": pin this image as the clip's
+    # first or last frame (image-to-video / keyframe interpolation).
+    frame_type: Optional[Literal["first_frame", "last_frame"]] = None
 
 
 @dataclass
@@ -36,6 +39,44 @@ class ModelInfo:
     name: str
     modality: Literal["chat", "image", "video"]
     description: str = ""
+
+
+@dataclass
+class VideoCapabilities:
+    """What a video model accepts in a single generation call.
+
+    `durations` is the explicit list of accepted clip lengths in seconds
+    (providers 400 on anything else). `first_frame` / `last_frame` say
+    whether the model can be pinned to start and/or end on a given image —
+    the last one is what lets an ambient loop close on itself natively.
+    """
+
+    durations: list[int] = field(default_factory=lambda: [5, 10])
+    first_frame: bool = False
+    last_frame: bool = False
+    known: bool = True  # False = fell back to defaults (model not listed)
+
+    @property
+    def max_seconds(self) -> int:
+        return max(self.durations) if self.durations else 5
+
+    def snap(self, seconds: float) -> int:
+        """Smallest supported duration >= seconds, else the maximum."""
+        ok = sorted(d for d in self.durations if d >= seconds - 1e-6)
+        return ok[0] if ok else self.max_seconds
+
+
+def expand_durations(raw) -> list[int]:
+    """Normalize a provider's supported_durations: either an explicit list
+    ([4, 6, 8]) or a {min,max}-style range, into a sorted int list."""
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        lo = int(raw.get("min") or raw.get("minimum") or 1)
+        hi = int(raw.get("max") or raw.get("maximum") or lo)
+        return list(range(lo, hi + 1))
+    out = sorted({int(round(float(x))) for x in raw if x is not None})
+    return out
 
 
 @dataclass
@@ -89,6 +130,10 @@ class VideoProvider(Protocol):
     def poll(self, job: SubmittedJob) -> JobStatus: ...
 
     def download(self, job: SubmittedJob) -> bytes: ...
+
+    def capabilities(self, model: str) -> VideoCapabilities:
+        """Per-model duration list + first/last-frame support."""
+        ...
 
 
 class TTSProvider(Protocol):

@@ -8,9 +8,9 @@ import { RenderHistory } from "@/components/RenderHistory";
 import { useToast } from "@/components/Toaster";
 import {
   ChipRow,
+  PlanSummary,
   SceneArt,
   fmtDuration,
-  loopMath,
   presetFor,
   sceneStatusLabel,
   statusTone,
@@ -114,7 +114,7 @@ function Inner() {
   const rendering = scene.status === "generating" && loopReady;
   const render = scene.latest_render;
   const rendered = render?.status === "completed";
-  const math = loopMath(scene.config);
+  const plan = scene.plan;
   const moodLabel =
     scene.config.music_mood === "none"
       ? "No music"
@@ -243,7 +243,7 @@ function Inner() {
                 <div className="p-6">
                   <div className="flex items-center gap-3 text-sm">
                     <span className="w-2 h-2 rounded-full grad animate-pulse" />
-                    Tiling {math.repeats} loops into {fmtDuration(scene.total_seconds)} and mixing the music bed…
+                    Tiling {plan.repeats} loops into {fmtDuration(scene.total_seconds)} and mixing the music bed…
                   </div>
                   <div className="h-1.5 rounded-full bg-ink-800 overflow-hidden mt-4">
                     <div className="h-full w-1/2 grad animate-shimmer" style={{ backgroundSize: "200% 100%" }} />
@@ -275,10 +275,8 @@ function Inner() {
             <div className="p-4 flex items-center justify-between gap-3 border-b border-ink-800">
               <div>
                 <h2 className="text-base font-medium">Loop clip</h2>
-                <div className="text-xs text-ink-400 mt-0.5">
-                  {scene.config.loop_seconds}s{scene.config.source === "video" && scene.config.slow_factor !== 1 ? ` × ${scene.config.slow_factor} slower` : ""}
-                  {" → "}
-                  {math.unit.toFixed(math.unit % 1 ? 1 : 0)}s seamless unit × {math.repeats}
+                <div className="mt-1.5">
+                  <PlanSummary plan={plan} total={scene.total_seconds} compact />
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -341,6 +339,9 @@ function Inner() {
                 </div>
               </div>
             )}
+            <div className="px-4 py-3 border-t border-ink-800">
+              <PlanSummary plan={plan} total={scene.total_seconds} />
+            </div>
             {scene.loop_shot?.prompt && (
               <details className="px-4 py-3 text-xs text-ink-300 border-t border-ink-800">
                 <summary className="cursor-pointer text-ink-200">Prompt sent to the model</summary>
@@ -407,7 +408,7 @@ function Inner() {
                 <h2 className="text-base font-medium">Render the full video</h2>
                 <p className="text-xs text-ink-400 mt-0.5">
                   {loopReady
-                    ? `Tiles the loop ${math.repeats}× into ${fmtDuration(scene.total_seconds)} with fades and music. Nothing is billed.`
+                    ? `Tiles the loop ${plan.repeats}× into ${fmtDuration(scene.total_seconds)} with fades and music. Nothing is billed.`
                     : "Generate the loop clip first."}
                 </p>
               </div>
@@ -563,7 +564,8 @@ function SettingsPanel({
     cfg.scene_preset !== scene.config.scene_preset ||
     cfg.source !== scene.config.source ||
     cfg.loop_seconds !== scene.config.loop_seconds ||
-    cfg.model_override !== scene.config.model_override;
+    cfg.model_override !== scene.config.model_override ||
+    cfg.chain_segments !== scene.config.chain_segments;
   const preset = presetFor(presets?.scenes ?? null, cfg.scene_preset);
 
   return (
@@ -634,6 +636,11 @@ function SettingsPanel({
             onChange={(e) => set("crossfade_seconds", Number(e.target.value))}
             className="w-full accent-[#7C5CFF] disabled:opacity-40"
           />
+          {scene.plan.closed && cfg.source === "video" && (
+            <p className="text-[11px] text-ink-400 mt-1">
+              Closed loop: only {scene.plan.seam_crossfade}s is used at the seam.
+            </p>
+          )}
         </div>
         <div>
           <label className="label" htmlFor="set-fade">
@@ -715,6 +722,19 @@ function SettingsPanel({
               className="text-xs"
             />
           </div>
+          {cfg.source === "video" && (
+            <div>
+              <div className="label">Longer than one clip</div>
+              <ChipRow
+                label="When the loop is longer than one clip"
+                options={["chain", "single"] as const}
+                value={cfg.chain_segments ? "chain" : "single"}
+                onChange={(v) => set("chain_segments", v === "chain")}
+                render={(v) => (v === "chain" ? "Chain clips" : "One clip")}
+                className="text-xs"
+              />
+            </div>
+          )}
           {cfg.source === "video" && (
             <div>
               <div className="label">Stillness</div>

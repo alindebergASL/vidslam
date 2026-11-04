@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Per-call clip cap assumed when a model's limits can't be discovered
+    # (OpenRouter /videos/models unreachable, or a model it doesn't list).
+    # Ambient loops longer than this are built from chained segments.
+    ambient_default_max_clip_seconds: int = 10
 
     # elevenlabs
     elevenlabs_api_key: str = ""

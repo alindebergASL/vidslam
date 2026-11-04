@@ -1,7 +1,7 @@
 "use client";
 import clsx from "clsx";
 import type { ReactNode } from "react";
-import type { AmbientConfig, AmbientScene, ScenePreset } from "@/lib/api";
+import type { AmbientScene, LoopPlan, ScenePreset } from "@/lib/api";
 
 /** "3600" → "1h", "5400" → "1h 30m", "600" → "10m", "20" → "20s". */
 export function fmtDuration(seconds: number): string {
@@ -14,16 +14,6 @@ export function fmtDuration(seconds: number): string {
   if (m && sec) return `${m}m ${String(sec).padStart(2, "0")}s`;
   if (m) return `${m}m`;
   return `${sec}s`;
-}
-
-/** Mirror of services.ambient._effective_unit_seconds so the creator can show
- *  the loop math live without a round trip. */
-export function loopMath(cfg: AmbientConfig) {
-  const base = cfg.loop_seconds * (cfg.source === "video" ? cfg.slow_factor : 1);
-  const cf = cfg.source === "image_drift" ? 0 : cfg.crossfade_seconds;
-  const unit = Math.max(1, base - cf);
-  const repeats = Math.max(1, Math.ceil(cfg.total_seconds / unit));
-  return { unit, repeats };
 }
 
 export function sceneStatusLabel(s: AmbientScene): string {
@@ -127,6 +117,81 @@ export function ChipRow<T extends string | number>({
           {render ? render(o) : String(o)}
         </button>
       ))}
+    </div>
+  );
+}
+
+const fmtSec = (n: number) => `${n % 1 ? n.toFixed(1) : n.toFixed(0)}s`;
+
+/**
+ * The loop recipe from the server's plan: which clips the model will make,
+ * how they join, and how many times the seamless unit tiles. Shown in the
+ * builder (live, from the cost estimate) and on the scene page.
+ */
+export function PlanSummary({
+  plan,
+  total,
+  compact = false,
+}: {
+  plan: LoopPlan | null | undefined;
+  total: number;
+  compact?: boolean;
+}) {
+  if (!plan) {
+    return <div className="h-12 skeleton" aria-hidden />;
+  }
+  const drift = plan.strategy === "drift";
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-1.5" aria-label="Loop clips">
+        {plan.anchored && (
+          <span className="chip text-[11px] py-0.5 px-2 border-iris/40 text-iris-soft" title="Anchor still: first frame of clip 1 and last frame of the final clip">
+            ◎ anchor
+          </span>
+        )}
+        {plan.segments.map((s, i) => (
+          <span key={i} className="inline-flex items-center gap-1.5">
+            {i > 0 && <span className="text-ink-400 text-xs" aria-hidden>+</span>}
+            <span className="rounded-md border border-ink-600 bg-ink-800 px-2 py-0.5 text-xs font-medium tabular-nums">
+              {drift ? `still · ${s}s` : `${s}s`}
+            </span>
+          </span>
+        ))}
+        <span className="text-ink-400 text-xs">→</span>
+        <span className="text-xs text-ink-200">
+          {fmtSec(plan.unit_seconds)} unit × <span className="text-grad font-semibold">{plan.repeats}</span> ={" "}
+          {fmtDuration(total)}
+        </span>
+      </div>
+      {!compact && (
+        <div className="flex flex-wrap gap-1.5 text-[11px]">
+          <span
+            className={clsx(
+              "rounded-full border px-2 py-0.5",
+              plan.closed
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                : "border-amber-500/40 bg-amber-500/10 text-amber-200"
+            )}
+          >
+            {plan.closed ? "Closed loop" : `Open loop · ${fmtSec(plan.seam_crossfade)} crossfade`}
+          </span>
+          {!drift && (
+            <span className="rounded-full border border-ink-600 px-2 py-0.5 text-ink-300">
+              model max {plan.max_clip_seconds}s{plan.caps_known ? "" : " (assumed)"}
+            </span>
+          )}
+          <span className="rounded-full border border-ink-600 px-2 py-0.5 text-ink-300">
+            {plan.provider_calls} provider call{plan.provider_calls === 1 ? "" : "s"}
+          </span>
+        </div>
+      )}
+      {!compact && plan.notes.length > 0 && (
+        <ul className="text-[11px] text-ink-400 space-y-0.5">
+          {plan.notes.map((n) => (
+            <li key={n}>· {n}</li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
