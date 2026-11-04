@@ -50,10 +50,10 @@ def test_cancel_mid_render_bails_out_at_checkpoint(auth_client, monkeypatch):
     from app.db import SessionLocal
     from app.services import pipeline
 
-    real_ensure = pipeline._ensure_clip_for_shot
+    real_ensure = pipeline.submit_shot_clip
     calls: list[int] = []
 
-    def _spy(db, project, shot):
+    def _spy(db, project, shot, **kw):
         calls.append(shot.id)
         # On the first shot, flip the latest render to 'cancelled' via a
         # separate session (mimicking the cancel endpoint running concurrently).
@@ -70,9 +70,9 @@ def test_cancel_mid_render_bails_out_at_checkpoint(auth_client, monkeypatch):
                 probe.commit()
             finally:
                 probe.close()
-        return real_ensure(db, project, shot)
+        return real_ensure(db, project, shot, **kw)
 
-    monkeypatch.setattr(pipeline, "_ensure_clip_for_shot", _spy)
+    monkeypatch.setattr(pipeline, "submit_shot_clip", _spy)
 
     db = SessionLocal()
     try:
@@ -86,7 +86,7 @@ def test_cancel_mid_render_bails_out_at_checkpoint(auth_client, monkeypatch):
     assert status["latest_render"]["status"] == "cancelled"
     assert status["latest_render"]["error"] == ""
     # The pipeline should NOT have continued past the cancel checkpoint:
-    # exactly one shot got the _ensure_clip_for_shot call.
+    # exactly one shot was submitted.
     body_shot_count = len([s for s in proj["shots"] if s["shot_type"] != "end_card"])
     assert body_shot_count >= 2
     assert len(calls) == 1, f"expected pipeline to bail after first shot, got {len(calls)} calls"
@@ -99,10 +99,10 @@ def test_retry_after_cancel_resumes_cleanly(auth_client, monkeypatch):
     from app.db import SessionLocal
     from app.services import pipeline
 
-    real_ensure = pipeline._ensure_clip_for_shot
+    real_ensure = pipeline.submit_shot_clip
     canceled_once = []
 
-    def _spy(db, project, shot):
+    def _spy(db, project, shot, **kw):
         if not canceled_once:
             canceled_once.append(True)
             probe = SessionLocal()
@@ -117,14 +117,14 @@ def test_retry_after_cancel_resumes_cleanly(auth_client, monkeypatch):
                 probe.commit()
             finally:
                 probe.close()
-        return real_ensure(db, project, shot)
+        return real_ensure(db, project, shot, **kw)
 
-    monkeypatch.setattr(pipeline, "_ensure_clip_for_shot", _spy)
+    monkeypatch.setattr(pipeline, "submit_shot_clip", _spy)
     auth_client.post(f"/api/projects/{pid}/generate-video")
     assert auth_client.get(f"/api/projects/{pid}").json()["status"] == "cancelled"
 
     # Restore real behavior and retry — should pick the 'resume' path and finish.
-    monkeypatch.setattr(pipeline, "_ensure_clip_for_shot", real_ensure)
+    monkeypatch.setattr(pipeline, "submit_shot_clip", real_ensure)
     r = auth_client.post(f"/api/projects/{pid}/retry").json()
     assert r["action"] == "resume"
     final_status = auth_client.get(f"/api/projects/{pid}/status").json()

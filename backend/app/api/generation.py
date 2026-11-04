@@ -17,6 +17,7 @@ from ..services import render_files
 from ..services.preflight import run_preflight
 from ..services.ratelimit import rate_limit
 from ..services.safety import UnsafeScriptError, validate_script
+from ..services.spend import budget_guard
 from ..workers.jobs import (
     generate_plan_job,
     generate_video_job,
@@ -73,7 +74,7 @@ def public_render_meta(token: str, db: Session = Depends(get_db)) -> dict:
     }
 
 
-@router.post("/projects/{project_id}/generate-plan", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/generate-plan", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_plan(
     project_id: int,
     preserve_edits: bool = False,
@@ -119,7 +120,7 @@ def cost_estimate(project_id: int, db: Session = Depends(get_db)) -> dict:
     return estimate_plan_cost(project_dict, plan)
 
 
-@router.post("/projects/{project_id}/generate-video", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/generate-video", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_video(
     project_id: int,
     force: bool = False,
@@ -179,13 +180,13 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     return {"render_id": latest.id, "status": "cancelled", "action": "signalled"}
 
 
-@router.post("/projects/{project_id}/retry", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/retry", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     """Smart retry after a failed render. Picks the cheapest viable path:
 
       - If every body shot already has a clip on disk AND the last render's audio
         file is intact → just recompose (no provider calls).
-      - Otherwise → resume the pipeline; render_project's _ensure_clip_for_shot
+      - Otherwise → resume the pipeline; render_project (which skips shots that already have clips)
         is idempotent on completed shots, so only the failed/missing ones get
         regenerated. Failed shots are reset to 'pending' so they actually retry.
     """
@@ -234,7 +235,7 @@ class BulkRegenIn(BaseModel):
     shot_ids: list[int]
 
 
-@router.post("/projects/{project_id}/shots/regenerate-bulk", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/shots/regenerate-bulk", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def regenerate_shots_bulk(
     project_id: int, body: BulkRegenIn, db: Session = Depends(get_db)
 ) -> dict:
@@ -273,7 +274,7 @@ def project_status(project_id: int, db: Session = Depends(get_db)) -> ProjectSta
     )
 
 
-@router.post("/projects/{project_id}/shots/{shot_id}/regenerate", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/shots/{shot_id}/regenerate", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def regenerate_shot(
     project_id: int,
     shot_id: int,

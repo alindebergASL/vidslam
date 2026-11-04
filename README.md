@@ -154,6 +154,31 @@ notes that the thumbnail wasn't set.
   inside a web worker. If Redis is down the API returns 503, and `/readyz`
   reports not-ready until Redis answers and a worker is registered. Jobs get
   `QUEUE_JOB_TIMEOUT_SECONDS` (default 4 h).
+- **Video jobs** are event-driven. Every shot of a render is submitted in
+  parallel and the worker returns; nothing sleeps in a poll loop. Each job
+  is a `video_jobs` row with its own callback URL
+  (`/api/webhooks/openrouter/videos/<token>`). The webhook (or a sweeper
+  poll, when no webhook arrives) downloads the clip, and the render is
+  composed exactly once, after its last shot lands. Webhooks need an HTTPS
+  `PUBLIC_BASE_URL` (`VIDEO_WEBHOOKS=auto|on|off`). Set
+  `OPENROUTER_WEBHOOK_SECRET` to verify signatures. Without webhooks, the
+  sweeper polls every `VIDEO_POLL_SECONDS`. Jobs fail after
+  `VIDEO_JOB_TIMEOUT_MINUTES`.
+- **Spend tracking.** Every paid provider call writes a row to the
+  `spend_entries` ledger, attributed to its project and render. Costs come
+  from the provider where it reports them: OpenRouter `usage.cost` on chat,
+  image and streamed audio, and on video jobs via the webhook or poll.
+  OpenRouter `/audio/speech` costs are looked up from `/generation`
+  about a minute later. ElevenLabs and Gemini have no per-call price, so
+  those rows are rate-card estimates (`COST_*`) and are flagged as such.
+  `Render.actual_cost` is the sum of that render's rows. **Settings → Spend**
+  shows the month by type, model and project, the recent charges, and
+  OpenRouter's own usage figure for the key, to cross-check.
+  It also holds the monthly budget: alerts fire at 80% and 100% (configurable)
+  through `ALERT_WEBHOOK_URL`. With the hard stop on, paid generation
+  endpoints return 402 at 100%; FFmpeg-only work (recompose, ambient
+  render) is never blocked. API: `GET /api/spend/summary|entries|openrouter`,
+  `GET|PUT /api/spend/budget`.
 - **Alerts** (`ALERT_WEBHOOK_URL`, Slack/Discord-compatible): render, loop
   and upload failures, a burst of provider errors (default 5 in 10 min),
   and an active model disappearing from the polled catalog. Duplicates are
@@ -302,11 +327,13 @@ into the owner's asset library, which is the Flow-style "save to characters/scen
 
 ```
 draft → planning → planned → generating_audio → generating_shots
-                              → polling → rendering → completed | failed
+                              → rendering → completed | failed | cancelled
+completed → regenerating (shots re-rolling) → generating (recompose) → completed
 ```
 
-Each `VideoShot` has its own status; failed shots can be regenerated without redoing
-the whole pipeline.
+Each `VideoShot` has its own status (`submitted → running → completed | failed`,
+driven by its video job). Failed shots can be regenerated without redoing the
+whole pipeline.
 
 ---
 

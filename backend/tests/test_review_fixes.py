@@ -60,8 +60,12 @@ def _talking_project(client, extra_shot=False) -> int:
 # 1 ── real Avatar IV adapter must accept what the pipeline passes
 @respx.mock
 def test_real_avatar_adapter_runs_through_pipeline(auth_client, monkeypatch):
+    """The real adapter submits; completion arrives by webhook and is polled /
+    downloaded by the provider that submitted the job (OpenRouter), even
+    though the active video provider here is the mock."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
-    from app import config, providers
+    from app import config, models, providers
+    from app.db import SessionLocal
     from app.providers.openrouter_avatar import OpenRouterAvatarProvider
 
     config.get_settings.cache_clear()
@@ -69,19 +73,26 @@ def test_real_avatar_adapter_runs_through_pipeline(auth_client, monkeypatch):
                            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-f", "mp4", "-movflags", "frag_keyframe", "pipe:1"],
                           capture_output=True, check=True).stdout
     sub = respx.post(f"{OR}/videos").mock(return_value=httpx.Response(202, json={"id": "a1", "polling_url": f"{OR}/videos/a1"}))
-    respx.get(f"{OR}/videos/a1").mock(return_value=httpx.Response(200, json={"status": "completed",
-                                                                           "unsigned_urls": [f"{OR}/videos/a1/content"]}))
     respx.get(f"{OR}/videos/a1/content").mock(return_value=httpx.Response(200, content=clip))
     real = OpenRouterAvatarProvider(api_key="sk-or")
-    real_animate = real.animate
-    monkeypatch.setattr(real, "animate", lambda **kw: real_animate(poll_seconds=0, **kw))
     monkeypatch.setattr(providers, "get_avatar", lambda: real)
     pid = _talking_project(auth_client)
     auth_client.post(f"/api/projects/{pid}/generate-video?force=true")
+    assert sub.called
+    st = auth_client.get(f"/api/projects/{pid}/status").json()
+    assert st["latest_render"]["status"] == "generating_shots"  # waiting on the avatar job
+    db = SessionLocal()
+    job = db.query(models.VideoJob).filter_by(purpose="avatar").one()
+    token = job.callback_token
+    db.close()
+    r = auth_client.post(f"/api/webhooks/openrouter/videos/{token}", json={
+        "type": "video.generation.completed", "data": {"id": "a1", "status": "completed",
+        "unsigned_urls": [f"{OR}/videos/a1/content"], "usage": {"cost": 0.3}}})
+    assert r.status_code == 204
     st = auth_client.get(f"/api/projects/{pid}/status").json()
     th = [s for s in st["shots"] if s["shot_type"] == "talking_head"][0]
     assert th["provider"] == "lipsync" and th["error"] == "", th["error"]
-    assert sub.called
+    assert st["latest_render"]["status"] == "completed", st["latest_render"]["error"]
 
 
 # 2 ── each talking-head shot gets its own voice slice; clip trimmed to the shot
@@ -91,12 +102,14 @@ def test_talking_head_shots_get_their_own_audio_slice(auth_client, monkeypatch):
     from app.services import public_media
 
     calls = []
+    real_submit = mock_avatar.MockAvatarProvider.submit_avatar
 
-    def animate(self, **kw):
+    def submit_avatar(self, **kw):
         calls.append(kw)
-        return _generate_clip("avatar", 12.0, 1)  # providers size clips to their audio, not the shot
+        monkeypatch.setattr(self, "render", lambda **_: _generate_clip("avatar", 12.0, 1))
+        return real_submit(self, **kw)  # providers size clips to their audio, not the shot
 
-    monkeypatch.setattr(mock_avatar.MockAvatarProvider, "animate", animate)
+    monkeypatch.setattr(mock_avatar.MockAvatarProvider, "submit_avatar", submit_avatar)
     pid = _talking_project(auth_client, extra_shot=True)
     auth_client.put("/api/models/active", json={"kind": "lipsync", "model": "heygen/avatar-iv", "allow_unlisted": True})
     auth_client.post(f"/api/projects/{pid}/generate-video?force=true")

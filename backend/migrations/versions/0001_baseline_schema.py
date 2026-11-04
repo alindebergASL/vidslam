@@ -1,8 +1,8 @@
-"""baseline schema (net-new build: the whole schema in one revision)
+"""baseline schema
 
 Revision ID: 0001
 Revises: 
-Create Date: 2026-11-04 18:31:12.357479
+Create Date: 2026-11-04 19:04:35.460512
 
 """
 from typing import Sequence, Union
@@ -105,6 +105,57 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
+    op.create_table('spend_entries',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('created_at', sa.DateTime(), nullable=False),
+    sa.Column('provider', sa.String(length=40), nullable=False),
+    sa.Column('kind', sa.String(length=20), nullable=False),
+    sa.Column('model', sa.String(length=200), nullable=False),
+    sa.Column('project_id', sa.Integer(), nullable=True),
+    sa.Column('render_id', sa.Integer(), nullable=True),
+    sa.Column('ref', sa.String(length=80), nullable=False),
+    sa.Column('cost_usd', sa.Float(), nullable=False),
+    sa.Column('is_estimate', sa.Boolean(), nullable=False),
+    sa.Column('source', sa.String(length=20), nullable=False),
+    sa.Column('generation_id', sa.String(length=120), nullable=False),
+    sa.Column('note', sa.String(length=300), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_spend_entries_created_at'), 'spend_entries', ['created_at'], unique=False)
+    op.create_index(op.f('ix_spend_entries_kind'), 'spend_entries', ['kind'], unique=False)
+    op.create_index(op.f('ix_spend_entries_project_id'), 'spend_entries', ['project_id'], unique=False)
+    op.create_index(op.f('ix_spend_entries_render_id'), 'spend_entries', ['render_id'], unique=False)
+    op.create_index(op.f('ix_spend_entries_source'), 'spend_entries', ['source'], unique=False)
+    op.create_table('video_jobs',
+    sa.Column('id', sa.Integer(), nullable=False),
+    sa.Column('purpose', sa.String(length=30), nullable=False),
+    sa.Column('ref_id', sa.Integer(), nullable=False),
+    sa.Column('project_id', sa.Integer(), nullable=True),
+    sa.Column('render_id', sa.Integer(), nullable=True),
+    sa.Column('provider', sa.String(length=40), nullable=False),
+    sa.Column('model', sa.String(length=300), nullable=False),
+    sa.Column('provider_job_id', sa.String(length=200), nullable=False),
+    sa.Column('polling_url', sa.String(length=500), nullable=False),
+    sa.Column('callback_token', sa.String(length=80), nullable=False),
+    sa.Column('uses_webhook', sa.Boolean(), nullable=False),
+    sa.Column('status', sa.String(length=20), nullable=False),
+    sa.Column('context_json', sa.JSON(), nullable=True),
+    sa.Column('result_path', sa.String(length=500), nullable=False),
+    sa.Column('error', sa.Text(), nullable=False),
+    sa.Column('cost_usd', sa.Float(), nullable=True),
+    sa.Column('checks', sa.Integer(), nullable=False),
+    sa.Column('next_check_at', sa.DateTime(), nullable=False),
+    sa.Column('deadline_at', sa.DateTime(), nullable=False),
+    sa.Column('completed_at', sa.DateTime(), nullable=True),
+    sa.Column('created_at', sa.DateTime(), nullable=False),
+    sa.Column('updated_at', sa.DateTime(), nullable=False),
+    sa.PrimaryKeyConstraint('id')
+    )
+    op.create_index(op.f('ix_video_jobs_callback_token'), 'video_jobs', ['callback_token'], unique=True)
+    op.create_index(op.f('ix_video_jobs_next_check_at'), 'video_jobs', ['next_check_at'], unique=False)
+    op.create_index(op.f('ix_video_jobs_project_id'), 'video_jobs', ['project_id'], unique=False)
+    op.create_index(op.f('ix_video_jobs_render_id'), 'video_jobs', ['render_id'], unique=False)
+    op.create_index(op.f('ix_video_jobs_status'), 'video_jobs', ['status'], unique=False)
     op.create_table('assets',
     sa.Column('id', sa.Integer(), nullable=False),
     sa.Column('owner_kind', sa.String(length=20), nullable=False),
@@ -127,9 +178,9 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_assets_public_token'), 'assets', ['public_token'], unique=True)
-    # assets ↔ asset_generation_jobs reference each other: add this FK once
-    # both tables exist. (An inline use_alter FK inside create_table is
-    # silently skipped by Alembic; batch mode lets SQLite add it too.)
+    # assets <-> asset_generation_jobs reference each other: add this FK once
+    # both tables exist (an inline use_alter FK is skipped by Alembic; batch
+    # mode lets SQLite add it too).
     with op.batch_alter_table('asset_generation_jobs', schema=None) as batch_op:
         batch_op.create_foreign_key(
             'fk_asset_generation_jobs_result_asset_id', 'assets', ['result_asset_id'], ['id']
@@ -275,6 +326,18 @@ def downgrade() -> None:
     op.drop_table('video_projects')
     op.drop_index(op.f('ix_assets_public_token'), table_name='assets')
     op.drop_table('assets')
+    op.drop_index(op.f('ix_video_jobs_status'), table_name='video_jobs')
+    op.drop_index(op.f('ix_video_jobs_render_id'), table_name='video_jobs')
+    op.drop_index(op.f('ix_video_jobs_project_id'), table_name='video_jobs')
+    op.drop_index(op.f('ix_video_jobs_next_check_at'), table_name='video_jobs')
+    op.drop_index(op.f('ix_video_jobs_callback_token'), table_name='video_jobs')
+    op.drop_table('video_jobs')
+    op.drop_index(op.f('ix_spend_entries_source'), table_name='spend_entries')
+    op.drop_index(op.f('ix_spend_entries_render_id'), table_name='spend_entries')
+    op.drop_index(op.f('ix_spend_entries_project_id'), table_name='spend_entries')
+    op.drop_index(op.f('ix_spend_entries_kind'), table_name='spend_entries')
+    op.drop_index(op.f('ix_spend_entries_created_at'), table_name='spend_entries')
+    op.drop_table('spend_entries')
     op.drop_table('ingredients')
     op.drop_table('custom_models')
     op.drop_index(op.f('ix_brand_kits_logo_public_token'), table_name='brand_kits')

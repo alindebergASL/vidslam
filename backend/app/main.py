@@ -97,14 +97,20 @@ def create_app() -> FastAPI:
         # pytest so tests never make network calls).
         import sys
 
-        from .services import model_catalog
+        from .services import model_catalog, video_jobs
 
+        under_pytest = "pytest" in sys.modules
         started = False
-        if "pytest" not in sys.modules:
+        if not under_pytest:
             started = model_catalog.start_poller()
+            # Safety net for video jobs: polls any job whose webhook hasn't
+            # arrived (and is the main path when webhooks can't reach us).
+            video_jobs.start_sweeper()
         yield
         if started:
             model_catalog.stop_poller()
+        if not under_pytest:
+            video_jobs.stop_sweeper()
 
     app = FastAPI(title="AvatarVideoStudio API", version="0.1.0", lifespan=lifespan)
     # Order matters: Starlette runs middlewares in reverse-add order, so adding

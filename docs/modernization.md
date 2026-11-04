@@ -25,7 +25,7 @@ and Replicate's current docs, and the npm/PyPI registries.
    throughout, so the work is a `postgres` service in the prod compose
    overlay, `psycopg[binary]`, and a one-time data copy. Effort: small to
    medium.
-2. **Webhooks instead of polling for video jobs.** OpenRouter's
+2. ✅ **Done: webhooks instead of polling for video jobs** (see README → Video jobs). OpenRouter's
    `POST /videos` takes a `callback_url`. Today a worker sleeps in a poll
    loop for each clip, up to about 10 minutes per clip, which ties up a
    worker for chained loops. Callbacks free the worker and are faster.
@@ -41,7 +41,7 @@ and Replicate's current docs, and the npm/PyPI registries.
    accounts (or SSO) are needed before more than one person or team uses
    it, especially now that the app connects a YouTube channel and spends
    on paid APIs. Effort: medium.
-5. **Spend tracking from provider responses.** OpenRouter returns
+5. ✅ **Done: spend tracking from provider responses** (see README → Spend tracking). OpenRouter returns
    `usage.cost` on chat and video jobs, so the app could record real spend
    per render instead of rate-card estimates, and enforce a budget cap.
    Effort: small to medium.

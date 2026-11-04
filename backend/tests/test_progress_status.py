@@ -33,9 +33,9 @@ def test_project_flips_to_generating_during_render(auth_client, monkeypatch):
     from app.services import pipeline
 
     seen: list[str] = []
-    real = pipeline._ensure_clip_for_shot
+    real = pipeline.submit_shot_clip
 
-    def _spy(db, project, shot):
+    def _spy(db, project, shot, **kw):
         # Capture the project's status as observed by a *separate* session,
         # mimicking a client polling while the render runs.
         probe = SessionLocal()
@@ -43,9 +43,9 @@ def test_project_flips_to_generating_during_render(auth_client, monkeypatch):
             seen.append(probe.get(models.VideoProject, project.id).status)
         finally:
             probe.close()
-        return real(db, project, shot)
+        return real(db, project, shot, **kw)
 
-    monkeypatch.setattr(pipeline, "_ensure_clip_for_shot", _spy)
+    monkeypatch.setattr(pipeline, "submit_shot_clip", _spy)
 
     db = SessionLocal()
     try:

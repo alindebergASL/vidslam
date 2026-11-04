@@ -31,6 +31,9 @@ class JobStatus:
     progress: float = 0.0
     result_url: Optional[str] = None
     error: Optional[str] = None
+    # Provider-reported cost in USD once the job is done (OpenRouter
+    # `usage.cost`); None when the provider doesn't say.
+    cost: Optional[float] = None
 
 
 @dataclass

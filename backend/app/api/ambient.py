@@ -25,6 +25,7 @@ from ..schemas.ambient import (
 )
 from ..services import ambient as svc
 from ..services.ratelimit import rate_limit
+from ..services.spend import budget_guard
 from ..workers.jobs import (
     ambient_batch_job,
     generate_ambient_loop_job,
@@ -80,7 +81,7 @@ def preset_preview(preset_id: str) -> FileResponse:
     return FileResponse(path, media_type="image/png")
 
 
-@router.post("/presets/previews", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/presets/previews", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_previews(missing_only: bool = True) -> dict:
     """Generate preview stills for presets (one image call each)."""
     ids = [p.id for p in svc.SCENE_PRESETS if p.prompt
@@ -89,7 +90,7 @@ def generate_previews(missing_only: bool = True) -> dict:
     return {"presets": ids, "job_id": job_id, "status": "enqueued" if ids else "nothing_to_do"}
 
 
-@router.post("/batch", status_code=201, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/batch", status_code=201, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def batch_create(body: AmbientBatchRequest, db: Session = Depends(get_db)) -> dict:
     """Create one scene per preset with shared settings, then generate (and
     optionally render) them one after another in a single background job."""
@@ -128,6 +129,8 @@ def list_scenes(db: Session = Depends(get_db)) -> list[AmbientOut]:
 @router.post("", response_model=AmbientOut, status_code=201,
              dependencies=[Depends(rate_limit("generation"))])
 def create_scene(body: AmbientCreate, db: Session = Depends(get_db)) -> AmbientOut:
+    if body.generate:
+        budget_guard()  # creating without generating is free
     try:
         project = svc.create_scene(db, body)
     except ValueError as e:
@@ -157,7 +160,7 @@ def update_scene(scene_id: int, body: AmbientUpdate, db: Session = Depends(get_d
 
 
 @router.post("/{scene_id}/generate-loop", status_code=202,
-             dependencies=[Depends(rate_limit("generation"))])
+             dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_loop(
     scene_id: int,
     regenerate_music: bool = True,
@@ -170,7 +173,7 @@ def generate_loop(
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
 
 
-@router.post("/{scene_id}/music", dependencies=[Depends(rate_limit("generation"))])
+@router.post("/{scene_id}/music", dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def regenerate_music(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
     """(Re)generate the scene's music bed at its configured length —
     multi-part + crossfaded when longer than the provider's per-call cap."""

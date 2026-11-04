@@ -97,6 +97,12 @@ class OpenRouterTTSProvider(TTSProvider):
                 raise RuntimeError(f"tts {r.status_code}: {r.text[:300]}")
             ctype = r.headers.get("content-type", "")
             data = r.content
+        from ..services import spend
+
+        spend.record_openrouter("tts", self.model, cost=None,
+                                generation_id=r.headers.get("x-generation-id", ""),
+                                estimate=len(text) / 1000 * get_settings().cost_tts_per_1k_chars,
+                                note=f"{len(text)} chars")
         if "pcm" in ctype or body["response_format"] == "pcm" and "mpeg" not in ctype:
             return pcm16_to_wav(data)
         return data
@@ -114,6 +120,7 @@ class OpenRouterTTSProvider(TTSProvider):
             ],
         }
         chunks: list[bytes] = []
+        usage: dict = {}
         with httpx.Client(timeout=300.0) as client:
             with client.stream("POST", f"{self._base}/chat/completions",
                                headers=self._headers(), json=body) as r:
@@ -129,10 +136,19 @@ class OpenRouterTTSProvider(TTSProvider):
                         evt = json.loads(payload)
                     except ValueError:
                         continue
+                    if evt.get("usage"):
+                        usage = {"usage": evt["usage"], "id": evt.get("id")}
+                    usage.setdefault("id", evt.get("id"))
                     for ch in evt.get("choices") or []:
                         audio = (ch.get("delta") or {}).get("audio") or {}
                         if audio.get("data"):
                             chunks.append(base64.b64decode(audio["data"]))
         if not chunks:
             raise RuntimeError("chat audio stream returned no audio")
+        from ..services import spend
+
+        spend.record_openrouter("tts", self.model, cost=spend.usage_cost(usage),
+                                generation_id=str(usage.get("id") or ""),
+                                estimate=len(text) / 1000 * get_settings().cost_tts_per_1k_chars,
+                                note=f"{len(text)} chars")
         return pcm16_to_wav(b"".join(chunks))

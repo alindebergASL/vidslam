@@ -7,8 +7,6 @@ import httpx
 from ..config import get_settings
 from .base import ImageProvider, ImageRef, ModelInfo
 
-settings = get_settings()
-
 
 class OpenRouterImageProvider(ImageProvider):
     """Thin adapter for OpenRouter's image generation endpoint.
@@ -18,16 +16,16 @@ class OpenRouterImageProvider(ImageProvider):
     """
 
     def __init__(self, *, api_key: str | None = None, model: str | None = None) -> None:
-        self.api_key = api_key or settings.openrouter_api_key
-        self.model = model or settings.openrouter_image_model
+        self.api_key = api_key or get_settings().openrouter_api_key
+        self.model = model or get_settings().openrouter_image_model
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY missing for real image provider")
 
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": settings.openrouter_site_url,
-            "X-Title": settings.openrouter_app_title,
+            "HTTP-Referer": get_settings().openrouter_site_url,
+            "X-Title": get_settings().openrouter_app_title,
             "Content-Type": "application/json",
         }
 
@@ -72,6 +70,11 @@ class OpenRouterImageProvider(ImageProvider):
             r = client.post(url, headers=self._headers(), json=body)
             r.raise_for_status()
             data = r.json()
+        from ..services import spend
+
+        spend.record_openrouter("image", body["model"], cost=spend.usage_cost(data),
+                                generation_id=str(data.get("id") or ""),
+                                estimate=get_settings().cost_image_per_item)
         item = (data.get("data") or [{}])[0]
         if "b64_json" in item:
             return base64.b64decode(item["b64_json"])

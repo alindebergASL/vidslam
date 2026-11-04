@@ -229,6 +229,8 @@ def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
     if render_ids:
         db.query(models.PublishJob).filter(models.PublishJob.render_id.in_(render_ids)).delete(
             synchronize_session=False)
+    db.query(models.VideoJob).filter(models.VideoJob.project_id == project_id).delete(
+        synchronize_session=False)
     # Provider logs are an audit trail: keep them, detach from the project.
     db.query(models.ProviderLog).filter(models.ProviderLog.project_id == project_id).update(
         {"project_id": None}, synchronize_session=False)

@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
 import { ModelsPanel } from "@/components/ModelsPanel";
+import { SpendPanel } from "@/components/SpendPanel";
 import { YouTubeCard } from "@/components/YouTubeCard";
 import { api, SystemInfo } from "@/lib/api";
 
@@ -81,6 +82,8 @@ function Inner() {
           </div>
         )}
       </section>
+
+      <SpendPanel />
 
       <ModelsPanel />
 

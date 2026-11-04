@@ -290,13 +290,10 @@ def test_avatar_iv_request_shape(monkeypatch):
 
     sub = respx.post(f"{OR}/videos").mock(return_value=httpx.Response(202, json={
         "id": "av1", "polling_url": f"{OR}/videos/av1", "status": "pending"}))
-    respx.get(f"{OR}/videos/av1").mock(return_value=httpx.Response(200, json={
-        "status": "completed", "unsigned_urls": [f"{OR}/videos/av1/content?index=0"]}))
-    content = respx.get(f"{OR}/videos/av1/content").mock(return_value=httpx.Response(200, content=b"MP4"))
-    out = OpenRouterAvatarProvider().animate(
+    job = OpenRouterAvatarProvider().submit_avatar(
         portrait_url="https://h/p.png", audio_url="https://h/a.m4a", script="Hi there",
-        aspect_ratio="9:16", voice_id="v42", poll_seconds=0)
-    assert out == b"MP4"
+        aspect_ratio="9:16", voice_id="v42", callback_url="https://app/api/webhooks/openrouter/videos/t")
+    assert job.job_id == "av1" and job.polling_url == f"{OR}/videos/av1" and job.provider == "openrouter"
     body = json.loads(sub.calls[0].request.content)
     assert body["model"] == "heygen/avatar-iv" and body["prompt"] == "Hi there"
     assert body["input_references"] == [
@@ -304,7 +301,7 @@ def test_avatar_iv_request_shape(monkeypatch):
         {"type": "audio_url", "audio_url": {"url": "https://h/a.m4a"}},
     ]
     assert body["provider"] == {"options": {"heygen": {"voice_id": "v42"}}}
-    assert content.calls[0].request.headers["Authorization"] == "Bearer sk-or"
+    assert body["callback_url"] == "https://app/api/webhooks/openrouter/videos/t"
 
 
 @respx.mock
@@ -362,7 +359,7 @@ def test_talking_head_falls_back_to_video_model_when_lipsync_fails(auth_client, 
     def boom(self, **kw):
         raise RuntimeError("avatar outage")
 
-    monkeypatch.setattr(mock_avatar.MockAvatarProvider, "animate", boom)
+    monkeypatch.setattr(mock_avatar.MockAvatarProvider, "submit_avatar", boom)
     pid = _talking_head_project(auth_client)
     auth_client.put("/api/models/active", json={"kind": "lipsync", "model": "heygen/avatar-iv", "allow_unlisted": True})
     auth_client.post(f"/api/projects/{pid}/generate-video?force=true")

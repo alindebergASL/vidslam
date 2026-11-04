@@ -104,6 +104,14 @@ class OpenRouterMusicProvider(MusicProvider):
             "Content-Type": "application/json",
         }
         chunks: list[bytes] = []
+        meta: dict = {}
+
+        def take(obj: dict) -> None:
+            _collect(obj, chunks)
+            meta.setdefault("id", obj.get("id"))
+            if obj.get("usage"):
+                meta["usage"] = obj["usage"]
+
         url = f"{s.openrouter_base_url.rstrip('/')}/chat/completions"
         with httpx.Client(timeout=600.0) as client:
             with client.stream("POST", url, headers=headers, json=body) as r:
@@ -118,15 +126,20 @@ class OpenRouterMusicProvider(MusicProvider):
                         if payload == "[DONE]":
                             break
                         try:
-                            _collect(json.loads(payload), chunks)
+                            take(json.loads(payload))
                         except ValueError:
                             continue
                 else:  # provider answered non-streamed
-                    _collect(json.loads(r.read() or b"{}"), chunks)
+                    take(json.loads(r.read() or b"{}"))
         if not chunks:
             raise RuntimeError(
                 "Lyria via OpenRouter returned no audio (response shape undocumented) — "
                 "try the Google route (GEMINI_API_KEY) or ElevenLabs"
             )
+        from ..services import spend
+
+        spend.record_openrouter("music", self.model, cost=spend.usage_cost(meta),
+                                generation_id=str(meta.get("id") or ""),
+                                estimate=s.cost_music_per_generation, note=f"{duration_seconds:.0f}s track")
         data, self._ext = sniff_audio(b"".join(chunks))
         return data

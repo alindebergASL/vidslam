@@ -12,12 +12,10 @@ and fall back to the regular clip path if the job fails.
 """
 from __future__ import annotations
 
-import time
-
 import httpx
 
 from ..config import get_settings
-from .base import ModelInfo
+from .base import ModelInfo, SubmittedJob
 
 
 class OpenRouterAvatarProvider:
@@ -40,14 +38,13 @@ class OpenRouterAvatarProvider:
     def list_models(self) -> list[ModelInfo]:
         return [ModelInfo(id=self.model, name=self.model, modality="video")]
 
-    def animate(
+    def submit_avatar(
         self, *, portrait_url: str, audio_url: str | None, script: str,
         aspect_ratio: str = "9:16", voice_id: str = "", motion_prompt: str = "",
-        duration_seconds: float | None = None,  # length follows the audio; the
-        # pipeline trims the result to the shot, so this isn't sent.
-        poll_seconds: float = 5.0, timeout_seconds: float = 900.0,
-        **_: object,
-    ) -> bytes:
+        duration_seconds: float | None = None, callback_url: str | None = None, **_: object,
+    ) -> SubmittedJob:
+        """Submit and return immediately; completion arrives like any other
+        OpenRouter video job (webhook or poll via the video provider)."""
         refs = [{"type": "image_url", "image_url": {"url": portrait_url}}]
         if audio_url:
             refs.append({"type": "audio_url", "audio_url": {"url": audio_url}})
@@ -57,6 +54,8 @@ class OpenRouterAvatarProvider:
             "aspect_ratio": aspect_ratio,
             "input_references": refs,
         }
+        if callback_url:
+            body["callback_url"] = callback_url
         heygen = {k: v for k, v in {"voice_id": voice_id, "motion_prompt": motion_prompt}.items() if v}
         if heygen:
             body["provider"] = {"options": {"heygen": heygen}}
@@ -65,22 +64,6 @@ class OpenRouterAvatarProvider:
             if r.status_code >= 400:
                 raise RuntimeError(f"avatar submit {r.status_code}: {r.text[:300]}")
             job = r.json()
-            poll = job.get("polling_url") or f"{self._base}/videos/{job.get('id')}"
-            deadline = time.monotonic() + timeout_seconds
-            while True:
-                st = client.get(poll, headers=self._headers())
-                st.raise_for_status()
-                data = st.json()
-                status = (data.get("status") or "").lower()
-                if status == "completed":
-                    urls = data.get("unsigned_urls") or []
-                    url = urls[0] if urls else f"{self._base}/videos/{job.get('id')}/content?index=0"
-                    out = client.get(url, headers={"Authorization": f"Bearer {self.api_key}"},
-                                     follow_redirects=True, timeout=300.0)
-                    out.raise_for_status()
-                    return out.content
-                if status in ("failed", "cancelled", "expired"):
-                    raise RuntimeError(f"avatar job {status}: {data.get('error')}")
-                if time.monotonic() > deadline:
-                    raise RuntimeError("avatar job timed out")
-                time.sleep(poll_seconds)
+        jid = str(job.get("id") or "")
+        return SubmittedJob(provider="openrouter", model=self.model, job_id=jid,
+                            polling_url=job.get("polling_url") or f"{self._base}/videos/{jid}")

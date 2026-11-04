@@ -71,5 +71,10 @@ class LyriaMusicProvider(MusicProvider):
                 continue
             for item in step.get("content") or []:
                 if item.get("type") == "audio" and item.get("data"):
+                    from ..services import spend
+
+                    # Gemini reports tokens, not dollars: use the rate card.
+                    spend.record_rate_card("gemini", "music", self.model, s.cost_music_per_generation,
+                                           note=f"{duration_seconds:.0f}s track")
                     return base64.b64decode(item["data"])
         raise RuntimeError("lyria response contained no audio")

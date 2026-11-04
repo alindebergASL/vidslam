@@ -10,8 +10,6 @@ from ..config import get_settings
 from ..schemas.storyboard import StoryboardPlan
 from .base import CastContext, ChatProvider
 
-settings = get_settings()
-
 
 def _load_system_prompt() -> str:
     # Read the prompt from the prompts/ directory packaged with the app.
@@ -46,8 +44,8 @@ def _format_user_payload(project: dict, cast: CastContext) -> str:
 class OpenRouterChatProvider(ChatProvider):
     def __init__(self, *, api_key: str | None = None, model: str | None = None,
                  json_mode: bool | None = None) -> None:
-        self.api_key = api_key or settings.openrouter_api_key
-        self.model = model or settings.openrouter_chat_model
+        self.api_key = api_key or get_settings().openrouter_api_key
+        self.model = model or get_settings().openrouter_chat_model
         # None = decide from the catalog entry's supported_parameters:
         #   structured_outputs → json_schema (schema-guided output)
         #   response_format    → json_object
@@ -70,8 +68,8 @@ class OpenRouterChatProvider(ChatProvider):
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": settings.openrouter_site_url,
-            "X-Title": settings.openrouter_app_title,
+            "HTTP-Referer": get_settings().openrouter_site_url,
+            "X-Title": get_settings().openrouter_app_title,
             "Content-Type": "application/json",
         }
 
@@ -101,7 +99,7 @@ class OpenRouterChatProvider(ChatProvider):
         if self.json_mode:
             formats.append({"type": "json_object"})
         formats.append(None)
-        url = f"{settings.openrouter_base_url.rstrip('/')}/chat/completions"
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
         with httpx.Client(timeout=180.0) as client:
             for i, fmt in enumerate(formats):
                 body.pop("response_format", None)
@@ -114,6 +112,11 @@ class OpenRouterChatProvider(ChatProvider):
                 break
             r.raise_for_status()
             data = r.json()
+        from ..services import spend
+
+        spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
+                                generation_id=str(data.get("id") or ""),
+                                estimate=get_settings().cost_chat_per_plan, note="storyboard plan")
         content = data["choices"][0]["message"]["content"]
         if isinstance(content, list):  # content-parts shape
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))

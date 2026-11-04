@@ -660,24 +660,36 @@ def _segment_shots(db: Session, project: models.VideoProject, n: int) -> list[mo
     return out
 
 
-def _generate_video_chain(
+_CHAIN_KEY = "_chain"  # in-flight chain state (cleared when the loop is done)
+
+
+def _set_state(project: models.VideoProject, key: str, value: Optional[dict]) -> None:
+    data = dict(project.ambient_config_json or {})
+    if value is None:
+        data.pop(key, None)
+    else:
+        data[key] = value
+    project.ambient_config_json = data
+
+
+def _start_video_chain(
     db: Session, project: models.VideoProject, shot: models.VideoShot,
-    cfg: AmbientConfig, plan: LoopPlanOut,
-) -> dict:
-    """Produce the loop clip from 1..N provider calls. Returns metadata
-    recorded under ambient_config_json._generated."""
-    from .pipeline import _ensure_clip_for_shot, _log_provider_call, _resolve_model
+    cfg: AmbientConfig, plan: LoopPlanOut, *, regenerate_music: bool, render_after: bool,
+) -> None:
+    """Make the anchor still (if any), create the segment shots and submit
+    segment 1. Each completion submits the next (on_segment_ready); the last
+    one joins them and finishes the scene (_finish_chain)."""
+    from .pipeline import _log_provider_call, _resolve_model
 
     out_dir = storage.render_subdir(project.id)
     frames_dir = out_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
-
     anchor_url: Optional[str] = None
     if plan.anchored:
         image = get_image()
         img_model = _resolve_model(db, _active_model("image"))
-        still_prompt = (cfg.scene_prompt.strip() or (_PRESET_BY_ID.get(cfg.scene_preset).prompt
-                        if _PRESET_BY_ID.get(cfg.scene_preset) else "")) + \
+        preset = _PRESET_BY_ID.get(cfg.scene_preset)
+        still_prompt = (cfg.scene_prompt.strip() or (preset.prompt if preset else "")) + \
             " Wide establishing shot, no people, no text, photorealistic, highly detailed."
         png = image.generate(model=img_model, prompt=still_prompt, references=[])
         anchor = frames_dir / "anchor.png"
@@ -687,13 +699,7 @@ def _generate_video_chain(
             db, project_id=project.id, provider=type(image).__name__, endpoint="image.generate(anchor)",
             request_summary={"model": img_model}, response_summary={"bytes": len(png)},
         )
-
     segs = _segment_shots(db, project, len(plan.segments))
-    shot.status = "polling"
-    db.commit()
-    prev_url = anchor_url
-    seg_paths: list[Path] = []
-    n = len(segs)
     for i, (seg, dur) in enumerate(zip(segs, plan.segments, strict=True)):
         seg.prompt = shot.prompt + (
             "" if i == 0 else " Continue the exact same shot from the given first frame, same lighting."
@@ -701,44 +707,142 @@ def _generate_video_chain(
         seg.negative_prompt = shot.negative_prompt
         seg.duration_seconds = float(dur)
         seg.model_override = shot.model_override
-        refs: list[ImageRef] = []
-        if prev_url:
-            refs.append(ImageRef(url=prev_url, role="scene", frame_type="first_frame"))
-        if plan.closed and i == n - 1 and anchor_url:
-            refs.append(ImageRef(url=anchor_url, role="scene", frame_type="last_frame"))
-        seg.reference_strategy = "frame_images" if refs else "input_references"
-        db.commit()
-        path = _ensure_clip_for_shot(db, project, seg, references=refs)
-        seg_paths.append(path)
-        if i < n - 1:
-            last = extract_frame(path, frames_dir / f"seg{i + 1}_last.png", last=True)
-            _, prev_url = _save_frame_public(last)
+    shot.status = "polling"
+    _set_state(project, _CHAIN_KEY, {
+        "segment_ids": [s.id for s in segs], "anchor_url": anchor_url, "plan": plan.model_dump(),
+        "regenerate_music": regenerate_music, "render_after": render_after,
+    })
+    db.commit()
+    _submit_segment(db, project, 0, prev_url=anchor_url)
 
-    clip = out_dir / f"shot_00_{shot.id}.mp4"
-    _, length = join_segments(
-        seg_paths, clip, aspect_ratio=project.aspect_ratio, crossfade=plan.join_crossfade
-    )
+
+def _submit_segment(db: Session, project: models.VideoProject, index: int, *, prev_url: Optional[str]) -> None:
+    from .pipeline import submit_shot_clip
+
+    chain = (project.ambient_config_json or {}).get(_CHAIN_KEY) or {}
+    plan = LoopPlanOut.model_validate(chain["plan"])
+    seg = db.get(models.VideoShot, chain["segment_ids"][index])
+    n = len(chain["segment_ids"])
+    refs: list[ImageRef] = []
+    if prev_url:
+        refs.append(ImageRef(url=prev_url, role="scene", frame_type="first_frame"))
+    if plan.closed and index == n - 1 and chain.get("anchor_url"):
+        refs.append(ImageRef(url=chain["anchor_url"], role="scene", frame_type="last_frame"))
+    seg.reference_strategy = "frame_images" if refs else "input_references"
+    db.commit()
+    submit_shot_clip(db, project, seg, purpose="ambient_segment", after="none",
+                     references=refs, context={"index": index})
+
+
+def on_segment_ready(db: Session, job: models.VideoJob) -> None:
+    project = db.get(models.VideoProject, job.project_id)
+    seg = db.get(models.VideoShot, job.ref_id)
+    if project is None or seg is None:
+        return
+    chain = (project.ambient_config_json or {}).get(_CHAIN_KEY)
+    if not chain:
+        return  # chain was superseded (scene regenerated / edited)
+    seg.clip_path = job.result_path
+    seg.status = "completed"
+    db.commit()
+    index = int((job.context_json or {}).get("index", 0))
+    n = len(chain["segment_ids"])
+    try:
+        if index < n - 1:
+            frames_dir = storage.render_subdir(project.id) / "frames"
+            frames_dir.mkdir(exist_ok=True)
+            last = extract_frame(Path(seg.clip_path), frames_dir / f"seg{index + 1}_last.png", last=True)
+            _, prev_url = _save_frame_public(last)
+            _submit_segment(db, project, index + 1, prev_url=prev_url)
+        else:
+            _finish_chain(db, project)
+    except Exception as e:  # noqa: BLE001
+        _fail_generation(db, project.id, e)
+
+
+def on_segment_failed(db: Session, job: models.VideoJob) -> None:
+    seg = db.get(models.VideoShot, job.ref_id)
+    if seg is not None:
+        seg.status = "failed"
+        seg.error = job.error[:500]
+        db.commit()
+    if job.project_id:
+        _fail_generation(db, job.project_id, RuntimeError(f"segment failed: {job.error[:300]}"))
+
+
+def _finish_chain(db: Session, project: models.VideoProject) -> None:
+    chain = (project.ambient_config_json or {}).get(_CHAIN_KEY) or {}
+    plan = LoopPlanOut.model_validate(chain["plan"])
+    cfg = _config_of(project)
+    shot = _loop_shot(project)
+    segs = [db.get(models.VideoShot, i) for i in chain["segment_ids"]]
+    clip = storage.render_subdir(project.id) / f"shot_00_{shot.id}.mp4"
+    _, length = join_segments([Path(s.clip_path) for s in segs], clip,
+                              aspect_ratio=project.aspect_ratio, crossfade=plan.join_crossfade)
     shot.clip_path = str(clip)
     shot.provider = segs[0].provider
     shot.provider_model = segs[0].provider_model
     shot.duration_seconds = round(length, 2)
     shot.status = "completed"
+    generated = {"strategy": plan.strategy, "segments": plan.segments, "closed": plan.closed,
+                 "anchored": plan.anchored, "model": plan.model, "clip_seconds": round(length, 2)}
+    _set_state(project, _CHAIN_KEY, None)
     db.commit()
-    return {
-        "strategy": plan.strategy,
-        "segments": plan.segments,
-        "closed": plan.closed,
-        "anchored": plan.anchored,
-        "model": plan.model,
-        "clip_seconds": round(length, 2),
-    }
+    _finalize_generation(db, project, cfg, plan, generated,
+                         regenerate_music=bool(chain.get("regenerate_music", True)),
+                         render_after=bool(chain.get("render_after")))
 
 
-def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True) -> models.VideoShot:
-    """Produce the loop clip (video provider, chained when the model's per-call
-    cap is below the loop length; or still + drift) and, unless the mood is
-    "none", the music bed. Leaves the project "planned" (loop ready) or
-    "failed"."""
+def _finalize_generation(
+    db: Session, project: models.VideoProject, cfg: AmbientConfig, plan: LoopPlanOut,
+    generated: dict, *, regenerate_music: bool, render_after: bool,
+) -> None:
+    """Record the loop, make the music bed, mark the scene ready (and
+    render it when a batch asked for that)."""
+    settings = get_settings()
+    generated["estimated_cost"] = estimate_ambient_cost(cfg, plan)["total"]
+    generated["billed"] = 0.0 if settings.video_is_mocked() else generated["estimated_cost"]
+    _set_state(project, _GENERATED_KEY, generated)
+    db.commit()
+    # Music: (re)generate when asked, and always when the scene wants a bed
+    # but doesn't have one yet — a first generate must yield a renderable scene.
+    has_music = bool(project.music_upload_path and Path(project.music_upload_path).exists())
+    if regenerate_music or (cfg.music_mood != "none" and not has_music):
+        prompt = resolve_music_prompt(cfg)
+        if prompt:
+            generate_music_bed(db, project, cfg, prompt)
+        elif project.music_upload_path:
+            Path(project.music_upload_path).unlink(missing_ok=True)
+            project.music_upload_path = ""
+    project.status = "planned"
+    db.commit()
+    if render_after:
+        from ..workers.jobs import render_ambient_job
+        from ..workers.queue import enqueue
+
+        enqueue(render_ambient_job, project.id)
+
+
+def _fail_generation(db: Session, project_id: int, e: Exception) -> None:
+    log.error("ambient loop generation failed for %s: %s", project_id, e)
+    db.rollback()
+    project = db.get(models.VideoProject, project_id)
+    shot = _loop_shot(project)
+    if shot is not None and shot.status != "failed":
+        shot.status = "failed"
+        shot.error = str(e)[:500]
+    _set_state(project, _CHAIN_KEY, None)
+    project.status = "failed"
+    db.commit()
+    alerts.render_failed("ambient loop", project_id, project.title, str(e))
+
+
+def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True,
+                  render_after: bool = False) -> models.VideoShot:
+    """Start producing the loop clip. Still + drift finishes here; a video
+    loop is submitted segment by segment and finishes asynchronously
+    (webhook / sweeper) — the scene goes "planned" when it's ready, and is
+    rendered then if `render_after`."""
     from .pipeline import _log_provider_call, _resolve_model
 
     project = db.get(models.VideoProject, project_id)
@@ -746,84 +850,49 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
         raise ValueError(f"ambient scene {project_id} not found")
     cfg = _config_of(project)
     shot = _ensure_loop_shot(db, project, cfg)
-    # Force a fresh clip even if one exists — this is an explicit (re)generate.
     shot.status = "pending"
     shot.clip_path = ""
     shot.error = ""
     project.status = "generating"
+    _set_state(project, _CHAIN_KEY, None)  # supersede any in-flight chain
     db.commit()
-
     settings = get_settings()
     try:
         plan = plan_loop(cfg)
-        if cfg.source == "image_drift":
-            image = get_image()
-            model = _resolve_model(
-                db, cfg.model_override or _active_model("image")
-            )
-            shot.status = "submitted"
-            shot.provider = "mock" if settings.image_is_mocked() else "openrouter"
-            shot.provider_model = model
-            db.commit()
-            png = image.generate(model=model, prompt=shot.prompt, references=[],
-                                 negative_prompt=shot.negative_prompt or "")
-            out_dir = storage.render_subdir(project.id)
-            still = out_dir / "ambient_still.png"
-            still.write_bytes(png)
-            w, h = _dims_for_aspect(project.aspect_ratio)
-            clip = out_dir / f"shot_00_{shot.id}.mp4"
-            render_image_drift_clip(still, clip, seconds=float(cfg.loop_seconds), width=w, height=h)
-            shot.clip_path = str(clip)
-            shot.status = "completed"
-            db.commit()
-            _log_provider_call(
-                db, project_id=project.id, provider=type(image).__name__,
-                endpoint="image.generate+drift",
-                request_summary={"model": model, "seconds": cfg.loop_seconds},
-                response_summary={"bytes": len(png)},
-            )
-            generated = {"strategy": "drift", "segments": [cfg.loop_seconds], "closed": True,
-                         "anchored": False, "model": model, "clip_seconds": float(cfg.loop_seconds)}
-        else:
-            generated = _generate_video_chain(db, project, shot, cfg, plan)
-
-        # Record what this generation cost once, here, not on every render.
-        generated["estimated_cost"] = estimate_ambient_cost(cfg, plan)["total"]
-        generated["billed"] = 0.0 if settings.video_is_mocked() else generated["estimated_cost"]
-        data = dict(project.ambient_config_json or {})
-        data[_GENERATED_KEY] = generated
-        project.ambient_config_json = data
-
-        # Music: (re)generate when asked, and always when the scene wants a
-        # bed but doesn't have one yet — a first "Generate loop" on a draft
-        # must produce a complete, renderable scene.
-        has_music = bool(project.music_upload_path and Path(project.music_upload_path).exists())
-        if regenerate_music or (cfg.music_mood != "none" and not has_music):
-            prompt = resolve_music_prompt(cfg)
-            if prompt:
-                generate_music_bed(db, project, cfg, prompt)
-            elif project.music_upload_path:
-                # Mood switched to "none": drop the stale bed.
-                try:
-                    Path(project.music_upload_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                project.music_upload_path = ""
-
-        project.status = "planned"
+        if cfg.source != "image_drift":
+            _start_video_chain(db, project, shot, cfg, plan,
+                               regenerate_music=regenerate_music, render_after=render_after)
+            db.refresh(shot)
+            return shot
+        image = get_image()
+        model = _resolve_model(db, cfg.model_override or _active_model("image"))
+        shot.status = "submitted"
+        shot.provider = "mock" if settings.image_is_mocked() else "openrouter"
+        shot.provider_model = model
         db.commit()
+        png = image.generate(model=model, prompt=shot.prompt, references=[],
+                             negative_prompt=shot.negative_prompt or "")
+        out_dir = storage.render_subdir(project.id)
+        still = out_dir / "ambient_still.png"
+        still.write_bytes(png)
+        w, h = _dims_for_aspect(project.aspect_ratio)
+        clip = out_dir / f"shot_00_{shot.id}.mp4"
+        render_image_drift_clip(still, clip, seconds=float(cfg.loop_seconds), width=w, height=h)
+        shot.clip_path = str(clip)
+        shot.status = "completed"
+        db.commit()
+        _log_provider_call(
+            db, project_id=project.id, provider=type(image).__name__, endpoint="image.generate+drift",
+            request_summary={"model": model, "seconds": cfg.loop_seconds}, response_summary={"bytes": len(png)},
+        )
+        generated = {"strategy": "drift", "segments": [cfg.loop_seconds], "closed": True,
+                     "anchored": False, "model": model, "clip_seconds": float(cfg.loop_seconds)}
+        _finalize_generation(db, project, cfg, plan, generated,
+                             regenerate_music=regenerate_music, render_after=render_after)
         return shot
     except Exception as e:  # noqa: BLE001
         log.exception("ambient loop generation failed")
-        db.rollback()
-        project = db.get(models.VideoProject, project_id)
-        shot = _loop_shot(project)
-        if shot is not None and shot.status != "failed":
-            shot.status = "failed"
-            shot.error = str(e)[:500]
-        project.status = "failed"
-        db.commit()
-        alerts.render_failed("ambient loop", project_id, project.title, str(e))
+        _fail_generation(db, project_id, e)
         raise
 
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 
 from ..db import SessionLocal
-from ..services import pipeline
+from ..services import pipeline, spend
 
 log = logging.getLogger("avs.jobs")
 
@@ -16,7 +16,8 @@ log = logging.getLogger("avs.jobs")
 def generate_plan_job(project_id: int, preserve_edits: bool = False) -> None:
     db = SessionLocal()
     try:
-        pipeline.generate_plan(db, project_id, preserve_edits=preserve_edits)
+        with spend.scope(project_id=project_id):
+            pipeline.generate_plan(db, project_id, preserve_edits=preserve_edits)
     finally:
         db.close()
 
@@ -24,7 +25,8 @@ def generate_plan_job(project_id: int, preserve_edits: bool = False) -> None:
 def generate_video_job(project_id: int) -> None:
     db = SessionLocal()
     try:
-        pipeline.render_project(db, project_id)
+        with spend.scope(project_id=project_id):
+            pipeline.render_project(db, project_id)
     finally:
         db.close()
 
@@ -32,7 +34,8 @@ def generate_video_job(project_id: int) -> None:
 def regenerate_shot_job(project_id: int, shot_id: int, recompose: bool = True) -> None:
     db = SessionLocal()
     try:
-        pipeline.regenerate_shot(db, project_id, shot_id, recompose=recompose)
+        with spend.scope(project_id=project_id):
+            pipeline.regenerate_shot(db, project_id, shot_id, recompose=recompose)
     finally:
         db.close()
 
@@ -48,7 +51,8 @@ def recompose_project_job(project_id: int) -> None:
 def regenerate_shots_bulk_job(project_id: int, shot_ids: list[int]) -> None:
     db = SessionLocal()
     try:
-        pipeline.regenerate_shots_bulk(db, project_id, shot_ids)
+        with spend.scope(project_id=project_id):
+            pipeline.regenerate_shots_bulk(db, project_id, shot_ids)
     finally:
         db.close()
 
@@ -56,7 +60,8 @@ def regenerate_shots_bulk_job(project_id: int, shot_ids: list[int]) -> None:
 def generate_asset_job(job_id: int) -> None:
     db = SessionLocal()
     try:
-        pipeline.run_studio_job(db, job_id)
+        with spend.scope(ref=f"studio_job:{job_id}"):
+            pipeline.run_studio_job(db, job_id)
     finally:
         db.close()
 
@@ -74,7 +79,8 @@ def generate_ambient_loop_job(project_id: int, regenerate_music: bool = True) ->
 
     db = SessionLocal()
     try:
-        ambient.generate_loop(db, project_id, regenerate_music=regenerate_music)
+        with spend.scope(project_id=project_id):
+            ambient.generate_loop(db, project_id, regenerate_music=regenerate_music)
     finally:
         db.close()
 
@@ -96,7 +102,8 @@ def generate_previews_job(preset_ids: list[str]) -> None:
     try:
         for pid in preset_ids:
             try:
-                ambient.generate_preview(db, pid)
+                with spend.scope(ref=f"preview:{pid}"):
+                    ambient.generate_preview(db, pid)
             except Exception:  # noqa: BLE001 — one bad preset shouldn't stop the rest
                 log.exception("preview generation failed for %s", pid)
     finally:
@@ -111,9 +118,10 @@ def ambient_batch_job(project_ids: list[int], render: bool = True) -> None:
     for pid in project_ids:
         db = SessionLocal()
         try:
-            ambient.generate_loop(db, pid)
-            if render:
-                ambient.render_scene(db, pid)
+            # Video loops finish asynchronously; render_after renders each
+            # scene when its loop is ready.
+            with spend.scope(project_id=pid):
+                ambient.generate_loop(db, pid, render_after=render)
         except Exception:  # noqa: BLE001 — failures are recorded on the scene
             log.exception("batch item %s failed", pid)
         finally:
@@ -153,5 +161,51 @@ def publish_youtube_job(job_id: int) -> None:
             job.error = str(e)[:800]
             db.commit()
             alerts.send(f"publish-failed:{job_id}", f"YouTube upload failed: “{job.title}”", str(e)[:600])
+    finally:
+        db.close()
+
+
+def check_video_job(job_id: int) -> None:
+    from ..services import video_jobs
+
+    db = SessionLocal()
+    try:
+        video_jobs.check(db, job_id)
+    finally:
+        db.close()
+
+
+def complete_video_job(job_id: int, cost: float | None = None, result_url: str | None = None) -> None:
+    from ..services import video_jobs
+
+    db = SessionLocal()
+    try:
+        video_jobs.complete(db, job_id, cost=cost, result_url=result_url)
+    finally:
+        db.close()
+
+
+def fail_video_job(job_id: int, error: str) -> None:
+    from ..services import video_jobs
+
+    db = SessionLocal()
+    try:
+        video_jobs.fail(db, job_id, error)
+    finally:
+        db.close()
+
+
+def compose_render_job(render_id: int) -> None:
+    db = SessionLocal()
+    try:
+        pipeline.compose_render(db, render_id)
+    finally:
+        db.close()
+
+
+def recompose_after_regen_job(project_id: int) -> None:
+    db = SessionLocal()
+    try:
+        pipeline.recompose_project(db, project_id)
     finally:
         db.close()

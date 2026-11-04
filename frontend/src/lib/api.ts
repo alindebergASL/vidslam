@@ -441,6 +441,48 @@ export type ModelCatalog = {
   active: Record<ModelKind, ActiveModel>;
 };
 
+export type SpendBucket = { key: string; cost_usd: number; count: number };
+export type SpendBudget = { monthly_usd: number; hard_stop: boolean; alert_pcts: number[] };
+export type SpendSummary = {
+  month: string;
+  currency: string;
+  total_usd: number;
+  estimated_usd: number;
+  pending: number;
+  budget: SpendBudget;
+  budget_pct: number | null;
+  blocked: boolean;
+  mock_mode: boolean;
+  by_kind: SpendBucket[];
+  by_provider: SpendBucket[];
+  by_model: SpendBucket[];
+  top_projects: { project_id: number; title: string; cost_usd: number }[];
+  daily: { date: string; cost_usd: number }[];
+};
+export type SpendEntry = {
+  id: number;
+  created_at: string;
+  provider: string;
+  kind: string;
+  model: string;
+  project_id: number | null;
+  render_id: number | null;
+  ref: string;
+  cost_usd: number;
+  is_estimate: boolean;
+  source: string;
+  note: string;
+};
+export type OpenRouterAccount = {
+  available: boolean;
+  reason?: string;
+  usage?: number;
+  usage_daily?: number;
+  usage_monthly?: number;
+  limit?: number | null;
+  limit_remaining?: number | null;
+};
+
 export const api = {
   base: API_BASE,
 
@@ -861,4 +903,16 @@ export const api = {
     req<Asset>(`/api/studio/jobs/${id}/save?asset_type=${asset_type}`, {
       method: "POST",
     }),
+  spendSummary: (month?: string) =>
+    req<SpendSummary>(`/api/spend/summary${month ? `?month=${month}` : ""}`),
+  spendEntries: (opts: { month?: string; project_id?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.month) q.set("month", opts.month);
+    if (opts.project_id) q.set("project_id", String(opts.project_id));
+    if (opts.limit) q.set("limit", String(opts.limit));
+    return req<SpendEntry[]>(`/api/spend/entries?${q}`);
+  },
+  setSpendBudget: (b: SpendBudget) =>
+    req<SpendBudget>("/api/spend/budget", { method: "PUT", body: JSON.stringify(b) }),
+  openRouterAccount: () => req<OpenRouterAccount>("/api/spend/openrouter"),
 };

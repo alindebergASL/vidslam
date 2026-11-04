@@ -16,7 +16,6 @@ from .base import (
     expand_durations,
 )
 
-settings = get_settings()
 log = logging.getLogger("avs.openrouter.video")
 
 # /videos/models is small and changes rarely; cache it per process so the
@@ -46,8 +45,8 @@ class OpenRouterVideoProvider(VideoProvider):
     """
 
     def __init__(self, *, api_key: str | None = None, model: str | None = None) -> None:
-        self.api_key = api_key or settings.openrouter_api_key
-        self.model = model or settings.openrouter_video_model
+        self.api_key = api_key or get_settings().openrouter_api_key
+        self.model = model or get_settings().openrouter_video_model
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY missing for real video provider")
 
@@ -58,8 +57,8 @@ class OpenRouterVideoProvider(VideoProvider):
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": settings.openrouter_site_url,
-            "X-Title": settings.openrouter_app_title,
+            "HTTP-Referer": get_settings().openrouter_site_url,
+            "X-Title": get_settings().openrouter_app_title,
             "Content-Type": "application/json",
         }
 
@@ -192,7 +191,9 @@ class OpenRouterVideoProvider(VideoProvider):
         if state == "completed":
             urls = data.get("unsigned_urls") or []
             result = urls[0] if urls else f"{self._base}/videos/{job.job_id}/content?index=0"
-            return JobStatus(state="succeeded", progress=1.0, result_url=result)
+            cost = (data.get("usage") or {}).get("cost")
+            return JobStatus(state="succeeded", progress=1.0, result_url=result,
+                             cost=float(cost) if cost is not None else None)
         if state in ("failed", "cancelled", "expired"):
             err = data.get("error")
             if isinstance(err, dict):
@@ -202,12 +203,16 @@ class OpenRouterVideoProvider(VideoProvider):
             return JobStatus(state="running", progress=float(data.get("progress") or 0.0))
         return JobStatus(state="queued")
 
-    def download(self, job: SubmittedJob) -> bytes:
-        st = self.poll(job)
-        if st.state != "succeeded" or not st.result_url:
-            raise RuntimeError(f"job not ready or missing result url: {st}")
+    def download(self, job: SubmittedJob, result_url: str | None = None) -> bytes:
+        """Fetch the finished video. `result_url` (from a webhook's
+        unsigned_urls) skips the extra status poll."""
+        if not result_url:
+            st = self.poll(job)
+            if st.state != "succeeded" or not st.result_url:
+                raise RuntimeError(f"job not ready or missing result url: {st}")
+            result_url = st.result_url
         # unsigned_urls are not presigned: they need the API key.
         with httpx.Client(timeout=300.0, follow_redirects=True) as client:
-            r = client.get(st.result_url, headers={"Authorization": f"Bearer {self.api_key}"})
+            r = client.get(result_url, headers={"Authorization": f"Bearer {self.api_key}"})
             r.raise_for_status()
             return r.content

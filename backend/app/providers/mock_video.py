@@ -92,8 +92,14 @@ class MockVideoProvider(VideoProvider):
             return JobStatus(state="succeeded", progress=1.0)
         return JobStatus(state="failed", error="unknown job id")
 
-    def download(self, job: SubmittedJob) -> bytes:
+    def download(self, job: SubmittedJob, result_url: str | None = None) -> bytes:
         return self._cache.pop(job.job_id, b"") or b""
+
+    def put(self, data: bytes) -> SubmittedJob:
+        """Register pre-made bytes as a finished job (mock avatar uses this)."""
+        job_id = uuid.uuid4().hex
+        self._cache[job_id] = data
+        return SubmittedJob(provider="mock", model="mock", job_id=job_id)
 
 
 # Process-wide singleton so submit→poll→download work across calls.

@@ -64,6 +64,17 @@ class Settings(BaseSettings):
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Video jobs complete by webhook (OpenRouter POSTs to callback_url, which
+    # must be HTTPS) with a polling sweeper as safety net. "auto" = webhooks
+    # when PUBLIC_BASE_URL is https and providers are live; "off" = poll only.
+    video_webhooks: str = "auto"
+    # Optional: the signing secret from OpenRouter workspace settings. When
+    # set, webhook deliveries must carry a valid X-OpenRouter-Signature.
+    openrouter_webhook_secret: str = ""
+    video_poll_seconds: int = 10  # poll cadence when webhooks are off
+    video_safety_poll_seconds: int = 120  # check-in on webhook jobs that went quiet
+    video_job_timeout_minutes: int = 45
+
     # Per-call clip cap assumed when a model's limits can't be discovered
     # (OpenRouter /videos/models unreachable, or a model it doesn't list).
     # Ambient loops longer than this are built from chained segments.
@@ -129,6 +140,11 @@ class Settings(BaseSettings):
     cost_video_per_second: float = 0.10
     cost_tts_per_1k_chars: float = 0.20
     cost_music_per_generation: float = 0.05
+    # Spend ledger defaults (Settings → Spend overrides them at runtime).
+    # 0 = no monthly cap. hard_stop: refuse new paid generations (HTTP 402)
+    # once the month's spend reaches the cap; otherwise only alert.
+    spend_monthly_budget_usd: float = 0.0
+    spend_hard_stop: bool = True
 
     @property
     def data_path(self) -> Path:

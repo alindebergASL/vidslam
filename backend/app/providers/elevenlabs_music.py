@@ -70,4 +70,8 @@ class ElevenLabsMusicProvider(MusicProvider):
         with httpx.Client(timeout=180.0) as client:
             r = client.post(url, headers=self._headers(), json=body)
             r.raise_for_status()
-            return r.content
+        from ..services import spend
+
+        spend.record_rate_card("elevenlabs", "music", self.model_id, s.cost_music_per_generation,
+                               note=f"{length_ms / 1000:.0f}s track")
+        return r.content

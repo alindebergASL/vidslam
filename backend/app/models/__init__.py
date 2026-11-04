@@ -12,6 +12,8 @@ from .core import (
     ProviderLog,
     PublishJob,
     Render,
+    SpendEntry,
+    VideoJob,
     VideoProject,
     VideoShot,
 )
@@ -30,6 +32,8 @@ __all__ = [
     "ProviderLog",
     "PublishJob",
     "Render",
+    "SpendEntry",
+    "VideoJob",
     "VideoProject",
     "VideoShot",
 ]

@@ -12,9 +12,11 @@ from . import (
     project_audio,
     projects,
     providers,
+    spend,
     studio,
     system,
     training,
+    webhooks,
     youtube,
 )
 
@@ -35,6 +37,8 @@ api_router.include_router(training.router, prefix="/api", tags=["training"])
 api_router.include_router(ambient.router, prefix="/api/ambient", tags=["ambient"])
 api_router.include_router(models_api.router, prefix="/api/models", tags=["models"])
 api_router.include_router(youtube.router, prefix="/api", tags=["publishing"])
+api_router.include_router(spend.router, prefix="/api/spend", tags=["spend"])
+api_router.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
 api_router.include_router(ambient.public_router, prefix="/api", tags=["public"])
 
 __all__ = ["api_router"]

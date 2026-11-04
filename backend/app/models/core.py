@@ -400,3 +400,65 @@ class PublishJob(Base):
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class VideoJob(Base):
+    """One asynchronous video generation at a provider — a storyboard shot,
+    an ambient chain segment, a Studio clip, or an Avatar IV talking head.
+
+    Workers submit and move on; completion arrives by webhook (OpenRouter
+    `callback_url` → /api/webhooks/openrouter/videos/{callback_token}) or,
+    as a safety net / when webhooks can't reach us, by the sweeper polling
+    jobs whose `next_check_at` has passed."""
+
+    __tablename__ = "video_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    purpose: Mapped[str] = mapped_column(String(30))  # shot|avatar|ambient_segment|studio
+    ref_id: Mapped[int] = mapped_column(Integer)  # VideoShot.id or AssetGenerationJob.id
+    project_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    render_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    model: Mapped[str] = mapped_column(String(300), default="")
+    provider_job_id: Mapped[str] = mapped_column(String(200), default="")
+    polling_url: Mapped[str] = mapped_column(String(500), default="")
+    callback_token: Mapped[str] = mapped_column(String(80), default=_token, unique=True, index=True)
+    uses_webhook: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(20), default="submitted", index=True)
+    # submitted | running | completing | completed | failed
+    context_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    result_path: Mapped[str] = mapped_column(String(500), default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    checks: Mapped[int] = mapped_column(Integer, default=0)
+    next_check_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class SpendEntry(Base):
+    """One billed (or estimated) provider call — the spend ledger.
+
+    `source` says where the number came from: "provider" (the API reported
+    it: OpenRouter `usage.cost`, video job cost), "lookup" (fetched later
+    from OpenRouter's generation endpoint), "pending" (waiting on that
+    lookup; `cost_usd` holds a rate-card estimate meanwhile) or "rate_card"
+    (provider reports nothing, e.g. ElevenLabs — `is_estimate` is True)."""
+
+    __tablename__ = "spend_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+    provider: Mapped[str] = mapped_column(String(40))  # openrouter|elevenlabs|gemini|replicate
+    kind: Mapped[str] = mapped_column(String(20), index=True)  # chat|image|video|avatar|tts|music|training
+    model: Mapped[str] = mapped_column(String(200), default="")
+    project_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    render_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    ref: Mapped[str] = mapped_column(String(80), default="")  # e.g. "video_job:12", "studio_job:3"
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(20), default="provider", index=True)
+    generation_id: Mapped[str] = mapped_column(String(120), default="")
+    note: Mapped[str] = mapped_column(String(300), default="")
