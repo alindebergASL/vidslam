@@ -99,7 +99,7 @@ function Dashboard() {
       <OnboardingChecklist />
 
       {isEmpty && (
-        <div className="card p-6 mb-8 border-accent/40 bg-gradient-to-br from-accent/10 via-ink-900 to-ink-900">
+        <div className="card p-6 mb-8 border-accent/40 bg-linear-to-br from-accent/10 via-ink-900 to-ink-900">
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
             <div>
               <div className="text-xl font-semibold">Get started in one click</div>
@@ -124,14 +124,18 @@ function Dashboard() {
       {providerStatus && (
         <div className="card p-4 mb-8">
           <div className="flex flex-wrap items-center gap-3 text-sm">
-            {Object.entries(providerStatus).map(([k, v]) => (
-              <span key={k} className="chip">
-                <span className="text-ink-300">{k}:</span>
-                <span className={v === "mock" || v === true ? "text-ink-200" : "text-accent"}>
-                  {String(v)}
+            {Object.entries(providerStatus)
+              // `models` (active model per kind) is an object, not a status
+              // flag; it's shown in full in Settings → Models.
+              .filter(([, v]) => typeof v !== "object" || v === null)
+              .map(([k, v]) => (
+                <span key={k} className="chip">
+                  <span className="text-ink-300">{k}:</span>
+                  <span className={v === "mock" || v === true ? "text-ink-200" : "text-accent"}>
+                    {String(v)}
+                  </span>
                 </span>
-              </span>
-            ))}
+              ))}
             <button
               className="btn-ghost text-xs ml-auto"
               disabled={healthBusy}
@@ -182,14 +186,14 @@ function Dashboard() {
                 className="shrink-0 w-32 group"
                 title={r.project_title}
               >
-                <div className="aspect-[9/16] rounded-lg overflow-hidden bg-ink-800 border border-ink-800 transition group-hover:border-iris/40 group-hover:shadow-glow relative">
+                <div className="aspect-9/16 rounded-lg overflow-hidden bg-ink-800 border border-ink-800 transition group-hover:border-iris/40 group-hover:shadow-glow relative">
                   <img
                     src={api.renderThumb(r.render_id)}
                     alt=""
                     aria-hidden
                     className="w-full h-full object-cover"
                   />
-                  <div className="absolute inset-x-0 bottom-0 p-1.5 bg-gradient-to-t from-black/85 to-transparent">
+                  <div className="absolute inset-x-0 bottom-0 p-1.5 bg-linear-to-t from-black/85 to-transparent">
                     <div className="text-[11px] text-white truncate">{r.project_title}</div>
                   </div>
                 </div>
@@ -243,7 +247,7 @@ function Dashboard() {
                   key={p.id}
                   className="card overflow-hidden card-hover flex flex-col"
                 >
-                  <div className="aspect-[9/16] max-h-44 bg-ink-800 overflow-hidden">
+                  <div className="aspect-9/16 max-h-44 bg-ink-800 overflow-hidden">
                     {rid ? (
                       <img
                         src={api.renderThumb(rid)}

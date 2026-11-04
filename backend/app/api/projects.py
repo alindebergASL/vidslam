@@ -222,6 +222,18 @@ def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
     p = db.get(models.VideoProject, project_id)
     if p is None:
         raise HTTPException(404, "project not found")
+    # Rows that reference the project (or its renders) without an ORM
+    # cascade. SQLite never enforced these FKs, so deletes left orphans;
+    # Postgres refuses the delete outright.
+    render_ids = [r.id for r in p.renders]
+    if render_ids:
+        db.query(models.PublishJob).filter(models.PublishJob.render_id.in_(render_ids)).delete(
+            synchronize_session=False)
+    db.query(models.VideoJob).filter(models.VideoJob.project_id == project_id).delete(
+        synchronize_session=False)
+    # Provider logs are an audit trail: keep them, detach from the project.
+    db.query(models.ProviderLog).filter(models.ProviderLog.project_id == project_id).update(
+        {"project_id": None}, synchronize_session=False)
     db.delete(p)
     db.commit()
     # Drop the project's render directory (final MP4s, audio, per-shot clips,
@@ -232,3 +244,14 @@ def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
         shutil.rmtree(render_dir, ignore_errors=True)
     except OSError:
         pass
+
+
+@router.get("/projects/{project_id}/publish-meta")
+def publish_meta(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """Draft YouTube title / description / tags / flags for this project."""
+    from ..services import publish_meta as pm
+
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    return pm.draft(project)

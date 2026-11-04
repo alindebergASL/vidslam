@@ -97,7 +97,7 @@ export type SystemInfo = {
   data_dir: string;
   public_base_url: string;
   redis_configured: boolean;
-  keys: { openrouter: boolean; elevenlabs: boolean };
+  keys: { openrouter: boolean; elevenlabs: boolean; gemini?: boolean };
   models: {
     chat: string | null;
     image: string | null;
@@ -174,7 +174,7 @@ export type Project = {
   id: number;
   title: string;
   original_script: string;
-  mode: "reel_montage" | "talking_head_beta" | "static_motion";
+  mode: "reel_montage" | "talking_head_beta" | "static_motion" | "ambient_loop";
   aspect_ratio: string;
   target_duration_seconds: number;
   cta_text: string;
@@ -224,6 +224,26 @@ export type CostEstimate = {
   lines: CostLine[];
   is_estimate: boolean;
   note: string;
+  plan?: LoopPlan; // ambient estimates only
+};
+
+/** How an ambient loop is produced on the configured video model. */
+export type LoopPlan = {
+  model: string;
+  max_clip_seconds: number;
+  caps_known: boolean;
+  supports_last_frame: boolean;
+  strategy: "single" | "chain" | "drift";
+  segments: number[];
+  anchored: boolean;
+  closed: boolean;
+  join_crossfade: number;
+  seam_crossfade: number;
+  loop_seconds: number;
+  unit_seconds: number;
+  repeats: number;
+  provider_calls: number;
+  notes: string[];
 };
 
 export type StudioJob = {
@@ -262,8 +282,294 @@ export type CustomModel = {
   completed_at?: string | null;
 };
 
+// --- Ambient (hour-long seamless-loop scenes) ---
+
+export type AmbientSource = "video" | "image_drift";
+
+export type AmbientConfig = {
+  scene_preset: string;
+  scene_prompt: string;
+  source: AmbientSource;
+  loop_seconds: number;
+  total_seconds: number;
+  crossfade_seconds: number;
+  slow_factor: number;
+  fade_seconds: number;
+  music_mood: string;
+  music_prompt: string;
+  music_volume: number;
+  model_override: string;
+  chain_segments: boolean;
+  music_bed_seconds: number;
+  output_resolution: "1080p" | "4k";
+};
+
+export type ScenePreset = {
+  id: string;
+  label: string;
+  emoji: string;
+  tagline: string;
+  prompt: string;
+  music_mood: string;
+  palette: [string, string];
+  preview_url: string | null;
+};
+
+export type MusicMood = { id: string; label: string; prompt: string };
+
+export type AmbientPresets = {
+  scenes: ScenePreset[];
+  music_moods: MusicMood[];
+  loop_options: number[];
+  total_options: number[];
+  aspect_options: string[];
+};
+
+export type AmbientScene = {
+  id: number;
+  title: string;
+  status: string; // draft | generating | planned | completed | failed | cancelled
+  aspect_ratio: string;
+  total_seconds: number;
+  config: AmbientConfig;
+  loop_status: string; // pending | submitted | polling | completed | failed
+  loop_error: string;
+  loop_shot: Shot | null;
+  music_ready: boolean;
+  repeats: number;
+  plan: LoopPlan;
+  latest_render: Render | null;
+  render_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
+  scene_preset: "waterfall",
+  scene_prompt: "",
+  source: "video",
+  loop_seconds: 30,
+  total_seconds: 3600,
+  crossfade_seconds: 2,
+  slow_factor: 1,
+  fade_seconds: 4,
+  music_mood: "spa",
+  music_prompt: "",
+  music_volume: 0.7,
+  model_override: "",
+  chain_segments: true,
+  music_bed_seconds: 0,
+  output_resolution: "1080p",
+};
+
+export type PublishMeta = {
+  title: string;
+  description: string;
+  tags: string[];
+  category_id: string;
+  contains_synthetic_media: boolean;
+  made_for_kids: boolean;
+};
+
+export type YouTubeStatus = {
+  configured: boolean;
+  connected: boolean;
+  channel: { id: string; title: string; thumbnail?: string | null } | null;
+  redirect_uri: string;
+  connected_at?: string | null;
+};
+
+export type PublishJob = {
+  id: number;
+  render_id: number;
+  platform: string;
+  status: "queued" | "uploading" | "processing" | "scheduled" | "published" | "failed";
+  title: string;
+  privacy: string;
+  publish_at: string | null;
+  contains_synthetic_media: boolean;
+  bytes_total: number;
+  bytes_sent: number;
+  external_id: string;
+  external_url: string;
+  error: string;
+  created_at: string;
+  updated_at: string;
+};
+
+// --- Model catalog + runtime switching ---
+
+export type ModelKind = "chat" | "image" | "video" | "tts" | "music" | "lipsync";
+
+export type CatalogEntry = {
+  id: string;
+  kind: ModelKind;
+  name: string;
+  provider: "openrouter" | "gemini" | "elevenlabs";
+  description: string;
+  usable: boolean;
+  new: boolean;
+  active?: boolean;
+  created?: number | null;
+  context_length?: number | null;
+  pricing?: Record<string, number>;
+  supported_parameters?: string[];
+  supported_voices?: string[];
+  output_modalities?: string[];
+  durations?: number[];
+  max_seconds?: number | null;
+  frame_images?: string[];
+  resolutions?: string[];
+  pricing_skus?: Record<string, string>;
+  also_via?: string;
+};
+
+export type ActiveModel = {
+  model: string;
+  provider: string;
+  default: string;
+  is_default: boolean;
+  options: Record<string, string>;
+};
+
+export type ModelCatalog = {
+  fetched_at: string | null;
+  entries: CatalogEntry[];
+  errors: Record<string, string>;
+  counts: Partial<Record<ModelKind, number>>;
+  new_count: number;
+  active: Record<ModelKind, ActiveModel>;
+};
+
+export type SpendBucket = { key: string; cost_usd: number; count: number };
+export type SpendBudget = { monthly_usd: number; hard_stop: boolean; alert_pcts: number[] };
+export type SpendSummary = {
+  month: string;
+  currency: string;
+  total_usd: number;
+  estimated_usd: number;
+  pending: number;
+  budget: SpendBudget;
+  budget_pct: number | null;
+  blocked: boolean;
+  mock_mode: boolean;
+  by_kind: SpendBucket[];
+  by_provider: SpendBucket[];
+  by_model: SpendBucket[];
+  top_projects: { project_id: number; title: string; cost_usd: number }[];
+  daily: { date: string; cost_usd: number }[];
+};
+export type SpendEntry = {
+  id: number;
+  created_at: string;
+  provider: string;
+  kind: string;
+  model: string;
+  project_id: number | null;
+  render_id: number | null;
+  ref: string;
+  cost_usd: number;
+  is_estimate: boolean;
+  source: string;
+  note: string;
+};
+export type OpenRouterAccount = {
+  available: boolean;
+  reason?: string;
+  usage?: number;
+  usage_daily?: number;
+  usage_monthly?: number;
+  limit?: number | null;
+  limit_remaining?: number | null;
+};
+
 export const api = {
   base: API_BASE,
+
+  // model catalog
+  modelCatalog: (kind?: ModelKind) =>
+    req<ModelCatalog>(`/api/models/catalog${kind ? `?kind=${kind}` : ""}`),
+  refreshModels: () => req<ModelCatalog>("/api/models/refresh", { method: "POST" }),
+  activeModels: () => req<Record<ModelKind, ActiveModel>>("/api/models/active"),
+  setActiveModel: (
+    kind: ModelKind,
+    model: string | null,
+    opts: { allow_unlisted?: boolean; options?: Record<string, string> } = {}
+  ) =>
+    req<Record<ModelKind, ActiveModel>>("/api/models/active", {
+      method: "PUT",
+      body: JSON.stringify({ kind, model, allow_unlisted: !!opts.allow_unlisted, options: opts.options }),
+    }),
+
+  // ambient
+  ambientPresets: () => req<AmbientPresets>("/api/ambient/presets"),
+  ambientEstimate: (config: AmbientConfig) =>
+    req<CostEstimate>("/api/ambient/estimate", {
+      method: "POST",
+      body: JSON.stringify({ config }),
+    }),
+  listAmbient: () => req<AmbientScene[]>("/api/ambient"),
+  getAmbient: (id: number) => req<AmbientScene>(`/api/ambient/${id}`),
+  createAmbient: (body: {
+    title?: string;
+    aspect_ratio?: string;
+    config: AmbientConfig;
+    generate?: boolean;
+  }) => req<AmbientScene>("/api/ambient", { method: "POST", body: JSON.stringify(body) }),
+  updateAmbient: (
+    id: number,
+    body: { title?: string; aspect_ratio?: string; config?: AmbientConfig }
+  ) => req<AmbientScene>(`/api/ambient/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  generateAmbientLoop: (id: number, regenerateMusic = true) =>
+    req<{ scene_id: number; job_id: string; status: string }>(
+      `/api/ambient/${id}/generate-loop?regenerate_music=${regenerateMusic}`,
+      { method: "POST" }
+    ),
+  regenerateAmbientMusic: (id: number) =>
+    req<AmbientScene>(`/api/ambient/${id}/music`, { method: "POST" }),
+  generatePresetPreviews: (missingOnly = true) =>
+    req<{ presets: string[]; job_id: string | null; status: string }>(
+      `/api/ambient/presets/previews?missing_only=${missingOnly}`,
+      { method: "POST" }
+    ),
+  presetPreviewUrl: (path: string) => `${API_BASE}${path}`,
+  ambientBatch: (body: { presets: string[]; aspect_ratio: string; config: AmbientConfig; render: boolean }) =>
+    req<{ scene_ids: number[]; job_id: string; estimated_total: number; scenes: AmbientScene[] }>(
+      "/api/ambient/batch",
+      { method: "POST", body: JSON.stringify(body) }
+    ),
+
+  // publishing
+  publishMeta: (projectId: number) => req<PublishMeta>(`/api/projects/${projectId}/publish-meta`),
+  youtubeStatus: () => req<YouTubeStatus>("/api/youtube/status"),
+  youtubeConnectUrl: () => req<{ url: string }>("/api/youtube/connect"),
+  youtubeDisconnect: () => req<YouTubeStatus>("/api/youtube/disconnect", { method: "POST" }),
+  publishYouTube: (
+    renderId: number,
+    body: {
+      title: string;
+      description: string;
+      tags: string[];
+      category_id: string;
+      privacy: "private" | "unlisted" | "public";
+      publish_at?: string | null;
+      made_for_kids: boolean;
+      contains_synthetic_media: boolean;
+      set_thumbnail: boolean;
+    }
+  ) =>
+    req<PublishJob>(`/api/renders/${renderId}/publish/youtube`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  renderPublishJobs: (renderId: number) => req<PublishJob[]>(`/api/renders/${renderId}/publish-jobs`),
+  retryPublishJob: (jobId: number) =>
+    req<PublishJob>(`/api/publish-jobs/${jobId}/retry`, { method: "POST" }),
+
+  renderAmbient: (id: number) =>
+    req<{ scene_id: number; job_id: string; status: string }>(`/api/ambient/${id}/render`, {
+      method: "POST",
+    }),
   publicAsset: (token: string) => `${API_BASE}/api/public-assets/${token}`,
   studioPreview: (jobId: number) => `${API_BASE}/api/studio/jobs/${jobId}/preview`,
   renderDownload: (id: number) => `${API_BASE}/api/renders/${id}/download`,
@@ -597,4 +903,16 @@ export const api = {
     req<Asset>(`/api/studio/jobs/${id}/save?asset_type=${asset_type}`, {
       method: "POST",
     }),
+  spendSummary: (month?: string) =>
+    req<SpendSummary>(`/api/spend/summary${month ? `?month=${month}` : ""}`),
+  spendEntries: (opts: { month?: string; project_id?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.month) q.set("month", opts.month);
+    if (opts.project_id) q.set("project_id", String(opts.project_id));
+    if (opts.limit) q.set("limit", String(opts.limit));
+    return req<SpendEntry[]>(`/api/spend/entries?${q}`);
+  },
+  setSpendBudget: (b: SpendBudget) =>
+    req<SpendBudget>("/api/spend/budget", { method: "PUT", body: JSON.stringify(b) }),
+  openRouterAccount: () => req<OpenRouterAccount>("/api/spend/openrouter"),
 };

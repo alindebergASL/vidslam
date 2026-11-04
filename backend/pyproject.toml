@@ -11,12 +11,15 @@ dependencies = [
   "pydantic-settings>=2.4",
   "python-multipart>=0.0.9",
   "httpx>=0.27",
+  "cryptography>=42",
   "Pillow>=10.4",
   "rq>=1.16",
   "redis>=5.0",
   "itsdangerous>=2.2",
   "python-slugify>=8.0",
   "alembic>=1.13",
+  # Postgres driver (production DB). SQLite needs nothing extra.
+  "psycopg[binary]>=3.2",
 ]
 
 # The alembic `migrations/` directory sits next to `app/` and would trip

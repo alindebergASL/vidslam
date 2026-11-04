@@ -160,8 +160,8 @@ def test_delete_blocked_on_running_job(auth_client):
     job_id = r.json()["id"]
 
     # Force "training" status so delete returns 409.
-    from app.db import SessionLocal
     from app import models as m
+    from app.db import SessionLocal
 
     with SessionLocal() as s:
         cm = s.get(m.CustomModel, job_id)

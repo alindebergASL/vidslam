@@ -247,7 +247,7 @@ function TileCard({
   return (
     <div
       className={clsx(
-        "group relative aspect-[9/16] rounded-lg overflow-hidden bg-ink-800 border transition",
+        "group relative aspect-9/16 rounded-lg overflow-hidden bg-ink-800 border transition",
         selected ? "border-accent" : "border-ink-800 hover:border-ink-600"
       )}
     >
@@ -271,7 +271,7 @@ function TileCard({
         </div>
       )}
 
-      <div className="absolute inset-x-0 bottom-0 p-2 bg-gradient-to-t from-black/85 to-transparent">
+      <div className="absolute inset-x-0 bottom-0 p-2 bg-linear-to-t from-black/85 to-transparent">
         <div className="text-xs text-white font-medium truncate">{tile.label}</div>
         <div className="text-[10px] text-ink-300 truncate">{tile.sub}</div>
       </div>
@@ -470,7 +470,7 @@ function PromptBar({
   };
 
   return (
-    <div className="fixed bottom-0 left-0 md:left-56 right-0 z-10 bg-ink-900/95 border-t border-ink-800 backdrop-blur">
+    <div className="fixed bottom-0 left-0 md:left-56 right-0 z-10 bg-ink-900/95 border-t border-ink-800 backdrop-blur-sm">
       <div className="max-w-5xl mx-auto px-6 py-3">
         {selectedRefs.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5 text-xs text-ink-300">
@@ -569,7 +569,7 @@ function PromptBar({
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="What do you want to create?"
-            className="flex-1 bg-transparent outline-none text-sm px-2"
+            className="flex-1 bg-transparent outline-hidden text-sm px-2"
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();

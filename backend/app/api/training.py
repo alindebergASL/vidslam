@@ -22,6 +22,7 @@ from .. import models
 from ..db import get_db
 from ..schemas import CustomModelOut, CustomModelTrainRequest
 from ..services.ratelimit import rate_limit
+from ..services.spend import budget_guard
 from ..workers.jobs import train_custom_model_job
 from ..workers.queue import enqueue
 from .auth import require_auth
@@ -45,7 +46,7 @@ def _resolve_owner(
     "/cast/{kind}/{owner_id}/train",
     response_model=CustomModelOut,
     status_code=202,
-    dependencies=[Depends(rate_limit("generation"))],
+    dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)],
 )
 def start_training(
     kind: Literal["avatar", "ingredient"],

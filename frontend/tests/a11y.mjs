@@ -19,6 +19,7 @@ const require = createRequire(import.meta.url);
 const BASE = process.env.AVS_BASE_URL || 'http://localhost:3000';
 const PW = process.env.AVS_PASSWORD || 'test-pw';
 const PID = process.env.AVS_PROJECT_ID || '1';
+const AMBIENT_ID = process.env.AVS_AMBIENT_ID || '2';
 
 let chromium;
 try {
@@ -40,6 +41,9 @@ const ROUTES = [
   '/projects',
   `/projects/${PID}`,
   `/projects/${PID}/render?id=1`,
+  '/ambient',
+  '/ambient/new',
+  `/ambient/${AMBIENT_ID}`,
   '/brand',
   '/settings',
 ];

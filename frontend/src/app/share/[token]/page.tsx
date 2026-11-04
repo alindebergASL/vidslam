@@ -6,10 +6,11 @@ import { SharePlayer } from "./SharePlayer";
 const PUBLIC_API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 const INTERNAL_API_BASE = process.env.INTERNAL_API_BASE || PUBLIC_API_BASE;
 
-type Props = { params: { token: string } };
+// Next 15+: route params arrive as a Promise (sync access removed in 16).
+type Props = { params: Promise<{ token: string }> };
 
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
-  const { token } = params;
+  const { token } = await params;
   const fallback: Metadata = {
     title: "Shared video · AvatarVideoStudio",
     description: "AI-generated virtual creator content.",
@@ -46,6 +47,7 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
   }
 }
 
-export default function SharePage({ params }: Props) {
-  return <SharePlayer token={params.token} />;
+export default async function SharePage({ params }: Props) {
+  const { token } = await params;
+  return <SharePlayer token={token} />;
 }

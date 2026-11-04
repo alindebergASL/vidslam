@@ -61,7 +61,7 @@ function Inner() {
       // before the user even clicks Generate Video. Skip while a render is
       // actively in flight (cheap call, but pointless every 2s during polling).
       const activeRender = st.latest_render &&
-        !["completed", "failed"].includes(st.latest_render.status);
+        !["completed", "failed", "cancelled"].includes(st.latest_render.status);
       if (!activeRender) {
         try {
           const pf = await api.preflight(projectId);
@@ -78,11 +78,17 @@ function Inner() {
       }
       const renderActive =
         !!st.latest_render &&
-        !["completed", "failed"].includes(st.latest_render.status);
-      const projectActive = !["completed", "failed", "draft", "planned"].includes(
+        !["completed", "failed", "cancelled"].includes(st.latest_render.status);
+      // "regenerating" (shots re-rolling before a recompose) counts as active.
+      const projectActive = !["completed", "failed", "draft", "planned", "cancelled"].includes(
         st.project_status
       );
-      setPolling(renderActive || projectActive);
+      // Clip-only re-rolls leave the project status alone; keep polling until
+      // the shot's video job lands (webhook or sweeper).
+      const shotsActive = p.shots.some((s) =>
+        ["submitted", "polling", "running"].includes(s.status)
+      );
+      setPolling(renderActive || projectActive || shotsActive);
     } catch (e: any) {
       setError(e.message);
     }
@@ -524,7 +530,7 @@ function Inner() {
                     {s.keys.map((k) => (
                       <kbd
                         key={k}
-                        className="px-1.5 py-0.5 text-[10px] rounded bg-ink-800 border border-ink-700 text-ink-100 font-mono"
+                        className="px-1.5 py-0.5 text-[10px] rounded-sm bg-ink-800 border border-ink-700 text-ink-100 font-mono"
                       >
                         {k}
                       </kbd>
@@ -732,7 +738,7 @@ function ShotRow({
               <video
                 key={shot.clip_path}
                 src={api.shotClip(projectId, shot.id)}
-                className="w-24 shrink-0 rounded bg-black aspect-[9/16] object-cover"
+                className="w-24 shrink-0 rounded-sm bg-black aspect-9/16 object-cover"
                 muted
                 loop
                 playsInline

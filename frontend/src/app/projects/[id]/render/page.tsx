@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
 import { AuthGate } from "@/components/AuthGate";
 import { useToast } from "@/components/Toaster";
+import { PublishPanel } from "@/components/PublishPanel";
 import { api, Project, Render } from "@/lib/api";
 
 export default function RenderPage() {
@@ -79,7 +80,9 @@ function Inner() {
                 aria-current={isCurrent ? "page" : undefined}
               >
                 v{allRenders.length - idx}
-                <span className="text-[10px] text-ink-400">
+                {/* On the light active chip, ink-400 grey fails contrast;
+                    use the chip's dark ink there. */}
+                <span className={`text-[10px] ${isCurrent ? "text-ink-700" : "text-ink-400"}`}>
                   {new Date(r.created_at).toLocaleTimeString([], {
                     hour: "2-digit",
                     minute: "2-digit",
@@ -205,6 +208,9 @@ function Inner() {
             >
               Duplicate project
             </button>
+          </div>
+          <div className="mt-6">
+            <PublishPanel projectId={projectId} renderId={render.id} />
           </div>
         </>
       )}

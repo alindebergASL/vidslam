@@ -82,7 +82,28 @@ def mirror_to_s3(local_path: Path, content_type: str) -> bool:
     return True
 
 
-def presigned_url_for(local_path: Path, content_type: str = "application/octet-stream") -> str | None:
+_known_present: set[str] = set()
+
+
+def object_exists(local_path: Path) -> bool:
+    """HEAD the mirror (cached once found) — so a never-mirrored or failed
+    upload falls back to the local file instead of a dead presigned URL."""
+    client = _client_or_none()
+    if client is None:
+        return False
+    key = _s3_key_for(local_path)
+    if key in _known_present:
+        return True
+    try:
+        client.head_object(Bucket=get_settings().s3_bucket, Key=key)
+    except Exception:  # noqa: BLE001
+        return False
+    _known_present.add(key)
+    return True
+
+
+def presigned_url_for(local_path: Path, content_type: str = "application/octet-stream",
+                      download_name: str | None = None) -> str | None:
     """Return a time-limited GET URL pointing at the S3 mirror of this
     local file, or None when S3 isn't configured or the URL can't be
     minted. Callers fall back to the app-served URL when this returns
@@ -95,9 +116,27 @@ def presigned_url_for(local_path: Path, content_type: str = "application/octet-s
     try:
         return client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": s.s3_bucket, "Key": key, "ResponseContentType": content_type},
+            Params={"Bucket": s.s3_bucket, "Key": key, "ResponseContentType": content_type,
+                    **({"ResponseContentDisposition": f'attachment; filename="{download_name}"'}
+                       if download_name else {})},
             ExpiresIn=s.s3_presign_ttl_seconds,
         )
     except Exception as e:  # noqa: BLE001
         log.warning("S3 presign failed for %s: %s", key, e)
         return None
+
+
+def delete_from_s3(local_path: Path) -> bool:
+    """Best-effort delete of the S3 mirror of a local file (retention)."""
+    client = _client_or_none()
+    if client is None:
+        return False
+    s = get_settings()
+    try:
+        key = _s3_key_for(local_path)
+        client.delete_object(Bucket=s.s3_bucket, Key=key)
+        _known_present.discard(key)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("S3 delete failed for %s: %s", local_path, e)
+        return False

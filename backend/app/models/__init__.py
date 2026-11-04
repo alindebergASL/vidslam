@@ -1,4 +1,5 @@
 from .core import (
+    AppSetting,
     Asset,
     AssetGenerationJob,
     Avatar,
@@ -9,12 +10,16 @@ from .core import (
     IngredientAsset,
     ProjectCastMember,
     ProviderLog,
+    PublishJob,
     Render,
+    SpendEntry,
+    VideoJob,
     VideoProject,
     VideoShot,
 )
 
 __all__ = [
+    "AppSetting",
     "Asset",
     "AssetGenerationJob",
     "Avatar",
@@ -25,7 +30,10 @@ __all__ = [
     "IngredientAsset",
     "ProjectCastMember",
     "ProviderLog",
+    "PublishJob",
     "Render",
+    "SpendEntry",
+    "VideoJob",
     "VideoProject",
     "VideoShot",
 ]

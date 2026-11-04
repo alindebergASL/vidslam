@@ -4,7 +4,6 @@ import time
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-
 from sqlalchemy.orm import Session
 
 from .. import models as models_pkg
@@ -54,13 +53,49 @@ def _trained_lora_entries(db: Session) -> list[dict]:
     ]
 
 
+def _catalog_entries(kind: str) -> list[dict]:
+    """Picker entries from the polled model catalog (empty if never polled)."""
+    from ..services import model_catalog
+
+    snap = model_catalog.get_snapshot() or {}
+    out = []
+    for e in snap.get("entries") or []:
+        if e.get("kind") != kind:
+            continue
+        bits = []
+        if e.get("max_seconds"):
+            bits.append(f"up to {e['max_seconds']}s")
+        frames = e.get("frame_images") or []
+        if "last_frame" in frames:
+            bits.append("first+last frame")
+        elif "first_frame" in frames:
+            bits.append("first frame")
+        name = e.get("name") or e["id"]
+        out.append({
+            "id": e["id"],
+            "name": f"{name} ({' · '.join(bits)})" if bits else name,
+            "description": ("" if e.get("usable") else "needs API key · ") + (e.get("description") or ""),
+        })
+    return out
+
+
+def _merged(kind: str, provider_list) -> list[dict]:
+    """Provider's own list (always includes whatever it can actually serve,
+    e.g. the mock model) plus the polled catalog, de-duplicated."""
+    try:
+        base = _to_dict(provider_list())
+    except Exception:  # noqa: BLE001 — the catalog may still have entries
+        base = []
+    seen = {m["id"] for m in base}
+    extra = [m for m in _catalog_entries(kind) if m["id"] not in seen]
+    if not base and not extra:
+        raise HTTPException(502, f"failed to list {kind} models")
+    return base + extra
+
+
 @router.get("/openrouter/video-models")
 def video_models(db: Session = Depends(get_db)) -> list[dict]:
-    try:
-        base = _to_dict(get_video().list_models())
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"failed to list video models: {e}") from e
-    return _trained_lora_entries(db) + base
+    return _trained_lora_entries(db) + _merged("video", lambda: get_video().list_models())
 
 
 @router.get("/openrouter/image-models")
@@ -71,13 +106,9 @@ def image_models(db: Session = Depends(get_db)) -> list[dict]:
     needing a second dropdown — pick it and the next generate-image call
     passes the adapter id through.
     """
-    try:
-        base = _to_dict(get_image().list_models())
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"failed to list image models: {e}") from e
     # Custom adapters surface first since users almost always want their
     # own model over the base when they've trained one.
-    return _trained_lora_entries(db) + base
+    return _trained_lora_entries(db) + _merged("image", lambda: get_image().list_models())
 
 
 @router.get("/caption-styles")

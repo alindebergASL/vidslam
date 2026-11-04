@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from slugify import slugify
 from sqlalchemy.orm import Session
@@ -13,9 +13,11 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db
 from ..schemas import ProjectStatusOut, RenderOut, ShotOut
+from ..services import render_files
 from ..services.preflight import run_preflight
 from ..services.ratelimit import rate_limit
 from ..services.safety import UnsafeScriptError, validate_script
+from ..services.spend import budget_guard
 from ..workers.jobs import (
     generate_plan_job,
     generate_video_job,
@@ -39,6 +41,9 @@ def public_render(token: str, db: Session = Depends(get_db)) -> FileResponse:
         raise HTTPException(404, "render not found")
     if not Path(r.final_video_path).exists():
         raise HTTPException(404, "render file missing")
+    url = render_files.delivery_url(r.final_video_path, "video/mp4")
+    if url:
+        return RedirectResponse(url, status_code=302)
     return FileResponse(r.final_video_path, media_type="video/mp4")
 
 
@@ -47,6 +52,9 @@ def public_render_thumbnail(token: str, db: Session = Depends(get_db)) -> FileRe
     r = db.query(models.Render).filter(models.Render.share_token == token).first()
     if r is None or not r.thumbnail_path or not Path(r.thumbnail_path).exists():
         raise HTTPException(404, "thumbnail not found")
+    url = render_files.delivery_url(r.thumbnail_path, "image/jpeg")
+    if url:
+        return RedirectResponse(url, status_code=302)
     return FileResponse(r.thumbnail_path, media_type="image/jpeg")
 
 
@@ -66,7 +74,7 @@ def public_render_meta(token: str, db: Session = Depends(get_db)) -> dict:
     }
 
 
-@router.post("/projects/{project_id}/generate-plan", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/generate-plan", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_plan(
     project_id: int,
     preserve_edits: bool = False,
@@ -112,7 +120,7 @@ def cost_estimate(project_id: int, db: Session = Depends(get_db)) -> dict:
     return estimate_plan_cost(project_dict, plan)
 
 
-@router.post("/projects/{project_id}/generate-video", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/generate-video", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_video(
     project_id: int,
     force: bool = False,
@@ -168,17 +176,21 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     if latest.status in ("completed", "failed", "cancelled"):
         return {"render_id": latest.id, "status": latest.status, "action": "noop"}
     latest.status = "cancelled"
+    # Shots are submitted asynchronously, so there may be no worker left in
+    # render_project to mirror this; in-flight clips that land later see a
+    # cancelled render and don't compose.
+    project.status = "cancelled"
     db.commit()
     return {"render_id": latest.id, "status": "cancelled", "action": "signalled"}
 
 
-@router.post("/projects/{project_id}/retry", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/retry", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     """Smart retry after a failed render. Picks the cheapest viable path:
 
       - If every body shot already has a clip on disk AND the last render's audio
         file is intact → just recompose (no provider calls).
-      - Otherwise → resume the pipeline; render_project's _ensure_clip_for_shot
+      - Otherwise → resume the pipeline; render_project (which skips shots that already have clips)
         is idempotent on completed shots, so only the failed/missing ones get
         regenerated. Failed shots are reset to 'pending' so they actually retry.
     """
@@ -227,7 +239,7 @@ class BulkRegenIn(BaseModel):
     shot_ids: list[int]
 
 
-@router.post("/projects/{project_id}/shots/regenerate-bulk", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/shots/regenerate-bulk", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def regenerate_shots_bulk(
     project_id: int, body: BulkRegenIn, db: Session = Depends(get_db)
 ) -> dict:
@@ -266,7 +278,7 @@ def project_status(project_id: int, db: Session = Depends(get_db)) -> ProjectSta
     )
 
 
-@router.post("/projects/{project_id}/shots/{shot_id}/regenerate", status_code=202, dependencies=[Depends(rate_limit("generation"))])
+@router.post("/projects/{project_id}/shots/{shot_id}/regenerate", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def regenerate_shot(
     project_id: int,
     shot_id: int,
@@ -379,6 +391,10 @@ def download_render(render_id: int, db: Session = Depends(get_db)) -> FileRespon
     r = db.get(models.Render, render_id)
     if r is None or not r.final_video_path or not Path(r.final_video_path).exists():
         raise HTTPException(404, "render not ready")
+    url = render_files.delivery_url(r.final_video_path, "video/mp4", download_name=f"avatar-video-{render_id}.mp4")
+    if url:
+        # Hour-long MP4s are 50–500 MB; let S3 (or a CDN in front) serve them.
+        return RedirectResponse(url, status_code=302)
     return FileResponse(
         r.final_video_path,
         media_type="video/mp4",

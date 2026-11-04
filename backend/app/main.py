@@ -80,6 +80,11 @@ def _enforce_production_secrets(s) -> None:
 
 _enforce_production_secrets(settings)
 
+if settings.database_url.startswith("sqlite") and not settings.mock_providers:
+    # Real providers on SQLite: works for one person, but every write is
+    # serialized across web workers + the RQ worker. See docs/postgres.md.
+    log.warning("DATABASE_URL is SQLite with live providers — use Postgres in production (docs/postgres.md)")
+
 
 def create_app() -> FastAPI:
     from contextlib import asynccontextmanager
@@ -88,7 +93,24 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         log.info("initializing database at %s", settings.database_url)
         init_db()
+        # Keep the model catalog fresh in the background (skipped under
+        # pytest so tests never make network calls).
+        import sys
+
+        from .services import model_catalog, video_jobs
+
+        under_pytest = "pytest" in sys.modules
+        started = False
+        if not under_pytest:
+            started = model_catalog.start_poller()
+            # Safety net for video jobs: polls any job whose webhook hasn't
+            # arrived (and is the main path when webhooks can't reach us).
+            video_jobs.start_sweeper()
         yield
+        if started:
+            model_catalog.stop_poller()
+        if not under_pytest:
+            video_jobs.stop_sweeper()
 
     app = FastAPI(title="AvatarVideoStudio API", version="0.1.0", lifespan=lifespan)
     # Order matters: Starlette runs middlewares in reverse-add order, so adding
@@ -156,9 +178,24 @@ def create_app() -> FastAPI:
         except OSError as e:
             checks["data_dir_writable"] = {"ok": False, "error": str(e)[:200]}
 
+        # Job queue: with QUEUE_MODE=required, not ready unless Redis answers
+        # and at least one RQ worker is registered.
+        from .workers.queue import queue_status
+
+        try:
+            checks["queue"] = queue_status()
+        except Exception as e:  # noqa: BLE001
+            checks["queue"] = {"ok": False, "error": str(e)[:200]}
+
         all_ok = all(c["ok"] for c in checks.values())
         body = {"status": "ready" if all_ok else "not_ready", "checks": checks}
         return JSONResponse(body, status_code=200 if all_ok else 503)
+
+    from .workers.queue import QueueUnavailable
+
+    @app.exception_handler(QueueUnavailable)
+    async def _queue_down(request, exc):  # noqa: ANN001
+        return JSONResponse({"detail": str(exc)}, status_code=503)
 
     app.include_router(api_router)
     return app

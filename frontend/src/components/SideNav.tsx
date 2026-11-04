@@ -9,6 +9,7 @@ const items = [
   { href: "/", label: "Dashboard", icon: "▦" },
   { href: "/studio", label: "Studio", icon: "✦" },
   { href: "/projects", label: "Projects", icon: "▷" },
+  { href: "/ambient", label: "Ambient", icon: "∿" },
   { href: "/cast", label: "Cast", icon: "☺" },
   { href: "/brand", label: "Brand", icon: "◆" },
   { href: "/settings", label: "Settings", icon: "⚙" },

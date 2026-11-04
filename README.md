@@ -18,7 +18,7 @@ useful for demos, CI, and local development.
 - **Frontend** — Next.js 14 + TypeScript + Tailwind
 - **Backend** — FastAPI + SQLAlchemy + Pydantic
 - **Queue** — Redis + RQ (falls back to inline execution if Redis is unavailable)
-- **DB** — SQLite (file in the data volume)
+- **DB** — Postgres 17 in production (`docker-compose.prod.yml`, migrations at boot); SQLite for local dev. See [`docs/postgres.md`](docs/postgres.md)
 - **Renderer** — FFmpeg (H.264 + AAC, ASS subtitles)
 - **Providers** — OpenRouter chat / image / video, ElevenLabs TTS — all behind clean
   adapter Protocols; pure mocks for fully offline operation.
@@ -89,6 +89,100 @@ missing — partial configs work fine. `GET /api/providers/status` reflects what
        │FFmpeg │
        └───────┘
 ```
+
+### Ambient scenes (hour-long loops)
+
+The **Ambient** section builds calm / landscape / spa videos — a waterfall,
+fireplace, ocean, snowfall… — that run for 10 minutes to 3 hours from a
+single 25/30/60-second clip that barely moves, under a spa-style music bed.
+The cost is the loop, not the hour:
+
+| Step | What happens | Who pays |
+| --- | --- | --- |
+| Loop clip | Video provider generates the loop — in one call if the model allows the full length, otherwise as **chained clips** (each starts on the previous clip's last frame). Models with last-frame support get an **anchor still** as clip 1's first frame and the final clip's last frame, so the loop closes natively. Or, with **Still + drift**, one image FFmpeg pushes in/out on a perfect period | provider, once per clip |
+| Music bed | 45–90 s of spa / zen / piano / singing-bowl music from the music provider | provider, once |
+| Seamless unit | `renderer.compose_ambient` crossfades the clip's tail into its own head (`xfade` of the clip against itself, then trim) so the unit ends on the frame it starts on | FFmpeg, seconds |
+| Tiling | The unit is repeated with the concat demuxer and `-c:v copy`; only the first/last pieces are re-encoded for the fade in/out. Music gets the same `acrossfade`-against-itself treatment and loops under the video | FFmpeg, seconds |
+
+A 1-hour 1080p30 render from a 30 s loop (28 s unit × 129) takes ~25 s of
+video work on a 4-core box; with a music bed the AAC encode of the full hour
+dominates (≈2–3 min total). Nothing in that time touches a provider. Scenes live in the same `VideoProject`/`Render` tables as
+storyboard projects (`mode=ambient_loop`, config in `ambient_config_json`), so
+render history, share links, export and S3 delivery all apply unchanged.
+
+Extras: **preset preview images** (one image call per preset, cached),
+**long music beds** (3–20 min, generated in parts and crossfaded when
+longer than a provider's per-call limit), **4K output** (a lanczos upscale
+of the loop unit before tiling: free, and YouTube streams 4K uploads at a
+higher bitrate), a **best-frame thumbnail** at 1280×720, and **batch
+create** (one scene per preset, generated and rendered one at a time).
+
+Which video models go past 10s, which can close a loop, and which to pick:
+[`docs/ambient_providers.md`](docs/ambient_providers.md).
+
+### Publishing to YouTube
+
+Settings → **YouTube** connects a channel through Google OAuth (needs
+`YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` from a Google Cloud OAuth
+client of type *Web application*, with the YouTube Data API v3 enabled and
+`{PUBLIC_BASE_URL}/api/youtube/callback` as an authorized redirect URI). The
+refresh token is stored encrypted with a key derived from `SESSION_SECRET`
+(rotating it forces a reconnect).
+
+Any completed render has a **Publish to YouTube** panel with a drafted
+title, description and tags (ambient drafts are written for sleep and
+relaxation search terms), category, visibility, optional scheduling (uploads
+as private with `publishAt`), made-for-kids, the best-frame thumbnail, and
+YouTube's AI disclosure (`containsSyntheticMedia`, **on by default**).
+Uploads use YouTube's resumable protocol in 8 MiB chunks; the session is
+saved on the job, so **Retry** resumes from the last byte YouTube has.
+Google's default quota allows 100 uploads per day. Custom thumbnails need
+a verified channel; without one the upload still succeeds and the job
+notes that the thumbnail wasn't set.
+
+### Production hardening
+
+- **Every render has its own files** (`render_<id>.mp4` / `.jpg`). Before
+  this, new renders overwrote one `final.mp4`, so render history and A/B
+  compare showed the latest video for every version.
+- **S3** (`S3_BUCKET`): renders and thumbnails are mirrored, and downloads
+  and share links redirect to presigned S3 URLs.
+- **Retention** (`RENDER_RETENTION_KEEP=N`): keeps the newest N completed
+  renders per project; older ones are deleted locally and from S3, and
+  marked `expired`. Compose scratch files are removed after every render.
+- **Queue** (`QUEUE_MODE=required` in the prod overlay): jobs never run
+  inside a web worker. If Redis is down the API returns 503, and `/readyz`
+  reports not-ready until Redis answers and a worker is registered. Jobs get
+  `QUEUE_JOB_TIMEOUT_SECONDS` (default 4 h).
+- **Video jobs** are event-driven. Every shot of a render is submitted in
+  parallel and the worker returns; nothing sleeps in a poll loop. Each job
+  is a `video_jobs` row with its own callback URL
+  (`/api/webhooks/openrouter/videos/<token>`). The webhook (or a sweeper
+  poll, when no webhook arrives) downloads the clip, and the render is
+  composed exactly once, after its last shot lands. Webhooks need an HTTPS
+  `PUBLIC_BASE_URL` (`VIDEO_WEBHOOKS=auto|on|off`). Set
+  `OPENROUTER_WEBHOOK_SECRET` to verify signatures. Without webhooks, the
+  sweeper polls every `VIDEO_POLL_SECONDS`. Jobs fail after
+  `VIDEO_JOB_TIMEOUT_MINUTES`.
+- **Spend tracking.** Every paid provider call writes a row to the
+  `spend_entries` ledger, attributed to its project and render. Costs come
+  from the provider where it reports them: OpenRouter `usage.cost` on chat,
+  image and streamed audio, and on video jobs via the webhook or poll.
+  OpenRouter `/audio/speech` costs are looked up from `/generation`
+  about a minute later. ElevenLabs and Gemini have no per-call price, so
+  those rows are rate-card estimates (`COST_*`) and are flagged as such.
+  `Render.actual_cost` is the sum of that render's rows. **Settings → Spend**
+  shows the month by type, model and project, the recent charges, and
+  OpenRouter's own usage figure for the key, to cross-check.
+  It also holds the monthly budget: alerts fire at 80% and 100% (configurable)
+  through `ALERT_WEBHOOK_URL`. With the hard stop on, paid generation
+  endpoints return 402 at 100%; FFmpeg-only work (recompose, ambient
+  render) is never blocked. API: `GET /api/spend/summary|entries|openrouter`,
+  `GET|PUT /api/spend/budget`.
+- **Alerts** (`ALERT_WEBHOOK_URL`, Slack/Discord-compatible): render, loop
+  and upload failures, a burst of provider errors (default 5 in 10 min),
+  and an active model disappearing from the polled catalog. Duplicates are
+  suppressed for `ALERT_DEDUPE_MINUTES`.
 
 ### Quality control
 
@@ -233,11 +327,13 @@ into the owner's asset library, which is the Flow-style "save to characters/scen
 
 ```
 draft → planning → planned → generating_audio → generating_shots
-                              → polling → rendering → completed | failed
+                              → rendering → completed | failed | cancelled
+completed → regenerating (shots re-rolling) → generating (recompose) → completed
 ```
 
-Each `VideoShot` has its own status; failed shots can be regenerated without redoing
-the whole pipeline.
+Each `VideoShot` has its own status (`submitted → running → completed | failed`,
+driven by its video job). Failed shots can be regenerated without redoing the
+whole pipeline.
 
 ---
 
@@ -253,6 +349,10 @@ the whole pipeline.
 | Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `GET /api/projects/{id}/cost-estimate` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `POST /api/projects/{id}/retry` (smart retry after a failed render — recomposes when all clips+audio survived, otherwise resumes) · `GET /api/projects/{id}/status` · `GET /api/projects/{id}/renders` · `GET /api/projects/{id}/renders/export` (zip of all completed renders) · `GET /api/renders/recent` (latest completed across all projects) · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `POST /api/projects/{id}/shots/regenerate-bulk` · `GET /api/renders/{id}/download` |
 | Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` · `GET /api/public-renders/{token}/meta` — **unauthenticated**, token-gated; backs the branded `/share/{token}` landing page so a finished video can be shared without exposing the app login |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
+| Ambient   | `GET /api/ambient/presets` · `POST /api/ambient/estimate` · `GET/POST /api/ambient` · `GET/PATCH /api/ambient/{id}` · `POST /api/ambient/{id}/generate-loop[?regenerate_music=false]` · `POST /api/ambient/{id}/render` — scenes are `VideoProject`s with `mode=ambient_loop`, so delete / cancel / renders / share / music preview reuse the project endpoints |
+| Publishing | `GET /api/youtube/status` · `GET /api/youtube/connect` · `GET /api/youtube/callback` · `POST /api/youtube/disconnect` · `POST /api/renders/{id}/publish/youtube` · `GET /api/renders/{id}/publish-jobs` · `GET /api/publish-jobs` · `POST /api/publish-jobs/{id}/retry` · `GET /api/projects/{id}/publish-meta` (drafted title/description/tags) |
+| Ambient extras | `POST /api/ambient/batch` · `POST /api/ambient/{id}/music` · `GET /api/ambient/presets/{id}/preview` · `POST /api/ambient/presets/previews` |
+| Models | `GET /api/models/catalog[?kind=…&refresh=true]` · `POST /api/models/refresh` · `GET /api/models/active` · `PUT /api/models/active {kind, model, options?, allow_unlisted?}` — live catalog polled from OpenRouter (`/models`, `/images/models`, `/videos/models`) and Gemini, plus runtime switching of the active chat / image / video / voice / music / lip-sync model (stored in the DB, `.env` values are the defaults) |
 | Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |
 | System | `GET /api/system/info` — non-secret deployment overview (version, mock flag, ffmpeg availability, configured model ids, key-presence booleans, entity counts); backs the **Settings & Status** page |
 

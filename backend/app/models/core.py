@@ -153,7 +153,7 @@ class VideoProject(Base):
     title: Mapped[str] = mapped_column(String(200), default="")
     original_script: Mapped[str] = mapped_column(Text, default="")
     mode: Mapped[str] = mapped_column(String(40), default="reel_montage")
-    # reel_montage | talking_head_beta | static_motion
+    # reel_montage | talking_head_beta | static_motion | ambient_loop
     aspect_ratio: Mapped[str] = mapped_column(String(10), default="9:16")
     target_duration_seconds: Mapped[int] = mapped_column(Integer, default=25)
     cta_text: Mapped[str] = mapped_column(String(280), default="")
@@ -170,6 +170,11 @@ class VideoProject(Base):
     status: Mapped[str] = mapped_column(String(40), default="draft")
     # draft|planning|planned|generating|completed|failed
     generated_plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Settings for mode="ambient_loop" (scene prompt, loop length, music mood,
+    # crossfade…). Validated by schemas.ambient.AmbientConfig; None for every
+    # other mode. Kept as JSON because these knobs evolve faster than the
+    # storyboard pipeline's columns and never need to be queried individually.
+    ambient_config_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     primary_avatar_id: Mapped[Optional[int]] = mapped_column(ForeignKey("avatars.id"))
     brand_kit_id: Mapped[Optional[int]] = mapped_column(ForeignKey("brand_kits.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -279,7 +284,14 @@ class AssetGenerationJob(Base):
     status: Mapped[str] = mapped_column(String(40), default="pending")
     # pending|submitted|polling|completed|failed|saved
     result_path: Mapped[str] = mapped_column(String(500), default="")
-    result_asset_id: Mapped[Optional[int]] = mapped_column(ForeignKey("assets.id"), nullable=True)
+    # assets ↔ asset_generation_jobs reference each other. use_alter emits
+    # this FK as a separate ALTER after both tables exist, so dependency
+    # ordering (create_all on Postgres, the SQLite→Postgres copy) works.
+    # The name matches the initial migration's constraint.
+    result_asset_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("assets.id", use_alter=True, name="fk_asset_generation_jobs_result_asset_id"),
+        nullable=True,
+    )
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
@@ -346,3 +358,107 @@ class ProviderLog(Base):
     cost: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(40), default="ok")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class AppSetting(Base):
+    """Small key/value store for runtime settings the UI can change without a
+    redeploy — chiefly the active model per capability ("model.video" →
+    "alibaba/wan-3.0") and the last polled model catalog snapshot."""
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class PublishJob(Base):
+    """One upload of a render to an external platform (YouTube for now)."""
+
+    __tablename__ = "publish_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    render_id: Mapped[int] = mapped_column(ForeignKey("renders.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(20), default="youtube")
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    # queued | uploading | processing | scheduled | published | failed
+    title: Mapped[str] = mapped_column(String(200), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    tags_json: Mapped[list | None] = mapped_column(JSON, default=list)
+    category_id: Mapped[str] = mapped_column(String(10), default="22")
+    privacy: Mapped[str] = mapped_column(String(20), default="private")  # private|unlisted|public
+    publish_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # UTC
+    made_for_kids: Mapped[bool] = mapped_column(Boolean, default=False)
+    contains_synthetic_media: Mapped[bool] = mapped_column(Boolean, default=True)
+    set_thumbnail: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Resumable session URI — kept so a crashed upload resumes, not restarts.
+    upload_url: Mapped[str] = mapped_column(String(1000), default="")
+    bytes_total: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_sent: Mapped[int] = mapped_column(Integer, default=0)
+    external_id: Mapped[str] = mapped_column(String(100), default="")
+    external_url: Mapped[str] = mapped_column(String(300), default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class VideoJob(Base):
+    """One asynchronous video generation at a provider — a storyboard shot,
+    an ambient chain segment, a Studio clip, or an Avatar IV talking head.
+
+    Workers submit and move on; completion arrives by webhook (OpenRouter
+    `callback_url` → /api/webhooks/openrouter/videos/{callback_token}) or,
+    as a safety net / when webhooks can't reach us, by the sweeper polling
+    jobs whose `next_check_at` has passed."""
+
+    __tablename__ = "video_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    purpose: Mapped[str] = mapped_column(String(30))  # shot|avatar|ambient_segment|studio
+    ref_id: Mapped[int] = mapped_column(Integer)  # VideoShot.id or AssetGenerationJob.id
+    project_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    render_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    model: Mapped[str] = mapped_column(String(300), default="")
+    provider_job_id: Mapped[str] = mapped_column(String(200), default="")
+    polling_url: Mapped[str] = mapped_column(String(500), default="")
+    callback_token: Mapped[str] = mapped_column(String(80), default=_token, unique=True, index=True)
+    uses_webhook: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(20), default="submitted", index=True)
+    # submitted | running | completing | completed | failed
+    context_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    result_path: Mapped[str] = mapped_column(String(500), default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    checks: Mapped[int] = mapped_column(Integer, default=0)
+    next_check_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+    deadline_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class SpendEntry(Base):
+    """One billed (or estimated) provider call — the spend ledger.
+
+    `source` says where the number came from: "provider" (the API reported
+    it: OpenRouter `usage.cost`, video job cost), "lookup" (fetched later
+    from OpenRouter's generation endpoint), "pending" (waiting on that
+    lookup; `cost_usd` holds a rate-card estimate meanwhile) or "rate_card"
+    (provider reports nothing, e.g. ElevenLabs — `is_estimate` is True)."""
+
+    __tablename__ = "spend_entries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+    provider: Mapped[str] = mapped_column(String(40))  # openrouter|elevenlabs|gemini|replicate
+    kind: Mapped[str] = mapped_column(String(20), index=True)  # chat|image|video|avatar|tts|music|training
+    model: Mapped[str] = mapped_column(String(200), default="")
+    project_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    render_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    ref: Mapped[str] = mapped_column(String(80), default="")  # e.g. "video_job:12", "studio_job:3"
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
+    source: Mapped[str] = mapped_column(String(20), default="provider", index=True)
+    generation_id: Mapped[str] = mapped_column(String(120), default="")
+    note: Mapped[str] = mapped_column(String(300), default="")

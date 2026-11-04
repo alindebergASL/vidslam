@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..config import get_settings
 from ..db import get_db
+from ..services.model_registry import active_model as _active_model
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -36,13 +37,15 @@ def system_info(db: Session = Depends(get_db)) -> dict:
         "keys": {
             "openrouter": bool(s.openrouter_api_key),
             "elevenlabs": bool(s.elevenlabs_api_key),
+            "gemini": bool(s.gemini_api_key),
         },
         "models": {
-            "chat": s.openrouter_chat_model or None,
-            "image": s.openrouter_image_model or None,
-            "video": s.openrouter_video_model or None,
-            "tts": s.elevenlabs_model_id or None,
-            "music": s.elevenlabs_music_model_id or None,
+            "chat": _active_model("chat") or None,
+            "image": _active_model("image") or None,
+            "video": _active_model("video") or None,
+            "tts": (s.elevenlabs_model_id if _active_model("tts") == "elevenlabs" else _active_model("tts")) or None,
+            "music": (s.elevenlabs_music_model_id or "elevenlabs") if _active_model("music") == "elevenlabs" else _active_model("music"),
+            "lipsync": _active_model("lipsync") or None,
         },
         "counts": {
             "avatars": _count(models.Avatar),

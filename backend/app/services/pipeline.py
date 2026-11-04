@@ -13,8 +13,9 @@ from ..db import SessionLocal
 from ..providers import get_chat, get_tts, get_video
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
-from . import storage
+from . import alerts, render_files, storage
 from .captions import chunks_to_timed
+from .model_registry import active_model as _active_model
 from .renderer import RenderInputs, compose
 
 log = logging.getLogger("avs.pipeline")
@@ -120,6 +121,8 @@ def _log_provider_call(
         )
     )
     db.commit()
+    if status == "error":
+        alerts.provider_error(provider, endpoint, str((response_summary or {}).get("error", "")))
 
 
 def _resolve_model(db: Session, model: str) -> str:
@@ -294,87 +297,277 @@ def generate_plan(
     return plan
 
 
-def _ensure_clip_for_shot(db: Session, project: models.VideoProject, shot: models.VideoShot) -> Path:
-    """Submit + poll + download a shot's clip if it doesn't have one yet."""
-    if shot.clip_path and Path(shot.clip_path).exists() and shot.status == "completed":
-        return Path(shot.clip_path)
+def submit_shot_clip(
+    db: Session,
+    project: models.VideoProject,
+    shot: models.VideoShot,
+    *,
+    render_id: Optional[int] = None,
+    after: str = "compose",
+    references: Optional[list[ImageRef]] = None,
+    purpose: str = "shot",
+    context: Optional[dict] = None,
+    note: str = "",
+) -> models.VideoJob:
+    """Submit a shot's clip as a VideoJob and return without waiting.
+
+    Completion (webhook or sweeper) lands in on_shot_clip_ready, which marks
+    the shot done and — per `after` — composes the waiting render
+    ("compose"), recomposes the project once every regenerated shot is back
+    ("recompose"), or does nothing ("none"). `references` overrides the
+    cast-asset lookup (the ambient chain pins first/last frames with it).
+    `note` is kept on the shot's error once the clip lands (e.g. why a
+    lip-sync shot fell back to the video model)."""
+    from . import video_jobs
 
     video = get_video()
-    refs = _resolve_references_for_shot(db, project, shot)
-    settings_local = get_settings()
+    refs = references if references is not None else _resolve_references_for_shot(db, project, shot)
     # Per-shot override (raw id or custom:<id> trained-LoRA selector) wins
     # over the deployment-wide default.
-    model = _resolve_model(
-        db,
-        shot.model_override or settings_local.openrouter_video_model or "mock/video-default",
-    )
-
+    model = _resolve_model(db, shot.model_override or _active_model("video"))
     shot.status = "submitted"
-    shot.provider = "mock" if settings_local.video_is_mocked() else "openrouter"
+    shot.error = note
+    shot.clip_path = ""
+    shot.provider = "mock" if get_settings().video_is_mocked() else "openrouter"
     shot.provider_model = model
     db.commit()
 
-    try:
-        submitted = video.submit(
-            model=model,
-            prompt=shot.prompt,
-            references=refs,
+    def start(callback: Optional[str]):
+        settings_extra = {
+            "aspect_ratio": project.aspect_ratio or None,
+            # generate_audio defaults to true on audio-capable models (Veo…);
+            # the renderer strips clip audio and lays in voice/music itself.
+            "generate_audio": False,
+        }
+        if callback:
+            settings_extra["callback_url"] = callback
+        return video.submit(
+            model=model, prompt=shot.prompt, references=refs,
             negative_prompt=shot.negative_prompt or "",
             reference_strategy=shot.reference_strategy or "input_references",
-            duration_seconds=shot.duration_seconds or 5.0,
+            duration_seconds=shot.duration_seconds or 5.0, settings=settings_extra,
         )
-        shot.provider_job_id = submitted.job_id
-        shot.polling_url = submitted.polling_url
-        shot.status = "polling"
-        db.commit()
 
-        # Synchronous loop (workers run inside RQ jobs; for mock this is instant).
-        # Real providers: we poll up to ~10 minutes.
-        from time import sleep
-
-        deadline = 60 * 10
-        elapsed = 0
-        while True:
-            st = video.poll(submitted)
-            if st.state == "succeeded":
-                break
-            if st.state == "failed":
-                raise RuntimeError(st.error or "video provider returned failure")
-            sleep(3)
-            elapsed += 3
-            if elapsed > deadline:
-                raise RuntimeError("video job poll timed out")
-
-        data = video.download(submitted)
-        out_dir = storage.render_subdir(project.id)
-        out_path = out_dir / f"shot_{shot.shot_order:02d}_{shot.id}.mp4"
-        out_path.write_bytes(data)
-        shot.clip_path = str(out_path)
-        shot.status = "completed"
-        db.commit()
-        _log_provider_call(
-            db,
-            project_id=project.id,
-            provider=submitted.provider,
-            endpoint="video.submit+poll+download",
-            request_summary={"model": submitted.model, "refs": len(refs), "shot": shot.id},
-            response_summary={"bytes": len(data)},
+    try:
+        job = video_jobs.submit(
+            db, purpose=purpose, ref_id=shot.id, project_id=project.id, render_id=render_id,
+            context={"after": after, **({"note": note} if note else {}), **(context or {})}, start=start,
         )
-        return out_path
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — submit itself failed
         shot.status = "failed"
         shot.error = str(e)[:500]
         db.commit()
-        _log_provider_call(
-            db,
-            project_id=project.id,
-            provider="video",
-            endpoint="video.submit",
-            request_summary={"shot": shot.id, "model": model},
-            response_summary={"error": str(e)[:500]},
-            status="error",
-        )
+        _log_provider_call(db, project_id=project.id, provider="video", endpoint="video.submit",
+                           request_summary={"shot": shot.id, "model": model},
+                           response_summary={"error": str(e)[:500]}, status="error")
         raise
+    _log_provider_call(db, project_id=project.id, provider=job.provider, endpoint="video.submit",
+                       request_summary={"model": model, "refs": len(refs), "shot": shot.id,
+                                        "webhook": job.uses_webhook},
+                       response_summary={"job": job.provider_job_id})
+    return job
+
+
+def on_shot_clip_ready(db: Session, job: models.VideoJob) -> None:
+    shot = db.get(models.VideoShot, job.ref_id)
+    if shot is None:
+        return
+    path = Path(job.result_path)
+    if job.purpose == "avatar":
+        # Avatar models size the clip to their audio/script; trim to the shot.
+        from .renderer import trim_clip
+
+        trimmed = path.with_name(f"shot_{shot.shot_order:02d}_{shot.id}.mp4")
+        trim_clip(path, trimmed, duration=float((job.context_json or {}).get("duration") or shot.duration_seconds or 5.0))
+        path.unlink(missing_ok=True)
+        path = trimmed
+    shot.clip_path = str(path)
+    shot.status = "completed"
+    shot.error = (job.context_json or {}).get("note", "")
+    db.commit()
+    _after_shot(db, job)
+
+
+def on_shot_clip_failed(db: Session, job: models.VideoJob) -> None:
+    shot = db.get(models.VideoShot, job.ref_id)
+    if shot is None:
+        return
+    project = db.get(models.VideoProject, job.project_id)
+    if job.purpose == "avatar" and project is not None:
+        # Lip-sync failed → fall back to the regular video model for this shot.
+        shot.error = f"lip-sync failed, used video model instead: {job.error[:300]}"
+        db.commit()
+        _log_provider_call(db, project_id=project.id, provider="avatar", endpoint="avatar.submit",
+                           request_summary={"shot": shot.id}, response_summary={"error": job.error[:500]},
+                           status="error")
+        try:
+            submit_shot_clip(db, project, shot, render_id=job.render_id,
+                             after=(job.context_json or {}).get("after", "compose"), note=shot.error)
+        except Exception:  # noqa: BLE001
+            log.exception("fallback video submit failed for shot %s", shot.id)
+            _after_shot(db, job)
+        return
+    shot.status = "failed"
+    shot.error = job.error[:500]
+    db.commit()
+    _log_provider_call(db, project_id=job.project_id, provider=job.provider or "video",
+                       endpoint="video.job", request_summary={"shot": shot.id, "job": job.id},
+                       response_summary={"error": job.error[:500]}, status="error")
+    _after_shot(db, job)
+
+
+def _after_shot(db: Session, job: models.VideoJob) -> None:
+    after = (job.context_json or {}).get("after", "compose")
+    if after == "compose" and job.render_id:
+        maybe_compose(db, job.render_id)
+    elif after == "recompose" and job.project_id:
+        maybe_recompose(db, job.project_id)
+
+
+def _body_shots(project: models.VideoProject) -> list[models.VideoShot]:
+    return [s for s in project.shots if s.shot_type not in ("end_card", "ambient_segment")]
+
+
+def maybe_compose(db: Session, render_id: int) -> None:
+    """Compose once every body shot of the render's project has its clip.
+    Exactly-once: the render moves generating_shots → rendering atomically."""
+    from sqlalchemy import update as sa_update
+
+    from ..workers.jobs import compose_render_job
+    from ..workers.queue import enqueue
+
+    render = db.get(models.Render, render_id)
+    if render is None or render.status != "generating_shots":
+        return
+    db.refresh(render)
+    project = db.get(models.VideoProject, render.project_id)
+    db.refresh(project)
+    shots = _body_shots(project)
+    for s in shots:
+        db.refresh(s)
+    failed = [s for s in shots if s.status == "failed"]
+    if failed:
+        _fail_render(db, render, project, f"shot {failed[0].shot_order} failed: {failed[0].error[:300]}")
+        return
+    if any(s.status != "completed" or not s.clip_path for s in shots):
+        return
+    res = db.execute(sa_update(models.Render)
+                     .where(models.Render.id == render_id, models.Render.status == "generating_shots")
+                     .values(status="rendering"))
+    db.commit()
+    if res.rowcount == 1:
+        enqueue(compose_render_job, render_id)
+
+
+def maybe_recompose(db: Session, project_id: int) -> None:
+    """After shot regenerations: recompose once none are outstanding."""
+    from sqlalchemy import update as sa_update
+
+    from ..workers.jobs import recompose_after_regen_job
+    from ..workers.queue import enqueue
+    from . import video_jobs
+
+    if video_jobs.pending_for(db, project_id=project_id) > 0:
+        return
+    res = db.execute(sa_update(models.VideoProject)
+                     .where(models.VideoProject.id == project_id, models.VideoProject.status == "regenerating")
+                     .values(status="generating"))
+    db.commit()
+    if res.rowcount == 1:
+        enqueue(recompose_after_regen_job, project_id)
+
+
+def _fail_render(db: Session, render: models.Render, project: models.VideoProject, error: str) -> None:
+    render.status = "failed"
+    render.error = error[:800]
+    project.status = "failed"
+    db.commit()
+    alerts.render_failed("render", project.id, project.title, error)
+
+
+def _hero_portrait(db: Session, project: models.VideoProject) -> Optional[models.Asset]:
+    """The primary avatar's hero image (or first image) — the face a
+    talking-head model animates."""
+    avatar = db.get(models.Avatar, project.primary_avatar_id) if project.primary_avatar_id else None
+    if avatar is None:
+        for cm in project.cast_members:
+            if cm.member_kind == "avatar" and cm.avatar is not None:
+                avatar = cm.avatar
+                break
+    if avatar is None or not avatar.assets:
+        return None
+    heroes = [a for a in avatar.assets if a.asset_type == "hero"]
+    return (heroes or avatar.assets)[0]
+
+
+def _shot_start(project: models.VideoProject, shot: models.VideoShot) -> float:
+    """Where `shot` starts in the voiceover: the summed length of the body
+    shots before it (end cards are appended after the voice)."""
+    t = 0.0
+    for s in project.shots:
+        if s.id == shot.id:
+            break
+        if s.shot_type != "end_card":
+            t += float(s.duration_seconds or 0)
+    return t
+
+
+def submit_talking_head(
+    db: Session, project: models.VideoProject, shot: models.VideoShot,
+    *, plan: StoryboardPlan, audio_path: str, start: float, render_id: Optional[int],
+    after: str = "compose",
+) -> bool | str:
+    """Submit a lip-synced talking-head job (portrait + this shot's slice of
+    the voiceover) when a lip-sync model is active. Returns True when
+    submitted; False when lip-sync is off or there's no portrait; or, when
+    the submit itself fails, a note to keep on the shot. Anything but True
+    means the caller uses the regular video model.
+    If the avatar job later fails, on_shot_clip_failed falls back to the
+    regular video model for this shot."""
+    from ..providers import get_avatar
+    from . import public_media, video_jobs
+    from .renderer import slice_audio
+
+    avatar = get_avatar()
+    if avatar is None:
+        return False
+    portrait = _hero_portrait(db, project)
+    if portrait is None:
+        log.info("talking-head lip-sync skipped for shot %s: no avatar image", shot.id)
+        return False
+    out_dir = storage.render_subdir(project.id)
+    dur = float(shot.duration_seconds or 5.0)
+    body = [s for s in project.shots if s.shot_type != "end_card"]
+    audio_url = None
+    if audio_path and Path(audio_path).exists():
+        # Each talking-head shot speaks only its own part of the voiceover,
+        # so lips, captions and the voice track stay aligned.
+        seg = slice_audio(Path(audio_path), out_dir / f"voice_shot_{shot.id}.m4a", start=start, duration=dur)
+        audio_url = public_media.publish(seg, "m4a")
+    script = (plan.cleaned_voice_script if len(body) == 1 else "") or shot.caption_text \
+        or plan.cleaned_voice_script or shot.prompt
+    shot.status = "submitted"
+    shot.provider = "lipsync"
+    shot.provider_model = getattr(avatar, "model", "")
+    shot.error = ""
+    shot.clip_path = ""
+    db.commit()
+
+    def start_fn(callback: Optional[str]):
+        return avatar.submit_avatar(
+            portrait_url=storage.public_url_for_token(portrait.public_token), audio_url=audio_url,
+            script=script, aspect_ratio=project.aspect_ratio, motion_prompt=shot.camera_direction or "",
+            duration_seconds=dur, callback_url=callback,
+        )
+
+    try:
+        video_jobs.submit(db, purpose="avatar", ref_id=shot.id, project_id=project.id, render_id=render_id,
+                          context={"after": after, "duration": dur}, start=start_fn)
+    except Exception as e:  # noqa: BLE001 — submit failed: use the video model
+        log.warning("talking-head submit failed for shot %s, falling back: %s", shot.id, e)
+        db.rollback()
+        return f"lip-sync failed, used video model instead: {str(e)[:300]}"
+    return True
 
 
 def generate_audio(
@@ -529,7 +722,6 @@ def render_project(db: Session, project_id: int) -> models.Render:
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
     from .cost import estimate_plan_cost
 
-    settings_local = get_settings()
     estimate = estimate_plan_cost(
         {"voiceover_source": project.voiceover_source, "music_will_generate": False},
         plan,
@@ -545,6 +737,9 @@ def render_project(db: Session, project_id: int) -> models.Render:
     project.status = "generating"
     db.commit()
     db.refresh(render)
+    from . import spend
+
+    spend.bind(project_id=project.id, render_id=render.id)  # voiceover etc. count toward this render
 
     try:
         _check_cancel(db, render)
@@ -556,39 +751,71 @@ def render_project(db: Session, project_id: int) -> models.Render:
         db.commit()
         _check_cancel(db, render)
 
-        # 2. per-shot clips (skip end_card; we render the CTA card in compose)
+        # 2. Submit every body shot at once (they generate in parallel at the
+        #    provider); end cards are drawn by compose. Completion arrives by
+        #    webhook / sweeper and maybe_compose() runs compose exactly once.
         project = db.get(models.VideoProject, project.id)  # refresh
-        clip_paths: list[Path] = []
+        body = 0
         for shot in project.shots:
             _check_cancel(db, render)
             if shot.shot_type == "end_card":
-                # End card rendered in compose() from cta_text. Skip provider call.
                 shot.status = "completed"
                 db.commit()
                 continue
-            clip = _ensure_clip_for_shot(db, project, shot)
-            clip_paths.append(clip)
-
-        if not clip_paths:
+            body += 1
+            if shot.status == "completed" and shot.clip_path and Path(shot.clip_path).exists():
+                continue  # reuse a clip that's already there
+            note = ""
+            if shot.shot_type == "talking_head":
+                ok = submit_talking_head(
+                    db, project, shot, plan=plan, audio_path=render.audio_path,
+                    start=_shot_start(project, shot), render_id=render.id,
+                )
+                if ok is True:
+                    continue
+                note = ok or ""
+                shot = db.get(models.VideoShot, shot.id)
+            submit_shot_clip(db, project, shot, render_id=render.id, after="compose", note=note)
+        if body == 0:
             raise RuntimeError("no clips were produced for any shot")
-
-        render.status = "rendering"
+        maybe_compose(db, render.id)
+        db.refresh(render)
+        return render
+    except RenderCancelled:
+        log.info("render %s cancelled by user", render.id)
+        # The render row was already flipped to 'cancelled' by the cancel endpoint;
+        # mirror it onto the project so the editor leaves polling and offers Retry.
+        render.status = "cancelled"
+        render.error = ""
+        project.status = "cancelled"
         db.commit()
+        return render
+    except Exception as e:  # noqa: BLE001
+        log.exception("render failed")
+        render.status = "failed"
+        render.error = str(e)[:800]
+        project.status = "failed"
+        db.commit()
+        alerts.render_failed("render", project.id, project.title, str(e))
+        raise
+
+
+def compose_render(db: Session, render_id: int) -> models.Render:
+    """FFmpeg composition for a storyboard render whose clips are all in
+    (called once by maybe_compose)."""
+    render = db.get(models.Render, render_id)
+    project = db.get(models.VideoProject, render.project_id)
+    plan = StoryboardPlan.model_validate(project.generated_plan_json)
+    try:
         _check_cancel(db, render)
-
-        # 3. caption timings (over body duration only — end card is appended last)
-        body_duration = sum(
-            s.duration_seconds for s in project.shots if s.shot_type != "end_card"
-        )
+        clip_paths = [Path(s.clip_path) for s in _body_shots(project)]
+        body_duration = sum(s.duration_seconds for s in _body_shots(project))
         timed = chunks_to_timed(plan.caption_chunks, max(body_duration, 1.0))
-
-        # 4. compose
         brand = _brand_kit_for(db, project)
-        out_dir = storage.render_subdir(project.id)
         outputs = compose(
             RenderInputs(
                 project_id=project.id,
-                out_dir=out_dir,
+                out_dir=storage.render_subdir(project.id),
                 clip_paths=clip_paths,
                 audio_path=Path(render.audio_path) if render.audio_path else None,
                 caption_timings=timed,
@@ -606,88 +833,78 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 caption_color=(brand.primary_color if brand else None),
             )
         )
-        render.final_video_path = str(outputs.final_video_path)
-        render.thumbnail_path = str(outputs.thumbnail_path)
         render.render_log = outputs.log
-        # Nothing is billed in mock mode; otherwise the actual matches the estimate
-        # (we don't get per-call billing back from the providers in the MVP).
-        render.actual_cost = 0.0 if settings_local.video_is_mocked() else render.estimated_cost
+        render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
         render.status = "completed"
         project.status = "completed"
         db.commit()
+        _settle_render_cost(db, render)
+        render_files.prune(db, project.id)
         return render
     except RenderCancelled:
-        log.info("render %s cancelled by user", render.id)
-        # The render row was already flipped to 'cancelled' by the cancel endpoint;
-        # mirror it onto the project so the editor leaves polling and offers Retry.
         render.status = "cancelled"
         render.error = ""
         project.status = "cancelled"
         db.commit()
         return render
     except Exception as e:  # noqa: BLE001
-        log.exception("render failed")
-        render.status = "failed"
-        render.error = str(e)[:800]
-        project.status = "failed"
-        db.commit()
+        log.exception("compose failed")
+        _fail_render(db, render, project, str(e))
         raise
+
+
+def _settle_render_cost(db: Session, render: models.Render) -> None:
+    """Actual cost = what providers reported for this render's jobs."""
+    from . import spend
+
+    render.actual_cost = spend.render_actual_cost(db, render)
+    db.commit()
 
 
 def regenerate_shot(
     db: Session, project_id: int, shot_id: int, *, recompose: bool = True
-) -> Path:
+) -> models.VideoJob:
+    """Regenerate one shot's clip (async). With `recompose`, the project is
+    recomposed once the new clip is back."""
     project = db.get(models.VideoProject, project_id)
     shot = db.get(models.VideoShot, shot_id)
     if not project or not shot or shot.project_id != project.id:
         raise ValueError("shot not found in project")
-    # Force regeneration of this clip only — other shots keep their clip_path,
-    # so the next compose will reuse them.
-    shot.clip_path = ""
-    shot.status = "pending"
-    shot.error = ""
-    db.commit()
-    clip = _ensure_clip_for_shot(db, project, shot)
     if recompose:
-        try:
-            recompose_project(db, project_id)
-        except Exception:  # noqa: BLE001
-            log.exception("recompose after shot regen failed")
-    return clip
+        project.status = "regenerating"
+        db.commit()
+    return submit_shot_clip(db, project, shot, after="recompose" if recompose else "none")
 
 
 def regenerate_shots_bulk(
     db: Session, project_id: int, shot_ids: list[int], *, recompose: bool = True
 ) -> list[int]:
-    """Regenerate several shots' clips in one pass, then optionally re-compose once.
-
-    Returns the list of shot ids that were successfully regenerated. A shot that
-    fails is marked failed and skipped; the recompose still runs for the rest as
-    long as every body shot ends up with a clip on disk."""
+    """Regenerate several shots at once (submitted in parallel); recompose
+    once, after the last one is back. Returns the ids that were submitted."""
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise ValueError(f"project {project_id} not found")
     by_id = {s.id: s for s in project.shots}
-    regenerated: list[int] = []
-    for sid in shot_ids:
-        shot = by_id.get(sid)
-        if shot is None or shot.shot_type == "end_card":
-            continue
-        shot.clip_path = ""
-        shot.status = "pending"
-        shot.error = ""
+    targets = [by_id[i] for i in shot_ids if i in by_id and by_id[i].shot_type != "end_card"]
+    if recompose and targets:
+        # Barrier: maybe_recompose only acts on "regenerating", so a clip that
+        # completes while the rest are still being submitted (mock/inline, or
+        # a very fast provider) can't recompose with the others' old clips.
+        project.status = "submitting"
         db.commit()
+    submitted: list[int] = []
+    for shot in targets:
         try:
-            _ensure_clip_for_shot(db, project, shot)
-            regenerated.append(sid)
+            submit_shot_clip(db, project, shot, after="recompose" if recompose else "none")
+            submitted.append(shot.id)
         except Exception:  # noqa: BLE001
-            log.exception("bulk regen failed for shot %s", sid)
-    if recompose:
-        try:
-            recompose_project(db, project_id)
-        except Exception:  # noqa: BLE001
-            log.exception("recompose after bulk regen failed")
-    return regenerated
+            log.exception("bulk regen failed for shot %s", shot.id)
+    if recompose and targets:
+        db.refresh(project)
+        project.status = "regenerating"
+        db.commit()
+        maybe_recompose(db, project_id)  # all already back (or every submit failed)
+    return submitted
 
 
 def _latest_completed_audio(db: Session, project_id: int) -> Optional[Path]:
@@ -773,12 +990,12 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
                 caption_color=(brand.primary_color if brand else None),
             )
         )
-        render.final_video_path = str(outputs.final_video_path)
-        render.thumbnail_path = str(outputs.thumbnail_path)
         render.render_log = outputs.log
+        render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
         render.status = "completed"
         project.status = "completed"
         db.commit()
+        render_files.prune(db, project.id)
         return render
     except RenderCancelled:
         log.info("recompose %s cancelled by user", render.id)
@@ -821,7 +1038,7 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             image = get_image()
             model = _resolve_model(
                 db,
-                job.provider_model or settings.openrouter_image_model or "mock/image-default",
+                job.provider_model or _active_model("image"),
             )
             job.provider = "mock" if settings.image_is_mocked() else "openrouter"
             job.provider_model = model
@@ -831,43 +1048,27 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             path = storage.save_generated_bytes(data, extension="png", subdir_name="images")
             job.result_path = str(path)
             job.status = "completed"
-        else:  # video_clip
+        else:  # video_clip — async: completes via webhook / sweeper
+            from . import video_jobs
+
             video = get_video()
-            model = _resolve_model(
-                db,
-                job.provider_model or settings.openrouter_video_model or "mock/video-default",
-            )
+            model = _resolve_model(db, job.provider_model or _active_model("video"))
             job.provider = "mock" if settings.video_is_mocked() else "openrouter"
             job.provider_model = model
-            db.commit()
-            submitted = video.submit(
-                model=model,
-                prompt=job.prompt,
-                references=refs,
-                negative_prompt=job.negative_prompt or "",
-                duration_seconds=5.0,
-            )
-            job.provider_job_id = submitted.job_id
             job.status = "polling"
             db.commit()
-            # mock returns succeeded immediately; real provider would block here
-            from time import sleep
 
-            elapsed = 0
-            while True:
-                st = video.poll(submitted)
-                if st.state == "succeeded":
-                    break
-                if st.state == "failed":
-                    raise RuntimeError(st.error or "video provider failure")
-                sleep(3)
-                elapsed += 3
-                if elapsed > 600:
-                    raise RuntimeError("video job poll timed out")
-            data = video.download(submitted)
-            path = storage.save_generated_bytes(data, extension="mp4", subdir_name="clips")
-            job.result_path = str(path)
-            job.status = "completed"
+            def start(callback):
+                return video.submit(
+                    model=model, prompt=job.prompt, references=refs,
+                    negative_prompt=job.negative_prompt or "", duration_seconds=5.0,
+                    settings={"callback_url": callback} if callback else None,
+                )
+
+            vj = video_jobs.submit(db, purpose="studio", ref_id=job.id, project_id=None, start=start)
+            job.provider_job_id = vj.provider_job_id
+            db.refresh(job)
+            return job
         db.commit()
         return job
     except Exception as e:  # noqa: BLE001
@@ -982,6 +1183,13 @@ def run_training_job(db: Session, job_id: int) -> None:
                         av.elevenlabs_voice_id = st.provider_model_id
                         av.default_voice_provider = "elevenlabs"
                 db.commit()
+                if cm.cost_usd and not type(provider).__name__.startswith("Mock"):
+                    from . import spend
+
+                    spend.record(provider="replicate" if "Replicate" in type(provider).__name__ else "elevenlabs",
+                                 kind="training", model=cm.kind, cost=cm.cost_usd,
+                                 is_estimate=True, source="rate_card", ref=f"custom_model:{cm.id}",
+                                 note="GPU seconds × rate")
                 _log_provider_call(
                     db,
                     project_id=0,
@@ -1018,3 +1226,24 @@ def run_training_job(db: Session, job_id: int) -> None:
         cm.error = str(e)[:500]
         db.commit()
         raise
+
+
+def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
+    job = db.get(models.AssetGenerationJob, vjob.ref_id)
+    if job is None:
+        return
+    data = Path(vjob.result_path).read_bytes()
+    path = storage.save_generated_bytes(data, extension="mp4", subdir_name="clips")
+    Path(vjob.result_path).unlink(missing_ok=True)
+    job.result_path = str(path)
+    job.status = "completed"
+    db.commit()
+
+
+def on_studio_clip_failed(db: Session, vjob: models.VideoJob) -> None:
+    job = db.get(models.AssetGenerationJob, vjob.ref_id)
+    if job is None:
+        return
+    job.status = "failed"
+    job.error = vjob.error[:500]
+    db.commit()

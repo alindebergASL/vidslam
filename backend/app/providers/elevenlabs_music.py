@@ -15,9 +15,10 @@ class ElevenLabsMusicProvider(MusicProvider):
     the app depends on provider specifics.
     """
 
-    def __init__(self, *, api_key: str | None = None) -> None:
+    def __init__(self, *, api_key: str | None = None, model_id: str | None = None) -> None:
         s = get_settings()
         self.api_key = api_key or s.elevenlabs_api_key
+        self.model_id = model_id or s.elevenlabs_music_model_id or "music_v2_5"
         if not self.api_key:
             raise RuntimeError("ELEVENLABS_API_KEY missing for real music provider")
 
@@ -52,15 +53,25 @@ class ElevenLabsMusicProvider(MusicProvider):
     ) -> bytes:
         s = get_settings()
         url = f"{s.elevenlabs_base_url.rstrip('/')}/music"
+        # elevenlabs.io/docs/api-reference/music/compose: prompt +
+        # music_length_ms (3 s–5 min per the FAQ; the schema allows 10 min),
+        # force_instrumental (prompt mode only). model_id is sent
+        # explicitly: the API default, music_v1, is deprecated and will be
+        # removed on 2027-01-31.
+        length_ms = int(min(300.0, max(3.0, duration_seconds)) * 1000)
         body: dict = {
             "prompt": prompt,
-            "music_length_ms": int(max(5.0, duration_seconds) * 1000),
+            "music_length_ms": length_ms,
+            "model_id": self.model_id,
+            "force_instrumental": True,  # beds sit under voice / ambient scenes
         }
-        if s.elevenlabs_music_model_id:
-            body["model_id"] = s.elevenlabs_music_model_id
         if settings:
             body.update(settings)
         with httpx.Client(timeout=180.0) as client:
             r = client.post(url, headers=self._headers(), json=body)
             r.raise_for_status()
-            return r.content
+        from ..services import spend
+
+        spend.record_rate_card("elevenlabs", "music", self.model_id, s.cost_music_per_generation,
+                               note=f"{length_ms / 1000:.0f}s track")
+        return r.content

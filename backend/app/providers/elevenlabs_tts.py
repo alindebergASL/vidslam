@@ -5,12 +5,10 @@ import httpx
 from ..config import get_settings
 from .base import TTSProvider
 
-settings = get_settings()
-
 
 class ElevenLabsTTSProvider(TTSProvider):
     def __init__(self, *, api_key: str | None = None) -> None:
-        self.api_key = api_key or settings.elevenlabs_api_key
+        self.api_key = api_key or get_settings().elevenlabs_api_key
         if not self.api_key:
             raise RuntimeError("ELEVENLABS_API_KEY missing for real tts provider")
 
@@ -21,7 +19,7 @@ class ElevenLabsTTSProvider(TTSProvider):
         return h
 
     def list_voices(self) -> list[dict]:
-        url = f"{settings.elevenlabs_base_url.rstrip('/')}/voices"
+        url = f"{get_settings().elevenlabs_base_url.rstrip('/')}/voices"
         with httpx.Client(timeout=30.0) as client:
             r = client.get(url, headers=self._headers())
             r.raise_for_status()
@@ -52,4 +50,10 @@ class ElevenLabsTTSProvider(TTSProvider):
         with httpx.Client(timeout=180.0) as client:
             r = client.post(url, headers=self._headers(accept_audio=True), json=body)
             r.raise_for_status()
-            return r.content
+        from ..services import spend
+
+        # ElevenLabs bills plan credits per character; no $ in the response.
+        chars = int(r.headers.get("character-cost") or len(text))
+        spend.record_rate_card("elevenlabs", "tts", body["model_id"],
+                               chars / 1000 * get_settings().cost_tts_per_1k_chars, note=f"{chars} chars")
+        return r.content

@@ -166,7 +166,7 @@ export function GenerationProgress({
       {(failed || cancelled) && (
         <div className="mt-3 space-y-2">
           {render.error && (
-            <pre className="p-3 bg-ink-800 text-xs text-accent whitespace-pre-wrap rounded">
+            <pre className="p-3 bg-ink-800 text-xs text-accent whitespace-pre-wrap rounded-sm">
               {render.error}
             </pre>
           )}

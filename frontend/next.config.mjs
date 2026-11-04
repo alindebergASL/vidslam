@@ -2,6 +2,7 @@
 const nextConfig = {
   reactStrictMode: true,
   images: { unoptimized: true },
-  experimental: { serverActions: { allowedOrigins: ["*"] } },
+  // (Removed experimental.serverActions.allowedOrigins: ["*"]: the app has no
+  // server actions, and a wildcard origin list only widened the surface.)
 };
 export default nextConfig;

@@ -6,7 +6,12 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from .base import ImageRef, JobStatus, ModelInfo, SubmittedJob, VideoProvider
+from .base import ImageRef, JobStatus, ModelInfo, SubmittedJob, VideoCapabilities, VideoProvider
+
+# Behave like the common real-world tier: 5s or 10s per call, first+last
+# frame keyframes supported. Keeps the ambient chaining path exercised in
+# mock mode instead of pretending a 30s clip comes back from one call.
+MOCK_CAPS = VideoCapabilities(durations=[5, 10], first_frame=True, last_frame=True)
 
 
 def _generate_clip(prompt: str, duration: float, refs_count: int) -> bytes:
@@ -15,20 +20,19 @@ def _generate_clip(prompt: str, duration: float, refs_count: int) -> bytes:
     h = abs(hash(prompt)) & 0xFFFFFF
     r, g, b = (h >> 16) & 0xFF, (h >> 8) & 0xFF, h & 0xFF
     color = f"0x{r:02X}{g:02X}{b:02X}"
-    safe = (
-        prompt[:120]
-        .replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "’")
-    )
-    overlay = f"MOCK CLIP\\nrefs: {refs_count}\\n{safe}"
-    vf = (
-        f"color=c={color}:s=720x1280:d={duration},"
-        f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-        f"text='{overlay}':fontcolor=white:fontsize=42:"
-        f"x=(w-text_w)/2:y=h-th-160:line_spacing=10:box=1:boxcolor=black@0.45:boxborderw=20"
-    )
+    from ..services.renderer import textfile_arg
+
     with tempfile.TemporaryDirectory() as td:
+        # The label goes in a file: inline text= needs filtergraph escaping
+        # that differs between FFmpeg versions (commas in prompts broke 7+).
+        label = Path(td) / "label.txt"
+        label.write_text(f"MOCK CLIP\nrefs: {refs_count}\n{prompt[:120]}", encoding="utf-8")
+        vf = (
+            f"color=c={color}:s=720x1280:d={duration},"
+            f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"{textfile_arg(label)}:fontcolor=white:fontsize=42:"
+            f"x=(w-text_w)/2:y=h-th-160:line_spacing=10:box=1:boxcolor=black@0.45:boxborderw=20"
+        )
         out = Path(td) / f"{uuid.uuid4().hex}.mp4"
         cmd = [
             "ffmpeg", "-y", "-f", "lavfi", "-i", vf,
@@ -54,11 +58,14 @@ class MockVideoProvider(VideoProvider):
         return [
             ModelInfo(
                 id="mock/video-default",
-                name="Mock Video (FFmpeg lavfi)",
+                name="Mock Video (FFmpeg lavfi) (up to 10s · first+last frame)",
                 modality="video",
                 description="Deterministic placeholder used in MOCK_PROVIDERS mode.",
             ),
         ]
+
+    def capabilities(self, model: str) -> VideoCapabilities:
+        return MOCK_CAPS
 
     def submit(
         self,
@@ -72,7 +79,10 @@ class MockVideoProvider(VideoProvider):
         settings: dict | None = None,
     ) -> SubmittedJob:
         job_id = uuid.uuid4().hex
-        data = _generate_clip(prompt, max(2.0, duration_seconds), len(references))
+        # Real providers reject durations they don't support; we snap like
+        # the OpenRouter adapter does so mock output lengths match reality.
+        dur = MOCK_CAPS.snap(duration_seconds) if duration_seconds > MOCK_CAPS.max_seconds else duration_seconds
+        data = _generate_clip(prompt, max(2.0, dur), len(references))
         self._cache[job_id] = data
         return SubmittedJob(provider="mock", model=model or "mock/video-default", job_id=job_id)
 
@@ -81,8 +91,14 @@ class MockVideoProvider(VideoProvider):
             return JobStatus(state="succeeded", progress=1.0)
         return JobStatus(state="failed", error="unknown job id")
 
-    def download(self, job: SubmittedJob) -> bytes:
+    def download(self, job: SubmittedJob, result_url: str | None = None) -> bytes:
         return self._cache.pop(job.job_id, b"") or b""
+
+    def put(self, data: bytes) -> SubmittedJob:
+        """Register pre-made bytes as a finished job (mock avatar uses this)."""
+        job_id = uuid.uuid4().hex
+        self._cache[job_id] = data
+        return SubmittedJob(provider="mock", model="mock", job_id=job_id)
 
 
 # Process-wide singleton so submit→poll→download work across calls.

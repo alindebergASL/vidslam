@@ -145,7 +145,9 @@ class CastMemberOut(CastMemberIn):
 class ProjectCreate(BaseModel):
     title: str = ""
     original_script: str = ""
-    mode: Literal["reel_montage", "talking_head_beta", "static_motion"] = "reel_montage"
+    mode: Literal["reel_montage", "talking_head_beta", "static_motion", "ambient_loop"] = (
+        "reel_montage"
+    )
     aspect_ratio: str = "9:16"
     target_duration_seconds: int = 25
     cta_text: str = ""
@@ -243,6 +245,7 @@ class ProjectOut(BaseModel):
     primary_avatar_id: Optional[int]
     brand_kit_id: Optional[int]
     generated_plan_json: Optional[dict]
+    ambient_config_json: Optional[dict] = None
     created_at: datetime
     updated_at: datetime
     cast_members: list[CastMemberOut] = Field(default_factory=list)

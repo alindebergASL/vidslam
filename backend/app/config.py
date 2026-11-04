@@ -20,6 +20,23 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/app.db"
     data_dir: str = "./data"
     redis_url: str = "redis://localhost:6379/0"
+    # Job queue: "auto" = RQ when Redis answers, else run inline (dev);
+    # "required" = refuse to run jobs inline (503) — use in production so a
+    # Redis outage can't pin web workers on hour-long renders; "inline" =
+    # never use Redis.
+    queue_mode: str = "auto"
+    # Per-job ceiling for RQ jobs. Chained ambient loops on real video
+    # models and avatar jobs can take well over the old 30 min.
+    queue_job_timeout_seconds: int = 4 * 3600
+
+    # Keep the newest N completed renders per project; older ones have their
+    # files deleted (local + S3) and are marked expired. 0 = keep all.
+    render_retention_keep: int = 0
+
+    # Ops alerts: Slack/Discord-compatible incoming webhook. Empty = log only.
+    alert_webhook_url: str = ""
+    alert_dedupe_minutes: int = 30
+    alert_provider_errors: int = 5
 
     # rate limiting (budget-burning generation endpoints only)
     rate_limit_enabled: bool = True
@@ -40,16 +57,57 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_site_url: str = "http://localhost:3000"
     openrouter_app_title: str = "AvatarVideoStudio"
-    openrouter_chat_model: str = "openai/gpt-4o-mini"
+    # Storyboard planner. Any OpenRouter text model works; switch live in
+    # Settings → Models. claude-haiku-5.5 (Oct 2026) replaced gpt-4o-mini
+    # (Jul 2024) as the default: newer, cheaper, supports structured outputs.
+    openrouter_chat_model: str = "anthropic/claude-haiku-5.5"
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    # Video jobs complete by webhook (OpenRouter POSTs to callback_url, which
+    # must be HTTPS) with a polling sweeper as safety net. "auto" = webhooks
+    # when PUBLIC_BASE_URL is https and providers are live; "off" = poll only.
+    video_webhooks: str = "auto"
+    # Optional: the signing secret from OpenRouter workspace settings. When
+    # set, webhook deliveries must carry a valid X-OpenRouter-Signature.
+    openrouter_webhook_secret: str = ""
+    video_poll_seconds: int = 10  # poll cadence when webhooks are off
+    video_safety_poll_seconds: int = 120  # check-in on webhook jobs that went quiet
+    video_job_timeout_minutes: int = 45
+
+    # Per-call clip cap assumed when a model's limits can't be discovered
+    # (OpenRouter /videos/models unreachable, or a model it doesn't list).
+    # Ambient loops longer than this are built from chained segments.
+    ambient_default_max_clip_seconds: int = 10
+
+    # Google Gemini API (Lyria music). Optional; enables google/lyria-* music
+    # models in the catalog.
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_api_revision: str = "2026-05-20"
+
+    # Model catalog: how often the background poller refreshes the list of
+    # available models from OpenRouter (and Gemini). 0 disables polling.
+    model_catalog_refresh_hours: float = 6.0
+
+    # YouTube publishing (Google OAuth "Web application" client). The
+    # redirect URI registered in Google Cloud must be
+    # {PUBLIC_BASE_URL}/api/youtube/callback unless overridden here.
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_redirect_uri: str = ""
 
     # elevenlabs
     elevenlabs_api_key: str = ""
     elevenlabs_default_voice_id: str = ""
-    elevenlabs_model_id: str = "eleven_turbo_v2_5"
-    elevenlabs_music_model_id: str = ""
+    # eleven_turbo_v2_5 is deprecated (ElevenLabs: use Flash instead).
+    # eleven_multilingual_v2 is their quality pick for the TTS endpoint;
+    # eleven_flash_v2_5 is the low-latency one. Eleven v4 is reachable via
+    # OpenRouter (elevenlabs/eleven-v4) under Settings → Models → Voice.
+    elevenlabs_model_id: str = "eleven_multilingual_v2"
+    # music_v2_5 = current Eleven Music model (music_v1, the API default, is
+    # deprecated and removed 2027-01-31).
+    elevenlabs_music_model_id: str = "music_v2_5"
     elevenlabs_base_url: str = "https://api.elevenlabs.io/v1"
 
     # S3-backed object storage (optional, for production deploys). When
@@ -71,9 +129,10 @@ class Settings(BaseSettings):
     # mocked even with MOCK_PROVIDERS=false.
     replicate_api_token: str = ""
     replicate_base_url: str = "https://api.replicate.com/v1"
-    # Default LoRA trainer model (Replicate "owner/model:version"). The
-    # SDXL LoRA trainer is the most battle-tested for character flavors.
-    replicate_lora_trainer: str = "ostris/flux-dev-lora-trainer:b6af14222e6bd9be257cbc1ea4afda3cd0503e1133083b9d1de0364d8568e6ef"
+    # Default LoRA trainer (Replicate "owner/model:version"; trainings need
+    # an explicit version). FLUX.1-dev LoRA trainer, pinned to its latest
+    # version as of Nov 2026.
+    replicate_lora_trainer: str = "ostris/flux-dev-lora-trainer:26dce37af90b9d997eeb970d92e47de3064d46c300504ae376c75bef6a9022d2"
 
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01
@@ -81,6 +140,11 @@ class Settings(BaseSettings):
     cost_video_per_second: float = 0.10
     cost_tts_per_1k_chars: float = 0.20
     cost_music_per_generation: float = 0.05
+    # Spend ledger defaults (Settings → Spend overrides them at runtime).
+    # 0 = no monthly cap. hard_stop: refuse new paid generations (HTTP 402)
+    # once the month's spend reaches the cap; otherwise only alert.
+    spend_monthly_budget_usd: float = 0.0
+    spend_hard_stop: bool = True
 
     @property
     def data_path(self) -> Path:
