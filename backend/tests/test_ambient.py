@@ -39,7 +39,7 @@ def _frame_mean_red(video: Path, *, first: bool, tmp: Path) -> float:
     idx = 0 if first else nb - 1
     png = tmp / f"frame_{idx}.png"
     subprocess.run(
-        ["ffmpeg", "-y", "-i", str(video), "-vf", f"select='eq(n\\,{idx})'", "-vsync", "0",
+        ["ffmpeg", "-y", "-i", str(video), "-vf", f"select='eq(n\\,{idx})'", "-fps_mode", "passthrough",
          "-frames:v", "1", str(png)],
         capture_output=True, text=True, check=True,
     )

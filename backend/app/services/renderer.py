@@ -40,6 +40,13 @@ class RenderOutputs:
     log: str
 
 
+
+def textfile_arg(path: Path) -> str:
+    """drawtext options that read text verbatim from `path` (no %{} expansion)."""
+    p = str(path).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    return f"textfile='{p}':expansion=none"
+
+
 def _run(cmd: list[str]) -> tuple[int, str]:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
@@ -90,14 +97,16 @@ def _make_end_card(
     logo_path: Optional[Path] = None,
 ) -> str:
     """Generate a branded end card: solid bg, optional centered logo, centered text."""
-    safe = text.replace("\\", "\\\\").replace(":", "\\:").replace("'", "’")
+    label = dst.parent / f".{dst.stem}_text.txt"
+    label.write_text(text, encoding="utf-8")
+    txt = textfile_arg(label)
     base = f"color=c={bg_color}:s={width}x{height}:d={duration}"
 
     if logo_path is not None and logo_path.exists():
         # Logo centered in the upper third, text below center.
         draw = (
             "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-            f"text='{safe}':fontcolor={text_color}:fontsize=64:"
+            f"{txt}:fontcolor={text_color}:fontsize=64:"
             f"x=(w-text_w)/2:y=h*0.60:line_spacing=18:box=0"
         )
         filter_complex = (
@@ -120,7 +129,7 @@ def _make_end_card(
         vf = (
             f"{base},"
             f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-            f"text='{safe}':fontcolor={text_color}:fontsize=72:"
+            f"{txt}:fontcolor={text_color}:fontsize=72:"
             f"x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=18:box=0"
         )
         cmd = [
@@ -131,6 +140,7 @@ def _make_end_card(
             str(dst),
         ]
     rc, log = _run(cmd)
+    label.unlink(missing_ok=True)
     if rc != 0:
         raise RuntimeError(f"ffmpeg end-card failed: {log[-2000:]}")
     return log
@@ -197,15 +207,13 @@ def _mux_audio_captions_overlays(
     if ass_path is not None:
         ass_str = str(ass_path).replace(":", r"\:").replace("'", r"\'")
         vf_chain.append(f"subtitles='{ass_str}'")
+    disclosure_file = None
     if disclosure_text:
-        safe = (
-            disclosure_text.replace("\\", "\\\\")
-            .replace(":", "\\:")
-            .replace("'", "’")
-        )
+        disclosure_file = silent_in.parent / f".{silent_in.stem}_disclosure.txt"
+        disclosure_file.write_text(disclosure_text, encoding="utf-8")
         vf_chain.append(
             "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:"
-            f"text='{safe}':fontcolor=white:fontsize=30:"
+            f"{textfile_arg(disclosure_file)}:fontcolor=white:fontsize=30:"
             "x=40:y=h-th-40:box=1:boxcolor=black@0.55:boxborderw=14"
         )
 
@@ -261,6 +269,8 @@ def _mux_audio_captions_overlays(
     cmd += [str(out)]
 
     rc, log = _run(cmd)
+    if disclosure_file is not None:
+        disclosure_file.unlink(missing_ok=True)
     if rc != 0:
         raise RuntimeError(f"ffmpeg mux failed: {log[-2000:]}")
     return log

@@ -20,20 +20,19 @@ def _generate_clip(prompt: str, duration: float, refs_count: int) -> bytes:
     h = abs(hash(prompt)) & 0xFFFFFF
     r, g, b = (h >> 16) & 0xFF, (h >> 8) & 0xFF, h & 0xFF
     color = f"0x{r:02X}{g:02X}{b:02X}"
-    safe = (
-        prompt[:120]
-        .replace("\\", "\\\\")
-        .replace(":", "\\:")
-        .replace("'", "’")
-    )
-    overlay = f"MOCK CLIP\\nrefs: {refs_count}\\n{safe}"
-    vf = (
-        f"color=c={color}:s=720x1280:d={duration},"
-        f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
-        f"text='{overlay}':fontcolor=white:fontsize=42:"
-        f"x=(w-text_w)/2:y=h-th-160:line_spacing=10:box=1:boxcolor=black@0.45:boxborderw=20"
-    )
+    from ..services.renderer import textfile_arg
+
     with tempfile.TemporaryDirectory() as td:
+        # The label goes in a file: inline text= needs filtergraph escaping
+        # that differs between FFmpeg versions (commas in prompts broke 7+).
+        label = Path(td) / "label.txt"
+        label.write_text(f"MOCK CLIP\nrefs: {refs_count}\n{prompt[:120]}", encoding="utf-8")
+        vf = (
+            f"color=c={color}:s=720x1280:d={duration},"
+            f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
+            f"{textfile_arg(label)}:fontcolor=white:fontsize=42:"
+            f"x=(w-text_w)/2:y=h-th-160:line_spacing=10:box=1:boxcolor=black@0.45:boxborderw=20"
+        )
         out = Path(td) / f"{uuid.uuid4().hex}.mp4"
         cmd = [
             "ffmpeg", "-y", "-f", "lavfi", "-i", vf,
