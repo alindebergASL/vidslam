@@ -94,7 +94,16 @@ def submit(
     job.uses_webhook = use_hook
     db.add(job)
     db.flush()  # assigns callback_token default
-    submitted = start(callback_url(job.callback_token) if use_hook else None)
+    try:
+        submitted = start(callback_url(job.callback_token) if use_hook else None)
+    except Exception as e:
+        # Never leave a "submitted" row without a provider job: the sweeper
+        # would poll nothing until the deadline and block recomposes.
+        job.status = "failed"
+        job.error = f"submit failed: {e}"[:1000]
+        job.completed_at = _now()
+        db.commit()
+        raise
     job.provider = provider_label or submitted.provider
     job.model = submitted.model or ""
     job.provider_job_id = submitted.job_id

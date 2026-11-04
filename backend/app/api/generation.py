@@ -176,6 +176,10 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     if latest.status in ("completed", "failed", "cancelled"):
         return {"render_id": latest.id, "status": latest.status, "action": "noop"}
     latest.status = "cancelled"
+    # Shots are submitted asynchronously, so there may be no worker left in
+    # render_project to mirror this; in-flight clips that land later see a
+    # cancelled render and don't compose.
+    project.status = "cancelled"
     db.commit()
     return {"render_id": latest.id, "status": "cancelled", "action": "signalled"}
 

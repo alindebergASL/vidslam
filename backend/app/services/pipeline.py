@@ -887,7 +887,10 @@ def regenerate_shots_bulk(
     by_id = {s.id: s for s in project.shots}
     targets = [by_id[i] for i in shot_ids if i in by_id and by_id[i].shot_type != "end_card"]
     if recompose and targets:
-        project.status = "regenerating"
+        # Barrier: maybe_recompose only acts on "regenerating", so a clip that
+        # completes while the rest are still being submitted (mock/inline, or
+        # a very fast provider) can't recompose with the others' old clips.
+        project.status = "submitting"
         db.commit()
     submitted: list[int] = []
     for shot in targets:
@@ -897,7 +900,10 @@ def regenerate_shots_bulk(
         except Exception:  # noqa: BLE001
             log.exception("bulk regen failed for shot %s", shot.id)
     if recompose and targets:
-        maybe_recompose(db, project_id)  # covers "every submit failed" too
+        db.refresh(project)
+        project.status = "regenerating"
+        db.commit()
+        maybe_recompose(db, project_id)  # all already back (or every submit failed)
     return submitted
 
 

@@ -272,3 +272,68 @@ def test_regenerate_recomposes_after_webhook(auth_client, live_video):
     st = _status(auth_client, pid)
     assert st["project_status"] == "completed"
     assert st["latest_render"]["id"] != first_render and st["latest_render"]["status"] == "completed"
+
+
+# ---------- review regressions ----------
+
+
+def test_bulk_regenerate_recomposes_once_after_every_shot(auth_client, monkeypatch):
+    """Mock jobs complete during submit: the first one must not recompose
+    before the rest of the batch has been submitted."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import pipeline
+
+    pid = _planned(auth_client)
+    auth_client.post(f"/api/projects/{pid}/generate-video?force=true")
+    db = SessionLocal()
+    body = [s.id for s in db.get(models.VideoProject, pid).shots if s.shot_type != "end_card"]
+    db.close()
+    assert len(body) >= 2
+
+    calls = []
+    real = pipeline.recompose_project
+
+    def spy(db, project_id):
+        calls.append(len(_jobs(project_id=project_id, purpose="shot")))
+        return real(db, project_id)
+
+    monkeypatch.setattr(pipeline, "recompose_project", spy)
+    before = len(_jobs(project_id=pid, purpose="shot"))
+    db = SessionLocal()
+    try:
+        pipeline.regenerate_shots_bulk(db, pid, body)
+    finally:
+        db.close()
+    assert calls == [before + len(body)], calls  # once, with every new clip in
+    assert _status(auth_client, pid)["project_status"] == "completed"
+
+
+def test_cancel_after_shots_are_submitted_settles_the_project(auth_client, live_video):
+    pid = _planned(auth_client)
+    auth_client.post(f"/api/projects/{pid}/generate-video?force=true")
+    assert _status(auth_client, pid)["latest_render"]["status"] == "generating_shots"
+    assert auth_client.post(f"/api/projects/{pid}/cancel").json()["action"] == "signalled"
+    st = _status(auth_client, pid)
+    assert st["project_status"] == "cancelled" and st["latest_render"]["status"] == "cancelled"
+    for _, t, j, *_ in _jobs(project_id=pid):
+        _hook(auth_client, t, j)  # late clips land: no compose, still cancelled
+    st = _status(auth_client, pid)
+    assert st["project_status"] == "cancelled" and st["latest_render"]["status"] == "cancelled"
+
+
+def test_rejected_submit_leaves_no_pending_job(auth_client, live_video):
+    from app.db import SessionLocal
+    from app.services import video_jobs
+
+    live_video.post(f"{OR}/videos").mock(return_value=httpx.Response(400, json={"error": "bad model"}))
+    pid = _planned(auth_client)
+    auth_client.post(f"/api/projects/{pid}/generate-video?force=true")
+    jobs = _jobs(project_id=pid)
+    assert jobs and all(j[3] == "failed" for j in jobs)
+    db = SessionLocal()
+    try:
+        assert video_jobs.pending_for(db, project_id=pid) == 0
+    finally:
+        db.close()
+    assert _status(auth_client, pid)["latest_render"]["status"] == "failed"
