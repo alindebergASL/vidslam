@@ -101,3 +101,17 @@ def presigned_url_for(local_path: Path, content_type: str = "application/octet-s
     except Exception as e:  # noqa: BLE001
         log.warning("S3 presign failed for %s: %s", key, e)
         return None
+
+
+def delete_from_s3(local_path: Path) -> bool:
+    """Best-effort delete of the S3 mirror of a local file (retention)."""
+    client = _client_or_none()
+    if client is None:
+        return False
+    s = get_settings()
+    try:
+        client.delete_object(Bucket=s.s3_bucket, Key=_s3_key_for(local_path))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("S3 delete failed for %s: %s", local_path, e)
+        return False

@@ -13,7 +13,7 @@ from ..db import SessionLocal
 from ..providers import get_chat, get_tts, get_video
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
-from . import storage
+from . import alerts, render_files, storage
 from .model_registry import active_model as _active_model
 from .captions import chunks_to_timed
 from .renderer import RenderInputs, compose
@@ -121,6 +121,8 @@ def _log_provider_call(
         )
     )
     db.commit()
+    if status == "error":
+        alerts.provider_error(provider, endpoint, str((response_summary or {}).get("error", "")))
 
 
 def _resolve_model(db: Session, model: str) -> str:
@@ -697,15 +699,15 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 caption_color=(brand.primary_color if brand else None),
             )
         )
-        render.final_video_path = str(outputs.final_video_path)
-        render.thumbnail_path = str(outputs.thumbnail_path)
         render.render_log = outputs.log
+        render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
         # Nothing is billed in mock mode; otherwise the actual matches the estimate
         # (we don't get per-call billing back from the providers in the MVP).
         render.actual_cost = 0.0 if settings_local.video_is_mocked() else render.estimated_cost
         render.status = "completed"
         project.status = "completed"
         db.commit()
+        render_files.prune(db, project.id)
         return render
     except RenderCancelled:
         log.info("render %s cancelled by user", render.id)
@@ -722,6 +724,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
         render.error = str(e)[:800]
         project.status = "failed"
         db.commit()
+        alerts.render_failed("render", project.id, project.title, str(e))
         raise
 
 
@@ -864,12 +867,12 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
                 caption_color=(brand.primary_color if brand else None),
             )
         )
-        render.final_video_path = str(outputs.final_video_path)
-        render.thumbnail_path = str(outputs.thumbnail_path)
         render.render_log = outputs.log
+        render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
         render.status = "completed"
         project.status = "completed"
         db.commit()
+        render_files.prune(db, project.id)
         return render
     except RenderCancelled:
         log.info("recompose %s cancelled by user", render.id)

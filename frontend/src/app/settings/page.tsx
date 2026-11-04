@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
 import { ModelsPanel } from "@/components/ModelsPanel";
+import { YouTubeCard } from "@/components/YouTubeCard";
 import { api, SystemInfo } from "@/lib/api";
 
 export default function SettingsPage() {
@@ -82,6 +83,8 @@ function Inner() {
       </section>
 
       <ModelsPanel />
+
+      <YouTubeCard />
 
       {info && (
         <>

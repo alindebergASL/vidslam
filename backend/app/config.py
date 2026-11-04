@@ -20,6 +20,23 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/app.db"
     data_dir: str = "./data"
     redis_url: str = "redis://localhost:6379/0"
+    # Job queue: "auto" = RQ when Redis answers, else run inline (dev);
+    # "required" = refuse to run jobs inline (503) — use in production so a
+    # Redis outage can't pin web workers on hour-long renders; "inline" =
+    # never use Redis.
+    queue_mode: str = "auto"
+    # Per-job ceiling for RQ jobs. Chained ambient loops on real video
+    # models and avatar jobs can take well over the old 30 min.
+    queue_job_timeout_seconds: int = 4 * 3600
+
+    # Keep the newest N completed renders per project; older ones have their
+    # files deleted (local + S3) and are marked expired. 0 = keep all.
+    render_retention_keep: int = 0
+
+    # Ops alerts: Slack/Discord-compatible incoming webhook. Empty = log only.
+    alert_webhook_url: str = ""
+    alert_dedupe_minutes: int = 30
+    alert_provider_errors: int = 5
 
     # rate limiting (budget-burning generation endpoints only)
     rate_limit_enabled: bool = True
@@ -58,6 +75,13 @@ class Settings(BaseSettings):
     # Model catalog: how often the background poller refreshes the list of
     # available models from OpenRouter (and Gemini). 0 disables polling.
     model_catalog_refresh_hours: float = 6.0
+
+    # YouTube publishing (Google OAuth "Web application" client). The
+    # redirect URI registered in Google Cloud must be
+    # {PUBLIC_BASE_URL}/api/youtube/callback unless overridden here.
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_redirect_uri: str = ""
 
     # elevenlabs
     elevenlabs_api_key: str = ""

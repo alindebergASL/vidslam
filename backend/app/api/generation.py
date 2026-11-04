@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 from slugify import slugify
 from sqlalchemy.orm import Session
@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db
 from ..schemas import ProjectStatusOut, RenderOut, ShotOut
+from ..services import render_files
 from ..services.preflight import run_preflight
 from ..services.ratelimit import rate_limit
 from ..services.safety import UnsafeScriptError, validate_script
@@ -39,6 +40,9 @@ def public_render(token: str, db: Session = Depends(get_db)) -> FileResponse:
         raise HTTPException(404, "render not found")
     if not Path(r.final_video_path).exists():
         raise HTTPException(404, "render file missing")
+    url = render_files.delivery_url(r.final_video_path, "video/mp4")
+    if url:
+        return RedirectResponse(url, status_code=302)
     return FileResponse(r.final_video_path, media_type="video/mp4")
 
 
@@ -47,6 +51,9 @@ def public_render_thumbnail(token: str, db: Session = Depends(get_db)) -> FileRe
     r = db.query(models.Render).filter(models.Render.share_token == token).first()
     if r is None or not r.thumbnail_path or not Path(r.thumbnail_path).exists():
         raise HTTPException(404, "thumbnail not found")
+    url = render_files.delivery_url(r.thumbnail_path, "image/jpeg")
+    if url:
+        return RedirectResponse(url, status_code=302)
     return FileResponse(r.thumbnail_path, media_type="image/jpeg")
 
 
@@ -379,6 +386,10 @@ def download_render(render_id: int, db: Session = Depends(get_db)) -> FileRespon
     r = db.get(models.Render, render_id)
     if r is None or not r.final_video_path or not Path(r.final_video_path).exists():
         raise HTTPException(404, "render not ready")
+    url = render_files.delivery_url(r.final_video_path, "video/mp4")
+    if url:
+        # Hour-long MP4s are 50–500 MB; let S3 (or a CDN in front) serve them.
+        return RedirectResponse(url, status_code=302)
     return FileResponse(
         r.final_video_path,
         media_type="video/mp4",

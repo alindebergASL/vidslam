@@ -87,3 +87,57 @@ def render_ambient_job(project_id: int) -> None:
         ambient.render_scene(db, project_id)
     finally:
         db.close()
+
+
+def generate_previews_job(preset_ids: list[str]) -> None:
+    from ..services import ambient
+
+    db = SessionLocal()
+    try:
+        for pid in preset_ids:
+            try:
+                ambient.generate_preview(db, pid)
+            except Exception:  # noqa: BLE001 — one bad preset shouldn't stop the rest
+                log.exception("preview generation failed for %s", pid)
+    finally:
+        db.close()
+
+
+def ambient_batch_job(project_ids: list[int], render: bool = True) -> None:
+    """Generate (and render) a batch of scenes sequentially, so a batch never
+    floods the provider with parallel jobs."""
+    from ..services import ambient
+
+    for pid in project_ids:
+        db = SessionLocal()
+        try:
+            ambient.generate_loop(db, pid)
+            if render:
+                ambient.render_scene(db, pid)
+        except Exception:  # noqa: BLE001 — failures are recorded on the scene
+            log.exception("batch item %s failed", pid)
+        finally:
+            db.close()
+
+
+def publish_youtube_job(job_id: int) -> None:
+    from .. import models
+    from ..services import alerts, youtube
+
+    db = SessionLocal()
+    try:
+        job = db.get(models.PublishJob, job_id)
+        if job is None:
+            return
+        try:
+            youtube.upload(db, job)
+        except Exception as e:  # noqa: BLE001
+            log.exception("youtube upload %s failed", job_id)
+            db.rollback()
+            job = db.get(models.PublishJob, job_id)
+            job.status = "failed"
+            job.error = str(e)[:800]
+            db.commit()
+            alerts.send(f"publish-failed:{job_id}", f"YouTube upload failed: “{job.title}”", str(e)[:600])
+    finally:
+        db.close()

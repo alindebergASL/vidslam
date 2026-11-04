@@ -232,3 +232,14 @@ def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
         shutil.rmtree(render_dir, ignore_errors=True)
     except OSError:
         pass
+
+
+@router.get("/projects/{project_id}/publish-meta")
+def publish_meta(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """Draft YouTube title / description / tags / flags for this project."""
+    from ..services import publish_meta as pm
+
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    return pm.draft(project)

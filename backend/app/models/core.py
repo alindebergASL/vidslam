@@ -363,3 +363,33 @@ class AppSetting(Base):
     key: Mapped[str] = mapped_column(String(120), primary_key=True)
     value: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class PublishJob(Base):
+    """One upload of a render to an external platform (YouTube for now)."""
+
+    __tablename__ = "publish_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    render_id: Mapped[int] = mapped_column(ForeignKey("renders.id"), index=True)
+    platform: Mapped[str] = mapped_column(String(20), default="youtube")
+    status: Mapped[str] = mapped_column(String(20), default="queued")
+    # queued | uploading | processing | scheduled | published | failed
+    title: Mapped[str] = mapped_column(String(200), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    tags_json: Mapped[list | None] = mapped_column(JSON, default=list)
+    category_id: Mapped[str] = mapped_column(String(10), default="22")
+    privacy: Mapped[str] = mapped_column(String(20), default="private")  # private|unlisted|public
+    publish_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # UTC
+    made_for_kids: Mapped[bool] = mapped_column(Boolean, default=False)
+    contains_synthetic_media: Mapped[bool] = mapped_column(Boolean, default=True)
+    set_thumbnail: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Resumable session URI — kept so a crashed upload resumes, not restarts.
+    upload_url: Mapped[str] = mapped_column(String(1000), default="")
+    bytes_total: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_sent: Mapped[int] = mapped_column(Integer, default=0)
+    external_id: Mapped[str] = mapped_column(String(100), default="")
+    external_url: Mapped[str] = mapped_column(String(300), default="")
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

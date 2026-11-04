@@ -56,6 +56,14 @@ class AmbientConfig(BaseModel):
     # reach the full loop length; False = one clip at the model's max and
     # loop that (cheaper, but the scene repeats more often).
     chain_segments: bool = True
+    # Music bed length in seconds. 0 = auto (45–90 s, offset from the video
+    # loop). Longer beds (3–20 min) repeat less over an hour; beds longer
+    # than the music provider's per-call cap are generated in parts and
+    # crossfaded together.
+    music_bed_seconds: int = Field(default=0, ge=0, le=1200)
+    # 4k = Lanczos upscale of the loop unit before tiling (no AI): free, and
+    # YouTube streams 4K uploads at a higher bitrate even when viewed at 1080p.
+    output_resolution: Literal["1080p", "4k"] = "1080p"
 
     @field_validator("scene_prompt", "music_prompt", "scene_preset", "music_mood", "model_override")
     @classmethod
@@ -77,6 +85,14 @@ class AmbientUpdate(BaseModel):
     config: Optional[AmbientConfig] = None
 
 
+class AmbientBatchRequest(BaseModel):
+    presets: list[str] = Field(min_length=1, max_length=20)
+    aspect_ratio: Literal["16:9", "9:16", "1:1"] = "16:9"
+    # Shared settings; scene_preset/music_mood come from each preset.
+    config: AmbientConfig = Field(default_factory=AmbientConfig)
+    render: bool = True
+
+
 class AmbientEstimateRequest(BaseModel):
     config: AmbientConfig = Field(default_factory=AmbientConfig)
 
@@ -88,6 +104,8 @@ class ScenePresetOut(BaseModel):
     tagline: str
     prompt: str
     music_mood: str
+    # Cached preview image (generated once with the image model), if any.
+    preview_url: Optional[str] = None
     # Two CSS colors the UI uses for the preset's gradient art.
     palette: tuple[str, str]
 

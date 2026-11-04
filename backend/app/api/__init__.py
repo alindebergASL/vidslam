@@ -15,6 +15,7 @@ from . import (
     studio,
     system,
     training,
+    youtube,
 )
 
 api_router = APIRouter()
@@ -33,6 +34,7 @@ api_router.include_router(system.router, prefix="/api/system", tags=["system"])
 api_router.include_router(training.router, prefix="/api", tags=["training"])
 api_router.include_router(ambient.router, prefix="/api/ambient", tags=["ambient"])
 api_router.include_router(models_api.router, prefix="/api/models", tags=["models"])
+api_router.include_router(youtube.router, prefix="/api", tags=["publishing"])
 api_router.include_router(ambient.public_router, prefix="/api", tags=["public"])
 
 __all__ = ["api_router"]

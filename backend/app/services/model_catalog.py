@@ -286,7 +286,31 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
             "new_count": sum(1 for e in entries if e["new"]),
         }
         reg.put_setting(CATALOG_KEY, snap)
+        _alert_missing_active(snap, prev_entries)
         return snap
+
+
+def _alert_missing_active(snap: dict, prev_entries: list[dict]) -> None:
+    """Alert when a model someone selected was listed last poll but isn't
+    now (retired / renamed) and its source answered this time."""
+    from . import alerts
+
+    if not prev_entries:
+        return
+    now = {(e["kind"], e["id"]) for e in snap["entries"]}
+    before = {(e["kind"], e["id"]) for e in prev_entries}
+    failed = snap.get("errors") or {}
+    for kind in reg.KINDS:
+        sel = reg.selected(kind)
+        if not sel or sel.startswith("mock/"):
+            continue
+        if (kind, sel) in before and (kind, sel) not in now and not failed:
+            alerts.send(
+                f"model-gone:{kind}:{sel}",
+                f"Active {kind} model {sel} is no longer listed",
+                "Jobs using it will likely fail. Pick a replacement in Settings → Models.",
+                severity="warning",
+            )
 
 
 def get_snapshot() -> Optional[dict]:

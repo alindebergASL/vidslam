@@ -45,12 +45,16 @@ def _run(cmd: list[str]) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-def _dims_for_aspect(aspect: str) -> tuple[int, int]:
+def _dims_for_aspect(aspect: str, resolution: str = "1080p") -> tuple[int, int]:
     if aspect == "16:9":
-        return 1920, 1080
-    if aspect == "1:1":
-        return 1080, 1080
-    return W, H
+        w, h = 1920, 1080
+    elif aspect == "1:1":
+        w, h = 1080, 1080
+    else:
+        w, h = W, H
+    if resolution == "4k":
+        return w * 2, h * 2
+    return w, h
 
 
 def _normalize_clip(src: Path, dst: Path, width: int, height: int) -> str:
@@ -311,6 +315,7 @@ class AmbientRenderInputs:
     # When the clip is already periodic (image_drift), skip the video
     # crossfade: it would only soften a seam that doesn't exist.
     clip_is_periodic: bool = False
+    resolution: str = "1080p"
 
 
 @dataclass
@@ -331,7 +336,7 @@ def _encode_normalized(
     src: Path, dst: Path, *, width: int, height: int, slow_factor: float
 ) -> str:
     vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
     )
     if slow_factor and abs(slow_factor - 1.0) > 1e-3:
@@ -483,7 +488,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     if inputs.total_seconds <= 0:
         raise ValueError("total_seconds must be positive")
 
-    width, height = _dims_for_aspect(inputs.aspect_ratio)
+    width, height = _dims_for_aspect(inputs.aspect_ratio, inputs.resolution)
     out = inputs.out_dir
     out.mkdir(parents=True, exist_ok=True)
     logs: list[str] = []
@@ -650,6 +655,65 @@ def join_segments(
     if rc != 0:
         raise RuntimeError(f"ffmpeg segment join failed: {log[-2000:]}")
     return dst, _probe_duration(dst)
+
+
+def join_audio(parts: list[Path], dst: Path, *, crossfade: float = 6.0) -> tuple[Path, float]:
+    """Crossfade several music parts into one bed (AAC)."""
+    if len(parts) == 1:
+        cmd = ["ffmpeg", "-y", "-i", str(parts[0]), "-vn", "-c:a", "aac", "-b:a", "192k", str(dst)]
+    else:
+        flt, prev = [], "0:a"
+        for i in range(1, len(parts)):
+            out = f"a{i}"
+            flt.append(f"[{prev}][{i}:a]acrossfade=d={crossfade:.2f}:c1=tri:c2=tri[{out}]")
+            prev = out
+        cmd = ["ffmpeg", "-y"]
+        for p in parts:
+            cmd += ["-i", str(p)]
+        cmd += ["-filter_complex", ";".join(flt), "-map", f"[{prev}]", "-c:a", "aac", "-b:a", "192k", str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg audio join failed: {log[-1500:]}")
+    return dst, _probe_duration(dst)
+
+
+def best_frame(src: Path, dst: Path, *, width: int, height: int, samples: int = 12) -> Path:
+    """Pick the most thumbnail-worthy frame of `src`: sharp (edge energy),
+    well exposed (mean luma near mid-grey) and colourful. Saved as a JPEG
+    at width×height (1280×720 for 16:9 — YouTube's recommended size)."""
+    import tempfile
+
+    from PIL import Image, ImageFilter, ImageStat
+
+    dur = max(0.5, _probe_duration(src))
+    best, best_score = None, -1.0
+    with tempfile.TemporaryDirectory() as td:
+        for i in range(samples):
+            t = dur * (i + 0.5) / samples
+            f = Path(td) / f"f{i}.png"
+            rc, _ = _run(["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(src), "-frames:v", "1",
+                          "-vf", "scale=320:-2", str(f)])
+            if rc != 0 or not f.exists():
+                continue
+            with Image.open(f) as im:
+                rgb = im.convert("RGB")
+                grey = rgb.convert("L")
+                sharp = ImageStat.Stat(grey.filter(ImageFilter.FIND_EDGES)).var[0] ** 0.5
+                mean = ImageStat.Stat(grey).mean[0]
+                exposure = 1.0 - abs(mean - 118) / 118
+                sat = ImageStat.Stat(rgb.convert("HSV")).mean[1] / 255
+                score = sharp * (0.5 + exposure) * (0.6 + sat)
+            if score > best_score:
+                best, best_score = t, score
+    if best is None:
+        raise RuntimeError("no frame could be decoded for the thumbnail")
+    vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase:flags=lanczos,"
+          f"crop={width}:{height}")
+    rc, log = _run(["ffmpeg", "-y", "-ss", f"{best:.3f}", "-i", str(src), "-frames:v", "1",
+                    "-vf", vf, "-q:v", "2", str(dst)])
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg thumbnail failed: {log[-1000:]}")
+    return dst
 
 
 def render_image_drift_clip(

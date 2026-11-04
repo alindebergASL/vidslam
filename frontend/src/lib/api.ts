@@ -300,6 +300,8 @@ export type AmbientConfig = {
   music_volume: number;
   model_override: string;
   chain_segments: boolean;
+  music_bed_seconds: number;
+  output_resolution: "1080p" | "4k";
 };
 
 export type ScenePreset = {
@@ -310,6 +312,7 @@ export type ScenePreset = {
   prompt: string;
   music_mood: string;
   palette: [string, string];
+  preview_url: string | null;
 };
 
 export type MusicMood = { id: string; label: string; prompt: string };
@@ -355,6 +358,43 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   music_volume: 0.7,
   model_override: "",
   chain_segments: true,
+  music_bed_seconds: 0,
+  output_resolution: "1080p",
+};
+
+export type PublishMeta = {
+  title: string;
+  description: string;
+  tags: string[];
+  category_id: string;
+  contains_synthetic_media: boolean;
+  made_for_kids: boolean;
+};
+
+export type YouTubeStatus = {
+  configured: boolean;
+  connected: boolean;
+  channel: { id: string; title: string; thumbnail?: string | null } | null;
+  redirect_uri: string;
+  connected_at?: string | null;
+};
+
+export type PublishJob = {
+  id: number;
+  render_id: number;
+  platform: string;
+  status: "queued" | "uploading" | "processing" | "scheduled" | "published" | "failed";
+  title: string;
+  privacy: string;
+  publish_at: string | null;
+  contains_synthetic_media: boolean;
+  bytes_total: number;
+  bytes_sent: number;
+  external_id: string;
+  external_url: string;
+  error: string;
+  created_at: string;
+  updated_at: string;
 };
 
 // --- Model catalog + runtime switching ---
@@ -443,6 +483,47 @@ export const api = {
       `/api/ambient/${id}/generate-loop?regenerate_music=${regenerateMusic}`,
       { method: "POST" }
     ),
+  regenerateAmbientMusic: (id: number) =>
+    req<AmbientScene>(`/api/ambient/${id}/music`, { method: "POST" }),
+  generatePresetPreviews: (missingOnly = true) =>
+    req<{ presets: string[]; job_id: string | null; status: string }>(
+      `/api/ambient/presets/previews?missing_only=${missingOnly}`,
+      { method: "POST" }
+    ),
+  presetPreviewUrl: (path: string) => `${API_BASE}${path}`,
+  ambientBatch: (body: { presets: string[]; aspect_ratio: string; config: AmbientConfig; render: boolean }) =>
+    req<{ scene_ids: number[]; job_id: string; estimated_total: number; scenes: AmbientScene[] }>(
+      "/api/ambient/batch",
+      { method: "POST", body: JSON.stringify(body) }
+    ),
+
+  // publishing
+  publishMeta: (projectId: number) => req<PublishMeta>(`/api/projects/${projectId}/publish-meta`),
+  youtubeStatus: () => req<YouTubeStatus>("/api/youtube/status"),
+  youtubeConnectUrl: () => req<{ url: string }>("/api/youtube/connect"),
+  youtubeDisconnect: () => req<YouTubeStatus>("/api/youtube/disconnect", { method: "POST" }),
+  publishYouTube: (
+    renderId: number,
+    body: {
+      title: string;
+      description: string;
+      tags: string[];
+      category_id: string;
+      privacy: "private" | "unlisted" | "public";
+      publish_at?: string | null;
+      made_for_kids: boolean;
+      contains_synthetic_media: boolean;
+      set_thumbnail: boolean;
+    }
+  ) =>
+    req<PublishJob>(`/api/renders/${renderId}/publish/youtube`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  renderPublishJobs: (renderId: number) => req<PublishJob[]>(`/api/renders/${renderId}/publish-jobs`),
+  retryPublishJob: (jobId: number) =>
+    req<PublishJob>(`/api/publish-jobs/${jobId}/retry`, { method: "POST" }),
+
   renderAmbient: (id: number) =>
     req<{ scene_id: number; job_id: string; status: string }>(`/api/ambient/${id}/render`, {
       method: "POST",

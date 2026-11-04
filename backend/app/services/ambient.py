@@ -35,13 +35,15 @@ from ..schemas.ambient import (
     ScenePresetOut,
 )
 from ..schemas.api import RenderOut, ShotOut
-from . import storage
+from . import alerts, render_files, storage
 from .model_registry import active_model as _active_model
 from .renderer import (
     AmbientRenderInputs,
     _dims_for_aspect,
     compose_ambient,
+    best_frame,
     extract_frame,
+    join_audio,
     join_segments,
     render_image_drift_clip,
 )
@@ -158,9 +160,42 @@ _PRESET_BY_ID = {p.id: p for p in SCENE_PRESETS}
 _MOOD_BY_ID = {m.id: m for m in MUSIC_MOODS}
 
 
+def preview_path(preset_id: str) -> Path:
+    d = get_settings().data_path / "ambient_previews"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{re.sub(r'[^a-z0-9_]', '', preset_id)}.png"
+
+
+def generate_preview(db: Session, preset_id: str) -> Path:
+    """Generate (or regenerate) a preset's preview still with the active
+    image model and cache it."""
+    from .pipeline import _log_provider_call, _resolve_model
+
+    preset = _PRESET_BY_ID.get(preset_id)
+    if preset is None or not preset.prompt:
+        raise ValueError(f"preset {preset_id!r} has no prompt")
+    image = get_image()
+    model = _resolve_model(db, _active_model("image"))
+    png = image.generate(
+        model=model, references=[],
+        prompt=preset.prompt + " Wide establishing shot, 16:9, photorealistic, no people, no text.",
+        settings={"aspect_ratio": "16:9"},
+    )
+    out = preview_path(preset_id)
+    out.write_bytes(png)
+    _log_provider_call(db, project_id=None, provider=type(image).__name__, endpoint="image.generate(preview)",
+                       request_summary={"preset": preset_id, "model": model}, response_summary={"bytes": len(png)})
+    return out
+
+
 def presets() -> AmbientPresetsOut:
+    scenes = []
+    for p in SCENE_PRESETS:
+        path = preview_path(p.id)
+        url = f"/api/ambient/presets/{p.id}/preview?v={int(path.stat().st_mtime)}" if path.exists() else None
+        scenes.append(p.model_copy(update={"preview_url": url}))
     return AmbientPresetsOut(
-        scenes=SCENE_PRESETS,
+        scenes=scenes,
         music_moods=MUSIC_MOODS,
         loop_options=list(LOOP_OPTIONS),
         total_options=list(TOTAL_OPTIONS),
@@ -196,10 +231,73 @@ def resolve_music_prompt(cfg: AmbientConfig) -> str:
 
 
 def music_bed_seconds(cfg: AmbientConfig) -> float:
-    """Length of the music bed to generate. Longer than the clip so the audio
-    seam and the video seam don't line up (phasing joins read as a loop);
-    capped so real music providers stay in their single-call limit."""
+    """Length of the music bed. Auto: 45–90 s, longer than the clip so the
+    audio and video seams don't line up. An explicit music_bed_seconds
+    (e.g. 10 min) repeats far less over an hour."""
+    if cfg.music_bed_seconds:
+        return float(cfg.music_bed_seconds)
     return float(min(90, max(45, cfg.loop_seconds * 2)))
+
+
+MUSIC_JOIN_CROSSFADE = 6.0
+
+
+def music_cap_seconds(model: Optional[str] = None) -> float:
+    """Longest track one music call returns, per active model."""
+    m = model if model is not None else _active_model("music")
+    if "lyria-3-clip" in m:
+        return 30.0
+    if m.startswith("google/lyria"):
+        return 180.0  # "a couple of minutes", prompt-steered
+    return 300.0  # ElevenLabs Music: 3 s – 5 min per call (and the mock)
+
+
+def music_parts(cfg: AmbientConfig, model: Optional[str] = None) -> list[float]:
+    """Per-call lengths that crossfade into a bed of music_bed_seconds."""
+    total = music_bed_seconds(cfg)
+    cap = music_cap_seconds(model)
+    if total <= cap:
+        return [total]
+    n = math.ceil((total - MUSIC_JOIN_CROSSFADE) / (cap - MUSIC_JOIN_CROSSFADE))
+    each = (total + MUSIC_JOIN_CROSSFADE * (n - 1)) / n
+    return [round(min(cap, each), 1)] * n
+
+
+def generate_music_bed(db: Session, project: models.VideoProject, cfg: AmbientConfig, prompt: str) -> Path:
+    """One call when the bed fits the provider's cap; otherwise several
+    tracks in the same mood, crossfaded into one long bed."""
+    from ..providers import get_music
+    from .pipeline import _log_provider_call, generate_music_for_project
+
+    parts = music_parts(cfg)
+    if len(parts) == 1:
+        return generate_music_for_project(db, project.id, prompt=prompt, duration_seconds=parts[0])
+    music = get_music()
+    out_dir = storage.render_subdir(project.id)
+    files: list[Path] = []
+    for i, secs in enumerate(parts):
+        variation = (
+            f" Part {i + 1} of {len(parts)} of one continuous piece: keep the same key, tempo, "
+            "instruments and mood; let it evolve gently, no ending or fade."
+        )
+        data = music.generate(prompt=prompt + variation, duration_seconds=secs)
+        ext = (music.output_extension() or "mp3").lstrip(".")
+        f = out_dir / f"music_part_{i + 1}.{ext}"
+        f.write_bytes(data)
+        files.append(f)
+        _log_provider_call(
+            db, project_id=project.id, provider=type(music).__name__, endpoint="music.generate(part)",
+            request_summary={"part": i + 1, "of": len(parts), "duration": secs},
+            response_summary={"bytes": len(data)},
+        )
+    for stale in out_dir.glob("music.*"):
+        stale.unlink(missing_ok=True)
+    bed, _ = join_audio(files, out_dir / "music.m4a", crossfade=MUSIC_JOIN_CROSSFADE)
+    for f in files:
+        f.unlink(missing_ok=True)
+    project.music_upload_path = str(bed)
+    db.commit()
+    return bed
 
 
 # ---------- loop planning ----------
@@ -330,11 +428,13 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
             "cost": round(secs * s.cost_video_per_second, 4),
         })
     if cfg.music_mood != "none":
+        parts = music_parts(cfg)
         lines.append({
-            "item": f"Music bed ({music_bed_seconds(cfg):.0f}s)",
-            "qty": 1, "unit": "track",
+            "item": f"Music bed ({_fmt_duration(int(music_bed_seconds(cfg)))}"
+                    + (f", {len(parts)} tracks crossfaded)" if len(parts) > 1 else ")"),
+            "qty": len(parts), "unit": "track",
             "unit_cost": s.cost_music_per_generation,
-            "cost": round(s.cost_music_per_generation, 4),
+            "cost": round(s.cost_music_per_generation * len(parts), 4),
         })
     lines.append({
         "item": f"Loop × {plan.repeats} → {_fmt_duration(cfg.total_seconds)} (FFmpeg stream copy)",
@@ -690,9 +790,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
         if regenerate_music or (cfg.music_mood != "none" and not has_music):
             prompt = resolve_music_prompt(cfg)
             if prompt:
-                generate_music_for_project(
-                    db, project.id, prompt=prompt, duration_seconds=music_bed_seconds(cfg)
-                )
+                generate_music_bed(db, project, cfg, prompt)
             elif project.music_upload_path:
                 # Mood switched to "none": drop the stale bed.
                 try:
@@ -714,6 +812,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
             shot.error = str(e)[:500]
         project.status = "failed"
         db.commit()
+        alerts.render_failed("ambient loop", project_id, project.title, str(e))
         raise
 
 
@@ -760,16 +859,25 @@ def render_scene(db: Session, project_id: int) -> models.Render:
                 music_path=_music_path_if_any(project) if cfg.music_mood != "none" else None,
                 music_volume=float(cfg.music_volume),
                 clip_is_periodic=(cfg.source == "image_drift"),
+                resolution=cfg.output_resolution,
             )
         )
         _check_cancel(db, render)
-        render.final_video_path = str(outputs.final_video_path)
-        render.thumbnail_path = str(outputs.thumbnail_path)
+        # Best frame of the loop clip as the thumbnail (YouTube: 1280×720).
+        try:
+            tw, th = _dims_for_aspect(project.aspect_ratio)
+            scale = 1280 / max(tw, th)
+            best_frame(Path(shot.clip_path), outputs.thumbnail_path,
+                       width=int(tw * scale) // 2 * 2, height=int(th * scale) // 2 * 2)
+        except Exception as e:  # noqa: BLE001 — keep compose's default thumbnail
+            log.warning("best-frame thumbnail failed: %s", e)
+        render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
         segs = gen.get("segments") or []
         # Summary line first (it's what the UI shows), ffmpeg tail after.
         render.render_log = (
             f"ambient: clips={len(segs) or 1} unit={outputs.unit_seconds:.2f}s "
             f"repeats={outputs.repeats} total={project.target_duration_seconds}s "
+            f"res={cfg.output_resolution} "
             f"seam={'closed' if closed else 'crossfade'}\n" + outputs.log[-7000:]
         )
         # Nothing is billed at render time — providers were paid in generate_loop.
@@ -777,6 +885,7 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         render.status = "completed"
         project.status = "completed"
         db.commit()
+        render_files.prune(db, project.id)
         return render
     except RenderCancelled:
         render.status = "cancelled"
@@ -790,4 +899,5 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         render.error = str(e)[:800]
         project.status = "failed"
         db.commit()
+        alerts.render_failed("ambient render", project.id, project.title, str(e))
         raise

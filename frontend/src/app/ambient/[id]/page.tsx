@@ -5,10 +5,13 @@ import { useCallback, useEffect, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { RenderHistory } from "@/components/RenderHistory";
+import { PublishPanel } from "@/components/PublishPanel";
 import { useToast } from "@/components/Toaster";
 import {
   ChipRow,
+  MUSIC_LENGTHS,
   PlanSummary,
+  previewSrc,
   SceneArt,
   fmtDuration,
   presetFor,
@@ -315,7 +318,7 @@ function Inner() {
               </div>
             ) : loopGenerating ? (
               <div className="relative">
-                <SceneArt palette={preset?.palette} emoji={preset?.emoji} className="aspect-video" />
+                <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={previewSrc(preset)} className="aspect-video" />
                 <div className="absolute inset-x-0 bottom-0 p-4 bg-gradient-to-t from-ink-950/90 to-transparent text-sm">
                   <span className="inline-flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full grad animate-pulse" />
@@ -329,7 +332,7 @@ function Inner() {
               </div>
             ) : (
               <div className="relative">
-                <SceneArt palette={preset?.palette} emoji={preset?.emoji} className="aspect-video" />
+                <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={previewSrc(preset)} className="aspect-video" />
                 <div className="absolute inset-x-0 bottom-0 p-4 bg-gradient-to-t from-ink-950/90 to-transparent text-sm">
                   {scene.loop_status === "failed" ? (
                     <span className="text-red-300">Loop failed: {scene.loop_error || "unknown error"}</span>
@@ -372,14 +375,7 @@ function Inner() {
                   onClick={() =>
                     run(
                       "music",
-                      () =>
-                        api.generateMusic(
-                          id,
-                          scene.config.music_prompt ||
-                            presets?.music_moods.find((m) => m.id === scene.config.music_mood)?.prompt ||
-                            "soft spa ambient music, no drums, loopable",
-                          Math.min(90, Math.max(45, scene.config.loop_seconds * 2))
-                        ),
+                      () => api.regenerateAmbientMusic(id),
                       "Music regenerated"
                     )
                   }
@@ -434,6 +430,8 @@ function Inner() {
               </button>
             </div>
           )}
+
+          {rendered && render && <PublishPanel projectId={id} renderId={render.id} />}
 
           <RenderHistory projectId={id} />
         </div>
@@ -657,6 +655,35 @@ function SettingsPanel({
             className="w-full accent-[#7C5CFF]"
           />
         </div>
+      </div>
+
+      {cfg.music_mood !== "none" && (
+        <div>
+          <div className="label">Music length</div>
+          <ChipRow
+            label="Music bed length"
+            options={MUSIC_LENGTHS.map((m) => m.secs)}
+            value={cfg.music_bed_seconds}
+            onChange={(v) => set("music_bed_seconds", v)}
+            render={(v) => MUSIC_LENGTHS.find((m) => m.secs === v)?.label ?? `${v}s`}
+            className="text-xs"
+          />
+          {cfg.music_bed_seconds !== scene.config.music_bed_seconds && (
+            <p className="text-[11px] text-ink-400 mt-1">Save, then Regenerate music to apply.</p>
+          )}
+        </div>
+      )}
+
+      <div>
+        <div className="label">Output</div>
+        <ChipRow
+          label="Output resolution"
+          options={["1080p", "4k"] as const}
+          value={cfg.output_resolution}
+          onChange={(v) => set("output_resolution", v)}
+          render={(v) => (v === "4k" ? "4K" : "1080p")}
+          className="text-xs"
+        />
       </div>
 
       <div>

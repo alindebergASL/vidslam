@@ -21,6 +21,15 @@
 #   NEXT_PUBLIC_API_BASE    — what the *browser* hits (e.g. https://avs.example.com)
 #   OPENROUTER_API_KEY      — optional; mocks otherwise
 #   ELEVENLABS_API_KEY      — optional; mocks otherwise
+#   S3_BUCKET               — strongly recommended: hour-long renders are
+#                             50–500 MB each; downloads redirect to S3
+#   RENDER_RETENTION_KEEP   — e.g. 3: keep the newest N renders per project
+#   ALERT_WEBHOOK_URL       — Slack/Discord webhook for failures
+#   YOUTUBE_CLIENT_ID / YOUTUBE_CLIENT_SECRET — optional, for publishing
+#
+# QUEUE_MODE=required (set below) makes the API return 503 instead of running
+# an hour-long job inside a web worker if Redis is down; /readyz also goes
+# not-ready until Redis answers and a worker is registered.
 
 services:
   backend:
@@ -31,6 +40,8 @@ services:
     ports: !reset []
     expose:
       - "8000"
+    environment:
+      QUEUE_MODE: required
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
 
   worker:
@@ -38,6 +49,8 @@ services:
       context: ./backend
     volumes:
       - ./data:/data
+    environment:
+      QUEUE_MODE: required
 
   frontend:
     build:

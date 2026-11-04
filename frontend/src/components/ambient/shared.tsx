@@ -1,6 +1,7 @@
 "use client";
 import clsx from "clsx";
 import type { ReactNode } from "react";
+import { api } from "@/lib/api";
 import type { AmbientScene, LoopPlan, ScenePreset } from "@/lib/api";
 
 /** "3600" → "1h", "5400" → "1h 30m", "600" → "10m", "20" → "20s". */
@@ -52,15 +53,30 @@ export function SceneArt({
   emoji,
   className,
   still = false,
+  image,
   children,
 }: {
   palette?: [string, string];
   emoji?: string;
   className?: string;
   still?: boolean;
+  /** Generated preset preview (absolute URL). Replaces the gradient art. */
+  image?: string | null;
   children?: ReactNode;
 }) {
   const [a, b] = palette || FALLBACK_PALETTE;
+  if (image) {
+    return (
+      <div className={clsx("relative overflow-hidden bg-ink-900", className)} aria-hidden>
+        <img
+          src={image}
+          alt=""
+          className={clsx("absolute inset-0 w-full h-full object-cover", !still && "animate-breathe motion-reduce:animate-none")}
+        />
+        {children}
+      </div>
+    );
+  }
   return (
     <div className={clsx("relative overflow-hidden bg-ink-900", className)} aria-hidden>
       <div
@@ -195,3 +211,16 @@ export function PlanSummary({
     </div>
   );
 }
+
+/** Absolute URL for a preset's cached preview, if it has one. */
+export function previewSrc(preset?: ScenePreset | null): string | null {
+  if (!preset?.preview_url) return null;
+  return api.presetPreviewUrl(preset.preview_url);
+}
+
+export const MUSIC_LENGTHS: { secs: number; label: string }[] = [
+  { secs: 0, label: "Auto (~1 min)" },
+  { secs: 180, label: "3 min" },
+  { secs: 600, label: "10 min" },
+  { secs: 1200, label: "20 min" },
+];

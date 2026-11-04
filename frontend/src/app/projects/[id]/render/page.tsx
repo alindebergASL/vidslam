@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
 import { AuthGate } from "@/components/AuthGate";
 import { useToast } from "@/components/Toaster";
+import { PublishPanel } from "@/components/PublishPanel";
 import { api, Project, Render } from "@/lib/api";
 
 export default function RenderPage() {
@@ -205,6 +206,9 @@ function Inner() {
             >
               Duplicate project
             </button>
+          </div>
+          <div className="mt-6">
+            <PublishPanel projectId={projectId} renderId={render.id} />
           </div>
         </>
       )}

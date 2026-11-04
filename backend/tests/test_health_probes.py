@@ -16,7 +16,7 @@ def test_readyz_reports_each_check_in_happy_state(client):
     assert body["status"] == "ready"
     checks = body["checks"]
     # All three probes are present and pass.
-    assert set(checks) == {"database", "ffmpeg", "data_dir_writable"}
+    assert set(checks) == {"database", "ffmpeg", "data_dir_writable", "queue"}
     assert all(c["ok"] for c in checks.values())
     # Database probe records a latency. ffmpeg is present in the test env.
     assert "latency_ms" in checks["database"]

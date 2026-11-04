@@ -110,8 +110,54 @@ dominates (≈2–3 min total). Nothing in that time touches a provider. Scenes 
 storyboard projects (`mode=ambient_loop`, config in `ambient_config_json`), so
 render history, share links, export and S3 delivery all apply unchanged.
 
+Extras: **preset preview images** (one image call per preset, cached),
+**long music beds** (3–20 min, generated in parts and crossfaded when
+longer than a provider's per-call limit), **4K output** (a lanczos upscale
+of the loop unit before tiling: free, and YouTube streams 4K uploads at a
+higher bitrate), a **best-frame thumbnail** at 1280×720, and **batch
+create** (one scene per preset, generated and rendered one at a time).
+
 Which video models go past 10s, which can close a loop, and which to pick:
 [`docs/ambient_providers.md`](docs/ambient_providers.md).
+
+### Publishing to YouTube
+
+Settings → **YouTube** connects a channel through Google OAuth (needs
+`YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` from a Google Cloud OAuth
+client of type *Web application*, with the YouTube Data API v3 enabled and
+`{PUBLIC_BASE_URL}/api/youtube/callback` as an authorized redirect URI). The
+refresh token is stored encrypted with a key derived from `SESSION_SECRET`
+(rotating it forces a reconnect).
+
+Any completed render has a **Publish to YouTube** panel with a drafted
+title, description and tags (ambient drafts are written for sleep and
+relaxation search terms), category, visibility, optional scheduling (uploads
+as private with `publishAt`), made-for-kids, the best-frame thumbnail, and
+YouTube's AI disclosure (`containsSyntheticMedia`, **on by default**).
+Uploads use YouTube's resumable protocol in 8 MiB chunks; the session is
+saved on the job, so **Retry** resumes from the last byte YouTube has.
+Google's default quota allows 100 uploads per day. Custom thumbnails need
+a verified channel; without one the upload still succeeds and the job
+notes that the thumbnail wasn't set.
+
+### Production hardening
+
+- **Every render has its own files** (`render_<id>.mp4` / `.jpg`). Before
+  this, new renders overwrote one `final.mp4`, so render history and A/B
+  compare showed the latest video for every version.
+- **S3** (`S3_BUCKET`): renders and thumbnails are mirrored, and downloads
+  and share links redirect to presigned S3 URLs.
+- **Retention** (`RENDER_RETENTION_KEEP=N`): keeps the newest N completed
+  renders per project; older ones are deleted locally and from S3, and
+  marked `expired`. Compose scratch files are removed after every render.
+- **Queue** (`QUEUE_MODE=required` in the prod overlay): jobs never run
+  inside a web worker. If Redis is down the API returns 503, and `/readyz`
+  reports not-ready until Redis answers and a worker is registered. Jobs get
+  `QUEUE_JOB_TIMEOUT_SECONDS` (default 4 h).
+- **Alerts** (`ALERT_WEBHOOK_URL`, Slack/Discord-compatible): render, loop
+  and upload failures, a burst of provider errors (default 5 in 10 min),
+  and an active model disappearing from the polled catalog. Duplicates are
+  suppressed for `ALERT_DEDUPE_MINUTES`.
 
 ### Quality control
 
@@ -277,6 +323,8 @@ the whole pipeline.
 | Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` · `GET /api/public-renders/{token}/meta` — **unauthenticated**, token-gated; backs the branded `/share/{token}` landing page so a finished video can be shared without exposing the app login |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
 | Ambient   | `GET /api/ambient/presets` · `POST /api/ambient/estimate` · `GET/POST /api/ambient` · `GET/PATCH /api/ambient/{id}` · `POST /api/ambient/{id}/generate-loop[?regenerate_music=false]` · `POST /api/ambient/{id}/render` — scenes are `VideoProject`s with `mode=ambient_loop`, so delete / cancel / renders / share / music preview reuse the project endpoints |
+| Publishing | `GET /api/youtube/status` · `GET /api/youtube/connect` · `GET /api/youtube/callback` · `POST /api/youtube/disconnect` · `POST /api/renders/{id}/publish/youtube` · `GET /api/renders/{id}/publish-jobs` · `GET /api/publish-jobs` · `POST /api/publish-jobs/{id}/retry` · `GET /api/projects/{id}/publish-meta` (drafted title/description/tags) |
+| Ambient extras | `POST /api/ambient/batch` · `POST /api/ambient/{id}/music` · `GET /api/ambient/presets/{id}/preview` · `POST /api/ambient/presets/previews` |
 | Models | `GET /api/models/catalog[?kind=…&refresh=true]` · `POST /api/models/refresh` · `GET /api/models/active` · `PUT /api/models/active {kind, model, options?, allow_unlisted?}` — live catalog polled from OpenRouter (`/models`, `/images/models`, `/videos/models`) and Gemini, plus runtime switching of the active chat / image / video / voice / music / lip-sync model (stored in the DB, `.env` values are the defaults) |
 | Providers | `GET /api/providers/status` · `POST /api/providers/health-check` · `GET /api/providers/openrouter/video-models` · `GET /api/providers/openrouter/image-models` · `GET /api/providers/elevenlabs/voices` |
 | System | `GET /api/system/info` — non-secret deployment overview (version, mock flag, ffmpeg availability, configured model ids, key-presence booleans, entity counts); backs the **Settings & Status** page |

@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { useToast } from "@/components/Toaster";
-import { ChipRow, PlanSummary, SceneArt, fmtDuration, presetFor } from "@/components/ambient/shared";
+import { ChipRow, MUSIC_LENGTHS, PlanSummary, SceneArt, fmtDuration, presetFor, previewSrc } from "@/components/ambient/shared";
 import {
   api,
   AmbientConfig,
@@ -44,6 +44,7 @@ function Inner() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [genPreviews, setGenPreviews] = useState(false);
 
   useEffect(() => {
     api.ambientPresets().then(setPresets).catch((e) => setError(e.message));
@@ -132,7 +133,38 @@ function Inner() {
         <div className="lg:col-span-2 space-y-6">
           {/* 1. Scene */}
           <section className="card p-5">
-            <StepHeading n={1} title="Scene" hint="Where are we?" />
+            <div className="flex items-start justify-between gap-3">
+              <StepHeading n={1} title="Scene" hint="Where are we?" />
+              {presets && presets.scenes.some((p) => p.prompt && !p.preview_url) && (
+                <button
+                  type="button"
+                  className="btn-ghost text-xs shrink-0"
+                  disabled={genPreviews}
+                  onClick={async () => {
+                    setGenPreviews(true);
+                    try {
+                      const r = await api.generatePresetPreviews();
+                      const want = new Set(r.presets);
+                      // Inline in dev; with a worker it runs in the background — poll.
+                      for (let i = 0; i < 40; i++) {
+                        const p = await api.ambientPresets();
+                        setPresets(p);
+                        if (p.scenes.every((x) => !want.has(x.id) || x.preview_url)) break;
+                        await new Promise((res) => setTimeout(res, 3000));
+                      }
+                      toast.success(`Generated ${r.presets.length} preview image${r.presets.length === 1 ? "" : "s"}`);
+                    } catch (e: any) {
+                      toast.error(e.message || "Preview generation failed");
+                    } finally {
+                      setGenPreviews(false);
+                    }
+                  }}
+                  title="One image-model call per preset; cached afterwards"
+                >
+                  {genPreviews ? "Generating…" : "Generate preview images"}
+                </button>
+              )}
+            </div>
             {!presets ? (
               <div className="grid grid-cols-2 sm:grid-cols-5 gap-3" aria-hidden>
                 {Array.from({ length: 10 }).map((_, i) => (
@@ -157,7 +189,7 @@ function Inner() {
                           : "border-ink-800 hover:border-ink-500"
                       )}
                     >
-                      <SceneArt palette={p.palette} emoji={p.emoji} still={!active} className="aspect-[4/3]" />
+                      <SceneArt palette={p.palette} emoji={p.emoji} image={previewSrc(p)} still={!active} className="aspect-[4/3]" />
                       <div className="px-2.5 py-2">
                         <div className="text-xs font-medium truncate">{p.label}</div>
                       </div>
@@ -284,6 +316,19 @@ function Inner() {
                   )}
                 />
               </div>
+              <div>
+                <div className="label">Output</div>
+                <ChipRow
+                  label="Output resolution"
+                  options={["1080p", "4k"] as const}
+                  value={cfg.output_resolution}
+                  onChange={(v) => set("output_resolution", v)}
+                  render={(v) => (v === "4k" ? "4K (upscaled)" : "1080p")}
+                />
+                <p className="text-xs text-ink-400 mt-2">
+                  4K is a free FFmpeg upscale; YouTube streams 4K uploads at a higher bitrate.
+                </p>
+              </div>
               {cfg.source === "video" && (
                 <div>
                   <div className="label">Stillness</div>
@@ -347,6 +392,18 @@ function Inner() {
                   onChange={(e) => set("music_volume", Number(e.target.value))}
                   className="w-full accent-[#7C5CFF]"
                 />
+                <div className="label mt-4">Music length</div>
+                <ChipRow
+                  label="Music bed length"
+                  options={MUSIC_LENGTHS.map((m) => m.secs)}
+                  value={cfg.music_bed_seconds}
+                  onChange={(v) => set("music_bed_seconds", v)}
+                  render={(v) => MUSIC_LENGTHS.find((m) => m.secs === v)?.label ?? `${v}s`}
+                />
+                <p className="text-xs text-ink-400 mt-2">
+                  Longer beds repeat less over an hour. Beds longer than one music call are made from
+                  several tracks crossfaded together.
+                </p>
               </>
             )}
           </section>
@@ -430,6 +487,7 @@ function Inner() {
             <SceneArt
               palette={preset?.palette}
               emoji={preset?.emoji}
+              image={previewSrc(preset)}
               className={clsx(aspect === "9:16" ? "aspect-[9/16] max-h-72" : aspect === "1:1" ? "aspect-square" : "aspect-video")}
             >
               <div className="absolute bottom-2 right-2 rounded-md bg-ink-950/70 backdrop-blur px-2 py-0.5 text-xs font-medium text-ink-100">

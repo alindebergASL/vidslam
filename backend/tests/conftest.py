@@ -31,6 +31,9 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     _c.get_settings.cache_clear()
     _mv._singleton = None
     _rl._limiter = None
+    from app.services import alerts as _al
+
+    _al.reset()
 
     # Rebind the engine + SessionLocal to this test's own SQLite file so tests are
     # truly isolated (the engine is module-bound at import; without this every test
