@@ -79,7 +79,7 @@ def test_downloads_redirect_to_s3_when_configured(auth_client, monkeypatch):
     from app.services import render_files
 
     monkeypatch.setattr(render_files, "delivery_url",
-                        lambda path, ctype: f"https://bucket.s3.example/{Path(path).name}?X-Amz-Signature=x")
+                        lambda path, ctype, download_name=None: f"https://bucket.s3.example/{Path(path).name}?X-Amz-Signature=x")
     d = auth_client.get(f"/api/renders/{r['id']}/download", follow_redirects=False)
     assert d.status_code == 302 and d.headers["location"].startswith("https://bucket.s3.example/render_")
     pub = auth_client.get(f"/api/public-renders/{r['share_token']}", follow_redirects=False)
