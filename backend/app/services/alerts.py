@@ -14,7 +14,6 @@ import logging
 import threading
 import time
 from collections import defaultdict, deque
-from typing import Optional
 
 import httpx
 

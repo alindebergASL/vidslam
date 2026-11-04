@@ -84,7 +84,7 @@ def test_estimate_is_independent_of_total_duration(auth_client):
     ).json()
     assert one_hour["total"] == three_hours["total"] > 0
     # The tiling line is explicit and free.
-    tiling = [l for l in one_hour["lines"] if l["unit"] == "repeat"]
+    tiling = [ln for ln in one_hour["lines"] if ln["unit"] == "repeat"]
     assert tiling and tiling[0]["cost"] == 0.0
     # Mock model caps clips at 10s with first+last frame support:
     # 3 × 10s chained (−2 × 0.5s joins) = 29s, closed loop → 0.5s seam
@@ -94,8 +94,8 @@ def test_estimate_is_independent_of_total_duration(auth_client):
     assert plan["segments"] == [10, 10, 10]
     assert plan["strategy"] == "chain" and plan["closed"] and plan["anchored"]
     assert plan["provider_calls"] == 4  # anchor still + 3 clips
-    assert any("Anchor still" in l["item"] for l in one_hour["lines"])
-    assert any("3 × 10s = 30s" in l["item"] for l in one_hour["lines"])
+    assert any("Anchor still" in ln["item"] for ln in one_hour["lines"])
+    assert any("3 × 10s = 30s" in ln["item"] for ln in one_hour["lines"])
 
 
 def test_estimate_image_drift_cheaper_and_no_music_drops_line(auth_client):
@@ -107,8 +107,8 @@ def test_estimate_image_drift_cheaper_and_no_music_drops_line(auth_client):
         json={"config": {"loop_seconds": 30, "source": "image_drift", "music_mood": "none"}},
     ).json()
     assert still["total"] < video["total"]
-    assert not any("Music" in l["item"] for l in still["lines"])
-    assert any("Music" in l["item"] for l in video["lines"])
+    assert not any("Music" in ln["item"] for ln in still["lines"])
+    assert any("Music" in ln["item"] for ln in video["lines"])
 
 
 # ---------- lifecycle ----------
@@ -447,7 +447,7 @@ def _frame_deltas(video: Path) -> list[float]:
          "metadata=print:key=lavfi.signalstats.YAVG:file=-", "-f", "null", "-"],
         capture_output=True, text=True, check=True,
     ).stdout
-    return [float(l.split("=")[1]) for l in out.splitlines() if "YAVG" in l]
+    return [float(ln.split("=")[1]) for ln in out.splitlines() if "YAVG" in ln]
 
 
 def _slow_drift_clip(path: Path, *, seconds: int, start: float) -> None:
@@ -476,7 +476,7 @@ def _raw_deltas(inputs: list[Path], graph: str, out: str) -> list[float]:
               "metadata=print:key=lavfi.signalstats.YAVG:file=-[m]")
     res = subprocess.run(cmd + ["-filter_complex", graph, "-map", "[m]", "-f", "null", "-"],
                          capture_output=True, text=True, check=True).stdout
-    return [float(l.split("=")[1]) for l in res.splitlines() if "YAVG" in l]
+    return [float(ln.split("=")[1]) for ln in res.splitlines() if "YAVG" in ln]
 
 
 def _raw_yavg(inputs: list[Path], graph: str, out: str) -> list[float]:
@@ -487,7 +487,7 @@ def _raw_yavg(inputs: list[Path], graph: str, out: str) -> list[float]:
     graph += f";[{out}]signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-[m]"
     res = subprocess.run(cmd + ["-filter_complex", graph, "-map", "[m]", "-f", "null", "-"],
                          capture_output=True, text=True, check=True).stdout
-    return [float(l.split("=")[1]) for l in res.splitlines() if "YAVG" in l]
+    return [float(ln.split("=")[1]) for ln in res.splitlines() if "YAVG" in ln]
 
 
 def _assert_linear_dissolve(got: list[float], a: list[float], b: list[float], label: str) -> None:

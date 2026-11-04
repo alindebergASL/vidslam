@@ -14,8 +14,8 @@ from ..providers import get_chat, get_tts, get_video
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
 from . import alerts, render_files, storage
-from .model_registry import active_model as _active_model
 from .captions import chunks_to_timed
+from .model_registry import active_model as _active_model
 from .renderer import RenderInputs, compose
 
 log = logging.getLogger("avs.pipeline")

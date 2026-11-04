@@ -284,7 +284,14 @@ class AssetGenerationJob(Base):
     status: Mapped[str] = mapped_column(String(40), default="pending")
     # pending|submitted|polling|completed|failed|saved
     result_path: Mapped[str] = mapped_column(String(500), default="")
-    result_asset_id: Mapped[Optional[int]] = mapped_column(ForeignKey("assets.id"), nullable=True)
+    # assets ↔ asset_generation_jobs reference each other. use_alter emits
+    # this FK as a separate ALTER after both tables exist, so dependency
+    # ordering (create_all on Postgres, the SQLite→Postgres copy) works.
+    # The name matches the initial migration's constraint.
+    result_asset_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("assets.id", use_alter=True, name="fk_asset_generation_jobs_result_asset_id"),
+        nullable=True,
+    )
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

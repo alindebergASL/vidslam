@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import get_settings
-from ..services.model_registry import active_model as _active_model
 from ..db import get_db
+from ..services.model_registry import active_model as _active_model
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])

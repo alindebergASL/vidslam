@@ -48,7 +48,7 @@ def test_long_music_bed_is_chained_and_crossfaded(auth_client, monkeypatch):
     assert bed.name == "music.m4a" and 48 <= _dur(bed) <= 52
     assert not list(bed.parent.glob("music_part_*"))
     est = auth_client.post("/api/ambient/estimate", json={"config": cfg}).json()
-    line = next(l for l in est["lines"] if l["item"].startswith("Music bed"))
+    line = next(ln for ln in est["lines"] if ln["item"].startswith("Music bed"))
     assert line["qty"] == 4 and "4 tracks crossfaded" in line["item"]  # 20 s cap, 6 s overlaps
     # Dedicated regenerate endpoint uses the same path.
     r = auth_client.post(f"/api/ambient/{scene['id']}/music")

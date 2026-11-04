@@ -50,7 +50,7 @@ class ElevenLabsVoiceLabProvider:
             raise ValueError("Voice cloning needs at least one audio sample")
 
         files = []
-        for i, a in enumerate(assets):
+        for _i, a in enumerate(assets):
             p = Path(a.local_path)
             mime = a.mime_type or mimetypes.guess_type(p.name)[0] or "audio/mpeg"
             files.append(("files", (p.name, p.read_bytes(), mime)))

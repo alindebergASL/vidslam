@@ -4,7 +4,6 @@ import time
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
-
 from sqlalchemy.orm import Session
 
 from .. import models as models_pkg

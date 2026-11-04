@@ -18,6 +18,8 @@ dependencies = [
   "itsdangerous>=2.2",
   "python-slugify>=8.0",
   "alembic>=1.13",
+  # Postgres driver (production DB). SQLite needs nothing extra.
+  "psycopg[binary]>=3.2",
 ]
 
 # The alembic `migrations/` directory sits next to `app/` and would trip

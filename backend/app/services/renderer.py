@@ -424,7 +424,7 @@ def _end_piece(unit: Path, dst: Path, *, unit_len: float, length: float,
     over if needed) cut to `length`, with the fade-out ending exactly at its
     end."""
     loops = 1 if length <= unit_len + 1e-3 else 2
-    flt = (f"[0:v][1:v]concat=n=2:v=1:a=0," if loops == 2 else "[0:v]")
+    flt = ("[0:v][1:v]concat=n=2:v=1:a=0," if loops == 2 else "[0:v]")
     flt += f"trim=duration={length:.3f},setpts=PTS-STARTPTS"
     if fade_in > 0:
         flt += f",fade=t=in:st=0:d={fade_in:.3f}"

@@ -40,8 +40,8 @@ from .model_registry import active_model as _active_model
 from .renderer import (
     AmbientRenderInputs,
     _dims_for_aspect,
-    compose_ambient,
     best_frame,
+    compose_ambient,
     extract_frame,
     join_audio,
     join_segments,
@@ -309,7 +309,6 @@ CLOSED_SEAM_CROSSFADE = 0.5
 
 
 def _video_model_for(cfg: AmbientConfig) -> str:
-    s = get_settings()
     return cfg.model_override or _active_model("video")
 
 
@@ -669,7 +668,6 @@ def _generate_video_chain(
     recorded under ambient_config_json._generated."""
     from .pipeline import _ensure_clip_for_shot, _log_provider_call, _resolve_model
 
-    settings = get_settings()
     out_dir = storage.render_subdir(project.id)
     frames_dir = out_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
@@ -696,7 +694,7 @@ def _generate_video_chain(
     prev_url = anchor_url
     seg_paths: list[Path] = []
     n = len(segs)
-    for i, (seg, dur) in enumerate(zip(segs, plan.segments)):
+    for i, (seg, dur) in enumerate(zip(segs, plan.segments, strict=True)):
         seg.prompt = shot.prompt + (
             "" if i == 0 else " Continue the exact same shot from the given first frame, same lighting."
         )
@@ -741,7 +739,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
     cap is below the loop length; or still + drift) and, unless the mood is
     "none", the music bed. Leaves the project "planned" (loop ready) or
     "failed"."""
-    from .pipeline import _log_provider_call, _resolve_model, generate_music_for_project
+    from .pipeline import _log_provider_call, _resolve_model
 
     project = db.get(models.VideoProject, project_id)
     if project is None or project.mode != AMBIENT_MODE:
@@ -843,7 +841,6 @@ def render_scene(db: Session, project_id: int) -> models.Render:
     gen = _generated_of(project)
     closed = bool(gen.get("closed"))
 
-    settings = get_settings()
     # Tiling is local FFmpeg work: nothing is billed at render time. The
     # provider spend was incurred (and recorded) when the loop was generated.
     render = models.Render(project_id=project.id, status="rendering", estimated_cost=0.0)

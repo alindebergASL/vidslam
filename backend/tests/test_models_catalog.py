@@ -184,7 +184,8 @@ def test_registry_builds_provider_for_active_model(auth_client, monkeypatch):
     from app.providers.openrouter_avatar import OpenRouterAvatarProvider
     from app.providers.openrouter_tts import OpenRouterTTSProvider
 
-    put = lambda k, m, **o: auth_client.put("/api/models/active", json={"kind": k, "model": m, **o})
+    def put(k, m, **o):
+        return auth_client.put("/api/models/active", json={"kind": k, "model": m, **o})
     put("video", "alibaba/wan-3.0")
     assert get_video().model == "alibaba/wan-3.0"
     put("chat", "anthropic/claude-sonnet-x")
@@ -310,9 +311,8 @@ def test_avatar_iv_request_shape(monkeypatch):
 def test_claude_storyboard_without_json_mode(monkeypatch):
     _real(monkeypatch)
     from app.providers.base import CastContext
-    from app.providers.openrouter_chat import OpenRouterChatProvider
-
     from app.providers.mock_chat import MockChatProvider
+    from app.providers.openrouter_chat import OpenRouterChatProvider
 
     plan = MockChatProvider().generate_storyboard(
         project={"title": "t", "mode": "reel_montage", "original_script": "Hello world.",
@@ -463,7 +463,8 @@ def test_lyria_routing_prefers_openrouter_then_google(auth_client, monkeypatch):
     _real(monkeypatch)
     _mock_sources()
     auth_client.post("/api/models/refresh")
-    put = lambda m: auth_client.put("/api/models/active", json={"kind": "music", "model": m})
+    def put(m):
+        return auth_client.put("/api/models/active", json={"kind": "music", "model": m})
     assert put("google/lyria-3-pro-preview").json()["music"]["provider"] == "openrouter"
     assert isinstance(get_music(), OpenRouterMusicProvider)
     assert put("google/lyria-3.5").json()["music"]["provider"] == "gemini"  # not on OpenRouter

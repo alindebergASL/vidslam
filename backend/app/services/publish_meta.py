@@ -4,8 +4,6 @@ category and disclosure flags, inside YouTube's documented limits
 no '<' or '>' anywhere)."""
 from __future__ import annotations
 
-from typing import Optional
-
 from .. import models
 
 TITLE_MAX = 100
@@ -120,7 +118,7 @@ def _storyboard(project: models.VideoProject) -> dict:
     words = [w.strip(".,!?").lower() for w in (project.title or "").split() if len(w) > 3]
     return {
         "title": _fit_title(project.title or hook or "New video"),
-        "description": _fit_desc("\n".join(l for l in lines if l is not None)),
+        "description": _fit_desc("\n".join(ln for ln in lines if ln is not None)),
         "tags": fit_tags(words + ["shorts" if project.aspect_ratio == "9:16" else "video", "ai video"]),
         "category_id": CATEGORY_PEOPLE,
         "contains_synthetic_media": True,

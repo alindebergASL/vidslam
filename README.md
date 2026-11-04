@@ -18,7 +18,7 @@ useful for demos, CI, and local development.
 - **Frontend** — Next.js 14 + TypeScript + Tailwind
 - **Backend** — FastAPI + SQLAlchemy + Pydantic
 - **Queue** — Redis + RQ (falls back to inline execution if Redis is unavailable)
-- **DB** — SQLite (file in the data volume)
+- **DB** — Postgres 17 in production (`docker-compose.prod.yml`, migrations at boot); SQLite for local dev. See [`docs/postgres.md`](docs/postgres.md)
 - **Renderer** — FFmpeg (H.264 + AAC, ASS subtitles)
 - **Providers** — OpenRouter chat / image / video, ElevenLabs TTS — all behind clean
   adapter Protocols; pure mocks for fully offline operation.

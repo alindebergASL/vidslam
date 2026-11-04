@@ -80,6 +80,11 @@ def _enforce_production_secrets(s) -> None:
 
 _enforce_production_secrets(settings)
 
+if settings.database_url.startswith("sqlite") and not settings.mock_providers:
+    # Real providers on SQLite: works for one person, but every write is
+    # serialized across web workers + the RQ worker. See docs/postgres.md.
+    log.warning("DATABASE_URL is SQLite with live providers — use Postgres in production (docs/postgres.md)")
+
 
 def create_app() -> FastAPI:
     from contextlib import asynccontextmanager

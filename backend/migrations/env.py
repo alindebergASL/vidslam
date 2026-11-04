@@ -27,11 +27,16 @@ from app import models  # noqa: F401,E402  — register tables on Base.metadata
 
 config = context.config
 
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+# The CLI configures logging from alembic.ini. When the app migrates at boot
+# (app.db.migrate) it skips that, and never disables existing loggers —
+# fileConfig's default would silence the app's own logging afterwards.
+if config.config_file_name is not None and config.attributes.get("configure_logger", True):
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Override whatever's in alembic.ini (which we intentionally left blank).
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+# Escape "%" — ConfigParser would read it as interpolation (e.g. URL-encoded
+# characters in a Postgres password).
+config.set_main_option("sqlalchemy.url", get_settings().database_url.replace("%", "%%"))
 
 target_metadata = Base.metadata
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import io
+import os
 from pathlib import Path
 
 import pytest
 from PIL import Image
+
+_PG_MIGRATED = False
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +42,24 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     # truly isolated (the engine is module-bound at import; without this every test
     # in a process would share the first-resolved DB).
     from app import db as _db
+
+    pg = os.environ.get("TEST_DATABASE_URL")
+    if pg:
+        # Postgres mode (CI job / local check): schema comes from the real
+        # Alembic migrations once per run; every table is emptied per test.
+        monkeypatch.setenv("DATABASE_URL", pg)
+        _c.get_settings.cache_clear()
+        _db.reset_engine(pg)
+        global _PG_MIGRATED
+        if not _PG_MIGRATED:
+            _db.migrate()
+            _PG_MIGRATED = True
+        from sqlalchemy import text
+
+        with _db.engine.begin() as conn:
+            names = ", ".join(t.name for t in _db.Base.metadata.sorted_tables)
+            conn.execute(text(f"TRUNCATE {names} RESTART IDENTITY CASCADE"))
+        return
 
     _db.reset_engine(f"sqlite:///{db}")
 

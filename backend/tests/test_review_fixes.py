@@ -5,7 +5,7 @@ import json
 import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -304,6 +304,7 @@ def test_extract_json_handles_escaped_quotes():
 # ── modernization ─────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(bool(__import__("os").environ.get("TEST_DATABASE_URL")), reason="SQLite-only")
 def test_sqlite_runs_in_wal_mode_with_busy_timeout(auth_client):
     from sqlalchemy import text
 
@@ -313,6 +314,7 @@ def test_sqlite_runs_in_wal_mode_with_busy_timeout(auth_client):
     try:
         assert db.execute(text("PRAGMA journal_mode")).scalar().lower() == "wal"
         assert db.execute(text("PRAGMA busy_timeout")).scalar() == 30000
+        assert db.execute(text("PRAGMA foreign_keys")).scalar() == 1
     finally:
         db.close()
 
@@ -350,3 +352,27 @@ def test_planner_uses_structured_outputs_then_falls_back(monkeypatch):
     second = json.loads(route.calls[1].request.content)["response_format"]
     assert first["type"] == "json_schema" and first["json_schema"]["schema"]["title"] == "StoryboardPlan"
     assert second == {"type": "json_object"}
+
+
+
+def test_deleting_project_with_logs_and_uploads(auth_client):
+    """Rows referencing a project/its renders (provider logs, publish jobs)
+    used to be orphaned on SQLite and blocked the delete on Postgres."""
+    from app import models
+    from app.db import SessionLocal
+
+    sid = auth_client.post("/api/ambient", json={"config": {"loop_seconds": 5, "total_seconds": 20,
+                                                            "fade_seconds": 1}, "generate": True}).json()["id"]
+    auth_client.post(f"/api/ambient/{sid}/render")
+    rid = auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["id"]
+    db = SessionLocal()
+    db.add(models.PublishJob(render_id=rid, title="t", status="published"))
+    db.commit()
+    assert db.query(models.ProviderLog).filter_by(project_id=sid).count() > 0
+    db.close()
+    assert auth_client.delete(f"/api/projects/{sid}").status_code == 204
+    db = SessionLocal()
+    assert db.query(models.ProviderLog).filter_by(project_id=sid).count() == 0
+    assert db.query(models.ProviderLog).filter(models.ProviderLog.project_id.is_(None)).count() > 0  # kept, detached
+    assert db.query(models.PublishJob).filter_by(render_id=rid).count() == 0
+    db.close()
