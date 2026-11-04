@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Optional
 
 import httpx
 
@@ -47,16 +48,19 @@ class OpenRouterChatProvider(ChatProvider):
                  json_mode: bool | None = None) -> None:
         self.api_key = api_key or settings.openrouter_api_key
         self.model = model or settings.openrouter_chat_model
-        # None = decide from the catalog entry's supported_parameters
-        # (unknown model → assume JSON mode, the historic behavior, except
-        # for Anthropic models where support is unverified).
+        # None = decide from the catalog entry's supported_parameters:
+        #   structured_outputs → json_schema (schema-guided output)
+        #   response_format    → json_object
+        #   neither / unknown  → plain prompting + lenient parsing
+        self.structured = False
         if json_mode is None:
             from ..services.model_catalog import find
 
             entry = find("chat", self.model) or {}
             params = entry.get("supported_parameters")
             if params:
-                json_mode = "response_format" in params
+                json_mode = "response_format" in params or "structured_outputs" in params
+                self.structured = "structured_outputs" in params
             else:
                 json_mode = not self.model.startswith("anthropic/")
         self.json_mode = json_mode
@@ -84,14 +88,30 @@ class OpenRouterChatProvider(ChatProvider):
         # supported_parameters); Claude and others get plain prompting and
         # the reply is parsed leniently. A 400 naming response_format also
         # falls back to plain prompting.
+        formats: list[Optional[dict]] = []
+        if self.structured:
+            formats.append({"type": "json_schema", "json_schema": {
+                "name": "storyboard_plan",
+                # strict=False: the Pydantic schema has optional/defaulted
+                # fields that strict mode rejects; the model is still guided
+                # by the schema and the result is validated below.
+                "strict": False,
+                "schema": StoryboardPlan.model_json_schema(),
+            }})
         if self.json_mode:
-            body["response_format"] = {"type": "json_object"}
+            formats.append({"type": "json_object"})
+        formats.append(None)
         url = f"{settings.openrouter_base_url.rstrip('/')}/chat/completions"
         with httpx.Client(timeout=180.0) as client:
-            r = client.post(url, headers=self._headers(), json=body)
-            if r.status_code == 400 and "response_format" in body and "response_format" in r.text:
-                body.pop("response_format")
+            for i, fmt in enumerate(formats):
+                body.pop("response_format", None)
+                if fmt is not None:
+                    body["response_format"] = fmt
                 r = client.post(url, headers=self._headers(), json=body)
+                # A route that rejects this format → try the next, simpler one.
+                if r.status_code == 400 and fmt is not None and i < len(formats) - 1:
+                    continue
+                break
             r.raise_for_status()
             data = r.json()
         content = data["choices"][0]["message"]["content"]

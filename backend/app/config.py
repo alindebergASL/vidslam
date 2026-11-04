@@ -57,7 +57,10 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_site_url: str = "http://localhost:3000"
     openrouter_app_title: str = "AvatarVideoStudio"
-    openrouter_chat_model: str = "openai/gpt-4o-mini"
+    # Storyboard planner. Any OpenRouter text model works; switch live in
+    # Settings → Models. claude-haiku-5.5 (Oct 2026) replaced gpt-4o-mini
+    # (Jul 2024) as the default: newer, cheaper, supports structured outputs.
+    openrouter_chat_model: str = "anthropic/claude-haiku-5.5"
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
@@ -86,7 +89,11 @@ class Settings(BaseSettings):
     # elevenlabs
     elevenlabs_api_key: str = ""
     elevenlabs_default_voice_id: str = ""
-    elevenlabs_model_id: str = "eleven_turbo_v2_5"
+    # eleven_turbo_v2_5 is deprecated (ElevenLabs: use Flash instead).
+    # eleven_multilingual_v2 is their quality pick for the TTS endpoint;
+    # eleven_flash_v2_5 is the low-latency one. Eleven v4 is reachable via
+    # OpenRouter (elevenlabs/eleven-v4) under Settings → Models → Voice.
+    elevenlabs_model_id: str = "eleven_multilingual_v2"
     # music_v2_5 = current Eleven Music model (music_v1, the API default, is
     # deprecated and removed 2027-01-31).
     elevenlabs_music_model_id: str = "music_v2_5"
@@ -111,9 +118,10 @@ class Settings(BaseSettings):
     # mocked even with MOCK_PROVIDERS=false.
     replicate_api_token: str = ""
     replicate_base_url: str = "https://api.replicate.com/v1"
-    # Default LoRA trainer model (Replicate "owner/model:version"). The
-    # SDXL LoRA trainer is the most battle-tested for character flavors.
-    replicate_lora_trainer: str = "ostris/flux-dev-lora-trainer:b6af14222e6bd9be257cbc1ea4afda3cd0503e1133083b9d1de0364d8568e6ef"
+    # Default LoRA trainer (Replicate "owner/model:version"; trainings need
+    # an explicit version). FLUX.1-dev LoRA trainer, pinned to its latest
+    # version as of Nov 2026.
+    replicate_lora_trainer: str = "ostris/flux-dev-lora-trainer:26dce37af90b9d997eeb970d92e47de3064d46c300504ae376c75bef6a9022d2"
 
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01

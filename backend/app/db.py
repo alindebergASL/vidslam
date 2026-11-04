@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from .config import get_settings
@@ -13,8 +13,25 @@ class Base(DeclarativeBase):
 
 
 def _make_engine(url: str):
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    return create_engine(url, connect_args=connect_args, future=True)
+    if not url.startswith("sqlite"):
+        # Postgres etc.: pre-ping drops connections a restart left dead.
+        return create_engine(url, future=True, pool_pre_ping=True)
+    # SQLite is shared by several web workers and the RQ worker. WAL lets
+    # readers run alongside a writer, and busy_timeout makes a writer wait
+    # for the lock instead of failing at once with "database is locked".
+    engine = create_engine(url, connect_args={"check_same_thread": False, "timeout": 30}, future=True)
+
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=30000")
+            cur.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cur.close()
+
+    return engine
 
 
 settings = get_settings()

@@ -299,3 +299,54 @@ def test_extract_json_handles_escaped_quotes():
     text = 'Here it is: {"hook": "say \\"{wow\\"", "n": 1} — enjoy'
     assert extract_json(text) == {"hook": 'say "{wow"', "n": 1}
     assert extract_json('{not json} then {"x": "a\\\\"}') == {"x": "a\\"}
+
+
+# ── modernization ─────────────────────────────────────────────────────────
+
+
+def test_sqlite_runs_in_wal_mode_with_busy_timeout(auth_client):
+    from sqlalchemy import text
+
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        assert db.execute(text("PRAGMA journal_mode")).scalar().lower() == "wal"
+        assert db.execute(text("PRAGMA busy_timeout")).scalar() == 30000
+    finally:
+        db.close()
+
+
+def test_defaults_are_current_models():
+    from app.config import Settings
+
+    s = Settings(_env_file=None)
+    assert s.openrouter_chat_model != "openai/gpt-4o-mini"
+    assert s.elevenlabs_model_id not in ("eleven_turbo_v2_5", "eleven_turbo_v2")  # deprecated by ElevenLabs
+    assert s.elevenlabs_music_model_id != "music_v1"  # removed 2027-01-31
+
+
+@respx.mock
+def test_planner_uses_structured_outputs_then_falls_back(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    from app import config
+    from app.providers.base import CastContext
+    from app.providers.mock_chat import MockChatProvider
+    from app.providers.openrouter_chat import OpenRouterChatProvider
+
+    config.get_settings.cache_clear()
+    plan = MockChatProvider().generate_storyboard(
+        project={"title": "t", "mode": "reel_montage", "original_script": "Hi there.", "target_duration_seconds": 10},
+        cast=CastContext()).model_dump(mode="json")
+    route = respx.post(f"{OR}/chat/completions").mock(side_effect=[
+        httpx.Response(400, json={"error": {"message": "json_schema not supported on this route"}}),
+        httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(plan)}}]}),
+    ])
+    p = OpenRouterChatProvider(model="x/y", json_mode=True)
+    p.structured = True
+    out = p.generate_storyboard(project={"title": "t"}, cast=CastContext())
+    assert out.cleaned_voice_script == plan["cleaned_voice_script"]
+    first = json.loads(route.calls[0].request.content)["response_format"]
+    second = json.loads(route.calls[1].request.content)["response_format"]
+    assert first["type"] == "json_schema" and first["json_schema"]["schema"]["title"] == "StoryboardPlan"
+    assert second == {"type": "json_object"}
