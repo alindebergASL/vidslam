@@ -37,6 +37,17 @@ MOCK_DEFAULTS = {
 }
 
 LYRIA_PREFIX = "google/lyria"
+# Lyria models OpenRouter serves (openrouter.ai/google/lyria-3-*), used when
+# the catalog hasn't been polled yet.
+OPENROUTER_LYRIA = {"google/lyria-3-pro-preview", "google/lyria-3-clip-preview"}
+
+
+def _catalog_provider(kind: str, model: str) -> Optional[str]:
+    snap = get_setting("catalog.snapshot") or {}
+    for e in snap.get("entries") or []:
+        if e.get("kind") == kind and e.get("id") == model:
+            return e.get("provider")
+    return None
 
 
 def env_default(kind: str) -> str:
@@ -130,7 +141,13 @@ def provider_for(kind: str, model: Optional[str] = None) -> str:
         return "openrouter" if s.openrouter_api_key else "mock"
     if kind == "music":
         if m.startswith(LYRIA_PREFIX):
-            return "gemini" if s.gemini_api_key else "mock"
+            # Lyria 3 Pro / Clip are on OpenRouter; Lyria 3.5 is Google-only.
+            on_openrouter = _catalog_provider("music", m) == "openrouter" or m in OPENROUTER_LYRIA
+            if on_openrouter and s.openrouter_api_key:
+                return "openrouter"
+            if s.gemini_api_key:
+                return "gemini"
+            return "mock"
         return "elevenlabs" if s.elevenlabs_api_key else "mock"
     if m.startswith("mock/"):
         return "mock"

@@ -64,6 +64,7 @@ def _price(pricing: dict | None) -> dict:
 
 
 def _classify_text_model(m: dict) -> list[str]:
+    mid = (m.get("id") or "").lower()
     arch = m.get("architecture") or {}
     outs = [x.lower() for x in (arch.get("output_modalities") or [])]
     if not outs:
@@ -71,6 +72,9 @@ def _classify_text_model(m: dict) -> list[str]:
         modality = (arch.get("modality") or "").lower()
         outs = modality.split("->", 1)[1].split("+") if "->" in modality else ["text"]
     kinds = []
+    # Music generators also report audio output; keep them out of Voice.
+    if ("audio" in outs or "music" in outs) and ("lyria" in mid or "music" in mid):
+        return ["music"]
     if "image" in outs:
         kinds.append("image")
     if "audio" in outs or "speech" in outs:
@@ -218,8 +222,14 @@ def _static_entries() -> list[dict]:
     return [
         {"id": "elevenlabs", "kind": "tts", "name": "ElevenLabs voices", "provider": "elevenlabs",
          "description": f"Per-avatar ElevenLabs voices (model {s.elevenlabs_model_id}).", "usable": el},
-        {"id": "elevenlabs", "kind": "music", "name": "ElevenLabs Music", "provider": "elevenlabs",
-         "description": "Prompted music beds of any length up to the API limit.", "usable": el},
+        {"id": "elevenlabs", "kind": "music", "name": f"ElevenLabs Music (default: {s.elevenlabs_music_model_id or 'music_v2_5'})",
+         "provider": "elevenlabs",
+         "description": "Instrumental beds of 3 s–5 min (force_instrumental). Paid ElevenLabs plans only.",
+         "usable": el},
+        {"id": "elevenlabs/music_v2_5", "kind": "music", "name": "ElevenLabs Music v2.5", "provider": "elevenlabs",
+         "description": "Current Eleven Music model. 3 s–5 min per call.", "usable": el},
+        {"id": "elevenlabs/music_v2", "kind": "music", "name": "ElevenLabs Music v2", "provider": "elevenlabs",
+         "description": "Previous Eleven Music model.", "usable": el},
     ]
 
 
@@ -239,7 +249,7 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
         entries: list[dict] = []
         errors: dict[str, str] = {}
         sources = {
-            "openrouter_models": (_fetch_openrouter_models, {"chat", "image", "tts"}, "openrouter"),
+            "openrouter_models": (_fetch_openrouter_models, {"chat", "image", "tts", "music"}, "openrouter"),
             "openrouter_videos": (_fetch_openrouter_videos, {"video", "lipsync"}, "openrouter"),
             "gemini_models": (_fetch_lyria, {"music"}, "gemini"),
         }
@@ -256,6 +266,15 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
             if own:
                 client.close()
         entries += _static_entries()
+        # A Lyria model served by both OpenRouter and Google appears once,
+        # as the OpenRouter entry (one key for everything); the Google route
+        # stays available as a fallback for it.
+        or_music = {e["id"] for e in entries if e["kind"] == "music" and e["provider"] == "openrouter"}
+        for e in entries:
+            if e["kind"] == "music" and e["provider"] == "openrouter":
+                e["also_via"] = "gemini"
+        entries = [e for e in entries
+                   if not (e["kind"] == "music" and e["provider"] == "gemini" and e["id"] in or_music)]
         # Flag models that weren't in the previous poll (none on the first poll).
         for e in entries:
             e["new"] = bool(prev_ids) and (e["kind"], e["id"]) not in prev_ids

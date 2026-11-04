@@ -381,6 +381,7 @@ export type CatalogEntry = {
   frame_images?: string[];
   resolutions?: string[];
   pricing_skus?: Record<string, string>;
+  also_via?: string;
 };
 
 export type ActiveModel = {

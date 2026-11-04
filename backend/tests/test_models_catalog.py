@@ -31,7 +31,12 @@ MODELS = {"data": [
      "supported_voices": ["alloy", "nova", "shimmer"]},
     {"id": "google/gemini-2.5-flash-image", "name": "Nano Banana",
      "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["image", "text"]}},
-], "total_count": 5}
+    {"id": "google/lyria-3-pro-preview", "name": "Google: Lyria 3 Pro Preview",
+     "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text", "audio"]},
+     "supported_parameters": ["max_tokens", "response_format", "seed", "temperature", "top_p"]},
+    {"id": "google/lyria-3-clip-preview", "name": "Google: Lyria 3 Clip Preview",
+     "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text", "audio"]}},
+], "total_count": 8}
 IMAGES = {"data": [{"id": "openai/gpt-image-2", "name": "GPT Image 2"},
                    {"id": "google/gemini-2.5-flash-image", "name": "Nano Banana"}]}
 VIDEOS = {"data": [
@@ -85,7 +90,16 @@ def test_catalog_groups_models_by_capability(auth_client, monkeypatch):
     assert _ids(snap, "image") == {"google/gemini-2.5-flash-image", "openai/gpt-image-2"}
     assert _ids(snap, "video") == {"alibaba/wan-3.0", "heygen/heygen-video-1"}
     assert _ids(snap, "lipsync") == {"heygen/avatar-iv"}
-    assert _ids(snap, "music") == {"google/lyria-3.5", "google/lyria-3-clip-preview", "elevenlabs"}
+    assert _ids(snap, "music") == {"google/lyria-3-pro-preview", "google/lyria-3-clip-preview",
+                                   "google/lyria-3.5", "elevenlabs", "elevenlabs/music_v2_5",
+                                   "elevenlabs/music_v2"}
+    music = {e["id"]: e for e in snap["entries"] if e["kind"] == "music"}
+    # Lyria 3 Pro/Clip appear once, as OpenRouter entries (Google = fallback);
+    # Lyria 3.5 is Google-only.
+    assert music["google/lyria-3-clip-preview"]["provider"] == "openrouter"
+    assert music["google/lyria-3-clip-preview"]["also_via"] == "gemini"
+    assert music["google/lyria-3.5"]["provider"] == "gemini"
+    assert [e["kind"] for e in snap["entries"] if e["id"] == "google/lyria-3-pro-preview"] == ["music"]
     wan = next(e for e in snap["entries"] if e["id"] == "alibaba/wan-3.0")
     assert wan["max_seconds"] == 30 and "last_frame" in wan["frame_images"]
     tts = next(e for e in snap["entries"] if e["id"] == "openai/gpt-4o-mini-tts")
@@ -384,3 +398,81 @@ def test_per_job_pickers_include_polled_catalog(auth_client):
     assert "needs API key" in wan["description"]
     imgs = [m["id"] for m in auth_client.get("/api/providers/openrouter/image-models").json()]
     assert "openai/gpt-image-2" in imgs
+
+
+
+# ---------- Lyria through OpenRouter ----------
+
+
+def _sse(*events) -> bytes:
+    return ("".join(f"data: {json.dumps(e)}\n\n" for e in events) + "data: [DONE]\n\n").encode()
+
+
+@respx.mock
+def test_lyria_via_openrouter_streamed_mp3(monkeypatch):
+    _real(monkeypatch)
+    from app.providers.openrouter_music import OpenRouterMusicProvider
+
+    mp3 = b"ID3" + b"\x00" * 64
+    half = len(mp3) // 2
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=httpx.Response(
+        200, headers={"content-type": "text/event-stream"},
+        content=_sse({"choices": [{"delta": {"content": "[Intro]"}}]},
+                     {"choices": [{"delta": {"audio": {"data": base64.b64encode(mp3[:half]).decode()}}}]},
+                     {"choices": [{"delta": {"audio": {"data": base64.b64encode(mp3[half:]).decode()}}}]})))
+    p = OpenRouterMusicProvider(model="google/lyria-3-pro-preview")
+    assert p.generate(prompt="spa pads", duration_seconds=120) == mp3
+    assert p.output_extension() == "mp3"
+    body = json.loads(route.calls[0].request.content)
+    assert body["model"] == "google/lyria-3-pro-preview" and body["stream"] is True
+    assert body["modalities"] == ["text", "audio"]
+    text = body["messages"][0]["content"]
+    assert "2 minutes" in text and "no vocals" in text.lower()
+    assert route.calls[0].request.headers["Authorization"] == "Bearer sk-or"
+
+
+@respx.mock
+def test_lyria_via_openrouter_non_streamed_and_pcm(monkeypatch):
+    _real(monkeypatch)
+    from app.providers.openrouter_music import OpenRouterMusicProvider
+
+    pcm = b"\x01\x00\x02\x00" * 480
+    respx.post(f"{OR}/chat/completions").mock(side_effect=[
+        httpx.Response(200, json={"choices": [{"message": {"content": [
+            {"type": "text", "text": "lyrics"},
+            {"type": "output_audio", "data": base64.b64encode(pcm).decode()}]}}]}),
+        httpx.Response(200, json={"choices": [{"message": {"content": "", "audio": {
+            "data": base64.b64encode(b"RIFF....WAVE").decode()}}}]}),
+        httpx.Response(200, json={"choices": [{"message": {"content": "sorry, text only"}}]}),
+    ])
+    p = OpenRouterMusicProvider(model="google/lyria-3-clip-preview")
+    wav = p.generate(prompt="zen", duration_seconds=30)
+    assert wav[:4] == b"RIFF" and p.output_extension() == "wav"  # raw PCM wrapped
+    assert "Create a" not in p.build_prompt("zen", 30)  # clip model is always 30 s
+    assert p.generate(prompt="zen", duration_seconds=30)[:4] == b"RIFF"
+    with pytest.raises(RuntimeError, match="returned no audio"):
+        p.generate(prompt="zen", duration_seconds=30)
+
+
+@respx.mock
+def test_lyria_routing_prefers_openrouter_then_google(auth_client, monkeypatch):
+    from app.providers import get_music
+    from app.providers.lyria_music import LyriaMusicProvider
+    from app.providers.openrouter_music import OpenRouterMusicProvider
+
+    _real(monkeypatch)
+    _mock_sources()
+    auth_client.post("/api/models/refresh")
+    put = lambda m: auth_client.put("/api/models/active", json={"kind": "music", "model": m})
+    assert put("google/lyria-3-pro-preview").json()["music"]["provider"] == "openrouter"
+    assert isinstance(get_music(), OpenRouterMusicProvider)
+    assert put("google/lyria-3.5").json()["music"]["provider"] == "gemini"  # not on OpenRouter
+    assert isinstance(get_music(), LyriaMusicProvider)
+    # Only a Gemini key → Lyria 3 Pro goes through Google directly.
+    _real(monkeypatch, OPENROUTER_API_KEY="")
+    assert put("google/lyria-3-pro-preview").json()["music"]["provider"] == "gemini"
+    assert isinstance(get_music(), LyriaMusicProvider)
+    # ElevenLabs model pinning.
+    _real(monkeypatch)
+    put("elevenlabs/music_v2")
+    assert get_music().model_id == "music_v2"

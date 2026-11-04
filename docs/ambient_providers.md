@@ -62,12 +62,33 @@ month's OpenRouter image catalogue, so choose from its image-model listing.
 
 | Provider | Status in this app | Notes |
 | --- | --- | --- |
-| **ElevenLabs Music** | ✅ wired (`ELEVENLABS_API_KEY`) | Generates a 45–90s bed per scene; the renderer crossfades it into a seamless loop. Prompt presets: spa, zen, soft piano, singing bowls, rain, acoustic. |
+| **ElevenLabs Music** | ✅ wired (`ELEVENLABS_API_KEY`) | `music_v2_5`, pinned because `music_v1`, the API's default, is deprecated and removed 2027-01-31. Uses `force_instrumental`, 3s–5 min per call. Needs a **paid** plan; read the licensing note below before publishing. |
+| **Google Lyria 3 Pro / Clip, via OpenRouter** | ✅ wired (same `OPENROUTER_API_KEY`), **experimental** | `google/lyria-3-pro-preview`: full songs, $0.08/song. `google/lyria-3-clip-preview`: 30s clips, $0.04. OpenRouter's pages document only a plain chat call, so the app requests audio the way OpenRouter's chat-audio models work and accepts any of the documented response shapes. Confirm with one real generation. |
+| **Google Lyria 3.5, via Google** | ✅ wired (`GEMINI_API_KEY`) | Not on OpenRouter. Full tracks of a couple of minutes, ~$0.08/song, paid Gemini tier. Also the fallback route for Lyria 3 Pro/Clip when there's no OpenRouter key. |
 | Upload your own | ✅ wired (Music bed → upload on the project) | Best for licensed spa libraries; looped the same way. |
-| Google Lyria 3 / 3.5 | not integrated | Full tracks of ~2–3 min (reported ~$0.04–0.08 per request), so the bed repeats less over an hour. Lyria 2 makes 30s clips; Lyria RealTime streams continuously. Gemini API / Vertex AI. **Best candidate to add next.** |
-| OpenAI gpt-audio | not a music model | Speech in/out (voice), not music. Could replace ElevenLabs TTS for voiceovers in storyboard projects. |
-| Mubert API | not integrated | Built for long-form generative ambient; worth adding if a 90s bed repeats too audibly over an hour. |
-| Stable Audio | not integrated | Alternatives behind the same `MusicProvider` interface. |
+| OpenAI gpt-audio | not a music model | Speech in/out. Available under **Voice**. |
+| Mubert API, Stable Audio | not integrated | Would slot in behind the same `MusicProvider` interface. |
+
+Every bed (45–90s, or a couple of minutes with Lyria) is crossfaded into a
+seamless loop under the scene. Prompt presets: spa, zen, soft piano,
+singing bowls, rain, acoustic.
+
+### ElevenLabs Music licensing (for ambient channels)
+
+From ElevenLabs' Music Terms (Exhibit A, updated 9 Oct 2026). Check the
+current terms before you publish:
+
+- **Free**: no API access. **Starter**: streaming-platform distribution is
+  *prohibited*. **Creator and up**: distribution permitted, no attribution
+  needed.
+- Commercial use is allowed except film, TV, radio and Studio Games
+  (Enterprise excepted).
+- **Building a "Music Library" from output is prohibited** below
+  Enterprise. Decide whether a channel of ambient tracks counts before
+  relying on ElevenLabs beds at scale.
+- Monthly generation and download minutes are capped per plan (for
+  example, Creator: 62 min generated / 250 min downloaded).
+- Prompts can't name artists, songs, albums or labels.
 
 ## Switching models (Settings → Models)
 
@@ -85,7 +106,7 @@ defaults that **Reset to default** returns to.
 | Image | OpenRouter Image API models (`POST /images`). |
 | Video | Any OpenRouter video generator; loop planning uses each model's limits. |
 | Voice | **ElevenLabs** (per-avatar voices), OpenRouter **speech** models (`/audio/speech`: gpt-4o-mini-tts, Gemini TTS, HeyGen Voice, …), or **gpt-audio** models (streamed chat audio). The voice is chosen in the panel. |
-| Music | **ElevenLabs** or **Google Lyria** (`lyria-3.5`: full tracks of a couple of minutes; `lyria-3-clip-preview`: 30s). |
+| Music | **ElevenLabs** (`music_v2_5` / `music_v2`), **Lyria 3 Pro / Clip via OpenRouter**, or **Lyria 3.5 via Google**. |
 | Lip-sync | Off, or **heygen/avatar-iv**: Talking Head shots are made from the avatar's hero photo plus the voiceover. **Experimental**: OpenRouter doesn't document how Avatar IV receives speech, so the app sends the portrait, the voiceover (as an audio reference) and the script, and falls back to the regular video model if the job fails. |
 
 ## Settings
@@ -96,7 +117,7 @@ OPENROUTER_API_KEY=sk-or-...
 OPENROUTER_VIDEO_MODEL=alibaba/wan-3.0      # or per scene: Advanced → Video model
 OPENROUTER_IMAGE_MODEL=<image model id>     # anchor stills + Still+drift
 ELEVENLABS_API_KEY=...                      # ElevenLabs voices / music
-GEMINI_API_KEY=...                          # Google Lyria music
+GEMINI_API_KEY=...                          # Lyria 3.5 (Lyria 3 Pro/Clip work via OpenRouter)
 PUBLIC_BASE_URL=https://your-host           # providers fetch anchor/first frames from here
 AMBIENT_DEFAULT_MAX_CLIP_SECONDS=10         # only used if a model's limits can't be read
 ```

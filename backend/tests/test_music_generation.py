@@ -121,7 +121,7 @@ def test_elevenlabs_music_adapter_parses_response(monkeypatch, tmp_path):
     _c.get_settings.cache_clear()
 
     fake_bytes = b"ID3" + b"\x00" * 1024
-    respx.post("https://api.elevenlabs.io/v1/music").mock(
+    route = respx.post("https://api.elevenlabs.io/v1/music").mock(
         return_value=Response(200, content=fake_bytes)
     )
 
@@ -129,3 +129,13 @@ def test_elevenlabs_music_adapter_parses_response(monkeypatch, tmp_path):
 
     out = ElevenLabsMusicProvider().generate(prompt="warm pad", duration_seconds=8.0)
     assert out == fake_bytes
+    import json as _json
+
+    body = _json.loads(route.calls[0].request.content)
+    # music_v1 (the API default) is deprecated → always pin the model.
+    assert body == {"prompt": "warm pad", "music_length_ms": 8000,
+                    "model_id": "music_v2_5", "force_instrumental": True}
+    # Length clamps to the documented 3 s – 5 min window.
+    ElevenLabsMusicProvider(model_id="music_v2").generate(prompt="x", duration_seconds=3600)
+    body2 = _json.loads(route.calls[1].request.content)
+    assert body2["music_length_ms"] == 300000 and body2["model_id"] == "music_v2"

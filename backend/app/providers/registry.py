@@ -107,9 +107,14 @@ def get_music() -> MusicProvider:
         from .lyria_music import LyriaMusicProvider
 
         return LyriaMusicProvider(model=model)
+    if provider == "openrouter":
+        from .openrouter_music import OpenRouterMusicProvider
+
+        return OpenRouterMusicProvider(model=model)
     from .elevenlabs_music import ElevenLabsMusicProvider
 
-    return ElevenLabsMusicProvider()
+    # "elevenlabs" = configured default model; "elevenlabs/<model_id>" pins one.
+    return ElevenLabsMusicProvider(model_id=model.split("/", 1)[1] if model.startswith("elevenlabs/") else None)
 
 
 def get_lipsync() -> LipSyncProvider:

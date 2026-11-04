@@ -9,7 +9,7 @@ const KINDS: { id: ModelKind; label: string; hint: string }[] = [
   { id: "image", label: "Image", hint: "Studio images, ambient anchor stills and Still + drift." },
   { id: "chat", label: "Planner", hint: "Writes storyboards (script, shots, captions)." },
   { id: "tts", label: "Voice", hint: "Voiceovers. ElevenLabs, or an OpenRouter speech / gpt-audio model." },
-  { id: "music", label: "Music", hint: "Music beds. ElevenLabs or Google Lyria (needs GEMINI_API_KEY)." },
+  { id: "music", label: "Music", hint: "Music beds. ElevenLabs, or Google Lyria — Lyria 3 Pro / Clip through OpenRouter (same key), Lyria 3.5 through Google (GEMINI_API_KEY)." },
   { id: "lipsync", label: "Lip-sync", hint: "Talking-head shots from the avatar's photo + voiceover. Off = regular video model." },
 ];
 
@@ -58,6 +58,7 @@ function chips(e: CatalogEntry): string[] {
   if (e.kind === "chat" && e.supported_parameters?.length)
     out.push(e.supported_parameters.includes("response_format") ? "JSON mode" : "plain JSON");
   if (e.supported_voices?.length) out.push(`${e.supported_voices.length} voices`);
+  if (e.also_via === "gemini") out.push("also via Google");
   if (e.kind === "tts" && e.output_modalities?.includes("audio") && !e.output_modalities.includes("speech"))
     out.push("chat audio");
   const price = priceChip(e);

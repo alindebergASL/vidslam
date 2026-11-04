@@ -63,7 +63,9 @@ class Settings(BaseSettings):
     elevenlabs_api_key: str = ""
     elevenlabs_default_voice_id: str = ""
     elevenlabs_model_id: str = "eleven_turbo_v2_5"
-    elevenlabs_music_model_id: str = ""
+    # music_v2_5 = current Eleven Music model (music_v1, the API default, is
+    # deprecated and removed 2027-01-31).
+    elevenlabs_music_model_id: str = "music_v2_5"
     elevenlabs_base_url: str = "https://api.elevenlabs.io/v1"
 
     # S3-backed object storage (optional, for production deploys). When
