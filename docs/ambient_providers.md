@@ -38,9 +38,12 @@ Prices change often, so check each model's `pricing_skus` on that listing.
 | `x-ai/grok-imagine-video(-1.5)` | 1–15s | ❌ first only | 2 × 15s, open | |
 | `minimax/hailuo-2.3`, `alibaba/wan-2.6` | 5/6–10s | ❌ first only | 3 × 10s, open | |
 
-Not suitable: `heygen/*` (talking avatars), and `flux-video-edit`,
-`flux-video-upscale` and `runway/aleph-2` (they edit existing video rather
-than generate it).
+| `heygen/heygen-video-1` | 5–15s (live listing has shown up to 30s) | ❌ first only | 2 × 15s, open | General scene model (released Sep 30 2026), very cheap (~$0.01–0.015/s), but 480p/768p only, so it gets upscaled to 1080p. Good for cheap drafts. |
+
+Not suitable for scenes: `heygen/avatar-iv` (a talking-head model that
+animates a photo with lip sync; a good fit for this app's Talking Head
+mode, not for Ambient), and `flux-video-edit`, `flux-video-upscale` and
+`runway/aleph-2` (they edit existing video rather than generate it).
 
 **Cheapest option for a perfect loop:** set the scene source to **Still +
 slow drift**. One image-model call gives an hour with zero seam, because
@@ -61,8 +64,10 @@ month's OpenRouter image catalogue, so choose from its image-model listing.
 | --- | --- | --- |
 | **ElevenLabs Music** | ✅ wired (`ELEVENLABS_API_KEY`) | Generates a 45–90s bed per scene; the renderer crossfades it into a seamless loop. Prompt presets: spa, zen, soft piano, singing bowls, rain, acoustic. |
 | Upload your own | ✅ wired (Music bed → upload on the project) | Best for licensed spa libraries; looped the same way. |
+| Google Lyria 3 / 3.5 | not integrated | Full tracks of ~2–3 min (reported ~$0.04–0.08 per request), so the bed repeats less over an hour. Lyria 2 makes 30s clips; Lyria RealTime streams continuously. Gemini API / Vertex AI. **Best candidate to add next.** |
+| OpenAI gpt-audio | not a music model | Speech in/out (voice), not music. Could replace ElevenLabs TTS for voiceovers in storyboard projects. |
 | Mubert API | not integrated | Built for long-form generative ambient; worth adding if a 90s bed repeats too audibly over an hour. |
-| Stable Audio, Google Lyria | not integrated | Alternatives behind the same `MusicProvider` interface. |
+| Stable Audio | not integrated | Alternatives behind the same `MusicProvider` interface. |
 
 ## Settings
 
