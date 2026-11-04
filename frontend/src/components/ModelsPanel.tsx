@@ -234,19 +234,19 @@ export function ModelsPanel() {
           <p className="text-xs text-ink-400 mb-2">{KINDS.find((k) => k.id === kind)?.hint}</p>
           <div className="flex flex-wrap items-center gap-3 mb-3">
             <input
-              className="input text-sm py-1.5 flex-1 min-w-[12rem]"
+              className="input text-sm py-1.5 flex-1 min-w-48"
               placeholder={`Search ${entries.length} ${KINDS.find((k) => k.id === kind)?.label.toLowerCase()} models…`}
               aria-label="Search models"
               value={q}
               onChange={(e) => setQ(e.target.value)}
             />
             <label className="text-xs text-ink-300 flex items-center gap-1.5">
-              <input type="checkbox" checked={onlyUsable} onChange={(e) => setOnlyUsable(e.target.checked)} className="accent-[#7C5CFF]" />
+              <input type="checkbox" checked={onlyUsable} onChange={(e) => setOnlyUsable(e.target.checked)} className="accent-iris" />
               Only usable with my keys
             </label>
           </div>
 
-          <ul className="space-y-1.5 max-h-[28rem] overflow-y-auto pr-1" aria-label="Available models">
+          <ul className="space-y-1.5 max-h-112 overflow-y-auto pr-1" aria-label="Available models">
             {entries.length === 0 && (
               <li className="text-sm text-ink-300 px-3 py-6 text-center border border-dashed border-ink-700 rounded-lg">
                 No models{q ? ` matching “${q}”` : ""}. Try Refresh now.
@@ -271,7 +271,7 @@ export function ModelsPanel() {
                     <div className="text-[11px] text-ink-400 break-all">{e.id} · {PROVIDER_LABEL[e.provider]}</div>
                     <div className="flex flex-wrap gap-1 mt-1">
                       {chips(e).map((c) => (
-                        <span key={c} className="rounded border border-ink-700 px-1.5 py-px text-[10px] text-ink-300">{c}</span>
+                        <span key={c} className="rounded-sm border border-ink-700 px-1.5 py-px text-[10px] text-ink-300">{c}</span>
                       ))}
                     </div>
                   </div>
@@ -299,7 +299,7 @@ export function ModelsPanel() {
             <label htmlFor="custom-model" className="text-xs text-ink-300">Model id not listed?</label>
             <input
               id="custom-model"
-              className="input text-xs py-1 flex-1 min-w-[12rem]"
+              className="input text-xs py-1 flex-1 min-w-48"
               placeholder="provider/model-id"
               value={custom}
               onChange={(e) => setCustom(e.target.value)}

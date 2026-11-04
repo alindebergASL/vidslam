@@ -166,7 +166,7 @@ function Inner() {
                     )}
                     <span
                       className={clsx(
-                        "absolute top-2 left-2 inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] backdrop-blur",
+                        "absolute top-2 left-2 inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] backdrop-blur-sm",
                         statusTone(s)
                       )}
                     >
@@ -175,7 +175,7 @@ function Inner() {
                       )}
                       {sceneStatusLabel(s)}
                     </span>
-                    <span className="absolute bottom-2 right-2 rounded-md bg-ink-950/70 backdrop-blur px-2 py-0.5 text-xs font-medium text-ink-100">
+                    <span className="absolute bottom-2 right-2 rounded-md bg-ink-950/70 backdrop-blur-sm px-2 py-0.5 text-xs font-medium text-ink-100">
                       {fmtDuration(s.total_seconds)}
                     </span>
                   </div>
@@ -188,7 +188,7 @@ function Inner() {
                   </div>
                 </Link>
                 <button
-                  className="absolute top-2 right-2 text-ink-100/80 hover:text-accent text-xs bg-ink-950/60 backdrop-blur rounded-full w-6 h-6 flex items-center justify-center opacity-70 md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 transition"
+                  className="absolute top-2 right-2 text-ink-100/80 hover:text-accent text-xs bg-ink-950/60 backdrop-blur-sm rounded-full w-6 h-6 flex items-center justify-center opacity-70 md:opacity-0 md:group-hover:opacity-100 focus:opacity-100 transition"
                   title="Delete scene"
                   aria-label={`Delete scene "${s.title || "Untitled"}"`}
                   onClick={() => remove(s)}
@@ -301,7 +301,7 @@ function BatchPanel({ presets, onDone }: { presets: AmbientPresets; onDone: (n: 
           <button key={p.id} type="button" aria-pressed={picked.includes(p.id)} onClick={() => toggle(p.id)}
                   className={clsx("rounded-xl overflow-hidden border text-left transition",
                     picked.includes(p.id) ? "border-iris shadow-glow" : "border-ink-800 hover:border-ink-500")}>
-            <SceneArt palette={p.palette} emoji={p.emoji} image={previewSrc(p)} still className="aspect-[4/3]" />
+            <SceneArt palette={p.palette} emoji={p.emoji} image={previewSrc(p)} still className="aspect-4/3" />
             <div className="px-2.5 py-1.5 text-xs font-medium flex items-center justify-between">
               {p.label}
               {picked.includes(p.id) && <span className="text-iris-soft" aria-hidden>✓</span>}
@@ -321,7 +321,7 @@ function BatchPanel({ presets, onDone }: { presets: AmbientPresets; onDone: (n: 
                    render={(v) => (v === "4k" ? "4K" : "1080p")} className="text-xs" />
         </div>
         <label className="flex items-center gap-2 text-sm text-ink-200">
-          <input type="checkbox" className="accent-[#7C5CFF]" checked={render} onChange={(e) => setRender(e.target.checked)} />
+          <input type="checkbox" className="accent-iris" checked={render} onChange={(e) => setRender(e.target.checked)} />
           Render each when its loop is ready
         </label>
       </div>

@@ -203,7 +203,7 @@ function GridSkeleton() {
     <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3" aria-hidden>
       {Array.from({ length: 4 }).map((_, i) => (
         <div key={i} className="card overflow-hidden">
-          <div className="aspect-[9/16] skeleton" />
+          <div className="aspect-9/16 skeleton" />
           <div className="p-3 space-y-2">
             <div className="h-3 skeleton w-3/4" />
             <div className="h-2 skeleton w-1/2" />
@@ -260,7 +260,7 @@ function Grid({
           onClick={() => onOpen(it.id)}
           className="card overflow-hidden card-hover text-left"
         >
-          <div className="aspect-[9/16] bg-ink-800 relative">
+          <div className="aspect-9/16 bg-ink-800 relative">
             {it.heroUrl && (
               <img src={String(it.heroUrl)} alt={it.title} className="w-full h-full object-cover" />
             )}

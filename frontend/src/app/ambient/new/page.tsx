@@ -168,7 +168,7 @@ function Inner() {
             {!presets ? (
               <div className="grid grid-cols-2 sm:grid-cols-5 gap-3" aria-hidden>
                 {Array.from({ length: 10 }).map((_, i) => (
-                  <div key={i} className="aspect-[4/3] skeleton" />
+                  <div key={i} className="aspect-4/3 skeleton" />
                 ))}
               </div>
             ) : (
@@ -189,7 +189,7 @@ function Inner() {
                           : "border-ink-800 hover:border-ink-500"
                       )}
                     >
-                      <SceneArt palette={p.palette} emoji={p.emoji} image={previewSrc(p)} still={!active} className="aspect-[4/3]" />
+                      <SceneArt palette={p.palette} emoji={p.emoji} image={previewSrc(p)} still={!active} className="aspect-4/3" />
                       <div className="px-2.5 py-2">
                         <div className="text-xs font-medium truncate">{p.label}</div>
                       </div>
@@ -390,7 +390,7 @@ function Inner() {
                   step={0.05}
                   value={cfg.music_volume}
                   onChange={(e) => set("music_volume", Number(e.target.value))}
-                  className="w-full accent-[#7C5CFF]"
+                  className="w-full accent-iris"
                 />
                 <div className="label mt-4">Music length</div>
                 <ChipRow
@@ -434,7 +434,7 @@ function Inner() {
                     value={cfg.crossfade_seconds}
                     disabled={cfg.source === "image_drift"}
                     onChange={(e) => set("crossfade_seconds", Number(e.target.value))}
-                    className="w-full accent-[#7C5CFF] disabled:opacity-40"
+                    className="w-full accent-iris disabled:opacity-40"
                   />
                   <p className="text-xs text-ink-400 mt-1">
                     {cfg.source === "image_drift"
@@ -454,7 +454,7 @@ function Inner() {
                     step={1}
                     value={cfg.fade_seconds}
                     onChange={(e) => set("fade_seconds", Number(e.target.value))}
-                    className="w-full accent-[#7C5CFF]"
+                    className="w-full accent-iris"
                   />
                   <p className="text-xs text-ink-400 mt-1">From and to black (and silence) at the very ends.</p>
                 </div>
@@ -488,9 +488,9 @@ function Inner() {
               palette={preset?.palette}
               emoji={preset?.emoji}
               image={previewSrc(preset)}
-              className={clsx(aspect === "9:16" ? "aspect-[9/16] max-h-72" : aspect === "1:1" ? "aspect-square" : "aspect-video")}
+              className={clsx(aspect === "9:16" ? "aspect-9/16 max-h-72" : aspect === "1:1" ? "aspect-square" : "aspect-video")}
             >
-              <div className="absolute bottom-2 right-2 rounded-md bg-ink-950/70 backdrop-blur px-2 py-0.5 text-xs font-medium text-ink-100">
+              <div className="absolute bottom-2 right-2 rounded-md bg-ink-950/70 backdrop-blur-sm px-2 py-0.5 text-xs font-medium text-ink-100">
                 {fmtDuration(cfg.total_seconds)}
               </div>
             </SceneArt>
@@ -542,7 +542,7 @@ function Inner() {
                   type="checkbox"
                   checked={generateNow}
                   onChange={(e) => setGenerateNow(e.target.checked)}
-                  className="accent-[#7C5CFF]"
+                  className="accent-iris"
                 />
                 Generate the loop right away
               </label>

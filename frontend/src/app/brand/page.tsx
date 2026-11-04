@@ -45,7 +45,7 @@ function Inner() {
           {Array.from({ length: 2 }).map((_, i) => (
             <div key={i} className="card p-4 space-y-3">
               <div className="h-4 skeleton w-1/3" />
-              <div className="aspect-[16/9] skeleton" />
+              <div className="aspect-video skeleton" />
               <div className="h-3 skeleton w-1/2" />
             </div>
           ))}
@@ -137,7 +137,7 @@ function BrandCard({ kit, onChange }: { kit: BrandKit; onChange: () => void }) {
 
       {/* End-card preview */}
       <div
-        className="rounded-lg aspect-[16/9] flex flex-col items-center justify-center gap-2 mb-3 overflow-hidden"
+        className="rounded-lg aspect-video flex flex-col items-center justify-center gap-2 mb-3 overflow-hidden"
         style={{ backgroundColor: k.end_card_bg_color }}
       >
         {k.logo_public_token && (
@@ -221,7 +221,7 @@ function ColorField({
           type="color"
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className="w-8 h-8 rounded bg-transparent border border-ink-700 cursor-pointer"
+          className="w-8 h-8 rounded-sm bg-transparent border border-ink-700 cursor-pointer"
         />
         <span className="text-[10px] text-ink-400">{value}</span>
       </div>

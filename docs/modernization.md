@@ -18,7 +18,7 @@ and Replicate's current docs, and the npm/PyPI registries.
 
 ## Recommended next (bigger changes, not done yet)
 
-1. **Postgres for production.** SQLite plus WAL is a stopgap. With multiple
+1. ✅ **Done: Postgres for production** (see `docs/postgres.md`). SQLite plus WAL was a stopgap. With multiple
    writers (web workers, RQ worker, background catalog poller) and long
    renders writing progress, Postgres removes lock contention and makes
    backups and replicas standard. The code is SQLAlchemy and Alembic
@@ -30,7 +30,7 @@ and Replicate's current docs, and the npm/PyPI registries.
    loop for each clip, up to about 10 minutes per clip, which ties up a
    worker for chained loops. Callbacks free the worker and are faster.
    Effort: medium.
-3. **Frontend framework upgrade: Next 16, React 19, Tailwind 4.** These
+3. ✅ **Done: Next 16.4, React 19.3, Tailwind 4.3** (TypeScript 5.9). Before/after screenshots of 10 routes showed no visual regressions. These
    are major versions with breaking changes: async `params`/`searchParams`
    in Next 15+, and Tailwind 4's CSS-first config replacing
    `tailwind.config.ts`. It's worth doing for performance (Turbopack builds,

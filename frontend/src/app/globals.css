@@ -1,8 +1,165 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
 
-/* ---------------------------------------------------------------------------
+@theme {
+  --color-ink-100: #e9eaf2;
+  --color-ink-200: #b5bac8;
+  --color-ink-300: #8b92a4;
+  --color-ink-400: #7e869b;
+  --color-ink-500: #3b4058;
+  --color-ink-600: #272b3f;
+  --color-ink-700: #1b1e2d;
+  --color-ink-800: #12141f;
+  --color-ink-900: #0a0c14;
+  --color-ink-950: #05060b;
+
+  --color-iris: #7c5cff;
+  --color-iris-soft: #c9b8ff;
+
+  --color-accent: #ff5c8a;
+  --color-accent-soft: #ffd0de;
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, Segoe UI, Inter, sans-serif;
+
+  --shadow-glow:
+    0 0 0 1px rgba(124, 92, 255, 0.35),
+    0 8px 40px -12px rgba(124, 92, 255, 0.45);
+  --shadow-glow-pink:
+    0 0 0 1px rgba(255, 92, 138, 0.35), 0 8px 40px -12px rgba(255, 92, 138, 0.4);
+  --shadow-lift: 0 12px 32px -16px rgba(0, 0, 0, 0.8);
+
+  --animate-fade-up: fade-up 0.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+  --animate-shimmer: shimmer 2.2s linear infinite;
+  --animate-breathe: breathe 14s ease-in-out infinite;
+
+  @keyframes fade-up {
+    0% {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    100% {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  @keyframes shimmer {
+    0% {
+      background-position: -200% 0;
+    }
+    100% {
+      background-position: 200% 0;
+    }
+  }
+  @keyframes breathe {
+    0%,
+    100% {
+      transform: scale(1) translate(0, 0);
+    }
+    50% {
+      transform: scale(1.06) translate(-1%, 1%);
+    }
+  }
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility grad {
+  /* Signature gradient as reusable utilities. */
+  @apply bg-linear-to-r from-iris to-accent;
+}
+
+@utility text-grad {
+  @apply bg-linear-to-r from-iris-soft via-iris to-accent bg-clip-text text-transparent;
+}
+
+@utility chip {
+  @apply inline-flex items-center gap-2 rounded-full bg-ink-800/80 border border-ink-700 px-3 py-1.5 text-sm text-ink-200 transition;
+  &:hover {
+    @apply border-ink-500 text-ink-100;
+  }
+}
+
+@utility chip-active {
+  /* Listed with :hover so the generic .chip:hover (light text) can't win
+     on a selected chip and leave light-on-light, unreadable text. */
+  @apply bg-ink-100 border-ink-100 text-ink-950 shadow-glow;
+  &:hover {
+    @apply bg-ink-100 border-ink-100 text-ink-950 shadow-glow;
+  }
+}
+
+@utility btn {
+  @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition active:scale-[0.98];
+}
+
+@utility btn-primary {
+  /* Primary = the signature gradient. Dark text keeps >7:1 contrast on both
+     gradient stops (iris and accent are both bright). */
+  @apply btn grad text-ink-950 hover:brightness-110 shadow-glow-pink;
+}
+
+@utility btn-ghost {
+  @apply btn bg-ink-800/70 border border-ink-700 hover:border-ink-500 hover:bg-ink-700 text-ink-100;
+}
+
+@utility card {
+  /* Cards are glass layers: translucent fill + blur + a whisper of top-edge
+     highlight. Hover lifts with the violet glow instead of a shadow. */
+  @apply rounded-xl border border-ink-800 bg-ink-900/70 backdrop-blur-md;
+  background-image: linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.025),
+    transparent 30%
+  );
+}
+
+@utility card-hover {
+  @apply transition duration-200 hover:border-iris/40 hover:shadow-glow;
+}
+
+@utility input {
+  @apply w-full bg-ink-900/80 border border-ink-700 rounded-lg px-3 py-2 text-sm placeholder:text-ink-400 transition;
+  &:focus {
+    @apply outline-hidden border-iris/60;
+    box-shadow: 0 0 0 3px rgba(124, 92, 255, 0.18);
+  }
+}
+
+@utility label {
+  @apply block text-xs uppercase tracking-wider text-ink-300 mb-1;
+}
+
+@utility skeleton {
+  /* Loading skeletons pick up a slow shimmer instead of a flat pulse. */
+  @apply rounded-sm bg-ink-800;
+  background-image: linear-gradient(
+    100deg,
+    transparent 30%,
+    rgba(124, 92, 255, 0.08) 50%,
+    transparent 70%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2.2s linear infinite;
+}
+
+@layer utilities {
+  /* ---------------------------------------------------------------------------
    AvatarVideoStudio visual system — "cinema dark"
 
    One signature: the iris→accent (violet→pink) gradient. It appears on the
@@ -11,141 +168,76 @@
    rather than drop shadows, so the UI reads like a color-graded edit bay.
 --------------------------------------------------------------------------- */
 
-html,
-body {
-  background: #05060b;
-  color: #e9eaf2;
-}
+  html,
+  body {
+    background: #05060b;
+    color: #e9eaf2;
+  }
 
-/* Ambient stage light: two fixed radial washes, violet top-left and pink
+  /* Ambient stage light: two fixed radial washes, violet top-left and pink
    bottom-right, at very low alpha. Gives the black canvas depth without
    patterned noise. pointer-events pass through. */
-body::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  background:
-    radial-gradient(52rem 36rem at 12% -8%, rgba(124, 92, 255, 0.13), transparent 60%),
-    radial-gradient(44rem 32rem at 105% 110%, rgba(255, 92, 138, 0.09), transparent 55%);
-  pointer-events: none;
-}
-
-body {
-  font-feature-settings: "ss01", "cv01";
-}
-
-::selection {
-  background: rgba(124, 92, 255, 0.45);
-  color: #fff;
-}
-
-/* Dark scrollbars so the chrome doesn't break the canvas. */
-* {
-  scrollbar-width: thin;
-  scrollbar-color: #272b3f transparent;
-}
-*::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-*::-webkit-scrollbar-thumb {
-  background: #272b3f;
-  border-radius: 8px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
-}
-*::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-/* One consistent, visible keyboard-focus treatment everywhere. */
-:focus-visible {
-  outline: 2px solid #7c5cff;
-  outline-offset: 2px;
-  border-radius: 4px;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-  }
-}
-
-@layer components {
-  /* Signature gradient as reusable utilities. */
-  .grad {
-    @apply bg-gradient-to-r from-iris to-accent;
-  }
-  .text-grad {
-    @apply bg-gradient-to-r from-iris-soft via-iris to-accent bg-clip-text text-transparent;
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    background:
+      radial-gradient(
+        52rem 36rem at 12% -8%,
+        rgba(124, 92, 255, 0.13),
+        transparent 60%
+      ),
+      radial-gradient(
+        44rem 32rem at 105% 110%,
+        rgba(255, 92, 138, 0.09),
+        transparent 55%
+      );
+    pointer-events: none;
   }
 
-  .chip {
-    @apply inline-flex items-center gap-2 rounded-full bg-ink-800/80 border border-ink-700 px-3 py-1.5 text-sm text-ink-200 transition;
-  }
-  .chip:hover {
-    @apply border-ink-500 text-ink-100;
-  }
-  /* Listed with :hover so the generic .chip:hover (light text) can't win
-     on a selected chip and leave light-on-light, unreadable text. */
-  .chip-active,
-  .chip-active:hover {
-    @apply bg-ink-100 border-ink-100 text-ink-950 shadow-glow;
+  body {
+    font-feature-settings: 'ss01', 'cv01';
   }
 
-  .btn {
-    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition active:scale-[0.98];
-  }
-  /* Primary = the signature gradient. Dark text keeps >7:1 contrast on both
-     gradient stops (iris and accent are both bright). */
-  .btn-primary {
-    @apply btn grad text-ink-950 hover:brightness-110 shadow-glow-pink;
-  }
-  .btn-ghost {
-    @apply btn bg-ink-800/70 border border-ink-700 hover:border-ink-500 hover:bg-ink-700 text-ink-100;
+  ::selection {
+    background: rgba(124, 92, 255, 0.45);
+    color: #fff;
   }
 
-  /* Cards are glass layers: translucent fill + blur + a whisper of top-edge
-     highlight. Hover lifts with the violet glow instead of a shadow. */
-  .card {
-    @apply rounded-xl border border-ink-800 bg-ink-900/70 backdrop-blur-md;
-    background-image: linear-gradient(
-      to bottom,
-      rgba(255, 255, 255, 0.025),
-      transparent 30%
-    );
+  /* Dark scrollbars so the chrome doesn't break the canvas. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #272b3f transparent;
   }
-  .card-hover {
-    @apply transition duration-200 hover:border-iris/40 hover:shadow-glow;
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
   }
-
-  .input {
-    @apply w-full bg-ink-900/80 border border-ink-700 rounded-lg px-3 py-2 text-sm placeholder:text-ink-400 transition;
+  *::-webkit-scrollbar-thumb {
+    background: #272b3f;
+    border-radius: 8px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
   }
-  .input:focus {
-    @apply outline-none border-iris/60;
-    box-shadow: 0 0 0 3px rgba(124, 92, 255, 0.18);
+  *::-webkit-scrollbar-track {
+    background: transparent;
   }
 
-  .label {
-    @apply block text-xs uppercase tracking-wider text-ink-300 mb-1;
+  /* One consistent, visible keyboard-focus treatment everywhere. */
+  :focus-visible {
+    outline: 2px solid #7c5cff;
+    outline-offset: 2px;
+    border-radius: 4px;
   }
 
-  /* Loading skeletons pick up a slow shimmer instead of a flat pulse. */
-  .skeleton {
-    @apply rounded bg-ink-800;
-    background-image: linear-gradient(
-      100deg,
-      transparent 30%,
-      rgba(124, 92, 255, 0.08) 50%,
-      transparent 70%
-    );
-    background-size: 200% 100%;
-    animation: shimmer 2.2s linear infinite;
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
   }
 }

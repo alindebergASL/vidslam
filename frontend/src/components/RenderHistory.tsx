@@ -55,7 +55,7 @@ export function RenderHistory({ projectId }: { projectId: number }) {
                 href={`/projects/${projectId}/render?id=${r.id}`}
                 className="block"
               >
-                <div className="aspect-[9/16] max-h-44 bg-ink-800 relative">
+                <div className="aspect-9/16 max-h-44 bg-ink-800 relative">
                   {completed ? (
                     <img
                       src={api.renderThumb(r.id)}

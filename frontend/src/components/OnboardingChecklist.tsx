@@ -96,7 +96,7 @@ export function OnboardingChecklist() {
 
   return (
     <section
-      className="card p-5 mb-8 border-accent/30 bg-gradient-to-br from-ink-900 via-ink-900 to-accent/5"
+      className="card p-5 mb-8 border-accent/30 bg-linear-to-br from-ink-900 via-ink-900 to-accent/5"
       aria-label="Getting-started checklist"
     >
       <div className="flex items-start justify-between gap-3 mb-3">

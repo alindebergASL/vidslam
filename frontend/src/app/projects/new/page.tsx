@@ -335,12 +335,12 @@ function Inner() {
                     <img
                       src={api.publicAsset(hero.public_token)}
                       alt=""
-                      className="w-6 h-6 rounded object-cover border border-ink-700"
+                      className="w-6 h-6 rounded-sm object-cover border border-ink-700"
                     />
                   ) : (
                     <span
                       aria-hidden
-                      className="w-6 h-6 rounded bg-ink-700 text-[10px] flex items-center justify-center text-ink-300"
+                      className="w-6 h-6 rounded-sm bg-ink-700 text-[10px] flex items-center justify-center text-ink-300"
                     >
                       {ing.kind.slice(0, 1).toUpperCase()}
                     </span>

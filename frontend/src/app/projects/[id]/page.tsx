@@ -524,7 +524,7 @@ function Inner() {
                     {s.keys.map((k) => (
                       <kbd
                         key={k}
-                        className="px-1.5 py-0.5 text-[10px] rounded bg-ink-800 border border-ink-700 text-ink-100 font-mono"
+                        className="px-1.5 py-0.5 text-[10px] rounded-sm bg-ink-800 border border-ink-700 text-ink-100 font-mono"
                       >
                         {k}
                       </kbd>
@@ -732,7 +732,7 @@ function ShotRow({
               <video
                 key={shot.clip_path}
                 src={api.shotClip(projectId, shot.id)}
-                className="w-24 shrink-0 rounded bg-black aspect-[9/16] object-cover"
+                className="w-24 shrink-0 rounded-sm bg-black aspect-9/16 object-cover"
                 muted
                 loop
                 playsInline

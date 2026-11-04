@@ -319,7 +319,7 @@ function Inner() {
             ) : loopGenerating ? (
               <div className="relative">
                 <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={previewSrc(preset)} className="aspect-video" />
-                <div className="absolute inset-x-0 bottom-0 p-4 bg-gradient-to-t from-ink-950/90 to-transparent text-sm">
+                <div className="absolute inset-x-0 bottom-0 p-4 bg-linear-to-t from-ink-950/90 to-transparent text-sm">
                   <span className="inline-flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full grad animate-pulse" />
                     {scene.loop_status === "polling"
@@ -333,7 +333,7 @@ function Inner() {
             ) : (
               <div className="relative">
                 <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={previewSrc(preset)} className="aspect-video" />
-                <div className="absolute inset-x-0 bottom-0 p-4 bg-gradient-to-t from-ink-950/90 to-transparent text-sm">
+                <div className="absolute inset-x-0 bottom-0 p-4 bg-linear-to-t from-ink-950/90 to-transparent text-sm">
                   {scene.loop_status === "failed" ? (
                     <span className="text-red-300">Loop failed: {scene.loop_error || "unknown error"}</span>
                   ) : (
@@ -612,7 +612,7 @@ function SettingsPanel({
               step={0.05}
               value={cfg.music_volume}
               onChange={(e) => set("music_volume", Number(e.target.value))}
-              className="w-full accent-[#7C5CFF]"
+              className="w-full accent-iris"
             />
           </>
         )}
@@ -632,7 +632,7 @@ function SettingsPanel({
             value={cfg.crossfade_seconds}
             disabled={cfg.source === "image_drift"}
             onChange={(e) => set("crossfade_seconds", Number(e.target.value))}
-            className="w-full accent-[#7C5CFF] disabled:opacity-40"
+            className="w-full accent-iris disabled:opacity-40"
           />
           {scene.plan.closed && cfg.source === "video" && (
             <p className="text-[11px] text-ink-400 mt-1">
@@ -652,7 +652,7 @@ function SettingsPanel({
             step={1}
             value={cfg.fade_seconds}
             onChange={(e) => set("fade_seconds", Number(e.target.value))}
-            className="w-full accent-[#7C5CFF]"
+            className="w-full accent-iris"
           />
         </div>
       </div>

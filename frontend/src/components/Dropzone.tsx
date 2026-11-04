@@ -135,7 +135,7 @@ export function Dropzone({
             <li
               key={`${r.name}-${i}`}
               className={clsx(
-                "flex items-center gap-2 rounded px-2 py-1",
+                "flex items-center gap-2 rounded-sm px-2 py-1",
                 r.state === "done" && "bg-emerald-500/10 text-emerald-300",
                 r.state === "error" && "bg-red-500/10 text-red-300",
                 (r.state === "uploading" || r.state === "pending") && "bg-ink-800 text-ink-200"

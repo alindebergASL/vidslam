@@ -142,18 +142,18 @@ export function PublishPanel({ projectId, renderId }: { projectId: number; rende
           </div>
           <div className="space-y-1.5 text-sm">
             <label className="flex items-start gap-2">
-              <input type="checkbox" className="accent-[#7C5CFF] mt-1" checked={synthetic} onChange={(e) => setSynthetic(e.target.checked)} />
+              <input type="checkbox" className="accent-iris mt-1" checked={synthetic} onChange={(e) => setSynthetic(e.target.checked)} />
               <span>
                 Disclose altered or synthetic content <span className="text-ink-400 text-xs">(YouTube requires this for realistic AI-generated video)</span>
               </span>
             </label>
             {!synthetic && <p className="text-[11px] text-amber-200 ml-6">Only untick this if the video isn&apos;t realistic AI content.</p>}
             <label className="flex items-center gap-2">
-              <input type="checkbox" className="accent-[#7C5CFF]" checked={kids} onChange={(e) => setKids(e.target.checked)} />
+              <input type="checkbox" className="accent-iris" checked={kids} onChange={(e) => setKids(e.target.checked)} />
               Made for kids
             </label>
             <label className="flex items-center gap-2">
-              <input type="checkbox" className="accent-[#7C5CFF]" checked={thumb} onChange={(e) => setThumb(e.target.checked)} />
+              <input type="checkbox" className="accent-iris" checked={thumb} onChange={(e) => setThumb(e.target.checked)} />
               Use this render&apos;s thumbnail <span className="text-ink-400 text-xs">(custom thumbnails need a verified channel)</span>
             </label>
           </div>

@@ -315,7 +315,7 @@ function TrainModal({
 
         <div>
           <div className="flex items-center justify-between mb-1">
-            <div className="label !mb-0">
+            <div className="label mb-0!">
               Training assets ({selected.length}/{assets.length})
             </div>
             <button

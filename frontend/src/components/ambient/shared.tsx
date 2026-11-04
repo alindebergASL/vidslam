@@ -80,7 +80,7 @@ export function SceneArt({
   return (
     <div className={clsx("relative overflow-hidden bg-ink-900", className)} aria-hidden>
       <div
-        className={clsx("absolute -inset-[8%]", !still && "animate-breathe motion-reduce:animate-none")}
+        className={clsx("absolute inset-[-8%]", !still && "animate-breathe motion-reduce:animate-none")}
         style={{
           background: [
             `radial-gradient(70% 60% at 22% 18%, ${b}cc, transparent 62%)`,

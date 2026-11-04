@@ -73,7 +73,7 @@ function Toaster({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: numbe
         <div
           key={t.id}
           role="status"
-          className={`pointer-events-auto flex items-start gap-2 px-3 py-2 rounded-md border text-sm shadow-lg backdrop-blur ${
+          className={`pointer-events-auto flex items-start gap-2 px-3 py-2 rounded-md border text-sm shadow-lg backdrop-blur-sm ${
             t.kind === "success"
               ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-100"
               : t.kind === "error"
@@ -84,7 +84,7 @@ function Toaster({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: numbe
           <span className="w-4 text-center">
             {t.kind === "success" ? "✓" : t.kind === "error" ? "✕" : "•"}
           </span>
-          <span className="flex-1 min-w-0 break-words">{t.message}</span>
+          <span className="flex-1 min-w-0 wrap-break-word">{t.message}</span>
           <button
             className="text-ink-300 hover:text-white text-xs leading-none mt-0.5"
             onClick={() => onDismiss(t.id)}
