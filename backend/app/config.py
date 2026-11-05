@@ -140,7 +140,8 @@ class Settings(BaseSettings):
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01
     cost_image_per_item: float = 0.04
-    cost_video_per_second: float = 0.10
+    # Live average: Wan ~$1.05 per 7 s clip ≈ $0.15/s (first EC2 deploy).
+    cost_video_per_second: float = 0.15
     cost_tts_per_1k_chars: float = 0.20
     cost_music_per_generation: float = 0.05
     # One 30 s looping sound effect (ElevenLabs bills ~40 credits/s).
