@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import Optional
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -105,8 +106,47 @@ def init_db() -> None:
 
         logging.getLogger("avs.db").info("database: %s", migrate())
         return
-    # SQLite (dev / tests): create_all is fast and fine for a single file.
+    _init_sqlite()
+
+
+def _init_sqlite() -> None:
+    """SQLite (dev / tests). A new file is built with create_all (fast) and
+    stamped at the latest revision; an existing file is migrated, so a dev
+    database from an older version picks up new columns too."""
+    from alembic import command
+    from sqlalchemy import inspect, text
+
+    tables = set(inspect(engine).get_table_names())
+    head = _alembic_head()
+    if "alembic_version" in tables:
+        with engine.connect() as conn:
+            current = conn.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        if current != head:
+            command.upgrade(_alembic_config(), "head")
+        return
+    if tables:
+        # Built by create_all before SQLite tracked revisions: it matches the
+        # baseline, so record that and apply everything after it.
+        command.stamp(_alembic_config(), _BASELINE)
+        command.upgrade(_alembic_config(), "head")
+        return
     Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:  # same as `alembic stamp head`, without the startup cost
+        conn.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"))
+        conn.execute(text("INSERT INTO alembic_version (version_num) VALUES (:v)"), {"v": head})
+
+
+_BASELINE = "0001"
+_HEAD: Optional[str] = None
+
+
+def _alembic_head() -> str:
+    global _HEAD
+    if _HEAD is None:
+        from alembic.script import ScriptDirectory
+
+        _HEAD = ScriptDirectory.from_config(_alembic_config()).get_current_head()
+    return _HEAD
 
 
 def get_db() -> Iterator[Session]:

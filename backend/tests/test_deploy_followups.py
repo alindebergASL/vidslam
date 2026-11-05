@@ -182,3 +182,40 @@ def test_image_info_falls_back_for_unreadable_bytes():
 
     assert image_info(b"not an image") == ("png", "image/png", 0, 0)
     assert image_info(make_png_bytes((8, 5)))[1:] == ("image/png", 8, 5)
+
+
+# ---------- existing SQLite databases get new columns ----------
+
+
+def test_existing_sqlite_db_is_migrated_at_boot(tmp_path, monkeypatch):
+    """A dev database built by create_all before 0002 (no alembic_version,
+    no duration_seconds) must be upgraded, not left missing the column."""
+    import sqlite3
+
+    from app import config
+    from app import db as dbmod
+
+    path = tmp_path / "old.db"
+    url = f"sqlite:///{path}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    config.get_settings.cache_clear()
+    dbmod.reset_engine(url)
+    dbmod.init_db()  # fresh file: create_all + stamped at head
+    con = sqlite3.connect(path)
+    assert con.execute("select version_num from alembic_version").fetchone()[0] == dbmod._alembic_head()
+    # Make it look like a pre-0002 create_all database with a Studio row.
+    con.execute("drop table alembic_version")
+    con.execute("alter table asset_generation_jobs drop column duration_seconds")
+    con.execute("insert into asset_generation_jobs (owner_kind, owner_id, output_kind, prompt, negative_prompt,"
+                " reference_asset_ids_json, provider, provider_model, provider_job_id, status, result_path,"
+                " error, created_at, updated_at) values ('avatar',1,'video_clip','old','','[]','mock','m','',"
+                "'completed','','',datetime('now'),datetime('now'))")
+    con.commit()
+    con.close()
+
+    dbmod.init_db()  # existing file: stamped at the baseline, then upgraded
+    con = sqlite3.connect(path)
+    assert con.execute("select prompt, duration_seconds from asset_generation_jobs").fetchall() == [("old", 5.0)]
+    assert con.execute("select version_num from alembic_version").fetchone()[0] == dbmod._alembic_head()
+    con.close()
+    dbmod.init_db()  # already at head: no-op
