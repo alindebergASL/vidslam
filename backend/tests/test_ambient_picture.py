@@ -163,3 +163,37 @@ def test_crop_handles_tall_sources(aspect, ratio):
     out = _crop_to_aspect(make_png_bytes((800, 2000)), aspect)
     w, h = Image.open(io.BytesIO(out)).size
     assert abs(w / h - ratio) < 0.01 and w == 800
+
+
+def test_drift_preview_uses_the_scene_image_model(auth_client, monkeypatch):
+    """Review: the preview becomes the drift still, so it must use the
+    scene's image model override, not the global one (video scenes keep the
+    active image model, since their override is a video model)."""
+    from app.providers import mock_image
+
+    seen = []
+    real = mock_image.MockImageProvider.generate
+
+    def spy(self, **kw):
+        seen.append(kw["model"])
+        return real(self, **kw)
+
+    monkeypatch.setattr(mock_image.MockImageProvider, "generate", spy)
+    drift = _scene(auth_client, source="image_drift", model_override="acme/painter-2")
+    auth_client.post(f"/api/ambient/{drift}/picture/generate")
+    video = _scene(auth_client, model_override="acme/video-9")
+    auth_client.post(f"/api/ambient/{video}/picture/generate")
+    assert seen[0] == "acme/painter-2" and seen[1] != "acme/video-9"
+
+
+def test_picture_version_changes_on_every_replacement(auth_client):
+    """Review: regenerating twice keeps the same config, so the image URL
+    needs a picture-specific version or the browser shows the old one."""
+    import time
+
+    sid = _scene(auth_client)
+    v1 = auth_client.post(f"/api/ambient/{sid}/picture/generate").json()["picture_version"]
+    time.sleep(0.01)
+    v2 = auth_client.post(f"/api/ambient/{sid}/picture/generate").json()["picture_version"]
+    assert v1 and v2 and v1 != v2
+    assert auth_client.delete(f"/api/ambient/{sid}/picture").json()["picture_version"] == ""

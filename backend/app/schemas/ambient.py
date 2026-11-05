@@ -214,6 +214,8 @@ class AmbientOut(BaseModel):
     sound_ready: bool = False
     # True when the scene has its own picture (see config.picture_origin).
     picture_ready: bool = False
+    # Changes whenever the picture file is replaced (cache-bust for <img>).
+    picture_version: str = ""
     # How many times the loop unit tiles into the total output.
     repeats: int
     plan: LoopPlanOut

@@ -133,7 +133,7 @@ export function ScenePicture({
         >
           {has ? (
             <img
-              src={api.ambientPictureUrl(scene.id, scene.updated_at)}
+              src={api.ambientPictureUrl(scene.id, scene.picture_version || scene.updated_at)}
               alt="Scene picture"
               className="w-full h-full object-cover"
             />

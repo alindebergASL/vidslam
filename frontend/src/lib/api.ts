@@ -356,6 +356,8 @@ export type AmbientScene = {
   music_ready: boolean;
   sound_ready?: boolean;
   picture_ready?: boolean;
+  /** Changes whenever the picture file is replaced (image cache-bust). */
+  picture_version?: string;
   repeats: number;
   plan: LoopPlan;
   latest_render: Render | null;

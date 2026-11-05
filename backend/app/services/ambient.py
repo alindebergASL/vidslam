@@ -407,7 +407,11 @@ def generate_picture(db: Session, project: models.VideoProject) -> models.VideoP
 
     cfg = _config_of(project)
     image = get_image()
-    model = _resolve_model(db, _active_model("image"))
+    # A Still + drift scene's model override is an image model, and this
+    # preview becomes its still: honor it, as the loop path would. For video
+    # scenes the override is a video model, so use the active image model.
+    override = cfg.model_override if cfg.source == "image_drift" else ""
+    model = _resolve_model(db, override or _active_model("image"))
     png = image.generate(model=model, prompt=still_prompt(cfg), references=[],
                          settings={"aspect_ratio": project.aspect_ratio})
     _log_provider_call(db, project_id=project.id, provider=type(image).__name__,
@@ -782,6 +786,7 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         picture_ready=has_picture(project, cfg),
+        picture_version=(str(picture_path(project).stat().st_mtime_ns) if has_picture(project, cfg) else ""),
         repeats=plan.repeats,
         plan=plan,
         latest_render=RenderOut.model_validate(latest) if latest else None,
