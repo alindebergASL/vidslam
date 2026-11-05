@@ -861,9 +861,39 @@ def _settle_render_cost(db: Session, render: models.Render) -> None:
     db.commit()
 
 
+def _latest_voiceover(db: Session, project: models.VideoProject) -> Optional[str]:
+    """The newest render's voiceover file, if it's still on disk."""
+    for r in (db.query(models.Render).filter(models.Render.project_id == project.id,
+                                            models.Render.audio_path != "")
+              .order_by(models.Render.id.desc()).limit(5)):
+        if Path(r.audio_path).exists():
+            return r.audio_path
+    return None
+
+
+def _submit_regen(db: Session, project: models.VideoProject, shot: models.VideoShot, *, after: str) -> None:
+    """Re-roll one shot the same way a full render makes it: talking-head
+    shots go to the lip-sync model with their slice of the latest voiceover
+    (falling back to the video model, with a note, if that isn't possible);
+    everything else goes to the video model."""
+    note = ""
+    if shot.shot_type == "talking_head" and project.generated_plan_json:
+        audio = _latest_voiceover(db, project)
+        if audio:
+            ok = submit_talking_head(
+                db, project, shot, plan=StoryboardPlan.model_validate(project.generated_plan_json),
+                audio_path=audio, start=_shot_start(project, shot), render_id=None, after=after,
+            )
+            if ok is True:
+                return
+            note = ok or ""
+            shot = db.get(models.VideoShot, shot.id)
+    submit_shot_clip(db, project, shot, after=after, note=note)
+
+
 def regenerate_shot(
     db: Session, project_id: int, shot_id: int, *, recompose: bool = True
-) -> models.VideoJob:
+) -> None:
     """Regenerate one shot's clip (async). With `recompose`, the project is
     recomposed once the new clip is back."""
     project = db.get(models.VideoProject, project_id)
@@ -873,7 +903,7 @@ def regenerate_shot(
     if recompose:
         project.status = "regenerating"
         db.commit()
-    return submit_shot_clip(db, project, shot, after="recompose" if recompose else "none")
+    _submit_regen(db, project, shot, after="recompose" if recompose else "none")
 
 
 def regenerate_shots_bulk(
@@ -895,7 +925,7 @@ def regenerate_shots_bulk(
     submitted: list[int] = []
     for shot in targets:
         try:
-            submit_shot_clip(db, project, shot, after="recompose" if recompose else "none")
+            _submit_regen(db, project, shot, after="recompose" if recompose else "none")
             submitted.append(shot.id)
         except Exception:  # noqa: BLE001
             log.exception("bulk regen failed for shot %s", shot.id)
