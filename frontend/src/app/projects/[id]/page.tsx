@@ -593,7 +593,7 @@ function StoryboardScript({
 
   return (
     <section className="card p-4 mb-6">
-      <div className="flex items-baseline justify-between mb-2">
+      <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-1 mb-2">
         <h2 className="text-lg font-medium">Voiceover & captions</h2>
         <span className="text-[11px] text-ink-400">
           What&apos;s actually spoken (TTS) and shown on screen — edits apply on the next render.
