@@ -55,6 +55,8 @@ log = logging.getLogger("avs.ambient")
 AMBIENT_MODE = "ambient_loop"
 LOOP_SHOT_TYPE = "ambient_loop"
 SEGMENT_SHOT_TYPE = "ambient_segment"
+# Variations 2..N of a less-repetition scene (variation 1 is the loop shot).
+VARIANT_SHOT_TYPE = "ambient_variant"
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,64}")
 
 # Prompt suffix that pushes video models toward loopable, low-motion footage.
@@ -363,11 +365,18 @@ def _crop_to_aspect(raw: bytes, aspect: str) -> bytes:
     return out.getvalue()
 
 
+def _reset_clips(project: models.VideoProject) -> None:
+    """Mark the loop clip and every variation's clip as needing a regenerate."""
+    for shot in project.shots:
+        if shot.shot_type in (LOOP_SHOT_TYPE, VARIANT_SHOT_TYPE):
+            shot.status, shot.clip_path, shot.error = "pending", "", ""
+
+
 def _invalidate_loop(project: models.VideoProject) -> None:
     """The loop clip was made from a different image: it needs regenerating."""
     shot = _loop_shot(project)
     if shot is not None and shot.clip_path:
-        shot.status, shot.clip_path, shot.error = "pending", "", ""
+        _reset_clips(project)
     data = dict(project.ambient_config_json or {})
     data.pop(_GENERATED_KEY, None)
     project.ambient_config_json = data
@@ -463,6 +472,66 @@ def resolve_scene_prompt(cfg: AmbientConfig) -> str:
     if cfg.source == "image_drift":
         return f"{base} Wide establishing shot, {style}. No people, no text."
     return f"{base} Rendered {style}." + _LOOP_DIRECTIVES
+
+
+# ---------- less repetition: variations ----------
+
+# Day → night, by how many variations: always ends at night.
+DAY_NIGHT_SEQUENCES: dict[int, list[str]] = {
+    2: ["golden_hour", "night"],
+    3: ["golden_hour", "dusk", "night"],
+    4: ["midday", "golden_hour", "dusk", "night"],
+    5: ["dawn", "midday", "golden_hour", "dusk", "night"],
+}
+# Small, different motion for each take, so the takes don't look identical.
+_TAKE_HINTS = (
+    "",
+    " A soft breeze moves through the scene now and then.",
+    " Soft clouds drift slowly and the light shifts gently.",
+    " A little mist drifts slowly across the scene.",
+    " Small details stir gently: leaves, ripples, a slow flicker of light.",
+)
+_SAME_PLACE = (" Exactly the same place, framing and composition as the reference image; "
+               "only the time of day and the light change.")
+
+
+def variant_count(cfg: AmbientConfig) -> int:
+    """Loop clips the scene is made of (1 = no variety)."""
+    if cfg.variety == "day_night":
+        return cfg.variations
+    if cfg.variety == "takes" and cfg.source == "video":
+        return cfg.variations
+    return 1
+
+
+def variant_config(cfg: AmbientConfig, i: int) -> AmbientConfig:
+    """The config variation i is made from (day → night sets its light)."""
+    if cfg.variety == "day_night" and variant_count(cfg) > 1:
+        return cfg.model_copy(update={"time_of_day": DAY_NIGHT_SEQUENCES[cfg.variations][i]})
+    return cfg
+
+
+def variant_labels(cfg: AmbientConfig) -> list[str]:
+    k = variant_count(cfg)
+    if k == 1:
+        return []
+    if cfg.variety == "day_night":
+        return [TIMES_OF_DAY[t][0] for t in DAY_NIGHT_SEQUENCES[k]]
+    return [f"Take {i + 1}" for i in range(k)]
+
+
+def variant_prompt(cfg: AmbientConfig, i: int) -> str:
+    """Scene prompt for variation i."""
+    prompt = resolve_scene_prompt(variant_config(cfg, i))
+    if cfg.variety == "takes" and variant_count(cfg) > 1:
+        prompt += _TAKE_HINTS[i % len(_TAKE_HINTS)]
+    return prompt
+
+
+def transition_seconds(cfg: AmbientConfig) -> float:
+    """Dissolve between variations: short between takes of the same scene,
+    long and gentle when the light changes."""
+    return 6.0 if cfg.variety == "day_night" else max(1.0, min(cfg.crossfade_seconds or 2.0, 3.0))
 
 
 def resolve_music_prompt(cfg: AmbientConfig) -> str:
@@ -578,16 +647,24 @@ def caps_first_frame(cfg: AmbientConfig) -> bool:
 def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> LoopPlanOut:
     """Decide how this scene's loop gets made on the configured model."""
     notes: list[str] = []
+    k = variant_count(cfg)
+    labels = variant_labels(cfg)
+    if cfg.variety == "takes" and cfg.source == "image_drift":
+        notes.append("Mix of takes needs a video scene; Still + drift uses one still. "
+                     "Try Day to night instead.")
     if cfg.source == "image_drift":
         loop = float(cfg.loop_seconds)
         repeats = max(1, math.ceil(cfg.total_seconds / loop))
+        notes.insert(0, "One still + periodic drift: seamless by construction, no video model needed."
+                     if k == 1 else f"{k} stills ({', '.join(labels)}) + periodic drift, "
+                     "each dissolving into the next.")
         return LoopPlanOut(
             model=cfg.model_override or _active_model("image"),
             max_clip_seconds=cfg.loop_seconds, caps_known=True, supports_last_frame=False,
             strategy="drift", segments=[cfg.loop_seconds], anchored=False, closed=True,
             join_crossfade=0.0, seam_crossfade=0.0, loop_seconds=loop, unit_seconds=loop,
-            repeats=repeats, provider_calls=1,
-            notes=["One still + periodic drift: seamless by construction, no video model needed."],
+            repeats=repeats, provider_calls=k, notes=notes,
+            variants=k, variant_labels=labels, repeat_every_seconds=loop,
         )
 
     model = _video_model_for(cfg)
@@ -625,6 +702,16 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
         notes.append("Closed loop: an anchor still is both the first and the last frame.")
     elif n >= 1:
         notes.append(f"Open loop: hidden with a {seam_cf:g}s tail→head crossfade.")
+    anchor_calls = 1 if anchored else 0
+    repeat_every = unit
+    if k > 1 and cfg.variety == "takes":
+        repeat_every = unit * k
+        notes.append(f"{k} takes of the scene, played in turn: the picture repeats every "
+                     f"~{_fmt_duration(int(repeat_every))} instead of every {unit:.0f}s.")
+    elif k > 1:
+        anchor_calls = k if anchored else 0
+        notes.append(f"Day to night: {' → '.join(labels)}, ~{_fmt_duration(int(cfg.total_seconds / k))} "
+                     "each, with a slow dissolve between them.")
     return LoopPlanOut(
         model=model,
         max_clip_seconds=caps.max_seconds,
@@ -639,8 +726,11 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
         loop_seconds=round(loop, 2),
         unit_seconds=round(unit, 2),
         repeats=max(1, math.ceil(cfg.total_seconds / unit)),
-        provider_calls=n + (1 if anchored else 0),
+        provider_calls=n * k + anchor_calls,
         notes=notes,
+        variants=k,
+        variant_labels=labels,
+        repeat_every_seconds=round(repeat_every, 2),
     )
 
 
@@ -652,6 +742,9 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
     plan = plan or plan_loop(cfg)
     lines: list[dict] = []
     own = bool(cfg.picture_origin)  # the scene's own picture: no image call at loop time
+    k = plan.variants
+    # Day to night needs its own still for each time of day after the first.
+    more_stills = k - 1 if cfg.variety == "day_night" else 0
     if plan.strategy == "drift":
         lines.append({
             "item": "Your picture (no image call)" if own else "Scene still (image)",
@@ -659,6 +752,12 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
             "unit_cost": 0.0 if own else s.cost_image_per_item,
             "cost": 0.0 if own else round(s.cost_image_per_item, 4),
         })
+        if more_stills:
+            lines.append({
+                "item": f"Stills for {', '.join(plan.variant_labels[1:])}",
+                "qty": more_stills, "unit": "image", "unit_cost": s.cost_image_per_item,
+                "cost": round(s.cost_image_per_item * more_stills, 4),
+            })
     else:
         if own:
             lines.append({
@@ -672,12 +771,21 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
                 "unit_cost": s.cost_image_per_item,
                 "cost": round(s.cost_image_per_item, 4),
             })
+        if more_stills and (plan.anchored or (own and caps_first_frame(cfg))):
+            lines.append({
+                "item": f"Anchor stills for {', '.join(plan.variant_labels[1:])}",
+                "qty": more_stills, "unit": "image", "unit_cost": s.cost_image_per_item,
+                "cost": round(s.cost_image_per_item * more_stills, 4),
+            })
         secs = float(sum(plan.segments))
         n = len(plan.segments)
         label = (
             f"Loop clip ({plan.segments[0]}s video)" if n == 1
             else f"Loop clips ({n} × {'/'.join(str(x) for x in sorted(set(plan.segments), reverse=True))}s = {secs:.0f}s video)"
         )
+        if k > 1:
+            label += f" × {k} variations"
+            secs *= k
         lines.append({
             "item": label,
             "qty": secs, "unit": "sec",
@@ -757,13 +865,48 @@ def _ensure_loop_shot(db: Session, project: models.VideoProject, cfg: AmbientCon
             status="pending",
         )
         db.add(shot)
-    shot.prompt = resolve_scene_prompt(cfg)
-    shot.negative_prompt = "people, faces, text, watermark, camera shake, fast motion, cuts, flicker"
+    _shape_clip_shot(shot, cfg, 0)
+    db.flush()
+    _ensure_variant_shots(db, project, cfg)
+    return shot
+
+
+_NEGATIVE = "people, faces, text, watermark, camera shake, fast motion, cuts, flicker"
+
+
+def _shape_clip_shot(shot: models.VideoShot, cfg: AmbientConfig, i: int) -> None:
+    shot.prompt = variant_prompt(cfg, i)
+    shot.negative_prompt = _NEGATIVE
     shot.duration_seconds = float(cfg.loop_seconds)
     shot.model_override = cfg.model_override or ""
     shot.camera_direction = "locked-off, static"
+
+
+def _variant_shots(project: models.VideoProject) -> list[models.VideoShot]:
+    return sorted((s for s in project.shots if s.shot_type == VARIANT_SHOT_TYPE),
+                  key=lambda s: s.shot_order)
+
+
+def _ensure_variant_shots(db: Session, project: models.VideoProject,
+                          cfg: AmbientConfig) -> list[models.VideoShot]:
+    """Exactly variant_count - 1 variation shots (orders 101..), shaped for cfg."""
+    want = variant_count(cfg) - 1
+    have = _variant_shots(project)
+    if len(have) > want:
+        for extra in have[want:]:
+            db.delete(extra)
+        db.flush()
+        db.expire(project, ["shots"])
+        have = have[:want]
+    for i in range(len(have), want):
+        sh = models.VideoShot(project_id=project.id, shot_order=101 + i, shot_type=VARIANT_SHOT_TYPE,
+                              status="pending", reference_strategy="input_references")
+        db.add(sh)
+        have.append(sh)
+    for i, sh in enumerate(have, start=1):
+        _shape_clip_shot(sh, cfg, i)
     db.flush()
-    return shot
+    return have
 
 
 def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
@@ -783,6 +926,7 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         loop_status=(shot.status if shot else "pending"),
         loop_error=(shot.error if shot else ""),
         loop_shot=ShotOut.model_validate(shot) if shot else None,
+        variant_shots=[ShotOut.model_validate(v) for v in _variant_shots(project)[:variant_count(cfg) - 1]],
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         picture_ready=has_picture(project, cfg),
@@ -847,7 +991,7 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
         # aspect; reusing it would letterbox it into the new frame.
         shot = _loop_shot(project)
         if shot is not None and shot.clip_path:
-            shot.status, shot.clip_path, shot.error = "pending", "", ""
+            _reset_clips(project)
             data = dict(project.ambient_config_json or {})
             data.pop(_GENERATED_KEY, None)
             project.ambient_config_json = data
@@ -871,11 +1015,9 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
         # compositing knobs (crossfade, fade, volume, total) keep it.
         clip_keys = ("scene_preset", "scene_prompt", "source", "loop_seconds",
                      "model_override", "chain_segments", "look", "look_strength",
-                     "time_of_day", "weather")
+                     "time_of_day", "weather", "variety", "variations")
         if any(getattr(old, k) != getattr(cfg, k) for k in clip_keys) and shot.clip_path:
-            shot.status = "pending"
-            shot.clip_path = ""
-            shot.error = ""
+            _reset_clips(project)
             data.pop(_GENERATED_KEY, None)
             project.ambient_config_json = data
     db.commit()
@@ -947,10 +1089,16 @@ def _set_state(project: models.VideoProject, key: str, value: Optional[object]) 
 def _start_video_chain(
     db: Session, project: models.VideoProject, shot: models.VideoShot,
     cfg: AmbientConfig, plan: LoopPlanOut, *, regenerate_music: bool, render_after: bool,
+    variant: int = 0, anchor0_url: Optional[str] = None,
 ) -> None:
     """Make the anchor still (if any), create the segment shots and submit
     segment 1. Each completion submits the next (on_segment_ready); the last
-    one joins them and finishes the scene (_finish_chain)."""
+    one joins them and finishes this variation (_finish_chain), which starts
+    the next variation's chain or finishes the scene.
+
+    Variations share the first one's anchor ("takes": every loop closes on
+    the same frame) or get their own still made from it ("day_night": the
+    same place in different light)."""
     from .pipeline import _log_provider_call, _resolve_model
 
     out_dir = storage.render_subdir(project.id)
@@ -959,20 +1107,29 @@ def _start_video_chain(
     anchor_url: Optional[str] = None
     picture = has_picture(project, cfg)
     if plan.anchored or (picture and caps_first_frame(cfg)):
-        # The scene's own picture when it has one; otherwise generate the still.
-        anchor = frames_dir / "anchor.png"
-        if picture:
-            shutil.copyfile(picture_path(project), anchor)
+        if variant > 0 and cfg.variety == "takes" and anchor0_url:
+            anchor_url = anchor0_url
         else:
-            image = get_image()
-            img_model = _resolve_model(db, _active_model("image"))
-            png = image.generate(model=img_model, prompt=still_prompt(cfg), references=[])
-            anchor.write_bytes(png)
-            _log_provider_call(
-                db, project_id=project.id, provider=type(image).__name__, endpoint="image.generate(anchor)",
-                request_summary={"model": img_model}, response_summary={"bytes": len(png)},
-            )
-        _, anchor_url = _save_frame_public(anchor)
+            # The scene's own picture when it has one; otherwise generate the still.
+            anchor = frames_dir / ("anchor.png" if variant == 0 else f"anchor_{variant}.png")
+            if picture and variant == 0:
+                shutil.copyfile(picture_path(project), anchor)
+            else:
+                image = get_image()
+                img_model = _resolve_model(db, _active_model("image"))
+                refs = [ImageRef(url=anchor0_url, role="scene")] if variant > 0 and anchor0_url else []
+                prompt = still_prompt(variant_config(cfg, variant)) + (_SAME_PLACE if refs else "")
+                png = image.generate(model=img_model, prompt=prompt, references=refs)
+                anchor.write_bytes(png)
+                _log_provider_call(
+                    db, project_id=project.id, provider=type(image).__name__,
+                    endpoint="image.generate(anchor)",
+                    request_summary={"model": img_model, "variant": variant},
+                    response_summary={"bytes": len(png)},
+                )
+            _, anchor_url = _save_frame_public(anchor)
+    if variant == 0:
+        anchor0_url = anchor_url
     segs = _segment_shots(db, project, len(plan.segments))
     for i, (seg, dur) in enumerate(zip(segs, plan.segments, strict=True)):
         seg.prompt = shot.prompt + (
@@ -985,6 +1142,7 @@ def _start_video_chain(
     _set_state(project, _CHAIN_KEY, {
         "segment_ids": [s.id for s in segs], "anchor_url": anchor_url, "plan": plan.model_dump(),
         "regenerate_music": regenerate_music, "render_after": render_after,
+        "variant": variant, "shot_id": shot.id, "anchor0_url": anchor0_url,
     })
     db.commit()
     _submit_segment(db, project, 0, prev_url=anchor_url)
@@ -1048,7 +1206,8 @@ def _finish_chain(db: Session, project: models.VideoProject) -> None:
     chain = (project.ambient_config_json or {}).get(_CHAIN_KEY) or {}
     plan = LoopPlanOut.model_validate(chain["plan"])
     cfg = _config_of(project)
-    shot = _loop_shot(project)
+    loop = _loop_shot(project)
+    shot = (db.get(models.VideoShot, chain["shot_id"]) if chain.get("shot_id") else None) or loop
     segs = [db.get(models.VideoShot, i) for i in chain["segment_ids"]]
     clip = storage.render_subdir(project.id) / f"shot_00_{shot.id}.mp4"
     _, length = join_segments([Path(s.clip_path) for s in segs], clip,
@@ -1057,10 +1216,24 @@ def _finish_chain(db: Session, project: models.VideoProject) -> None:
     shot.provider = segs[0].provider
     shot.provider_model = segs[0].provider_model
     shot.duration_seconds = round(length, 2)
-    shot.status = "completed"
-    generated = {"strategy": plan.strategy, "segments": plan.segments, "closed": plan.closed,
-                 "anchored": plan.anchored, "model": plan.model, "clip_seconds": round(length, 2)}
+    variant, k = int(chain.get("variant") or 0), variant_count(cfg)
     _set_state(project, _CHAIN_KEY, None)
+    if variant < k - 1:
+        # More variations to make: the loop shot stays "polling" until the last.
+        if variant > 0:
+            shot.status = "completed"
+        db.commit()
+        nxt = _variant_shots(project)[variant]
+        _start_video_chain(db, project, nxt, cfg, plan,
+                           regenerate_music=bool(chain.get("regenerate_music", True)),
+                           render_after=bool(chain.get("render_after")),
+                           variant=variant + 1, anchor0_url=chain.get("anchor0_url"))
+        return
+    shot.status = "completed"
+    loop.status = "completed"
+    generated = {"strategy": plan.strategy, "segments": plan.segments, "closed": plan.closed,
+                 "anchored": plan.anchored, "model": plan.model, "clip_seconds": round(loop.duration_seconds, 2),
+                 "variants": k, "variety": cfg.variety if k > 1 else "none"}
     db.commit()
     _finalize_generation(db, project, cfg, plan, generated,
                          regenerate_music=bool(chain.get("regenerate_music", True)),
@@ -1127,9 +1300,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
         raise ValueError(f"ambient scene {project_id} not found")
     cfg = _config_of(project)
     shot = _ensure_loop_shot(db, project, cfg)
-    shot.status = "pending"
-    shot.clip_path = ""
-    shot.error = ""
+    _reset_clips(project)
     project.status = "generating"
     _set_state(project, _CHAIN_KEY, None)  # supersede any in-flight chain
     db.commit()
@@ -1142,35 +1313,45 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
             db.refresh(shot)
             return shot
         out_dir = storage.render_subdir(project.id)
-        still = out_dir / "ambient_still.png"
-        shot.status = "submitted"
-        if has_picture(project, cfg):
-            # The scene's own picture is the still: no image call, nothing billed.
-            model = "your picture"
-            shot.provider, shot.provider_model = "picture", model
-            db.commit()
-            png = picture_path(project).read_bytes()
-        else:
-            image = get_image()
-            model = _resolve_model(db, cfg.model_override or _active_model("image"))
-            shot.provider = "mock" if settings.image_is_mocked() else "openrouter"
-            shot.provider_model = model
-            db.commit()
-            png = image.generate(model=model, prompt=shot.prompt, references=[],
-                                 negative_prompt=shot.negative_prompt or "")
-        still.write_bytes(png)
         w, h = _dims_for_aspect(project.aspect_ratio)
-        clip = out_dir / f"shot_00_{shot.id}.mp4"
-        render_image_drift_clip(still, clip, seconds=float(cfg.loop_seconds), width=w, height=h)
-        shot.clip_path = str(clip)
-        shot.status = "completed"
-        db.commit()
-        _log_provider_call(
-            db, project_id=project.id, provider=shot.provider, endpoint="image.generate+drift",
-            request_summary={"model": model, "seconds": cfg.loop_seconds}, response_summary={"bytes": len(png)},
-        )
+        targets = [shot, *_variant_shots(project)[:variant_count(cfg) - 1]]
+        first_url: Optional[str] = None  # reference for the other times of day
+        model = ""
+        for i, target in enumerate(targets):
+            still = out_dir / ("ambient_still.png" if i == 0 else f"ambient_still_{i}.png")
+            target.status = "submitted"
+            if i == 0 and has_picture(project, cfg):
+                # The scene's own picture is the still: no image call, nothing billed.
+                target.provider, target.provider_model = "picture", "your picture"
+                db.commit()
+                png = picture_path(project).read_bytes()
+            else:
+                image = get_image()
+                img_model = _resolve_model(db, cfg.model_override or _active_model("image"))
+                target.provider = "mock" if settings.image_is_mocked() else "openrouter"
+                target.provider_model = img_model
+                db.commit()
+                refs = [ImageRef(url=first_url, role="scene")] if first_url else []
+                png = image.generate(model=img_model, prompt=target.prompt + (_SAME_PLACE if refs else ""),
+                                     references=refs, negative_prompt=target.negative_prompt or "")
+            still.write_bytes(png)
+            if i == 0:
+                model = target.provider_model
+                if len(targets) > 1:
+                    _, first_url = _save_frame_public(still)
+            clip = out_dir / f"shot_00_{target.id}.mp4"
+            render_image_drift_clip(still, clip, seconds=float(cfg.loop_seconds), width=w, height=h)
+            target.clip_path = str(clip)
+            target.status = "completed"
+            db.commit()
+            _log_provider_call(
+                db, project_id=project.id, provider=target.provider, endpoint="image.generate+drift",
+                request_summary={"model": target.provider_model, "seconds": cfg.loop_seconds, "variant": i},
+                response_summary={"bytes": len(png)},
+            )
         generated = {"strategy": "drift", "segments": [cfg.loop_seconds], "closed": True,
-                     "anchored": False, "model": model, "clip_seconds": float(cfg.loop_seconds)}
+                     "anchored": False, "model": model, "clip_seconds": float(cfg.loop_seconds),
+                     "variants": len(targets), "variety": cfg.variety if len(targets) > 1 else "none"}
         _finalize_generation(db, project, cfg, plan, generated,
                              regenerate_music=regenerate_music, render_after=render_after)
         return shot
@@ -1193,6 +1374,13 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         raise ValueError("generate the loop clip before rendering")
     gen = _generated_of(project)
     closed = bool(gen.get("closed"))
+    k = int(gen.get("variants") or 1)
+    extra: list[Path] = []
+    if k > 1:
+        variants = _variant_shots(project)[:k - 1]
+        if len(variants) < k - 1 or any(not v.clip_path or not Path(v.clip_path).exists() for v in variants):
+            raise ValueError("generate the loop clips before rendering")
+        extra = [Path(v.clip_path) for v in variants]
 
     # Tiling is local FFmpeg work: nothing is billed at render time. The
     # provider spend was incurred (and recorded) when the loop was generated.
@@ -1223,6 +1411,9 @@ def render_scene(db: Session, project_id: int) -> models.Render:
                 sound_volume=float(cfg.sound_volume),
                 clip_is_periodic=(cfg.source == "image_drift"),
                 resolution=cfg.output_resolution,
+                extra_clips=extra,
+                variety=str(gen.get("variety") or "none"),
+                transition_seconds=transition_seconds(cfg),
             )
         )
         _check_cancel(db, render)
@@ -1238,7 +1429,7 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         segs = gen.get("segments") or []
         # Summary line first (it's what the UI shows), ffmpeg tail after.
         render.render_log = (
-            f"ambient: clips={len(segs) or 1} unit={outputs.unit_seconds:.2f}s "
+            f"ambient: clips={len(segs) or 1} variations={k} unit={outputs.unit_seconds:.2f}s "
             f"repeats={outputs.repeats} total={project.target_duration_seconds}s "
             f"res={cfg.output_resolution} "
             f"seam={'closed' if closed else 'crossfade'}\n" + outputs.log[-7000:]

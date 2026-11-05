@@ -123,6 +123,15 @@ page and regenerate until it looks right, before paying for any video. A
 video loop is then built from it (its first and last frame, so it closes on
 your picture); a Still + drift scene uses it as the still, with no image
 call. Pictures are center-cropped to the scene's aspect.
+**Less repetition:** instead of one loop for the whole video, a scene can be
+made of 2–5 loop clips. *Mix of takes* makes several clips of the same scene
+(sharing one anchor frame) and plays them in turn, so the picture repeats
+every few minutes instead of every 30 s. *Day to night* makes the same place
+at several times of day (each still made from the first, so the framing
+stays put) and plays each for an equal share of the video, with a slow
+dissolve between them; it also works with Still + drift. Each variation is
+its own loop clip, so the video cost scales with the count; the full-length
+render is still local FFmpeg work.
 
 Extras: **preset preview images** (one image call per preset, cached),
 **long music beds** (3–20 min, generated in parts and crossfaded when

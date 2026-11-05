@@ -13,6 +13,7 @@ import {
   PlanSummary,
   SceneArt,
   SoundControls,
+  VarietyControls,
   fmtDuration,
   presetFor,
   previewSrc,
@@ -352,7 +353,10 @@ function Inner() {
 
           {/* 3. Length */}
           <section className="card p-5">
-            <StepHeading n={3} title="Length" hint="One loop, repeated." />
+            <StepHeading n={3} title="Length" hint="One loop, repeated — or a few, for less repetition." />
+            <div className="mb-5">
+              <VarietyControls cfg={cfg} set={set} labels={plan?.variant_labels} />
+            </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
               <div>
                 <div className="label">Loop clip</div>

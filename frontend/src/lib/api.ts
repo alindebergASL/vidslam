@@ -246,6 +246,10 @@ export type LoopPlan = {
   repeats: number;
   provider_calls: number;
   notes: string[];
+  /** Less repetition: loop clips in the scene, their labels, exact-repeat period. */
+  variants?: number;
+  variant_labels?: string[];
+  repeat_every_seconds?: number;
 };
 
 export type StudioJob = {
@@ -315,6 +319,9 @@ export type AmbientConfig = {
   sound_volume: number;
   /** Set by the /picture endpoints: "" = generated at loop time. */
   picture_origin: "" | "upload" | "generated" | "studio" | "asset";
+  /** Less repetition: several takes of the scene, or day → night. */
+  variety: "none" | "takes" | "day_night";
+  variations: number;
 };
 
 export type ScenePreset = {
@@ -353,6 +360,8 @@ export type AmbientScene = {
   loop_status: string; // pending | submitted | polling | completed | failed
   loop_error: string;
   loop_shot: Shot | null;
+  /** Variations 2..N (variation 1 is loop_shot). */
+  variant_shots?: Shot[];
   music_ready: boolean;
   sound_ready?: boolean;
   picture_ready?: boolean;
@@ -390,6 +399,8 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   sound_prompt: "",
   sound_volume: 0.6,
   picture_origin: "",
+  variety: "none",
+  variations: 3,
 };
 
 export type PublishMeta = {

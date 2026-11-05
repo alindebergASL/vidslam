@@ -31,6 +31,9 @@ TimeOfDay = Literal["any", "dawn", "golden_hour", "midday", "dusk", "night"]
 Weather = Literal["any", "clear", "light_rain", "heavy_rain", "snow", "fog"]
 # Where the scene's picture came from; "" = none (generated at loop time).
 PictureOrigin = Literal["", "upload", "generated", "studio", "asset"]
+# Less repetition over a long video: "takes" = several clips of the same
+# scene, cycled; "day_night" = the scene at several times of day, in order.
+Variety = Literal["none", "takes", "day_night"]
 
 
 class AmbientConfig(BaseModel):
@@ -86,6 +89,11 @@ class AmbientConfig(BaseModel):
     # When present it is the anchor (first + last frame) of a video loop, or
     # the still of a Still + drift scene, instead of a generated image.
     picture_origin: PictureOrigin = ""
+    # Less repetition: how many variations ("takes" of the same scene, or
+    # times of day for "day_night"), each its own loop clip. Costs one loop
+    # per variation; the full-length render is still local.
+    variety: Variety = "none"
+    variations: int = Field(default=3, ge=2, le=5)
 
     @field_validator("scene_prompt", "music_prompt", "scene_preset", "music_mood", "model_override",
                      "sound", "sound_prompt")
@@ -190,6 +198,11 @@ class LoopPlanOut(BaseModel):
     repeats: int
     provider_calls: int
     notes: list[str] = Field(default_factory=list)
+    # Less repetition: how many loop clips the scene has, their labels, and
+    # how often the picture repeats exactly (the takes cycle, or one unit).
+    variants: int = 1
+    variant_labels: list[str] = Field(default_factory=list)
+    repeat_every_seconds: float = 0.0
 
 
 class AmbientOut(BaseModel):
@@ -208,6 +221,8 @@ class AmbientOut(BaseModel):
     loop_status: str
     loop_error: str
     loop_shot: Optional[ShotOut] = None
+    # Variations 2..N (variation 1 is loop_shot), when config.variety is on.
+    variant_shots: list[ShotOut] = Field(default_factory=list)
     # True once a music bed exists on disk (generated or uploaded).
     music_ready: bool
     # True once a nature-sound bed exists (config.sound != "none").

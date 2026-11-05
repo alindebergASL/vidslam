@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -329,6 +329,13 @@ class AmbientRenderInputs:
     # crossfade: it would only soften a seam that doesn't exist.
     clip_is_periodic: bool = False
     resolution: str = "1080p"
+    # Less repetition: more loop clips of the same scene, played after the
+    # first one. "takes" cycles A, B, C, A, B, C…; "day_night" plays each
+    # for an equal share of the total (dawn → … → night). Each change is a
+    # dissolve of `transition_seconds`.
+    extra_clips: list[Path] = field(default_factory=list)
+    variety: str = "none"
+    transition_seconds: float = 2.0
 
 
 @dataclass
@@ -528,6 +535,150 @@ def _tile_and_mux(
     return log
 
 
+def _transition_piece(a: Path, b: Path, dst: Path, *, b_len: float, dissolve: float) -> str:
+    """One full play of unit `b` that starts as unit `a` and dissolves into
+    `b` over `dissolve` seconds.
+
+    It starts on a's first frame (where the previous piece, a, wrapped to)
+    and ends on b's last frame (where the next piece, b again or a
+    transition from b, starts), so it drops into the stream-copied tiling
+    with no cut on either side."""
+    flt = (
+        f"[0:v]trim=duration={b_len:.4f},setpts=PTS-STARTPTS[a];"
+        f"[1:v]setpts=PTS-STARTPTS[b];"
+        f"[a][b]blend=all_expr='{_dissolve_expr(dissolve)}':shortest=1,format=yuv420p[v]"
+    )
+    cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(a), "-i", str(b),
+           "-filter_complex", flt, "-map", "[v]", "-an", *_X264, "-r", str(FPS), str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg ambient transition failed: {log[-2000:]}")
+    return log
+
+
+def _end_piece_from(sources: list[Path], dst: Path, *, length: float,
+                    fade_in: float, fade_out: float) -> str:
+    """`sources` played back to back, cut to `length`, with the fades."""
+    n = len(sources)
+    flt = "".join(f"[{i}:v]" for i in range(n)) + (f"concat=n={n}:v=1:a=0," if n > 1 else "")
+    flt += f"trim=duration={length:.3f},setpts=PTS-STARTPTS"
+    if fade_in > 0:
+        flt += f",fade=t=in:st=0:d={fade_in:.3f}"
+    if fade_out > 0:
+        flt += f",fade=t=out:st={max(0.0, length - fade_out):.3f}:d={fade_out:.3f}"
+    cmd = ["ffmpeg", "-y"]
+    for src in sources:
+        cmd += ["-i", str(src)]
+    cmd += ["-filter_complex", flt + "[v]", "-map", "[v]", "-an", *_X264, "-r", str(FPS), str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg end piece failed: {log[-2000:]}")
+    return log
+
+
+def variety_slots(variety: str, lengths: list[float], total: float) -> list[int]:
+    """Which loop unit plays in each slot of the tiling, until `total` is
+    covered. "takes": A, B, C, A, B, C… (the pattern repeats every
+    sum(lengths)). "day_night": each unit for ~total/K, in order."""
+    k = len(lengths)
+    slots: list[int] = []
+    covered = 0.0
+    if variety == "day_night":
+        share = total / k
+        for v, length in enumerate(lengths):
+            # The last variant runs to the end, whatever rounding left over.
+            n = max(1, round(share / length)) if v < k - 1 else 10**9
+            for _ in range(n):
+                if covered >= total - 1e-3:
+                    return slots
+                slots.append(v)
+                covered += length
+        return slots
+    v = 0
+    while covered < total - 1e-3:
+        slots.append(v)
+        covered += lengths[v]
+        v = (v + 1) % k
+    return slots
+
+
+def _variety_pieces(units: list[Path], lengths: list[float], out: Path, *, variety: str,
+                    total: float, fade: float, dissolve: float) -> tuple[list[Path], list[str]]:
+    """Pieces that cover exactly `total` for a multi-variant scene: each slot
+    is a unit, or a transition into it when the unit changes. Transitions
+    are encoded once per (from, to) pair; everything else is stream-copied."""
+    logs: list[str] = []
+    slots = variety_slots(variety, lengths, total)
+    trans: dict[tuple[int, int], Path] = {}
+    pieces: list[Path] = []
+    plens: list[float] = []
+    prev: Optional[int] = None
+    for v in slots:
+        if prev is None or prev == v:
+            pieces.append(units[v])
+        else:
+            key = (prev, v)
+            if key not in trans:
+                dst = out / f"ambient_trans_{prev}_{v}.mp4"
+                cf = max(0.1, min(dissolve, lengths[v] / 2))
+                logs.append(_transition_piece(units[prev], units[v], dst, b_len=lengths[v], dissolve=cf))
+                trans[key] = dst
+            pieces.append(trans[key])
+        plens.append(lengths[v])
+        prev = v
+
+    # The end piece: the last slot cut to what's left (with the fade-out
+    # ending at `total`), absorbing the slot before it if too little is left.
+    used = sum(plens[:-1])
+    remainder = total - used
+    tail_from = len(pieces) - 1
+    if tail_from >= 1 and remainder < fade + 0.5:
+        tail_from -= 1
+        remainder += plens[tail_from]
+    head_in_tail = tail_from == 0
+    end = out / "ambient_tail.mp4"
+    logs.append(_end_piece_from(pieces[tail_from:], end, length=remainder,
+                                fade_in=fade if head_in_tail else 0.0, fade_out=fade))
+    body = pieces[:tail_from]
+    if body and fade > 0:
+        head = out / "ambient_head.mp4"
+        logs.append(_faded_copy(body[0], head, unit_len=plens[0], fade_in=fade, fade_out=0.0))
+        body = [head, *body[1:]]
+    return [*body, end], logs
+
+
+def _single_unit_pieces(unit: Path, unit_len: float, out: Path, *, total: float,
+                        fade_seconds: float, logs: list[str]) -> tuple[list[Path], int, float]:
+    """Pieces covering exactly `total` for one loop unit."""
+    # Tile plan. The pieces cover exactly `total`: head (fade-in), plain
+    #    units, and an end piece cut to the remaining time whose fade-out
+    #    ends at `total`. (Fading the last full unit instead got cut off
+    #    whenever repeats × unit overshot total.)
+    fade = max(0.0, min(fade_seconds, unit_len / 2.5, total / 2.5))
+    full = int(total // unit_len)
+    remainder = total - full * unit_len
+    if remainder < 0.05:  # lands on a unit boundary
+        full, remainder = full - 1, unit_len
+    if full >= 1 and remainder < fade + 0.5:
+        # Too little left for a full fade: the end piece absorbs one unit.
+        full, remainder = full - 1, remainder + unit_len
+    repeats = full + 1
+    if full == 0:
+        single = out / "ambient_single.mp4"
+        logs.append(_end_piece(unit, single, unit_len=unit_len, length=remainder, fade_in=fade, fade_out=fade))
+        pieces = [single]
+    else:
+        end = out / "ambient_tail.mp4"
+        logs.append(_end_piece(unit, end, unit_len=unit_len, length=remainder, fade_in=0.0, fade_out=fade))
+        if fade > 0:
+            head = out / "ambient_head.mp4"
+            logs.append(_faded_copy(unit, head, unit_len=unit_len, fade_in=fade, fade_out=0.0))
+            pieces = [head, *([unit] * (full - 1)), end]
+        else:
+            pieces = [*([unit] * full), end]
+    return pieces, repeats, fade
+
+
 def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg binary not found on PATH")
@@ -557,34 +708,34 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         shutil.copyfile(norm, unit)
     unit_len = _probe_duration(unit) or (length - cf)
 
-    # 3. Tile plan. The pieces cover exactly `total`: head (fade-in), plain
-    #    units, and an end piece cut to the remaining time whose fade-out
-    #    ends at `total`. (Fading the last full unit instead got cut off
-    #    whenever repeats × unit overshot total.)
     total = float(inputs.total_seconds)
-    fade = max(0.0, min(inputs.fade_seconds, unit_len / 2.5, total / 2.5))
-    full = int(total // unit_len)
-    remainder = total - full * unit_len
-    if remainder < 0.05:  # lands on a unit boundary
-        full, remainder = full - 1, unit_len
-    if full >= 1 and remainder < fade + 0.5:
-        # Too little left for a full fade: the end piece absorbs one unit.
-        full, remainder = full - 1, remainder + unit_len
-    repeats = full + 1
     pieces: list[Path]
-    if full == 0:
-        single = out / "ambient_single.mp4"
-        logs.append(_end_piece(unit, single, unit_len=unit_len, length=remainder, fade_in=fade, fade_out=fade))
-        pieces = [single]
+    if inputs.extra_clips:
+        # 2b. Less repetition: a seamless unit per extra clip, then a slot
+        #     plan that moves between them (see _variety_pieces).
+        units, lengths = [unit], [unit_len]
+        for i, clip in enumerate(inputs.extra_clips, start=1):
+            n_i = out / f"ambient_norm_{i}.mp4"
+            logs.append(_encode_normalized(clip, n_i, width=width, height=height,
+                                           slow_factor=inputs.slow_factor))
+            l_i = _probe_duration(n_i)
+            if l_i <= 0.5:
+                raise RuntimeError(f"normalized loop clip {i + 1} is empty or unreadable")
+            u_i = out / f"ambient_unit_{i}.mp4"
+            if cf > 0 and l_i > (2 * cf + 0.5):
+                logs.append(_make_seamless_unit(n_i, u_i, length=l_i, crossfade=cf))
+            else:
+                shutil.copyfile(n_i, u_i)
+            units.append(u_i)
+            lengths.append(_probe_duration(u_i) or (l_i - cf))
+        fade = max(0.0, min(inputs.fade_seconds, min(lengths) / 2.5, total / 2.5))
+        pieces, plogs = _variety_pieces(units, lengths, out, variety=inputs.variety, total=total,
+                                        fade=fade, dissolve=inputs.transition_seconds)
+        logs.extend(plogs)
+        repeats = len(pieces)
     else:
-        end = out / "ambient_tail.mp4"
-        logs.append(_end_piece(unit, end, unit_len=unit_len, length=remainder, fade_in=0.0, fade_out=fade))
-        if fade > 0:
-            head = out / "ambient_head.mp4"
-            logs.append(_faded_copy(unit, head, unit_len=unit_len, fade_in=fade, fade_out=0.0))
-            pieces = [head, *([unit] * (full - 1)), end]
-        else:
-            pieces = [*([unit] * full), end]
+        pieces, repeats, fade = _single_unit_pieces(unit, unit_len, out, total=total,
+                                                    fade_seconds=inputs.fade_seconds, logs=logs)
 
     # 4. Music unit (optional).
     music_unit: Optional[Path] = None

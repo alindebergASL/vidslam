@@ -179,6 +179,15 @@ export function PlanSummary({
           {fmtDuration(total)}
         </span>
       </div>
+      {(plan.variants ?? 1) > 1 && (
+        <div className="text-xs text-ink-200">
+          <span className="text-grad font-semibold">{plan.variants}</span> variations
+          {plan.variant_labels?.length ? ` (${plan.variant_labels.join(" → ")})` : ""}
+          {plan.repeat_every_seconds && plan.repeat_every_seconds > plan.unit_seconds
+            ? ` · the picture repeats every ${fmtDuration(Math.round(plan.repeat_every_seconds))}`
+            : ""}
+        </div>
+      )}
       {!compact && (
         <div className="flex flex-wrap gap-1.5 text-[11px]">
           <span
@@ -290,7 +299,12 @@ export function LookControls({
           </>
         )}
       </div>
-      {times.length > 0 && (
+      {times.length > 0 && cfg.variety === "day_night" ? (
+        <div>
+          <div className="label">Time of day</div>
+          <p className="text-xs text-ink-400">Set by Day to night (Less repetition, below).</p>
+        </div>
+      ) : times.length > 0 && (
         <div>
           <div className="label">Time of day</div>
           <ChipRow
@@ -317,6 +331,95 @@ export function LookControls({
         </div>
       )}
     </div>
+  );
+}
+
+const VARIETY: { id: AmbientConfig["variety"]; label: string; desc: string }[] = [
+  { id: "none", label: "One loop", desc: "The same loop, repeated for the whole video." },
+  {
+    id: "takes",
+    label: "Mix of takes",
+    desc: "Several clips of the scene, played in turn, so the picture repeats far less often.",
+  },
+  {
+    id: "day_night",
+    label: "Day to night",
+    desc: "The same place as the light changes, from day into night, with a slow dissolve.",
+  },
+];
+
+/** Less repetition: one loop, several takes, or day → night. */
+export function VarietyControls({
+  cfg,
+  set,
+  labels,
+}: {
+  cfg: AmbientConfig;
+  set: CfgSetter;
+  labels?: string[];
+}) {
+  // Takes need a video model; a drift scene is one still.
+  const options = VARIETY.filter((v) => v.id !== "takes" || cfg.source === "video");
+  const current = VARIETY.find((v) => v.id === cfg.variety) ?? VARIETY[0];
+  return (
+    <div>
+      <div className="label">Less repetition</div>
+      <ChipRow
+        label="Less repetition"
+        options={options.map((v) => v.id)}
+        value={cfg.variety}
+        onChange={(v) => set("variety", v)}
+        render={(id) => VARIETY.find((v) => v.id === id)?.label ?? id}
+        className="text-xs"
+      />
+      <p className="text-xs text-ink-400 mt-2">{current.desc}</p>
+      {cfg.variety !== "none" && (
+        <div className="mt-3">
+          <div className="label">Variations</div>
+          <ChipRow
+            label="Number of variations"
+            options={[2, 3, 4, 5]}
+            value={cfg.variations}
+            onChange={(v) => set("variations", v)}
+            className="text-xs"
+          />
+          <p className="text-xs text-ink-400 mt-2">
+            {labels?.length ? `${labels.join(" → ")}. ` : ""}
+            Each variation is its own loop clip, so the video model cost is ×{cfg.variations}. The full-length
+            render is still free.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Status of each variation's clip on the scene page. */
+export function VariantStrip({ scene }: { scene: AmbientScene }) {
+  const labels = scene.plan.variant_labels ?? [];
+  if (labels.length < 2 || !scene.loop_shot) return null;
+  const shots = [scene.loop_shot, ...(scene.variant_shots ?? [])];
+  // The first clip's status reads "completed" only once every variation is done.
+  const done = (i: number) => (i === 0 ? !!shots[0]?.clip_path : shots[i]?.status === "completed");
+  return (
+    <ul className="flex flex-wrap gap-1.5 text-[11px]" aria-label="Variations">
+      {labels.map((label, i) => (
+        <li
+          key={label}
+          className={clsx(
+            "rounded-full border px-2 py-0.5",
+            done(i)
+              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+              : shots[i]?.status === "failed"
+              ? "border-red-500/40 bg-red-500/10 text-red-200"
+              : "border-ink-600 text-ink-300"
+          )}
+        >
+          {done(i) ? "✓ " : ""}
+          {label}
+        </li>
+      ))}
+    </ul>
   );
 }
 
