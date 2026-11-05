@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError
 
 from .. import models
 from ..config import get_settings
@@ -90,7 +90,18 @@ def put_setting(key: str, value: Optional[dict]) -> None:
             db.add(models.AppSetting(key=key, value=value))
         else:
             row.value = value
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Another process (e.g. a second web worker's catalog poller)
+            # inserted the same key between our read and our insert: the row
+            # exists now, so update it instead.
+            db.rollback()
+            row = db.get(models.AppSetting, key)
+            if row is None:
+                raise
+            row.value = value
+            db.commit()
     finally:
         db.close()
 

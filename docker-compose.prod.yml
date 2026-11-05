@@ -8,7 +8,7 @@
 #     no HMR, no source volume mount, no `.next` tmpfs.
 #   - Backend drops --reload and binds workers=2 so a stuck request can't pin
 #     the only worker.
-#   - The :8000 / :3000 ports are not published; only nginx (or whatever you
+#   - The :8000 / :3000 ports are published on 127.0.0.1 only; only host nginx (or whatever you
 #     put in front) talks to them, so the prod stack is intended to sit
 #     behind nginx/avatarvideostudio.conf on a single EC2 host.
 #   - No bind-mount of code into the containers — the image *is* the artifact.
@@ -58,9 +58,10 @@ services:
       context: ./backend
     volumes:
       - ./data:/data
-    ports: !reset []
-    expose:
-      - "8000"
+    # Loopback only: host nginx proxies to 127.0.0.1:8000, but nothing
+    # outside the host can reach the backend directly.
+    ports: !override
+      - "127.0.0.1:8000:8000"
     environment:
       QUEUE_MODE: required
       DATABASE_URL: postgresql+psycopg://avs:${POSTGRES_PASSWORD}@postgres:5432/avs
@@ -94,9 +95,8 @@ services:
         # targets the externally-reachable origin, not the in-cluster name.
         NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
     volumes: !reset []
-    ports: !reset []
-    expose:
-      - "3000"
+    ports: !override
+      - "127.0.0.1:3000:3000"
     command: npm run start
 
 volumes:

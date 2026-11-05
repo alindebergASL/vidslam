@@ -106,12 +106,23 @@ class OpenRouterChatProvider(ChatProvider):
                 if fmt is not None:
                     body["response_format"] = fmt
                 r = client.post(url, headers=self._headers(), json=body)
+                # OpenRouter can also reject with HTTP 200 and an error body
+                # (e.g. {"error": {"code": 400, "message": "Schema is too
+                # complex."}}), so check the body as well as the status.
+                err = _body_error(r) if r.status_code == 200 else None
+                rejected = r.status_code == 400 or (err is not None and err.get("code") == 400)
                 # A route that rejects this format → try the next, simpler one.
-                if r.status_code == 400 and fmt is not None and i < len(formats) - 1:
+                if rejected and fmt is not None and i < len(formats) - 1:
                     continue
                 break
             r.raise_for_status()
             data = r.json()
+        # An error body is not a billable completion: fail before recording spend.
+        if "choices" not in data:
+            err = data.get("error") or {}
+            raise RuntimeError(
+                f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}"
+            )
         from ..services import spend
 
         spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
@@ -121,6 +132,17 @@ class OpenRouterChatProvider(ChatProvider):
         if isinstance(content, list):  # content-parts shape
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
         return StoryboardPlan.model_validate(extract_json(content))
+
+
+def _body_error(r: httpx.Response) -> Optional[dict]:
+    """The `error` object of a JSON body that carries no `choices`, else None."""
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+    if isinstance(data, dict) and "choices" not in data and isinstance(data.get("error"), dict):
+        return data["error"]
+    return None
 
 
 def extract_json(text: str) -> dict:
