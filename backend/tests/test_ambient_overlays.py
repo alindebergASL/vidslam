@@ -124,3 +124,64 @@ def test_overlays_on_a_multi_variation_scene(tmp_path):
     assert _bright(_frame(final, 1.2, tmp_path), CENTER) > 150
     for t in (1.2, 4.5, 10.0):  # inside a unit and inside dissolves
         assert _bright(_frame(final, t, tmp_path), BOTTOM_RIGHT) > 60, t
+
+
+def test_long_title_and_watermark_fit_a_vertical_frame(tmp_path):
+    """Review: drawtext neither wraps nor fits, so a long title (or watermark)
+    in 9:16 ran off both edges. It is now wrapped (≤ 3 lines) and shrunk."""
+    from app.services.renderer import _FONT, _FONT_BOLD, _text_width
+
+    title = "A very long title for a vertical video about rain falling softly on a quiet forest at night"
+    out = _compose(tmp_path, aspect_ratio="9:16", overlay_title=title, title_seconds=3.0,
+                   watermark="@a-rather-long-channel-name-for-a-watermark-test-1234567")
+    lines = sorted((tmp_path / "out").glob("overlay_title_*.txt"))
+    assert 1 < len(lines) <= 3
+    text = [p.read_text() for p in lines]
+    assert " ".join(text) == title  # nothing dropped
+    width = 1080
+    assert all(_text_width(t, _FONT_BOLD, 40) > 0 for t in text)
+    img = _frame(out.final_video_path, 1.5, tmp_path)
+    w, h = img.size
+    assert img.size[0] < img.size[1]
+    edges = [img.crop((0, int(h * 0.3), int(w * 0.03), int(h * 0.7))),
+             img.crop((int(w * 0.97), int(h * 0.3), w, int(h * 0.7)))]
+    assert all(e.getextrema()[1] < 30 for e in edges)  # no text touching the sides
+    assert _bright(img, CENTER) > 150
+    wm = (tmp_path / "out" / "overlay_watermark.txt").read_text()
+    from app.services.renderer import fit_lines
+
+    _, size = fit_lines(wm, font=_FONT, size=int(1920 * 0.032), max_width=width - 2 * int(1920 * 0.035),
+                        max_lines=1, min_size=10)
+    assert _text_width(wm, _FONT, size) <= width - 2 * int(1920 * 0.035)
+
+
+def test_title_can_outlast_one_loop(tmp_path):
+    """Review: a title longer than the first loop unit was cut to that unit.
+    With ~3 s units and an 8 s title it now stays up for the full 8 s."""
+    out = _compose(tmp_path, total=20, overlay_title="Eight seconds", title_seconds=8.0)
+    final = out.final_video_path
+    assert abs(_duration(final) - 20) < 0.2
+    assert _bright(_frame(final, 6.5, tmp_path), CENTER) > 150
+    assert _bright(_frame(final, 10.0, tmp_path), CENTER) < 30
+    assert _bright(_frame(final, 15.0, tmp_path), CENTER) < 30
+
+
+def test_title_can_outlast_one_loop_with_variations(tmp_path):
+    from app.services.renderer import AmbientRenderInputs, compose_ambient
+
+    clips = [_black_clip(tmp_path / f"c{i}.mp4") for i in range(3)]
+    out = compose_ambient(AmbientRenderInputs(
+        project_id=1, out_dir=tmp_path / "out", clip_path=clips[0], extra_clips=clips[1:],
+        total_seconds=24, crossfade_seconds=1.0, fade_seconds=0.5, variety="takes",
+        transition_seconds=1.0, overlay_title="Eight seconds", title_seconds=8.0))
+    final = out.final_video_path
+    assert abs(_duration(final) - 24) < 0.2
+    assert _bright(_frame(final, 6.5, tmp_path), CENTER) > 150
+    assert _bright(_frame(final, 12.0, tmp_path), CENTER) < 30
+
+
+def test_title_longer_than_a_short_video(tmp_path):
+    out = _compose(tmp_path, total=6, overlay_title="Whole video", title_seconds=30.0)
+    final = out.final_video_path
+    assert abs(_duration(final) - 6) < 0.2
+    assert _bright(_frame(final, 4.5, tmp_path), CENTER) > 100
