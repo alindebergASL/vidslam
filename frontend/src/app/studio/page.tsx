@@ -173,7 +173,7 @@ function Studio() {
         ))}
       </div>
 
-      <div className="flex-1 overflow-y-auto px-6 py-4 pb-40">
+      <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-4 pb-44">
         {tiles.length === 0 ? (
           <div className="text-ink-300 text-sm py-12 text-center">
             Nothing yet. Add characters or scenes in <a href="/cast" className="underline">Cast</a>,
@@ -296,9 +296,9 @@ function TileCard({
       )}
 
       {tile.kind === "job" && tile.status === "completed" && tile.jobId && (
-        // Always visible (touch devices have no hover); a subtle scrim keeps
-        // them readable over the image.
-        <div className="absolute top-2 right-2 flex flex-col gap-1">
+        // Desktop: shown on hover/focus so they don't cover the image.
+        // Touch screens have no hover, so there they stay visible.
+        <div className="absolute top-2 right-2 flex flex-col gap-1 transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
           <button
             onClick={async () => {
               try {
@@ -473,7 +473,7 @@ function PromptBar({
 
   return (
     <div className="fixed bottom-0 left-0 md:left-56 right-0 z-10 bg-ink-900/95 border-t border-ink-800 backdrop-blur-sm">
-      <div className="max-w-5xl mx-auto px-6 py-3">
+      <div className="max-w-5xl mx-auto px-3 sm:px-6 py-3">
         {selectedRefs.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5 text-xs text-ink-300">
             <span>References:</span>
@@ -534,7 +534,8 @@ function PromptBar({
           </div>
         )}
 
-        <div className="card flex items-center gap-2 p-2">
+        {/* Phones: the prompt gets its own full-width row; the controls wrap under it. */}
+        <div className="card flex flex-wrap items-center gap-2 p-2">
           <button
             onClick={() => setOutputKind(outputKind === "image" ? "video_clip" : "image")}
             className="chip text-xs"
@@ -586,7 +587,7 @@ function PromptBar({
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="What do you want to create?"
-            className="flex-1 bg-transparent outline-hidden text-sm px-2"
+            className="flex-1 min-w-0 basis-full sm:basis-0 order-first sm:order-none bg-transparent outline-hidden text-sm px-2 py-2 sm:py-0"
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
@@ -597,7 +598,7 @@ function PromptBar({
           <button
             onClick={submit}
             disabled={submitting || !prompt.trim()}
-            className="btn-primary text-sm disabled:opacity-50"
+            className="btn-primary text-sm disabled:opacity-50 ml-auto sm:ml-0"
           >
             {submitting ? "…" : "Generate →"}
           </button>

@@ -152,7 +152,7 @@ export function AudioPanel({
           />
           {project.voiceover_source === "tts" && (
             <div className="text-xs text-ink-400 mt-1">
-              Uses ElevenLabs if configured; otherwise mock silent audio.
+              Read aloud by the voice model chosen in Settings → Models.
             </div>
           )}
         </div>

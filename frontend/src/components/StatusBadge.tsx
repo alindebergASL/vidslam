@@ -1,3 +1,5 @@
+import { statusLabel } from "@/lib/labels";
+
 export function StatusBadge({
   status,
   className = "",
@@ -18,7 +20,7 @@ export function StatusBadge({
       className={`inline-flex items-center gap-2 rounded-full border px-2.5 py-0.5 text-xs ${tone} ${className}`}
     >
       <span className="w-1.5 h-1.5 rounded-full bg-current" />
-      {status}
+      {statusLabel(status)}
     </span>
   );
 }

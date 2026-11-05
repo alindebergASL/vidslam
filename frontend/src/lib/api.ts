@@ -177,6 +177,8 @@ export type Project = {
   mode: "reel_montage" | "talking_head_beta" | "static_motion" | "ambient_loop";
   aspect_ratio: string;
   target_duration_seconds: number;
+  /** Newest completed render, for list thumbnails (GET /projects only). */
+  latest_render_id?: number | null;
   cta_text: string;
   caption_style: string;
   include_disclosure: boolean;

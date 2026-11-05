@@ -52,7 +52,7 @@ function Inner() {
   const comparing = render && compareRender && render.status === "completed";
 
   return (
-    <div className={`p-8 ${comparing ? "max-w-6xl" : "max-w-3xl"}`}>
+    <div className={`p-4 sm:p-8 ${comparing ? "max-w-6xl" : "max-w-3xl"}`}>
       <Link
         href={`/projects/${projectId}`}
         className="text-xs text-ink-300 hover:text-ink-100"
@@ -153,7 +153,17 @@ function Inner() {
         />
       ) : (
         <>
-          <div className="card overflow-hidden mb-4 bg-black">
+          {/* Size the player to the video's shape: a 9:16 video in a full-width
+              box is mostly black bars. */}
+          <div
+            className={`card overflow-hidden mb-4 bg-black ${
+              project.aspect_ratio === "9:16"
+                ? "max-w-[420px]"
+                : project.aspect_ratio === "1:1"
+                ? "max-w-xl"
+                : ""
+            }`}
+          >
             <video
               src={api.renderDownload(render.id)}
               controls

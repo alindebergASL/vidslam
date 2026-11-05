@@ -9,6 +9,7 @@ import { AudioPanel } from "@/components/AudioPanel";
 import { RenderHistory } from "@/components/RenderHistory";
 import { GenerationProgress } from "@/components/GenerationProgress";
 import { useToast } from "@/components/Toaster";
+import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
 import { api, Asset, Project, Shot, Render } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 
@@ -207,20 +208,20 @@ function Inner() {
     );
 
   return (
-    <div className="p-8 max-w-6xl">
-      <header className="mb-6 flex items-end justify-between">
-        <div>
+    <div className="p-4 sm:p-8 max-w-6xl w-full min-w-0">
+      <header className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+        <div className="min-w-0">
           <Link href="/projects" className="text-xs text-ink-300 hover:text-ink-100">
             ← Projects
           </Link>
-          <h1 className="text-3xl font-semibold tracking-tight mt-1">
+          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight mt-1 break-words">
             {project.title || "Untitled"}
           </h1>
           <div className="text-sm text-ink-300 mt-1">
-            {project.mode} · {project.aspect_ratio} · {project.target_duration_seconds}s
+            {modeLabel(project.mode)} · {project.aspect_ratio} · {formatDuration(project.target_duration_seconds)}
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <StatusBadge status={project.status} />
           {preflight && project.generated_plan_json && (
             <button
@@ -288,10 +289,17 @@ function Inner() {
         )}
 
       <section className="card p-4 mb-6">
-        <label className="label" htmlFor="proj-voice-script">Voice script</label>
+        <label className="label" htmlFor="proj-voice-script">
+          {project.generated_plan_json ? "Original script" : "Script"}
+        </label>
+        {project.generated_plan_json && (
+          <p className="text-[11px] text-ink-400 -mt-1 mb-2">
+            What you wrote. The planner turns it into the spoken script below; changes here apply when you re-plan.
+          </p>
+        )}
         <textarea
           id="proj-voice-script"
-          aria-label="Voice script"
+          aria-label="Original script"
           className="input min-h-[100px]"
           value={project.original_script}
           onChange={(e) =>
@@ -359,9 +367,9 @@ function Inner() {
       )}
 
       <section className="mb-6">
-        <div className="flex items-baseline justify-between mb-3">
+        <div className="flex flex-wrap items-baseline justify-between gap-2 mb-3">
           <h2 className="text-lg font-medium">Storyboard</h2>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-3">
             {selected.length > 0 ? (
               <>
                 <span className="text-xs text-ink-300">{selected.length} selected</span>
@@ -388,8 +396,17 @@ function Inner() {
             ) : (
               <>
                 {project.shots.length > 1 && (
-                  <span className="text-xs text-ink-400">Drag to reorder · tick to bulk re-roll</span>
+                  <span className="hidden sm:inline text-xs text-ink-400">Drag to reorder · tick to bulk re-roll</span>
                 )}
+                <button
+                  type="button"
+                  onClick={() => setShowShortcuts(true)}
+                  className="hidden md:inline text-xs text-ink-400 hover:text-ink-100"
+                  title="Show keyboard shortcuts"
+                  aria-label="Show keyboard shortcuts"
+                >
+                  Shortcuts <kbd className="px-1 rounded-sm bg-ink-800 border border-ink-700 font-mono text-[10px]">?</kbd>
+                </button>
                 <button
                   className="btn-ghost text-xs"
                   title="Re-plan keeping your per-shot edits (prompt, duration, references). Hold Shift to discard them."
@@ -489,16 +506,6 @@ function Inner() {
       )}
 
       <RenderHistory projectId={projectId} />
-
-      <button
-        type="button"
-        onClick={() => setShowShortcuts(true)}
-        className="fixed bottom-4 right-4 chip text-[11px] py-1"
-        title="Show keyboard shortcuts"
-        aria-label="Show keyboard shortcuts"
-      >
-        ? shortcuts
-      </button>
 
       {showShortcuts && (
         <div
@@ -707,9 +714,9 @@ function ShotRow({
       onDragOver={onDragOver}
       onDrop={onDrop}
     >
-      <div className="flex items-start justify-between gap-4">
-        <div className="flex-1">
-          <div className="flex items-center gap-2 mb-2">
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+        <div className="flex-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2 mb-2">
             {shot.shot_type !== "end_card" && (
               <input
                 type="checkbox"
@@ -730,15 +737,16 @@ function ShotRow({
               ⠿
             </span>
             <span className="text-xs font-medium text-ink-200">Shot {shot.shot_order}</span>
-            <span className="chip text-[10px] py-0.5">{shot.shot_type}</span>
+            <span className="chip text-[10px] py-0.5">{shotTypeLabel(shot.shot_type)}</span>
             <StatusBadge status={shot.status} />
           </div>
           <div className="flex gap-3">
             {shot.status === "completed" && shot.clip_path && shot.shot_type !== "end_card" && (
               <video
                 key={shot.clip_path}
-                src={api.shotClip(projectId, shot.id)}
-                className="w-24 shrink-0 rounded-sm bg-black aspect-9/16 object-cover"
+                src={`${api.shotClip(projectId, shot.id)}#t=0.1`}
+                preload="metadata"
+                className="w-20 sm:w-24 shrink-0 rounded-sm bg-black aspect-9/16 object-cover"
                 muted
                 loop
                 playsInline
@@ -758,7 +766,7 @@ function ShotRow({
                 api.updateShot(projectId, shot.id, { prompt }).then(onChange)
               }
               aria-label={`Shot ${shot.shot_order} prompt`}
-              className="input min-h-[60px] flex-1"
+              className="input min-h-[60px] flex-1 min-w-0"
             />
           </div>
           {castAssets.length > 0 && shot.shot_type !== "end_card" && (
@@ -801,7 +809,7 @@ function ShotRow({
             </div>
           )}
         </div>
-        <div className="w-44 space-y-2 text-xs">
+        <div className="w-full sm:w-44 shrink-0 space-y-2 text-xs">
           <label className="label" htmlFor={`shot-${shot.id}-duration`}>Duration</label>
           <input
             id={`shot-${shot.id}-duration`}
@@ -819,15 +827,15 @@ function ShotRow({
             }
           />
           <button
-            className="btn-primary w-full text-xs disabled:opacity-50"
+            className="btn-ghost w-full text-xs disabled:opacity-50"
             onClick={() => regenerate(true)}
             disabled={regenBusy}
             title="Regenerate just this shot's clip, then re-stitch the final video using existing audio + other shots."
           >
-            {regenBusy ? "Regenerating…" : "Regenerate + re-compose"}
+            {regenBusy ? "Regenerating…" : "Regenerate shot"}
           </button>
           <button
-            className="btn-ghost w-full text-xs disabled:opacity-50"
+            className="w-full text-[11px] text-ink-400 hover:text-ink-100 disabled:opacity-50 py-0.5"
             onClick={() => regenerate(false)}
             disabled={regenBusy}
             title="Just remake the clip; click Re-compose at the top when you want to update the final video."

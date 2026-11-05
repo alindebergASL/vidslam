@@ -83,3 +83,16 @@ def test_public_render_meta(auth_client):
         assert meta["title"] == "T"
         assert meta["disclosure"]
         assert anon.get("/api/public-renders/bad-token/meta").status_code == 404
+
+
+def test_project_list_includes_latest_render_for_thumbnails(auth_client):
+    pid = auth_client.post("/api/projects", json={"title": "T", "original_script": "one two three four",
+                                                  "cta_text": "Go"}).json()["id"]
+    other = auth_client.post("/api/projects", json={"title": "Draft", "original_script": "x"}).json()["id"]
+    auth_client.post(f"/api/projects/{pid}/generate-plan")
+    auth_client.post(f"/api/projects/{pid}/generate-video?force=true")
+    auth_client.post(f"/api/projects/{pid}/generate-video?force=true")
+    rows = {p["id"]: p for p in auth_client.get("/api/projects").json()}
+    renders = auth_client.get(f"/api/projects/{pid}/renders").json()
+    assert rows[pid]["latest_render_id"] == max(r["id"] for r in renders if r["status"] == "completed")
+    assert rows[other]["latest_render_id"] is None

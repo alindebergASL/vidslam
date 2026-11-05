@@ -246,6 +246,8 @@ class ProjectOut(BaseModel):
     brand_kit_id: Optional[int]
     generated_plan_json: Optional[dict]
     ambient_config_json: Optional[dict] = None
+    # Newest completed render (for list thumbnails); set by GET /projects only.
+    latest_render_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
     cast_members: list[CastMemberOut] = Field(default_factory=list)

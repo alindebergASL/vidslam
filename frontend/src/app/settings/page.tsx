@@ -41,15 +41,47 @@ function Inner() {
   };
 
   return (
-    <div className="p-8 max-w-4xl">
-      <header className="mb-6">
-        <h1 className="text-3xl font-semibold tracking-tight">Settings & Status</h1>
-        <p className="text-ink-300 mt-1">Models, provider connectivity and deployment overview.</p>
+    <div className="p-4 sm:p-8 max-w-4xl">
+      <header className="mb-4">
+        <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">Settings & Status</h1>
+        <p className="text-ink-300 mt-1">Models, spend, publishing, provider keys and deployment.</p>
       </header>
+
+      {/* Section menu: the page is long, so jump straight to what you need. */}
+      <nav
+        aria-label="Settings sections"
+        className="sticky top-0 z-10 -mx-4 sm:mx-0 px-4 sm:px-0 py-2 mb-4 bg-ink-950/90 backdrop-blur-sm flex gap-2 overflow-x-auto"
+      >
+        {[
+          ["models", "Models"],
+          ["spend", "Spend"],
+          ["youtube", "YouTube"],
+          ["keys", "Provider keys"],
+          ["deployment", "Deployment"],
+          ["library", "Library"],
+        ].map(([id, label]) => (
+          <a key={id} href={`#${id}`} className="chip text-xs whitespace-nowrap">
+            {label}
+          </a>
+        ))}
+      </nav>
 
       {error && <div className="text-sm text-accent mb-4">{error}</div>}
 
-      {/* Provider connectivity */}
+      <div id="models" className="scroll-mt-16">
+        <ModelsPanel />
+      </div>
+
+      <div id="spend" className="scroll-mt-16">
+        <SpendPanel />
+      </div>
+
+      <div className="scroll-mt-16">
+        <YouTubeCard />
+      </div>
+
+      <div id="keys" className="scroll-mt-16">
+        {/* Provider connectivity */}
       <section className="card p-4 mb-6">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-lg font-medium">Provider connectivity</h2>
@@ -83,27 +115,10 @@ function Inner() {
         )}
       </section>
 
-      <SpendPanel />
-
-      <ModelsPanel />
-
-      <YouTubeCard />
+      </div>
 
       {info && (
         <>
-          <section className="card p-4 mb-6">
-            <h2 className="text-lg font-medium mb-3">Deployment</h2>
-            <dl className="grid grid-cols-2 md:grid-cols-3 gap-y-3 gap-x-4 text-sm">
-              <Row label="Version" value={info.version} />
-              <Row label="Mode" value={info.mock_providers ? "Mock providers" : "Live providers"} />
-              <Row label="Redis" value={info.redis_configured ? "Configured" : "Inline jobs"} />
-              <Row label="FFmpeg" value={info.ffmpeg_available ? "Available" : "Missing"} bad={!info.ffmpeg_available} />
-              <Row label="FFprobe" value={info.ffprobe_available ? "Available" : "Missing"} bad={!info.ffprobe_available} />
-              <Row label="Data dir" value={info.data_dir} />
-              <Row label="Public base" value={info.public_base_url} />
-            </dl>
-          </section>
-
           <section className="card p-4 mb-6">
             <h2 className="text-lg font-medium mb-3">Provider keys</h2>
             <p className="text-xs text-ink-400 mb-3">
@@ -138,7 +153,20 @@ function Inner() {
             </div>
           </section>
 
-          <section className="card p-4">
+          <section id="deployment" className="card p-4 mb-6 scroll-mt-16">
+            <h2 className="text-lg font-medium mb-3">Deployment</h2>
+            <dl className="grid grid-cols-2 md:grid-cols-3 gap-y-3 gap-x-4 text-sm">
+              <Row label="Version" value={info.version} />
+              <Row label="Mode" value={info.mock_providers ? "Mock providers" : "Live providers"} />
+              <Row label="Redis" value={info.redis_configured ? "Configured" : "Inline jobs"} />
+              <Row label="FFmpeg" value={info.ffmpeg_available ? "Available" : "Missing"} bad={!info.ffmpeg_available} />
+              <Row label="FFprobe" value={info.ffprobe_available ? "Available" : "Missing"} bad={!info.ffprobe_available} />
+              <Row label="Data dir" value={info.data_dir} />
+              <Row label="Public base" value={info.public_base_url} />
+            </dl>
+          </section>
+
+          <section id="library" className="card p-4 scroll-mt-16">
             <h2 className="text-lg font-medium mb-3">Library</h2>
             <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
               <Stat label="Avatars" value={info.counts.avatars} />

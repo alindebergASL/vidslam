@@ -211,7 +211,7 @@ function Inner() {
                 <div>
                   <h2 className="text-base font-medium">Full-length render</h2>
                   <div className="text-xs text-ink-400 mt-0.5">
-                    {firstLine(render.render_log) || `${fmtDuration(scene.total_seconds)} · ${scene.aspect_ratio}`}
+                    {renderSummary(render.render_log, `${fmtDuration(scene.total_seconds)} · ${scene.aspect_ratio}`)}
                   </div>
                 </div>
                 {rendered && (
@@ -452,10 +452,19 @@ function Inner() {
   );
 }
 
-function firstLine(log: string | undefined): string {
-  if (!log) return "";
-  const l = log.split("\n")[0] || "";
-  return l.startsWith("ambient:") ? l.replace("ambient:", "").trim().replace(/ /g, " · ") : "";
+/** "1 h · 1080p · seamless loop · 3 clips" from the render log's summary line
+ *  (`ambient: clips=3 unit=28.50s repeats=127 total=3600s res=1080p seam=closed`). */
+function renderSummary(log: string | undefined, fallback: string): string {
+  const line = (log || "").split("\n")[0] || "";
+  if (!line.startsWith("ambient:")) return fallback;
+  const kv = Object.fromEntries(
+    line.replace("ambient:", "").trim().split(/\s+/).map((p) => p.split("=") as [string, string])
+  );
+  const parts = [fallback];
+  if (kv.res) parts.push(kv.res);
+  if (kv.seam) parts.push(kv.seam === "closed" ? "seamless loop" : "crossfaded loop");
+  if (kv.clips && Number(kv.clips) > 1) parts.push(`${kv.clips} clips`);
+  return parts.join(" · ");
 }
 
 function Step({
