@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from .. import models
+from ..config import get_settings
 from ..db import get_db
 from ..schemas.ambient import (
     AmbientBatchRequest,
@@ -22,6 +23,7 @@ from ..schemas.ambient import (
     AmbientOut,
     AmbientPresetsOut,
     AmbientUpdate,
+    PictureFrom,
 )
 from ..services import ambient as svc
 from ..services.ratelimit import rate_limit
@@ -207,6 +209,78 @@ def sound_file(scene_id: int, db: Session = Depends(get_db)) -> FileResponse:
     if not path.exists():
         raise HTTPException(404, "no nature sound yet")
     return FileResponse(path, media_type="audio/mpeg")
+
+
+# ---------- scene picture ----------
+
+
+def _picture_busy(project: models.VideoProject) -> None:
+    if project.status == "generating":
+        raise HTTPException(409, "the loop is generating; change the picture when it's done")
+
+
+@router.post("/{scene_id}/picture")
+async def upload_picture(scene_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)) -> AmbientOut:
+    """Use your own image: it becomes the loop's first (and last) frame, or
+    the still of a Still + drift scene. Cropped to the scene's aspect."""
+    project = _get_scene(db, scene_id)
+    _picture_busy(project)
+    s = get_settings()
+    if (file.content_type or "") not in s.allowed_image_mimes:
+        raise HTTPException(415, f"unsupported image type {file.content_type!r}")
+    raw = await file.read(s.max_upload_bytes + 1)
+    if len(raw) > s.max_upload_bytes:
+        raise HTTPException(413, f"image is larger than {s.max_upload_bytes // (1024 * 1024)} MB")
+    try:
+        svc.set_picture(db, project, raw, "upload")
+    except svc.PictureError as e:
+        raise HTTPException(422, str(e)) from e
+    return svc.to_out(db, project)
+
+
+@router.post("/{scene_id}/picture/generate",
+             dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
+def generate_picture(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
+    """Generate the picture now (one image call) to preview it before
+    making the video; regenerate until it looks right."""
+    project = _get_scene(db, scene_id)
+    _picture_busy(project)
+    try:
+        svc.generate_picture(db, project)
+    except svc.PictureError as e:
+        raise HTTPException(422, str(e)) from e
+    return svc.to_out(db, project)
+
+
+@router.post("/{scene_id}/picture/from")
+def picture_from(scene_id: int, body: PictureFrom, db: Session = Depends(get_db)) -> AmbientOut:
+    """Use a Cast image (asset_id) or a Studio result (studio_job_id)."""
+    project = _get_scene(db, scene_id)
+    _picture_busy(project)
+    try:
+        svc.picture_from(db, project, asset_id=body.asset_id, studio_job_id=body.studio_job_id)
+    except LookupError as e:
+        raise HTTPException(404, str(e)) from e
+    except svc.PictureError as e:
+        raise HTTPException(422, str(e)) from e
+    return svc.to_out(db, project)
+
+
+@router.delete("/{scene_id}/picture")
+def clear_picture(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
+    """Back to generating the image from the prompt at loop time."""
+    project = _get_scene(db, scene_id)
+    _picture_busy(project)
+    svc.clear_picture(db, project)
+    return svc.to_out(db, project)
+
+
+@router.get("/{scene_id}/picture")
+def picture_file(scene_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    project = _get_scene(db, scene_id)
+    if not svc.has_picture(project):
+        raise HTTPException(404, "this scene has no picture")
+    return FileResponse(svc.picture_path(project), media_type="image/png")
 
 
 @router.post("/{scene_id}/render", status_code=202,

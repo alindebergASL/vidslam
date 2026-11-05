@@ -313,6 +313,8 @@ export type AmbientConfig = {
   sound: string; // "none" | "auto" | sound preset id
   sound_prompt: string;
   sound_volume: number;
+  /** Set by the /picture endpoints: "" = generated at loop time. */
+  picture_origin: "" | "upload" | "generated" | "studio" | "asset";
 };
 
 export type ScenePreset = {
@@ -353,6 +355,7 @@ export type AmbientScene = {
   loop_shot: Shot | null;
   music_ready: boolean;
   sound_ready?: boolean;
+  picture_ready?: boolean;
   repeats: number;
   plan: LoopPlan;
   latest_render: Render | null;
@@ -384,6 +387,7 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   sound: "none",
   sound_prompt: "",
   sound_volume: 0.6,
+  picture_origin: "",
 };
 
 export type PublishMeta = {
@@ -553,6 +557,33 @@ export const api = {
     req<AmbientScene>(`/api/ambient/${id}/music`, { method: "POST" }),
   regenerateAmbientSound: (id: number) =>
     req<AmbientScene>(`/api/ambient/${id}/sound`, { method: "POST" }),
+  uploadAmbientPicture: async (id: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    const r = await fetch(`${API_BASE}/api/ambient/${id}/picture`, {
+      method: "POST",
+      credentials: "include",
+      body: fd,
+    });
+    if (!r.ok) {
+      let detail = await r.text();
+      try {
+        detail = JSON.parse(detail).detail ?? detail;
+      } catch {
+        /* not JSON */
+      }
+      throw new Error(`${r.status}: ${detail}`);
+    }
+    return (await r.json()) as AmbientScene;
+  },
+  generateAmbientPicture: (id: number) =>
+    req<AmbientScene>(`/api/ambient/${id}/picture/generate`, { method: "POST" }),
+  ambientPictureFrom: (id: number, body: { asset_id?: number; studio_job_id?: number }) =>
+    req<AmbientScene>(`/api/ambient/${id}/picture/from`, { method: "POST", body: JSON.stringify(body) }),
+  clearAmbientPicture: (id: number) =>
+    req<AmbientScene>(`/api/ambient/${id}/picture`, { method: "DELETE" }),
+  ambientPictureUrl: (id: number, v?: string | number) =>
+    `${API_BASE}/api/ambient/${id}/picture${v ? `?v=${encodeURIComponent(String(v))}` : ""}`,
   ambientSoundUrl: (id: number, v?: string) => `${API_BASE}/api/ambient/${id}/sound${v ? `?v=${encodeURIComponent(v)}` : ""}`,
   generatePresetPreviews: (missingOnly = true) =>
     req<{ presets: string[]; job_id: string | null; status: string }>(

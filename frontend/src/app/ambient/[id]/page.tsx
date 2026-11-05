@@ -7,6 +7,7 @@ import { AuthGate } from "@/components/AuthGate";
 import { RenderHistory } from "@/components/RenderHistory";
 import { PublishPanel } from "@/components/PublishPanel";
 import { useToast } from "@/components/Toaster";
+import { ScenePicture } from "@/components/ambient/ScenePicture";
 import {
   ChipRow,
   LookControls,
@@ -277,6 +278,16 @@ function Inner() {
               )}
             </section>
           )}
+
+          {/* ---- 0. Picture: the image the loop is built from ---- */}
+          <ScenePicture
+            scene={scene}
+            disabled={inFlight}
+            onChange={(s) => {
+              setScene(s);
+              setCacheBust(Date.now());
+            }}
+          />
 
           {/* ---- 1. Loop ---- */}
           <section className="card overflow-hidden">

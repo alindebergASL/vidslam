@@ -29,6 +29,8 @@ SceneSource = Literal["video", "image_drift"]
 Look = Literal["photoreal", "cinematic", "painterly", "watercolor", "anime", "claymation", "dreamy"]
 TimeOfDay = Literal["any", "dawn", "golden_hour", "midday", "dusk", "night"]
 Weather = Literal["any", "clear", "light_rain", "heavy_rain", "snow", "fog"]
+# Where the scene's picture came from; "" = none (generated at loop time).
+PictureOrigin = Literal["", "upload", "generated", "studio", "asset"]
 
 
 class AmbientConfig(BaseModel):
@@ -80,6 +82,10 @@ class AmbientConfig(BaseModel):
     sound: str = "none"
     sound_prompt: str = Field(default="", max_length=500)
     sound_volume: float = Field(default=0.6, ge=0.0, le=1.0)
+    # Scene picture: set through the /picture endpoints, not edited directly.
+    # When present it is the anchor (first + last frame) of a video loop, or
+    # the still of a Still + drift scene, instead of a generated image.
+    picture_origin: PictureOrigin = ""
 
     @field_validator("scene_prompt", "music_prompt", "scene_preset", "music_mood", "model_override",
                      "sound", "sound_prompt")
@@ -100,6 +106,13 @@ class AmbientUpdate(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)
     aspect_ratio: Optional[Literal["16:9", "9:16", "1:1"]] = None
     config: Optional[AmbientConfig] = None
+
+
+class PictureFrom(BaseModel):
+    """Use an existing image as the scene picture: a cast asset or a Studio result."""
+
+    asset_id: Optional[int] = None
+    studio_job_id: Optional[int] = None
 
 
 class AmbientBatchRequest(BaseModel):
@@ -199,6 +212,8 @@ class AmbientOut(BaseModel):
     music_ready: bool
     # True once a nature-sound bed exists (config.sound != "none").
     sound_ready: bool = False
+    # True when the scene has its own picture (see config.picture_origin).
+    picture_ready: bool = False
     # How many times the loop unit tiles into the total output.
     repeats: int
     plan: LoopPlanOut

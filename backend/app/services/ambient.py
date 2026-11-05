@@ -314,6 +314,124 @@ def presets() -> AmbientPresetsOut:
     )
 
 
+# ---------- scene picture ----------
+
+PICTURE_MAX_SIDE = 3840  # keeps 4K output sharp; larger uploads are scaled down
+PICTURE_MIN_SIDE = 480
+
+
+class PictureError(ValueError):
+    """Not a usable picture (bad type, too small, unreadable)."""
+
+
+def picture_path(project: models.VideoProject) -> Path:
+    return storage.render_subdir(project.id) / "picture.png"
+
+
+def has_picture(project: models.VideoProject, cfg: Optional[AmbientConfig] = None) -> bool:
+    cfg = cfg or _config_of(project)
+    return bool(cfg.picture_origin) and picture_path(project).exists()
+
+
+def _crop_to_aspect(raw: bytes, aspect: str) -> bytes:
+    """Center-crop to the scene's aspect and cap the size; PNG out."""
+    import io
+
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+    except (UnidentifiedImageError, OSError) as e:
+        raise PictureError("not a readable image") from e
+    if min(img.size) < PICTURE_MIN_SIDE:
+        raise PictureError(f"picture is too small ({img.size[0]}×{img.size[1]}); "
+                           f"use at least {PICTURE_MIN_SIDE}px on the short side")
+    tw, th = _dims_for_aspect(aspect)
+    target = tw / th
+    w, h = img.size
+    if w / h > target:  # too wide: trim the sides
+        nw = round(h * target)
+        img = img.crop(((w - nw) // 2, 0, (w - nw) // 2 + nw, h))
+    elif w / h < target:  # too tall: trim top and bottom
+        nh = round(w / target)
+        img = img.crop((0, (h - nh) // 2, w, (h - nh) // 2 + nh))
+    if max(img.size) > PICTURE_MAX_SIDE:
+        img.thumbnail((PICTURE_MAX_SIDE, PICTURE_MAX_SIDE), Image.LANCZOS)
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+def _invalidate_loop(project: models.VideoProject) -> None:
+    """The loop clip was made from a different image: it needs regenerating."""
+    shot = _loop_shot(project)
+    if shot is not None and shot.clip_path:
+        shot.status, shot.clip_path, shot.error = "pending", "", ""
+    data = dict(project.ambient_config_json or {})
+    data.pop(_GENERATED_KEY, None)
+    project.ambient_config_json = data
+
+
+def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: str) -> models.VideoProject:
+    png = _crop_to_aspect(raw, project.aspect_ratio)
+    picture_path(project).write_bytes(png)
+    _invalidate_loop(project)
+    _set_state(project, "picture_origin", origin)
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+def clear_picture(db: Session, project: models.VideoProject) -> models.VideoProject:
+    picture_path(project).unlink(missing_ok=True)
+    if _config_of(project).picture_origin:
+        _invalidate_loop(project)
+    _set_state(project, "picture_origin", "")
+    db.commit()
+    db.refresh(project)
+    return project
+
+
+def still_prompt(cfg: AmbientConfig) -> str:
+    """Prompt for the scene's still: preset/user text + look, light, weather."""
+    preset = _PRESET_BY_ID.get(cfg.scene_preset)
+    base = cfg.scene_prompt.strip() or (preset.prompt if preset else "")
+    return f"{base} Wide establishing shot, {style_phrase(cfg)}. No people, no text."
+
+
+def generate_picture(db: Session, project: models.VideoProject) -> models.VideoProject:
+    """Generate the scene's picture now (one image call), so it can be
+    previewed and regenerated before any video is made."""
+    from .pipeline import _log_provider_call, _resolve_model
+
+    cfg = _config_of(project)
+    image = get_image()
+    model = _resolve_model(db, _active_model("image"))
+    png = image.generate(model=model, prompt=still_prompt(cfg), references=[],
+                         settings={"aspect_ratio": project.aspect_ratio})
+    _log_provider_call(db, project_id=project.id, provider=type(image).__name__,
+                       endpoint="image.generate(picture)", request_summary={"model": model},
+                       response_summary={"bytes": len(png)})
+    return set_picture(db, project, png, "generated")
+
+
+def picture_from(db: Session, project: models.VideoProject, *, asset_id: Optional[int] = None,
+                 studio_job_id: Optional[int] = None) -> models.VideoProject:
+    if asset_id is not None:
+        asset = db.get(models.Asset, asset_id)
+        if asset is None or not asset.file_path or not Path(asset.file_path).exists():
+            raise LookupError("asset not found")
+        return set_picture(db, project, Path(asset.file_path).read_bytes(), "asset")
+    if studio_job_id is not None:
+        job = db.get(models.AssetGenerationJob, studio_job_id)
+        if (job is None or job.output_kind != "image" or job.status not in ("completed", "saved")
+                or not job.result_path or not Path(job.result_path).exists()):
+            raise LookupError("studio image not found")
+        return set_picture(db, project, Path(job.result_path).read_bytes(), "studio")
+    raise PictureError("give asset_id or studio_job_id")
+
+
 # ---------- prompt resolution ----------
 
 
@@ -321,6 +439,16 @@ def resolve_scene_prompt(cfg: AmbientConfig) -> str:
     """User text wins; otherwise the preset's prompt. Always append the loop
     directives — they're what keep a generative video model from panning,
     cutting, or putting a person in the frame."""
+    if cfg.picture_origin and cfg.source == "video":
+        # The clip starts from the scene's own picture: animate that image as
+        # it is rather than describing the preset or restyling it. Light and
+        # weather still guide the motion (falling snow, drifting fog).
+        what = cfg.scene_prompt.strip() or "the scene in the given image"
+        extras = ", ".join(x for x in (TIMES_OF_DAY.get(cfg.time_of_day, ("", ""))[1],
+                                       WEATHERS.get(cfg.weather, ("", ""))[1]) if x)
+        return (f"Bring the given image to life exactly as it is: {what}"
+                + (f", {extras}" if extras else "")
+                + ". Keep its composition, colors and art style unchanged." + _LOOP_DIRECTIVES)
     base = cfg.scene_prompt.strip()
     if not base:
         preset = _PRESET_BY_ID.get(cfg.scene_preset)
@@ -438,6 +566,11 @@ def _segments_for(target: int, caps: VideoCapabilities) -> list[int]:
     return segs
 
 
+def caps_first_frame(cfg: AmbientConfig) -> bool:
+    """Can the scene's video model start a clip from a given image?"""
+    return video_capabilities(_video_model_for(cfg)).first_frame
+
+
 def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> LoopPlanOut:
     """Decide how this scene's loop gets made on the configured model."""
     notes: list[str] = []
@@ -460,6 +593,9 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
             f"Couldn't read this model's limits; assuming {caps.max_seconds}s per clip "
             "(AMBIENT_DEFAULT_MAX_CLIP_SECONDS)."
         )
+    if cfg.picture_origin and cfg.source == "video" and not caps.first_frame:
+        notes.append("This model can't start a clip from an image, so your picture isn't used "
+                     "for the video. Pick a model that takes a first frame, or use Still + drift.")
     chain_ok = cfg.chain_segments and caps.first_frame
     if cfg.loop_seconds > caps.max_seconds and cfg.chain_segments and not caps.first_frame:
         notes.append("This model can't start from a given frame, so clips can't be chained; "
@@ -511,15 +647,21 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
     s = get_settings()
     plan = plan or plan_loop(cfg)
     lines: list[dict] = []
+    own = bool(cfg.picture_origin)  # the scene's own picture: no image call at loop time
     if plan.strategy == "drift":
         lines.append({
-            "item": "Scene still (image)",
+            "item": "Your picture (no image call)" if own else "Scene still (image)",
             "qty": 1, "unit": "image",
-            "unit_cost": s.cost_image_per_item,
-            "cost": round(s.cost_image_per_item, 4),
+            "unit_cost": 0.0 if own else s.cost_image_per_item,
+            "cost": 0.0 if own else round(s.cost_image_per_item, 4),
         })
     else:
-        if plan.anchored:
+        if own:
+            lines.append({
+                "item": "Your picture as the first frame" + (" = last frame" if plan.anchored else ""),
+                "qty": 1, "unit": "image", "unit_cost": 0.0, "cost": 0.0,
+            })
+        elif plan.anchored:
             lines.append({
                 "item": "Anchor still (first = last frame)",
                 "qty": 1, "unit": "image",
@@ -639,6 +781,7 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         loop_shot=ShotOut.model_validate(shot) if shot else None,
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
+        picture_ready=has_picture(project, cfg),
         repeats=plan.repeats,
         plan=plan,
         latest_render=RenderOut.model_validate(latest) if latest else None,
@@ -708,6 +851,9 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
         resolve_scene_prompt(cfg)
         old = _config_of(project)
         generated = _generated_of(project)
+        # The picture is set through its own endpoints; a settings save
+        # (maybe from a page loaded before the upload) must not clear it.
+        cfg = cfg.model_copy(update={"picture_origin": old.picture_origin})
         data = cfg.model_dump()
         if generated:
             data[_GENERATED_KEY] = generated
@@ -784,7 +930,7 @@ def _segment_shots(db: Session, project: models.VideoProject, n: int) -> list[mo
 _CHAIN_KEY = "_chain"  # in-flight chain state (cleared when the loop is done)
 
 
-def _set_state(project: models.VideoProject, key: str, value: Optional[dict]) -> None:
+def _set_state(project: models.VideoProject, key: str, value: Optional[object]) -> None:
     data = dict(project.ambient_config_json or {})
     if value is None:
         data.pop(key, None)
@@ -806,20 +952,22 @@ def _start_video_chain(
     frames_dir = out_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
     anchor_url: Optional[str] = None
-    if plan.anchored:
-        image = get_image()
-        img_model = _resolve_model(db, _active_model("image"))
-        preset = _PRESET_BY_ID.get(cfg.scene_preset)
-        still_prompt = (cfg.scene_prompt.strip() or (preset.prompt if preset else "")) + \
-            f" Wide establishing shot, {style_phrase(cfg)}. No people, no text."
-        png = image.generate(model=img_model, prompt=still_prompt, references=[])
+    picture = has_picture(project, cfg)
+    if plan.anchored or (picture and caps_first_frame(cfg)):
+        # The scene's own picture when it has one; otherwise generate the still.
         anchor = frames_dir / "anchor.png"
-        anchor.write_bytes(png)
+        if picture:
+            shutil.copyfile(picture_path(project), anchor)
+        else:
+            image = get_image()
+            img_model = _resolve_model(db, _active_model("image"))
+            png = image.generate(model=img_model, prompt=still_prompt(cfg), references=[])
+            anchor.write_bytes(png)
+            _log_provider_call(
+                db, project_id=project.id, provider=type(image).__name__, endpoint="image.generate(anchor)",
+                request_summary={"model": img_model}, response_summary={"bytes": len(png)},
+            )
         _, anchor_url = _save_frame_public(anchor)
-        _log_provider_call(
-            db, project_id=project.id, provider=type(image).__name__, endpoint="image.generate(anchor)",
-            request_summary={"model": img_model}, response_summary={"bytes": len(png)},
-        )
     segs = _segment_shots(db, project, len(plan.segments))
     for i, (seg, dur) in enumerate(zip(segs, plan.segments, strict=True)):
         seg.prompt = shot.prompt + (
@@ -988,16 +1136,23 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
                                regenerate_music=regenerate_music, render_after=render_after)
             db.refresh(shot)
             return shot
-        image = get_image()
-        model = _resolve_model(db, cfg.model_override or _active_model("image"))
-        shot.status = "submitted"
-        shot.provider = "mock" if settings.image_is_mocked() else "openrouter"
-        shot.provider_model = model
-        db.commit()
-        png = image.generate(model=model, prompt=shot.prompt, references=[],
-                             negative_prompt=shot.negative_prompt or "")
         out_dir = storage.render_subdir(project.id)
         still = out_dir / "ambient_still.png"
+        shot.status = "submitted"
+        if has_picture(project, cfg):
+            # The scene's own picture is the still: no image call, nothing billed.
+            model = "your picture"
+            shot.provider, shot.provider_model = "picture", model
+            db.commit()
+            png = picture_path(project).read_bytes()
+        else:
+            image = get_image()
+            model = _resolve_model(db, cfg.model_override or _active_model("image"))
+            shot.provider = "mock" if settings.image_is_mocked() else "openrouter"
+            shot.provider_model = model
+            db.commit()
+            png = image.generate(model=model, prompt=shot.prompt, references=[],
+                                 negative_prompt=shot.negative_prompt or "")
         still.write_bytes(png)
         w, h = _dims_for_aspect(project.aspect_ratio)
         clip = out_dir / f"shot_00_{shot.id}.mp4"
@@ -1006,7 +1161,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
         shot.status = "completed"
         db.commit()
         _log_provider_call(
-            db, project_id=project.id, provider=type(image).__name__, endpoint="image.generate+drift",
+            db, project_id=project.id, provider=shot.provider, endpoint="image.generate+drift",
             request_summary={"model": model, "seconds": cfg.loop_seconds}, response_summary={"bytes": len(png)},
         )
         generated = {"strategy": "drift", "segments": [cfg.loop_seconds], "closed": True,

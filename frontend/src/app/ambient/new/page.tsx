@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { useToast } from "@/components/Toaster";
+import { PickedImage, PicturePicker, pictureUse } from "@/components/ambient/ScenePicture";
 import {
   ChipRow,
   LookControls,
@@ -55,6 +56,23 @@ function Inner() {
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [genPreviews, setGenPreviews] = useState(false);
+  // Optional picture to build the scene from: a file to upload, or a
+  // Studio/Cast image. Attached right after the scene is created.
+  const [picture, setPicture] = useState<{ file?: File; picked?: PickedImage; url: string } | null>(null);
+  const [picking, setPicking] = useState(false);
+  const fileRef = useRef<HTMLInputElement | null>(null);
+
+  // Studio → "Ambient scene" lands here with ?studio_job=<id>.
+  useEffect(() => {
+    const id = Number(new URLSearchParams(window.location.search).get("studio_job"));
+    if (Number.isFinite(id) && id > 0) {
+      setPicture({ picked: { kind: "studio", id, url: api.studioPreview(id), label: "From Studio" },
+                   url: api.studioPreview(id) });
+    }
+  }, []);
+  useEffect(() => () => {
+    if (picture?.file) URL.revokeObjectURL(picture.url);
+  }, [picture]);
 
   useEffect(() => {
     api.ambientPresets().then(setPresets).catch((e) => setError(e.message));
@@ -71,12 +89,15 @@ function Inner() {
   useEffect(() => {
     if (estTimer.current) clearTimeout(estTimer.current);
     estTimer.current = setTimeout(() => {
-      api.ambientEstimate(cfg).then(setEstimate).catch(() => {});
+      api
+        .ambientEstimate({ ...cfg, picture_origin: picture ? (picture.file ? "upload" : picture.picked!.kind) : "" })
+        .then(setEstimate)
+        .catch(() => {});
     }, 250);
     return () => {
       if (estTimer.current) clearTimeout(estTimer.current);
     };
-  }, [cfg]);
+  }, [cfg, picture]);
 
   const preset = presetFor(presets?.scenes ?? null, cfg.scene_preset);
   const mood = presets?.music_moods.find((m) => m.id === cfg.music_mood);
@@ -96,19 +117,42 @@ function Inner() {
   };
 
   const effectivePrompt = cfg.scene_prompt || preset?.prompt || "";
+  // With a picture, the picture is the scene: no description needed.
   const canSubmit =
-    !submitting && effectivePrompt.trim().length > 0 && (cfg.scene_preset !== "custom" || cfg.scene_prompt.trim());
+    !submitting &&
+    (!!picture || (effectivePrompt.trim().length > 0 && (cfg.scene_preset !== "custom" || cfg.scene_prompt.trim())));
 
   const submit = async () => {
     setSubmitting(true);
     setError(null);
     try {
+      const config =
+        picture && cfg.scene_preset === "custom" && !cfg.scene_prompt.trim()
+          ? { ...cfg, scene_prompt: "the scene in the given image" }
+          : cfg;
+      // With a picture: create without generating, attach it, then generate,
+      // so the loop is built from the picture rather than a generated still.
       const scene = await api.createAmbient({
         title,
         aspect_ratio: aspect,
-        config: cfg,
-        generate: generateNow,
+        config,
+        generate: generateNow && !picture,
       });
+      if (picture) {
+        try {
+          if (picture.file) await api.uploadAmbientPicture(scene.id, picture.file);
+          else
+            await api.ambientPictureFrom(
+              scene.id,
+              picture.picked!.kind === "studio" ? { studio_job_id: picture.picked!.id } : { asset_id: picture.picked!.id }
+            );
+        } catch (e: any) {
+          toast.error(`Scene created, but the picture failed: ${e.message || e}`);
+          router.push(`/ambient/${scene.id}`);
+          return;
+        }
+        if (generateNow) await api.generateAmbientLoop(scene.id);
+      }
       toast.success(generateNow ? "Scene created — generating the loop" : "Scene created");
       router.push(`/ambient/${scene.id}`);
     } catch (e: any) {
@@ -210,22 +254,76 @@ function Inner() {
             )}
 
             <label className="label mt-5" htmlFor="amb-prompt">
-              Scene description
+              {picture ? "Describe the motion (optional)" : "Scene description"}
             </label>
             <textarea
               id="amb-prompt"
               className="input min-h-[88px]"
               value={cfg.scene_prompt}
-              placeholder={preset?.prompt || "Describe the place in a sentence or two…"}
+              placeholder={
+                picture
+                  ? "e.g. gentle ripples on the lake, clouds drifting slowly"
+                  : preset?.prompt || "Describe the place in a sentence or two…"
+              }
               onChange={(e) => {
                 setPromptTouched(true);
                 set("scene_prompt", e.target.value);
               }}
             />
             <p className="text-xs text-ink-400 mt-1">
-              Leave blank to use the preset text. We add &ldquo;static camera, no cuts, no people,
-              seamless loop&rdquo; directives automatically.
+              {picture
+                ? "With a picture, this only guides what moves; the picture sets the scene and its style."
+                : "Leave blank to use the preset text."}{" "}
+              We add &ldquo;static camera, no cuts, no people, seamless loop&rdquo; directives automatically.
             </p>
+
+            <div className="label mt-5">Start from a picture (optional)</div>
+            <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
+              {picture && (
+                <img src={picture.url} alt="Chosen picture" className="w-full sm:w-40 aspect-video object-cover rounded-md border border-ink-700" />
+              )}
+              <div className="min-w-0">
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" className="btn-ghost text-xs" onClick={() => fileRef.current?.click()}>
+                    {picture ? "Upload another" : "Upload"}
+                  </button>
+                  <button type="button" className="btn-ghost text-xs" onClick={() => setPicking(true)}>
+                    Choose from Studio / Cast
+                  </button>
+                  {picture && (
+                    <button type="button" className="text-xs text-ink-400 hover:text-ink-100 px-2" onClick={() => setPicture(null)}>
+                      Remove
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-ink-400 mt-1">
+                  {picture
+                    ? pictureUse(cfg.source)
+                    : "Use your own photo or artwork instead of a generated image. You can also generate and preview one on the scene page."}
+                </p>
+              </div>
+            </div>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/png,image/jpeg,image/webp"
+              className="hidden"
+              aria-label="Upload a scene picture"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = "";
+                if (f) setPicture({ file: f, url: URL.createObjectURL(f) });
+              }}
+            />
+            {picking && (
+              <PicturePicker
+                onClose={() => setPicking(false)}
+                onPick={(p) => {
+                  setPicking(false);
+                  setPicture({ picked: p, url: p.url });
+                }}
+              />
+            )}
 
             <div className="label mt-5">Source</div>
             <div role="radiogroup" aria-label="Scene source" className="grid grid-cols-1 sm:grid-cols-2 gap-3">
