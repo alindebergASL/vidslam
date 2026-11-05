@@ -292,7 +292,7 @@ class StudioRequest(BaseModel):
     negative_prompt: str = ""
     reference_asset_ids: list[int] = Field(default_factory=list)
     model: Optional[str] = None
-    duration_seconds: float = 5.0
+    duration_seconds: float = Field(5.0, ge=1.0, le=60.0)
 
 
 class StudioJobOut(BaseModel):
@@ -302,6 +302,7 @@ class StudioJobOut(BaseModel):
     owner_id: int
     output_kind: str
     prompt: str
+    duration_seconds: float
     provider: str
     provider_model: str
     status: str

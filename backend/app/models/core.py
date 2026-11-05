@@ -275,6 +275,9 @@ class AssetGenerationJob(Base):
     owner_kind: Mapped[str] = mapped_column(String(20), default="avatar")  # avatar|ingredient
     owner_id: Mapped[int] = mapped_column(Integer)
     output_kind: Mapped[str] = mapped_column(String(20), default="image")  # image|video_clip
+    # Requested clip length (video_clip only); the provider snaps it to what
+    # the model supports.
+    duration_seconds: Mapped[float] = mapped_column(Float, default=5.0)
     prompt: Mapped[str] = mapped_column(Text, default="")
     negative_prompt: Mapped[str] = mapped_column(Text, default="")
     reference_asset_ids_json: Mapped[list | None] = mapped_column(JSON, default=list)

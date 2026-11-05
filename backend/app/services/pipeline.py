@@ -1045,7 +1045,8 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             db.commit()
             data = image.generate(model=model, prompt=job.prompt, references=refs,
                                   negative_prompt=job.negative_prompt)
-            path = storage.save_generated_bytes(data, extension="png", subdir_name="images")
+            ext, _mime, _w, _h = storage.image_info(data)
+            path = storage.save_generated_bytes(data, extension=ext, subdir_name="images")
             job.result_path = str(path)
             job.status = "completed"
         else:  # video_clip — async: completes via webhook / sweeper
@@ -1061,7 +1062,8 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             def start(callback):
                 return video.submit(
                     model=model, prompt=job.prompt, references=refs,
-                    negative_prompt=job.negative_prompt or "", duration_seconds=5.0,
+                    negative_prompt=job.negative_prompt or "",
+                    duration_seconds=float(job.duration_seconds or 5.0),
                     settings={"callback_url": callback} if callback else None,
                 )
 
@@ -1088,6 +1090,10 @@ def save_studio_result_as_asset(
     if not is_image:
         # We only file image results into the visual asset library; clips stay in /studio.
         raise ValueError("only image studio results can be saved as cast assets")
+    import hashlib
+
+    raw = Path(job.result_path).read_bytes()
+    _ext, mime, width, height = storage.image_info(raw)
     asset = models.Asset(
         owner_kind=job.owner_kind,
         avatar_id=job.owner_id if job.owner_kind == "avatar" else None,
@@ -1095,10 +1101,10 @@ def save_studio_result_as_asset(
         asset_type=asset_type,
         original_filename=Path(job.result_path).name,
         file_path=job.result_path,
-        mime_type="image/png",
-        width=0,
-        height=0,
-        checksum="",
+        mime_type=mime,
+        width=width,
+        height=height,
+        checksum=hashlib.sha256(raw).hexdigest(),
         source="generated",
         generation_job_id=job.id,
     )

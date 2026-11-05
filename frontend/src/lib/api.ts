@@ -252,6 +252,7 @@ export type StudioJob = {
   owner_id: number;
   output_kind: "image" | "video_clip";
   prompt: string;
+  duration_seconds: number;
   provider: string;
   provider_model: string;
   status: string;

@@ -21,10 +21,12 @@ processes start at once one migrates and the others wait. There's no manual
 
 ## Schema and migrations
 
-This is a net-new build, so the whole schema is one Alembic revision
-(`migrations/versions/0001_baseline_schema.py`). Add new revisions on top
-for future changes (`make db-revision MSG=...`); they apply automatically at
-the next boot.
+The schema starts from one baseline revision
+(`migrations/versions/0001_baseline_schema.py`). A live deployment now runs
+on it, so never edit or regenerate an applied revision: add a new one for
+every schema change (`make db-revision MSG=...`) and it applies
+automatically at the next boot. A new NOT NULL column needs a
+`server_default` so existing rows can be filled (see `0002`).
 
 - On Postgres the app runs `alembic upgrade head` at boot, under a Postgres
   advisory lock, so when several processes start together one migrates and

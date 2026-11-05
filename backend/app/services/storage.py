@@ -91,6 +91,19 @@ def save_uploaded_image(
     }
 
 
+def image_info(raw: bytes) -> tuple[str, str, int, int]:
+    """(extension, mime type, width, height) read from the bytes themselves.
+    Providers return PNG, JPEG or WebP regardless of what was asked for."""
+    fmt_map = {"PNG": ("png", "image/png"), "JPEG": ("jpg", "image/jpeg"),
+               "WEBP": ("webp", "image/webp"), "GIF": ("gif", "image/gif")}
+    try:
+        with Image.open(io.BytesIO(raw)) as img:
+            ext, mime = fmt_map.get(img.format or "", ("png", "image/png"))
+            return ext, mime, img.size[0], img.size[1]
+    except Exception:  # noqa: BLE001 — unreadable: keep the old default
+        return "png", "image/png", 0, 0
+
+
 def save_generated_bytes(
     raw: bytes,
     *,
