@@ -94,23 +94,41 @@ if ! $yes; then
   [[ "$answer" == restore ]] || die "cancelled"
 fi
 
+safety=""
 if [[ -n "$db" ]]; then
-  safety="pre-restore-$(date -u +%Y%m%dT%H%M%SZ).dump"
-  log "safety dump of the current database → $safety"
   # shellcheck disable=SC2086
-  if $PG_EXEC pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner > "$work/$safety" 2>/dev/null; then
+  exists=$($PG_EXEC psql -tA -U "$DB_USER" -d postgres \
+    -c "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'") || die "can't reach Postgres to check for '$DB_NAME'"
+  if [[ "$exists" == 1 ]]; then
+    # The current data is about to be dropped: without a stored copy, stop here.
+    safety="pre-restore-$(date -u +%Y%m%dT%H%M%SZ).dump"
+    log "safety dump of the current database → $safety"
+    # shellcheck disable=SC2086
+    $PG_EXEC pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner > "$work/$safety" \
+      || die "safety dump failed: nothing was changed"
+    # shellcheck disable=SC2086
+    $PG_EXEC pg_restore --list < "$work/$safety" > /dev/null || die "safety dump is unreadable: nothing was changed"
     if $is_s3; then aws s3 cp --only-show-errors "$work/$safety" "$TARGET/db/$safety"
-    else cp "$work/$safety" "$TARGET/db/$safety"; fi
+    else cp "$work/$safety" "$TARGET/db/$safety"; fi || die "couldn't store the safety dump: nothing was changed"
   else
-    log "warning: could not dump the current database (it may not exist yet); continuing"
+    log "database '$DB_NAME' doesn't exist yet: no safety dump needed"
   fi
 fi
 
 log "stopping backend, worker and frontend"
 $SERVICES stop backend worker frontend
 
-restart() { log "starting services"; $SERVICES up -d backend worker frontend; }
-trap 'restart; rm -rf "$work"' EXIT
+# From here on a failure leaves the app STOPPED: bringing it back on a
+# half-restored database or media folder would serve (and write to) bad state.
+stopped_failure() {
+  log "ERROR: restore failed at line $1: $2"
+  log "The backend, worker and frontend are left stopped."
+  [[ -n "$safety" ]] && log "To roll back to the data from before this restore: scripts/restore.sh --db $safety"
+  log "To retry: rerun the same restore. To start the app anyway: $COMPOSE up -d backend worker frontend"
+  rm -rf "$work"
+  exit 1
+}
+trap 'stopped_failure $LINENO "$BASH_COMMAND"' ERR
 
 if [[ -n "$db" ]]; then
   log "recreating database $DB_NAME"
@@ -132,4 +150,7 @@ if $data; then
   log "media restored"
 fi
 
+trap - ERR
+log "starting services"
+$SERVICES up -d backend worker frontend
 log "restore complete (migrations, if any, run as the backend starts)"

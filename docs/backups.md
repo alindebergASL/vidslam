@@ -116,11 +116,17 @@ What it does, in order:
    A damaged dump stops the restore before anything is touched.
 2. **Takes a safety dump** of the current database into
    `<target>/db/pre-restore-<time>.dump`, so a restore can itself be undone.
+   If the database exists and that dump fails, the restore stops before it
+   changes anything.
 3. **Stops** the backend, worker and frontend. Postgres keeps running.
 4. **Restores:** recreates the database and loads the dump; and/or mirrors
    `<target>/data/` back into `./data`. Files added after the backup are removed.
 5. **Starts** the services again. Migrations run at boot, so a dump taken on
    an older version is upgraded to the current schema.
+
+If any restore step fails, the app is **left stopped**, so it never serves or
+writes to a half-restored database. The script prints the exact command to
+roll back with the safety dump, how to retry, and how to start the app anyway.
 
 ### Restoring onto a new server
 

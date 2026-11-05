@@ -77,6 +77,51 @@ ls "$BACKUP_TARGET/db"/pre-restore-*.dump >/dev/null || boom "no safety dump bef
 [[ "$(q "SELECT version_num FROM alembic_version")" != "" ]] || boom "alembic_version missing after restore"
 pass "restore brought back the database and media, after a safety dump"
 
+# --- restore failure paths (review: never drop without a safety copy, never
+#     restart on a half-restored state) ---
+cat > "$root/pgfail" <<'WRAP'
+#!/usr/bin/env bash
+# pgfail <tool-to-fail> <tool> args...: run through PGFAIL_INNER, except fail
+# pg_dump, or a real (non --list) pg_restore, on request.
+fail="$1"; shift
+if [[ "$fail" == pg_dump && "$1" == pg_dump ]]; then echo "simulated pg_dump failure" >&2; exit 1; fi
+if [[ "$fail" == pg_restore && "$1" == pg_restore && "$*" != *--list* ]]; then
+  echo "simulated pg_restore failure" >&2; exit 1
+fi
+# shellcheck disable=SC2086
+exec $PGFAIL_INNER "$@"
+WRAP
+cat > "$root/svc" <<'SVC'
+#!/usr/bin/env bash
+echo "$*" >> "$SVC_LOG"
+SVC
+chmod +x "$root/pgfail" "$root/svc"
+export PGFAIL_INNER="$BACKUP_PG_EXEC" SVC_LOG="$root/svc.log"
+q "INSERT INTO app_settings (key, value, updated_at) VALUES ('live', '{}', now())" >/dev/null
+rows_now=$(q "SELECT count(*) FROM app_settings")
+
+: > "$SVC_LOG"
+if BACKUP_PG_EXEC="$root/pgfail pg_dump" BACKUP_SERVICES_CMD="$root/svc" \
+   scripts/restore.sh --db latest --yes > "$root/r1.log" 2>&1; then boom "restore went ahead without a safety dump"; fi
+[[ "$(q "SELECT count(*) FROM app_settings")" == "$rows_now" ]] || boom "database changed after a failed safety dump"
+[[ ! -s "$SVC_LOG" ]] || boom "services were touched after a failed safety dump"
+grep -q "nothing was changed" "$root/r1.log" || boom "no clear message for a failed safety dump"
+pass "a failed safety dump aborts before stopping anything or dropping the database"
+
+: > "$SVC_LOG"
+if BACKUP_PG_EXEC="$root/pgfail pg_restore" BACKUP_SERVICES_CMD="$root/svc" \
+   scripts/restore.sh --db latest --yes > "$root/r2.log" 2>&1; then boom "a failed pg_restore reported success"; fi
+grep -q "^stop " "$SVC_LOG" || boom "services weren't stopped before restoring"
+! grep -q "^up " "$SVC_LOG" || boom "services restarted on a half-restored database"
+grep -q "left stopped" "$root/r2.log" && grep -q "pre-restore-" "$root/r2.log" || boom "no rollback instructions"
+pass "a failed restore leaves the app stopped and prints how to roll back"
+
+# Roll back with the printed safety dump: the 'live' row is back.
+safety=$(grep -o 'pre-restore-[0-9TZ]*\.dump' "$root/r2.log" | head -1)
+scripts/restore.sh --db "$safety" --yes > /dev/null
+[[ "$(q "SELECT count(*) FROM app_settings WHERE key='live'")" == 1 ]] || boom "rollback dump didn't restore"
+pass "the safety dump rolls the failed restore back"
+
 # --- retention ---
 touch -d '30 days ago' "$BACKUP_TARGET/db/avs-20200101T000000Z.dump"
 BACKUP_KEEP_DAYS=14 scripts/backup.sh > /dev/null
