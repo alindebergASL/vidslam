@@ -535,17 +535,19 @@ def _tile_and_mux(
     return log
 
 
-def _transition_piece(a: Path, b: Path, dst: Path, *, b_len: float, dissolve: float) -> str:
-    """One full play of unit `b` that starts as unit `a` and dissolves into
-    `b` over `dissolve` seconds.
+def _transition_piece(a: Path, b: Path, dst: Path, *, b_len: float, dissolve: float,
+                      a_offset: float = 0.0) -> str:
+    """`b` played from its start for `b_len` seconds, starting as `a` (from
+    `a_offset`, where the previous piece left a) and dissolving into `b`
+    over `dissolve` seconds.
 
-    It starts on a's first frame (where the previous piece, a, wrapped to)
-    and ends on b's last frame (where the next piece, b again or a
-    transition from b, starts), so it drops into the stream-copied tiling
-    with no cut on either side."""
+    It starts exactly where the previous piece left off and, when `b_len` is
+    b's full length, ends on b's last frame, where the next play of b
+    starts, so it drops into the stream-copied tiling with no cut on either
+    side."""
     flt = (
-        f"[0:v]trim=duration={b_len:.4f},setpts=PTS-STARTPTS[a];"
-        f"[1:v]setpts=PTS-STARTPTS[b];"
+        f"[0:v]trim=start={a_offset:.4f}:duration={b_len:.4f},setpts=PTS-STARTPTS[a];"
+        f"[1:v]trim=duration={b_len:.4f},setpts=PTS-STARTPTS[b];"
         f"[a][b]blend=all_expr='{_dissolve_expr(dissolve)}':shortest=1,format=yuv420p[v]"
     )
     cmd = ["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(a), "-i", str(b),
@@ -576,61 +578,88 @@ def _end_piece_from(sources: list[Path], dst: Path, *, length: float,
     return log
 
 
-def variety_slots(variety: str, lengths: list[float], total: float) -> list[int]:
-    """Which loop unit plays in each slot of the tiling, until `total` is
-    covered. "takes": A, B, C, A, B, C… (the pattern repeats every
-    sum(lengths)). "day_night": each unit for ~total/K, in order."""
-    k = len(lengths)
+def variety_slots(lengths: list[float], total: float) -> list[int]:
+    """Mix of takes: which unit plays in each slot, A, B, C, A, B, C… until
+    `total` is covered (the pattern repeats every sum(lengths))."""
     slots: list[int] = []
-    covered = 0.0
-    if variety == "day_night":
-        share = total / k
-        for v, length in enumerate(lengths):
-            # The last variant runs to the end, whatever rounding left over.
-            n = max(1, round(share / length)) if v < k - 1 else 10**9
-            for _ in range(n):
-                if covered >= total - 1e-3:
-                    return slots
-                slots.append(v)
-                covered += length
-        return slots
-    v = 0
+    covered, v = 0.0, 0
     while covered < total - 1e-3:
         slots.append(v)
         covered += lengths[v]
-        v = (v + 1) % k
+        v = (v + 1) % len(lengths)
     return slots
+
+
+# A piece of the tiling: ("unit", v, len) a full play of unit v ·
+# ("part", v, len) unit v from its start, cut short · ("trans", p, o, v, len)
+# unit v from its start, dissolving in from unit p played from second o.
+Piece = tuple
+
+
+def variety_plan(variety: str, lengths: list[float], total: float) -> list[Piece]:
+    """The pieces that cover `total` for a multi-variant scene.
+
+    Day to night gives each variation exactly total/K: its block is whole
+    plays of its unit, the last one cut at the boundary, and the next
+    variation dissolves in from where that cut left off. So every time of
+    day appears, even when total is shorter than all the loops together."""
+    pieces: list[Piece] = []
+    if variety != "day_night":
+        prev: Optional[int] = None
+        for v in variety_slots(lengths, total):
+            pieces.append(("unit", v, lengths[v]) if prev is None else ("trans", prev, 0.0, v, lengths[v]))
+            prev = v
+        return pieces
+    k = len(lengths)
+    t, prev, phase = 0.0, None, 0.0
+    for v in range(k):
+        end = total if v == k - 1 else total * (v + 1) / k
+        first = True
+        while t < end - 1e-3:
+            length = min(lengths[v], end - t)
+            full = length >= lengths[v] - 1e-3
+            if first and prev is not None:
+                pieces.append(("trans", prev, phase, v, length))
+            else:
+                pieces.append(("unit", v, lengths[v]) if full else ("part", v, length))
+            t += length
+            phase = 0.0 if full else length
+            first = False
+        prev = v
+    return pieces
 
 
 def _variety_pieces(units: list[Path], lengths: list[float], out: Path, *, variety: str,
                     total: float, fade: float, dissolve: float) -> tuple[list[Path], list[str]]:
-    """Pieces that cover exactly `total` for a multi-variant scene: each slot
-    is a unit, or a transition into it when the unit changes. Transitions
-    are encoded once per (from, to) pair; everything else is stream-copied."""
+    """Files that cover exactly `total` for a multi-variant scene (see
+    variety_plan). Transitions and cut-short plays are encoded once each;
+    whole plays of a unit are stream-copied."""
     logs: list[str] = []
-    slots = variety_slots(variety, lengths, total)
-    trans: dict[tuple[int, int], Path] = {}
+    made: dict[tuple, Path] = {}
     pieces: list[Path] = []
     plens: list[float] = []
-    prev: Optional[int] = None
-    for v in slots:
-        if prev is None or prev == v:
-            pieces.append(units[v])
+    for spec in variety_plan(variety, lengths, total):
+        length = spec[-1]
+        if spec[0] == "unit":
+            path = units[spec[1]]
         else:
-            key = (prev, v)
-            if key not in trans:
-                dst = out / f"ambient_trans_{prev}_{v}.mp4"
-                cf = max(0.1, min(dissolve, lengths[v] / 2))
-                logs.append(_transition_piece(units[prev], units[v], dst, b_len=lengths[v], dissolve=cf))
-                trans[key] = dst
-            pieces.append(trans[key])
-        plens.append(lengths[v])
-        prev = v
+            key = tuple(round(x, 3) if isinstance(x, float) else x for x in spec)
+            if key not in made:
+                dst = out / f"ambient_{'_'.join(str(x) for x in key)}.mp4"
+                if spec[0] == "part":
+                    logs.append(_end_piece_from([units[spec[1]]], dst, length=length, fade_in=0.0, fade_out=0.0))
+                else:
+                    _, p, o, v, _ = spec
+                    cf = max(0.1, min(dissolve, length / 2))
+                    logs.append(_transition_piece(units[p], units[v], dst, b_len=length, dissolve=cf, a_offset=o))
+                made[key] = dst
+            path = made[key]
+        pieces.append(path)
+        plens.append(length)
 
-    # The end piece: the last slot cut to what's left (with the fade-out
-    # ending at `total`), absorbing the slot before it if too little is left.
-    used = sum(plens[:-1])
-    remainder = total - used
+    # The end piece: the last piece cut to what's left (with the fade-out
+    # ending at `total`), absorbing the piece before it if too little is left.
+    remainder = total - sum(plens[:-1])
     tail_from = len(pieces) - 1
     if tail_from >= 1 and remainder < fade + 0.5:
         tail_from -= 1

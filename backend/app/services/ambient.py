@@ -702,14 +702,17 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
         notes.append("Closed loop: an anchor still is both the first and the last frame.")
     elif n >= 1:
         notes.append(f"Open loop: hidden with a {seam_cf:g}s tail→head crossfade.")
-    anchor_calls = 1 if anchored else 0
+    # With variations, a first-frame-only model still gets a shared start
+    # still, so the takes / times of day show the same view.
+    first_still = anchored or (caps.first_frame and (bool(cfg.picture_origin) or k > 1))
+    anchor_calls = 1 if (anchored or (k > 1 and first_still)) else 0
     repeat_every = unit
     if k > 1 and cfg.variety == "takes":
         repeat_every = unit * k
         notes.append(f"{k} takes of the scene, played in turn: the picture repeats every "
                      f"~{_fmt_duration(int(repeat_every))} instead of every {unit:.0f}s.")
     elif k > 1:
-        anchor_calls = k if anchored else 0
+        anchor_calls = k if first_still else 0
         notes.append(f"Day to night: {' → '.join(labels)}, ~{_fmt_duration(int(cfg.total_seconds / k))} "
                      "each, with a slow dissolve between them.")
     return LoopPlanOut(
@@ -731,6 +734,7 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
         variants=k,
         variant_labels=labels,
         repeat_every_seconds=round(repeat_every, 2),
+        first_frame_still=first_still,
     )
 
 
@@ -764,14 +768,15 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
                 "item": "Your picture as the first frame" + (" = last frame" if plan.anchored else ""),
                 "qty": 1, "unit": "image", "unit_cost": 0.0, "cost": 0.0,
             })
-        elif plan.anchored:
+        elif plan.anchored or (k > 1 and plan.first_frame_still):
             lines.append({
-                "item": "Anchor still (first = last frame)",
+                "item": "Anchor still (first = last frame)" if plan.anchored
+                        else "Shared first frame (image)",
                 "qty": 1, "unit": "image",
                 "unit_cost": s.cost_image_per_item,
                 "cost": round(s.cost_image_per_item, 4),
             })
-        if more_stills and (plan.anchored or (own and caps_first_frame(cfg))):
+        if more_stills and plan.first_frame_still:
             lines.append({
                 "item": f"Anchor stills for {', '.join(plan.variant_labels[1:])}",
                 "qty": more_stills, "unit": "image", "unit_cost": s.cost_image_per_item,
@@ -1106,7 +1111,7 @@ def _start_video_chain(
     frames_dir.mkdir(exist_ok=True)
     anchor_url: Optional[str] = None
     picture = has_picture(project, cfg)
-    if plan.anchored or (picture and caps_first_frame(cfg)):
+    if plan.first_frame_still or plan.anchored or (picture and caps_first_frame(cfg)):
         if variant > 0 and cfg.variety == "takes" and anchor0_url:
             anchor_url = anchor0_url
         else:

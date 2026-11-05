@@ -203,6 +203,9 @@ class LoopPlanOut(BaseModel):
     variants: int = 1
     variant_labels: list[str] = Field(default_factory=list)
     repeat_every_seconds: float = 0.0
+    # A still is the first frame of the loop (the anchor, the scene picture,
+    # or, with variations on a first-frame-only model, a shared start frame).
+    first_frame_still: bool = False
 
 
 class AmbientOut(BaseModel):

@@ -52,12 +52,40 @@ def _compose(tmp: Path, variety: str, total: float):
 def test_variety_slots():
     from app.services.renderer import variety_slots
 
-    assert variety_slots("takes", [3, 3, 3], 20) == [0, 1, 2, 0, 1, 2, 0]
-    # Day to night: an equal share each, the last one runs to the end.
-    assert variety_slots("day_night", [3, 3, 3], 36) == [0] * 4 + [1] * 4 + [2] * 4
-    assert variety_slots("day_night", [3, 3, 3], 40) == [0] * 4 + [1] * 4 + [2] * 6
-    # Shorter than one share: every variation still gets at least one slot.
-    assert variety_slots("day_night", [3, 3, 3], 8) == [0, 1, 2]
+    assert variety_slots([3, 3, 3], 20) == [0, 1, 2, 0, 1, 2, 0]
+
+
+def _shares(plan, k):
+    got = [0.0] * k
+    for p in plan:
+        got[p[1] if p[0] != "trans" else p[3]] += p[-1]
+    return got
+
+
+def test_day_night_plan_gives_each_time_its_share():
+    from app.services.renderer import variety_plan
+
+    plan = variety_plan("day_night", [3, 3, 3], 36)
+    assert [p[0] for p in plan] == ["unit"] * 4 + ["trans"] + ["unit"] * 3 + ["trans"] + ["unit"] * 3
+    assert _shares(plan, 3) == pytest.approx([12, 12, 12])
+    # Uneven: the block is cut at its boundary and the next dissolves in
+    # from where the cut left off.
+    plan = variety_plan("day_night", [3, 3, 3], 40)
+    assert plan[4] == ("part", 0, pytest.approx(40 / 3 - 12))
+    assert plan[5][:3] == ("trans", 0, pytest.approx(40 / 3 - 12))
+    assert _shares(plan, 3) == pytest.approx([40 / 3] * 3)
+
+
+def test_day_night_shows_every_time_even_when_loops_outlast_the_video():
+    """Review: 600 s with five 180 s units (60 s drift × slow 3) used to stop
+    after four, so the paid-for night variation never appeared."""
+    from app.services.renderer import variety_plan
+
+    plan = variety_plan("day_night", [180.0] * 5, 600)
+    assert _shares(plan, 5) == pytest.approx([120.0] * 5)
+    assert [p[0] for p in plan] == ["part", "trans", "trans", "trans", "trans"]
+    # Each dissolve starts where the previous cut left off.
+    assert all(p[2] == pytest.approx(120.0) for p in plan[1:])
 
 
 # ---------- renderer ----------
@@ -79,6 +107,21 @@ def test_day_night_plays_each_clip_for_its_share(tmp_path):
     assert abs(_duration(final) - 36) < 0.2
     assert [_color_at(final, t, tmp_path) for t in (2, 8, 14, 20, 26, 32)] == [
         "red", "red", "green", "green", "blue", "blue"]
+
+
+def test_day_night_shorter_than_the_loops(tmp_path):
+    """Each time of day still gets its third when one loop outlasts it."""
+    from app.services.renderer import AmbientRenderInputs, compose_ambient
+
+    clips = [_solid_clip(tmp_path / f"{c}.mp4", c, seconds=10.0) for c in ("red", "green", "blue")]
+    out = compose_ambient(AmbientRenderInputs(
+        project_id=1, out_dir=tmp_path / "out", clip_path=clips[0], extra_clips=clips[1:],
+        total_seconds=12, crossfade_seconds=1.0, fade_seconds=0.5, variety="day_night",
+        transition_seconds=1.0,
+    ))
+    final = out.final_video_path
+    assert abs(_duration(final) - 12) < 0.2
+    assert [_color_at(final, t, tmp_path) for t in (2.5, 6.5, 10.5)] == ["red", "green", "blue"]
 
 
 def test_transition_dissolves_instead_of_cutting(tmp_path):
@@ -200,6 +243,32 @@ def test_day_night_scene_makes_a_still_per_time_of_day(auth_client, monkeypatch)
     assert "at night" in scene["variant_shots"][1]["prompt"]
     auth_client.post(f"/api/ambient/{sid}/render")
     assert auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["status"] == "completed"
+
+
+def test_first_frame_only_models_share_a_start_still(auth_client, monkeypatch):
+    """Review: a model with first-frame but no last-frame input made each
+    variation from text alone. It now gets one shared start still (takes) or
+    one per time of day, and the estimate prices it."""
+    from app.providers.base import VideoCapabilities
+    from app.services import ambient
+
+    caps = VideoCapabilities(durations=[5, 10], first_frame=True, last_frame=False)
+    monkeypatch.setattr(ambient, "video_capabilities", lambda model: caps)
+    plan = ambient.plan_loop(_cfg(variety="takes", variations=3))
+    assert not plan.anchored and plan.first_frame_still
+    assert plan.provider_calls == len(plan.segments) * 3 + 1
+    est = ambient.estimate_ambient_cost(_cfg(variety="takes", variations=3))
+    assert any(ln["item"] == "Shared first frame (image)" for ln in est["lines"])
+    # One loop on the same model stays as it was: no still.
+    assert not ambient.plan_loop(_cfg()).first_frame_still
+
+    images = _image_spy(monkeypatch)
+    sid = _make(auth_client, variety="takes", variations=3)
+    assert auth_client.get(f"/api/ambient/{sid}").json()["loop_status"] == "completed"
+    assert len(images) == 1
+    images.clear()
+    _make(auth_client, variety="day_night", variations=3)
+    assert len(images) == 3 and all(len(c["references"]) == 1 for c in images[1:])
 
 
 def test_drift_day_night_starts_from_the_picture(auth_client, monkeypatch):
