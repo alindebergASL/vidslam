@@ -5,6 +5,7 @@ import { AuthGate } from "@/components/AuthGate";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useToast } from "@/components/Toaster";
 import { api, Project } from "@/lib/api";
+import { formatDuration, modeLabel } from "@/lib/labels";
 
 export default function ProjectsPage() {
   return (
@@ -131,31 +132,39 @@ function Inner() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {filtered.map((p) => (
-            <div key={p.id} className="card p-4 card-hover group relative">
+            <div key={p.id} className="card overflow-hidden card-hover group relative">
               {/* Ambient scenes live in their own section; the storyboard
                   editor would make no sense for them. */}
               <Link href={p.mode === "ambient_loop" ? `/ambient/${p.id}` : `/projects/${p.id}`} className="block">
+                <div className="h-36 bg-ink-800 overflow-hidden flex items-center justify-center">
+                  {p.latest_render_id ? (
+                    <img
+                      src={api.renderThumb(p.latest_render_id)}
+                      alt=""
+                      aria-hidden
+                      loading="lazy"
+                      className="h-full w-full object-cover"
+                    />
+                  ) : (
+                    <span className="text-xs text-ink-400">No video yet</span>
+                  )}
+                </div>
+                <div className="p-4">
                 <div className="text-sm font-medium pr-6">{p.title || "Untitled"}</div>
                 <div className="text-xs text-ink-300 mt-1">
                   {p.mode === "ambient_loop" ? (
-                    <>
-                      <span className="text-iris-soft">∿ ambient</span> ·{" "}
-                      {p.target_duration_seconds >= 3600
-                        ? `${(p.target_duration_seconds / 3600).toFixed(p.target_duration_seconds % 3600 ? 1 : 0)}h`
-                        : `${Math.round(p.target_duration_seconds / 60)}m`}{" "}
-                      · {p.aspect_ratio}
-                    </>
+                    <span className="text-iris-soft">∿ Ambient scene</span>
                   ) : (
-                    <>
-                      {p.mode} · {p.target_duration_seconds}s · {p.aspect_ratio}
-                    </>
-                  )}
+                    modeLabel(p.mode)
+                  )}{" "}
+                  · {formatDuration(p.target_duration_seconds)} · {p.aspect_ratio}
                 </div>
                 <StatusBadge status={p.status} className="mt-3" />
+                </div>
               </Link>
               {/* Always-visible icon buttons (touch-friendly); aria-labels
                   give screen readers something to announce beyond the glyph. */}
-              <div className="absolute top-2 right-2 flex items-center gap-2 opacity-70 md:opacity-0 md:group-hover:opacity-100 focus-within:opacity-100 transition">
+              <div className="absolute top-2 right-2 flex items-center gap-2 rounded-md bg-black/60 px-2 py-1 opacity-80 md:opacity-0 md:group-hover:opacity-100 focus-within:opacity-100 transition">
                 {p.mode !== "ambient_loop" && (
                 <button
                   className="text-ink-400 hover:text-ink-100 text-xs"

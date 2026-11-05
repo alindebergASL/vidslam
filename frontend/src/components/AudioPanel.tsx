@@ -105,7 +105,7 @@ export function AudioPanel({
 
   return (
     <section className="card p-4 mb-6">
-      <div className="flex items-baseline justify-between mb-3">
+      <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-1 mb-3">
         <h2 className="text-lg font-medium">Audio</h2>
         <span className="text-xs text-ink-400">
           Voiceover and an optional music bed mixed under it.
@@ -152,7 +152,7 @@ export function AudioPanel({
           />
           {project.voiceover_source === "tts" && (
             <div className="text-xs text-ink-400 mt-1">
-              Uses ElevenLabs if configured; otherwise mock silent audio.
+              Read aloud by the voice model chosen in Settings → Models.
             </div>
           )}
         </div>

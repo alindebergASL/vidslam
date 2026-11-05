@@ -50,9 +50,19 @@ def _apply_cast(db: Session, project: models.VideoProject, cast: list[CastMember
 
 @router.get("/projects", response_model=list[ProjectOut])
 def list_projects(db: Session = Depends(get_db)) -> list[models.VideoProject]:
-    return (
-        db.query(models.VideoProject).order_by(models.VideoProject.created_at.desc()).all()
+    from sqlalchemy import func
+
+    projects = db.query(models.VideoProject).order_by(models.VideoProject.created_at.desc()).all()
+    # One grouped query for every card's thumbnail, instead of one per project.
+    latest = dict(
+        db.query(models.Render.project_id, func.max(models.Render.id))
+        .filter(models.Render.status == "completed", models.Render.thumbnail_path != "")
+        .group_by(models.Render.project_id)
+        .all()
     )
+    for p in projects:
+        p.latest_render_id = latest.get(p.id)
+    return projects
 
 
 @router.post("/projects", response_model=ProjectOut, status_code=201)

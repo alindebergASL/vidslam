@@ -6,6 +6,36 @@ import { OnboardingChecklist } from "@/components/OnboardingChecklist";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useToast } from "@/components/Toaster";
 import { api, Avatar, Ingredient, Project } from "@/lib/api";
+import { formatDuration, modeLabel } from "@/lib/labels";
+
+const PROVIDER_NAMES: Record<string, string> = {
+  openrouter: "OpenRouter", elevenlabs: "ElevenLabs", gemini: "Google", replicate: "Replicate",
+};
+// Every kind that can call a paid provider, or "nothing is billed" could lie
+// (e.g. a live lip-sync model while the video model is still a mock).
+const KIND_NAMES: Record<string, string> = {
+  chat: "planner", image: "images", video: "video", tts: "voice", music: "music",
+  lipsync: "lip-sync", training_lora: "LoRA training", training_voice: "voice cloning",
+};
+
+/** One sentence for the provider status instead of raw flags. */
+function providerSummary(st: Record<string, any>): { live: boolean; text: string } {
+  const kinds = Object.keys(KIND_NAMES).filter((k) => typeof st[k] === "string");
+  const real = kinds.filter((k) => st[k] !== "mock" && st[k] !== "off");
+  if (st.mock_providers_env === true || real.length === 0) {
+    return { live: false, text: "Demo mode: videos use placeholder clips and nothing is billed." };
+  }
+  const names = [...new Set(real.map((k) => PROVIDER_NAMES[st[k]] || st[k]))].join(" + ");
+  // Only the everyday kinds are worth calling out as placeholders; optional
+  // extras (lip-sync off, no training key) would just add noise.
+  const mocked = ["chat", "image", "video", "tts", "music"]
+    .filter((k) => st[k] === "mock")
+    .map((k) => KIND_NAMES[k]);
+  return {
+    live: true,
+    text: `Live with ${names}.` + (mocked.length ? ` Still placeholder: ${mocked.join(", ")}.` : ""),
+  };
+}
 
 export default function DashboardPage() {
   return (
@@ -40,19 +70,7 @@ function Dashboard() {
     api.recentRenders(12).then(setRecent).catch(() => setRecent([]));
     const ps = await api.listProjects();
     setProjects(ps);
-    const slice = ps.slice(0, 6);
-    const entries = await Promise.all(
-      slice.map(async (p) => {
-        if (p.status !== "completed") return [p.id, null] as const;
-        try {
-          const s = await api.projectStatus(p.id);
-          return [p.id, s.latest_render?.id ?? null] as const;
-        } catch {
-          return [p.id, null] as const;
-        }
-      })
-    );
-    setThumbnails(Object.fromEntries(entries));
+    setThumbnails(Object.fromEntries(ps.map((p) => [p.id, p.latest_render_id ?? null])));
     setAvatars(await api.listAvatars());
     setIngredients(await api.listIngredients());
     setLoaded(true);
@@ -124,18 +142,21 @@ function Dashboard() {
       {providerStatus && (
         <div className="card p-4 mb-8">
           <div className="flex flex-wrap items-center gap-3 text-sm">
-            {Object.entries(providerStatus)
-              // `models` (active model per kind) is an object, not a status
-              // flag; it's shown in full in Settings → Models.
-              .filter(([, v]) => typeof v !== "object" || v === null)
-              .map(([k, v]) => (
-                <span key={k} className="chip">
-                  <span className="text-ink-300">{k}:</span>
-                  <span className={v === "mock" || v === true ? "text-ink-200" : "text-accent"}>
-                    {String(v)}
-                  </span>
+            {(() => {
+              const sum = providerSummary(providerStatus);
+              return (
+                <span className="flex items-center gap-2 text-ink-200">
+                  <span
+                    aria-hidden
+                    className={`w-2 h-2 rounded-full ${sum.live ? "bg-emerald-400" : "bg-amber-400"}`}
+                  />
+                  {sum.text}
                 </span>
-              ))}
+              );
+            })()}
+            <Link href="/settings#models" className="text-xs text-ink-400 hover:text-ink-100">
+              Models &amp; keys →
+            </Link>
             <button
               className="btn-ghost text-xs ml-auto"
               disabled={healthBusy}
@@ -243,7 +264,7 @@ function Dashboard() {
               const rid = thumbnails[p.id];
               return (
                 <Link
-                  href={`/projects/${p.id}`}
+                  href={p.mode === "ambient_loop" ? `/ambient/${p.id}` : `/projects/${p.id}`}
                   key={p.id}
                   className="card overflow-hidden card-hover flex flex-col"
                 >
@@ -256,14 +277,19 @@ function Dashboard() {
                       />
                     ) : (
                       <div className="w-full h-full flex items-center justify-center text-ink-300 text-xs">
-                        no render yet
+                        No video yet
                       </div>
                     )}
                   </div>
                   <div className="p-4">
                     <div className="text-sm font-medium">{p.title || "Untitled"}</div>
                     <div className="text-xs text-ink-300 mt-1">
-                      {p.mode} · {p.target_duration_seconds}s
+                      {p.mode === "ambient_loop" ? (
+                        <span className="text-iris-soft">∿ Ambient scene</span>
+                      ) : (
+                        modeLabel(p.mode)
+                      )}{" "}
+                      · {formatDuration(p.target_duration_seconds)}
                     </div>
                     <StatusBadge status={p.status} className="mt-3" />
                   </div>
