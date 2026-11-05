@@ -108,6 +108,9 @@ class Settings(BaseSettings):
     # music_v2_5 = current Eleven Music model (music_v1, the API default, is
     # deprecated and removed 2027-01-31).
     elevenlabs_music_model_id: str = "music_v2_5"
+    # Sound effects (ambient nature-sound beds). v2 is deprecated (removed
+    # 2027-03-01), so the model is always sent explicitly.
+    elevenlabs_sound_model_id: str = "eleven_text_to_sound_v3"
     elevenlabs_base_url: str = "https://api.elevenlabs.io/v1"
 
     # S3-backed object storage (optional, for production deploys). When
@@ -140,6 +143,8 @@ class Settings(BaseSettings):
     cost_video_per_second: float = 0.10
     cost_tts_per_1k_chars: float = 0.20
     cost_music_per_generation: float = 0.05
+    # One 30 s looping sound effect (ElevenLabs bills ~40 credits/s).
+    cost_sound_per_generation: float = 0.10
     # Spend ledger defaults (Settings → Spend overrides them at runtime).
     # 0 = no monthly cap. hard_stop: refuse new paid generations (HTTP 402)
     # once the month's spend reaches the cap; otherwise only alert.

@@ -11,6 +11,7 @@ const KIND_LABEL: Record<string, string> = {
   image: "Images",
   tts: "Voice",
   music: "Music",
+  sound: "Nature sound",
   training: "Training",
 };
 

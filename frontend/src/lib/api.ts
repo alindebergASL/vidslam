@@ -288,6 +288,7 @@ export type CustomModel = {
 // --- Ambient (hour-long seamless-loop scenes) ---
 
 export type AmbientSource = "video" | "image_drift";
+export type AmbientLook = "photoreal" | "cinematic" | "painterly" | "watercolor" | "anime" | "claymation" | "dreamy";
 
 export type AmbientConfig = {
   scene_preset: string;
@@ -305,6 +306,13 @@ export type AmbientConfig = {
   chain_segments: boolean;
   music_bed_seconds: number;
   output_resolution: "1080p" | "4k";
+  look: AmbientLook;
+  look_strength: number;
+  time_of_day: string;
+  weather: string;
+  sound: string; // "none" | "auto" | sound preset id
+  sound_prompt: string;
+  sound_volume: number;
 };
 
 export type ScenePreset = {
@@ -319,10 +327,15 @@ export type ScenePreset = {
 };
 
 export type MusicMood = { id: string; label: string; prompt: string };
+export type AmbientOption = { id: string; label: string };
 
 export type AmbientPresets = {
   scenes: ScenePreset[];
   music_moods: MusicMood[];
+  sounds?: MusicMood[];
+  looks?: AmbientOption[];
+  times_of_day?: AmbientOption[];
+  weathers?: AmbientOption[];
   loop_options: number[];
   total_options: number[];
   aspect_options: string[];
@@ -339,6 +352,7 @@ export type AmbientScene = {
   loop_error: string;
   loop_shot: Shot | null;
   music_ready: boolean;
+  sound_ready?: boolean;
   repeats: number;
   plan: LoopPlan;
   latest_render: Render | null;
@@ -363,6 +377,13 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   chain_segments: true,
   music_bed_seconds: 0,
   output_resolution: "1080p",
+  look: "photoreal",
+  look_strength: 0.6,
+  time_of_day: "any",
+  weather: "any",
+  sound: "none",
+  sound_prompt: "",
+  sound_volume: 0.6,
 };
 
 export type PublishMeta = {
@@ -530,6 +551,9 @@ export const api = {
     ),
   regenerateAmbientMusic: (id: number) =>
     req<AmbientScene>(`/api/ambient/${id}/music`, { method: "POST" }),
+  regenerateAmbientSound: (id: number) =>
+    req<AmbientScene>(`/api/ambient/${id}/sound`, { method: "POST" }),
+  ambientSoundUrl: (id: number, v?: string) => `${API_BASE}/api/ambient/${id}/sound${v ? `?v=${encodeURIComponent(v)}` : ""}`,
   generatePresetPreviews: (missingOnly = true) =>
     req<{ presets: string[]; job_id: string | null; status: string }>(
       `/api/ambient/presets/previews?missing_only=${missingOnly}`,

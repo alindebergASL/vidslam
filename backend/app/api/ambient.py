@@ -187,6 +187,28 @@ def regenerate_music(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut
     return svc.to_out(db, project)
 
 
+@router.post("/{scene_id}/sound", dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
+def regenerate_sound(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
+    """(Re)generate the scene's nature-sound bed (one 30 s seamless loop)."""
+    project = _get_scene(db, scene_id)
+    cfg = svc._config_of(project)
+    if not svc.resolve_sound_prompt(cfg):
+        raise HTTPException(409, "nature sound is off for this scene")
+    svc.generate_sound_bed(db, project, cfg)
+    db.refresh(project)
+    return svc.to_out(db, project)
+
+
+@router.get("/{scene_id}/sound")
+def sound_file(scene_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    """Preview the nature-sound bed."""
+    project = _get_scene(db, scene_id)
+    path = svc.sound_path(project)
+    if not path.exists():
+        raise HTTPException(404, "no nature sound yet")
+    return FileResponse(path, media_type="audio/mpeg")
+
+
 @router.post("/{scene_id}/render", status_code=202,
              dependencies=[Depends(rate_limit("generation"))])
 def render_scene(scene_id: int, db: Session = Depends(get_db)) -> dict:

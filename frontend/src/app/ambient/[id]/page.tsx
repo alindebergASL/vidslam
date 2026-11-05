@@ -9,6 +9,7 @@ import { PublishPanel } from "@/components/PublishPanel";
 import { useToast } from "@/components/Toaster";
 import {
   ChipRow,
+  LookControls,
   MUSIC_LENGTHS,
   PlanSummary,
   previewSrc,
@@ -16,6 +17,7 @@ import {
   fmtDuration,
   presetFor,
   sceneStatusLabel,
+  SoundControls,
   statusTone,
 } from "@/components/ambient/shared";
 import { api, AmbientConfig, AmbientPresets, AmbientScene } from "@/lib/api";
@@ -397,6 +399,43 @@ function Inner() {
             )}
           </section>
 
+          {/* ---- 2b. Nature sound ---- */}
+          {scene.config.sound !== "none" && (
+            <section className="card p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-base font-medium">Nature sound</h2>
+                  <div className="text-xs text-ink-400 mt-0.5">
+                    {(scene.config.sound === "auto"
+                      ? "Matches the scene"
+                      : presets?.sounds?.find((x) => x.id === scene.config.sound)?.label ?? "Custom")}
+                    {` · ${Math.round(scene.config.sound_volume * 100)}% · 30 s seamless loop`}
+                    {scene.config.music_mood === "none" ? " · no music" : " · under the music"}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="btn-ghost text-sm"
+                  disabled={inFlight || busy !== null}
+                  onClick={() => run("sound", () => api.regenerateAmbientSound(id), "Nature sound regenerated")}
+                >
+                  {busy === "sound" ? "Generating…" : scene.sound_ready ? "Regenerate sound" : "Generate sound"}
+                </button>
+              </div>
+              {scene.sound_ready && (
+                <audio
+                  key={`s-${cacheBust}`}
+                  controls
+                  loop
+                  preload="none"
+                  src={api.ambientSoundUrl(id, String(cacheBust))}
+                  className="w-full mt-3"
+                  aria-label="Nature sound preview"
+                />
+              )}
+            </section>
+          )}
+
           {/* ---- 3. Render CTA (when nothing rendered yet) ---- */}
           {!render && (
             <section className="card p-5 flex flex-wrap items-center justify-between gap-4">
@@ -572,7 +611,11 @@ function SettingsPanel({
     cfg.source !== scene.config.source ||
     cfg.loop_seconds !== scene.config.loop_seconds ||
     cfg.model_override !== scene.config.model_override ||
-    cfg.chain_segments !== scene.config.chain_segments;
+    cfg.chain_segments !== scene.config.chain_segments ||
+    cfg.look !== scene.config.look ||
+    cfg.look_strength !== scene.config.look_strength ||
+    cfg.time_of_day !== scene.config.time_of_day ||
+    cfg.weather !== scene.config.weather;
   const preset = presetFor(presets?.scenes ?? null, cfg.scene_preset);
 
   return (
@@ -585,6 +628,8 @@ function SettingsPanel({
           </span>
         )}
       </div>
+
+      <LookControls cfg={cfg} set={set} presets={presets} idPrefix="set-look" />
 
       <div>
         <div className="label">Total length</div>
@@ -626,6 +671,11 @@ function SettingsPanel({
           </>
         )}
       </div>
+
+      <SoundControls cfg={cfg} set={set} presets={presets} idPrefix="set-sound" />
+      {cfg.sound !== scene.config.sound && (
+        <p className="text-[11px] text-ink-400 -mt-2">Save, then Generate sound to apply.</p>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         <div>

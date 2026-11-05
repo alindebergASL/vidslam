@@ -25,6 +25,10 @@ LOOP_OPTIONS = (10, 25, 30, 60)
 TOTAL_OPTIONS = (600, 1800, 3600, 7200, 10800)
 
 SceneSource = Literal["video", "image_drift"]
+# How the scene is rendered: photoreal (default) through fully stylized.
+Look = Literal["photoreal", "cinematic", "painterly", "watercolor", "anime", "claymation", "dreamy"]
+TimeOfDay = Literal["any", "dawn", "golden_hour", "midday", "dusk", "night"]
+Weather = Literal["any", "clear", "light_rain", "heavy_rain", "snow", "fog"]
 
 
 class AmbientConfig(BaseModel):
@@ -64,8 +68,21 @@ class AmbientConfig(BaseModel):
     # 4k = Lanczos upscale of the loop unit before tiling (no AI): free, and
     # YouTube streams 4K uploads at a higher bitrate even when viewed at 1080p.
     output_resolution: Literal["1080p", "4k"] = "1080p"
+    # Look: art style of the scene, and how strongly it applies (0 = a hint,
+    # 1 = fully stylized). Ignored for photoreal.
+    look: Look = "photoreal"
+    look_strength: float = Field(default=0.6, ge=0.0, le=1.0)
+    # Light and weather layered on top of the preset/prompt; "any" = as written.
+    time_of_day: TimeOfDay = "any"
+    weather: Weather = "any"
+    # Nature-sound bed, mixed separately from (or instead of) music:
+    # "none", "auto" (matches the scene/weather) or an id from SOUND_PRESETS.
+    sound: str = "none"
+    sound_prompt: str = Field(default="", max_length=500)
+    sound_volume: float = Field(default=0.6, ge=0.0, le=1.0)
 
-    @field_validator("scene_prompt", "music_prompt", "scene_preset", "music_mood", "model_override")
+    @field_validator("scene_prompt", "music_prompt", "scene_preset", "music_mood", "model_override",
+                     "sound", "sound_prompt")
     @classmethod
     def _strip(cls, v: str) -> str:
         return (v or "").strip()
@@ -116,9 +133,24 @@ class MusicMoodOut(BaseModel):
     prompt: str
 
 
+class OptionOut(BaseModel):
+    id: str
+    label: str
+
+
+class SoundPresetOut(BaseModel):
+    id: str
+    label: str
+    prompt: str
+
+
 class AmbientPresetsOut(BaseModel):
     scenes: list[ScenePresetOut]
     music_moods: list[MusicMoodOut]
+    sounds: list[SoundPresetOut] = Field(default_factory=list)
+    looks: list[OptionOut] = Field(default_factory=list)
+    times_of_day: list[OptionOut] = Field(default_factory=list)
+    weathers: list[OptionOut] = Field(default_factory=list)
     loop_options: list[int]
     total_options: list[int]
     aspect_options: list[str]
@@ -165,6 +197,8 @@ class AmbientOut(BaseModel):
     loop_shot: Optional[ShotOut] = None
     # True once a music bed exists on disk (generated or uploaded).
     music_ready: bool
+    # True once a nature-sound bed exists (config.sound != "none").
+    sound_ready: bool = False
     # How many times the loop unit tiles into the total output.
     repeats: int
     plan: LoopPlanOut

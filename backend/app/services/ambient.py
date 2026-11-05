@@ -32,7 +32,9 @@ from ..schemas.ambient import (
     AmbientUpdate,
     LoopPlanOut,
     MusicMoodOut,
+    OptionOut,
     ScenePresetOut,
+    SoundPresetOut,
 )
 from ..schemas.api import RenderOut, ShotOut
 from . import alerts, render_files, storage
@@ -58,8 +60,8 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,64}")
 # Prompt suffix that pushes video models toward loopable, low-motion footage.
 _LOOP_DIRECTIVES = (
     " Locked-off static camera, no camera movement, no cuts, no people, no text. "
-    "Very slow, gentle, continuous motion only. Consistent lighting from first "
-    "frame to last so the clip loops seamlessly. Cinematic, high detail, serene."
+    "Very slow, gentle, continuous motion only. Consistent lighting and style from "
+    "first frame to last so the clip loops seamlessly. High detail, serene."
 )
 
 SCENE_PRESETS: list[ScenePresetOut] = [
@@ -156,6 +158,111 @@ MUSIC_MOODS: list[MusicMoodOut] = [
     MusicMoodOut(id="none", label="No music", prompt=""),
 ]
 
+# ---------- look, light, weather, sound ----------
+
+# Look → the style phrase sent to the image/video model. Photoreal is the
+# default and ignores strength.
+LOOKS: dict[str, tuple[str, str]] = {
+    "photoreal": ("Photoreal", "photorealistic, natural light, highly detailed"),
+    "cinematic": ("Cinematic film", "cinematic film still, rich color grade, shallow depth of field, "
+                                    "subtle 35mm film grain"),
+    "painterly": ("Painterly", "oil painting, visible brush strokes, impressionist palette"),
+    "watercolor": ("Watercolor", "watercolor illustration, soft washes, paper texture"),
+    "anime": ("Hand-drawn anime", "hand-drawn anime background art, painted clouds, soft cel shading"),
+    "claymation": ("Claymation", "stop-motion claymation miniature diorama, handcrafted clay textures"),
+    "dreamy": ("Dreamy", "dreamy and ethereal, soft focus, gentle glow, pastel haze"),
+}
+TIMES_OF_DAY: dict[str, tuple[str, str]] = {
+    "any": ("As written", ""),
+    "dawn": ("Dawn", "at dawn, soft pink early light"),
+    "golden_hour": ("Golden hour", "at golden hour, warm low sunlight, long soft shadows"),
+    "midday": ("Midday", "in bright, even midday light"),
+    "dusk": ("Dusk", "at dusk, blue-hour twilight"),
+    "night": ("Night", "at night, moonlight and deep blue shadows"),
+}
+WEATHERS: dict[str, tuple[str, str]] = {
+    "any": ("As written", ""),
+    "clear": ("Clear", "clear sky"),
+    "light_rain": ("Light rain", "light, gentle rain falling"),
+    "heavy_rain": ("Heavy rain", "heavy, steady rain falling"),
+    "snow": ("Snow", "soft snow falling"),
+    "fog": ("Fog", "drifting fog and mist"),
+}
+
+SOUND_PRESETS: list[SoundPresetOut] = [
+    SoundPresetOut(id="rain", label="Rain", prompt="steady gentle rain on leaves and ground, close and calm, no thunder"),
+    SoundPresetOut(id="thunderstorm", label="Thunderstorm",
+                   prompt="heavy rain with distant rolling thunder, calm and enveloping"),
+    SoundPresetOut(id="fireplace", label="Crackling fire", prompt="crackling fireplace, soft pops and embers, cozy"),
+    SoundPresetOut(id="ocean", label="Ocean waves", prompt="slow ocean waves washing onto a sandy shore"),
+    SoundPresetOut(id="stream", label="Flowing stream", prompt="gentle forest stream flowing over smooth stones"),
+    SoundPresetOut(id="waterfall", label="Waterfall", prompt="distant waterfall, steady rushing water, soft and even"),
+    SoundPresetOut(id="forest", label="Forest birds",
+                   prompt="quiet forest ambience with soft birdsong and light breeze in the leaves"),
+    SoundPresetOut(id="night", label="Night crickets", prompt="calm summer night, crickets and soft distant frogs"),
+    SoundPresetOut(id="wind", label="Soft wind", prompt="soft winter wind, gentle and even, no gusts"),
+]
+_SOUND_BY_ID = {p.id: p for p in SOUND_PRESETS}
+# "auto": weather wins (rain on screen should sound like rain), then the scene.
+_AUTO_SOUND_BY_WEATHER = {"light_rain": "rain", "heavy_rain": "thunderstorm", "snow": "wind"}
+_AUTO_SOUND_BY_SCENE = {
+    "waterfall": "waterfall", "fireplace": "fireplace", "ocean": "ocean", "rainforest": "rain",
+    "snowfall": "wind", "zen_garden": "stream", "night_sky": "night", "lavender": "forest",
+    "candles": "fireplace",
+}
+
+
+def style_phrase(cfg: AmbientConfig) -> str:
+    """Look + light + weather, as one phrase for image and video prompts."""
+    name, phrase = LOOKS.get(cfg.look, LOOKS["photoreal"])
+    if cfg.look == "photoreal":
+        look = phrase
+    elif cfg.look_strength < 0.34:
+        look = f"mostly realistic with a subtle {name.lower()} touch ({phrase})"
+    elif cfg.look_strength <= 0.67:
+        look = f"in a {name.lower()} style: {phrase}"
+    else:
+        look = f"fully stylized, {phrase}, strongly {name.lower()}"
+    extras = [TIMES_OF_DAY.get(cfg.time_of_day, ("", ""))[1], WEATHERS.get(cfg.weather, ("", ""))[1]]
+    return ", ".join([x for x in extras if x] + [look])
+
+
+def resolve_sound_prompt(cfg: AmbientConfig) -> str:
+    """'' = no sound bed. A custom sound_prompt wins over the preset."""
+    if cfg.sound == "none":
+        return ""
+    if cfg.sound_prompt.strip():
+        return cfg.sound_prompt.strip()
+    sid = cfg.sound
+    if sid == "auto":
+        sid = _AUTO_SOUND_BY_WEATHER.get(cfg.weather) or _AUTO_SOUND_BY_SCENE.get(cfg.scene_preset, "")
+    preset = _SOUND_BY_ID.get(sid)
+    return (preset.prompt + ", seamless loop, no music, no voices") if preset else ""
+
+
+def sound_path(project: models.VideoProject) -> Path:
+    return storage.render_subdir(project.id) / "sound.mp3"
+
+
+def generate_sound_bed(db: Session, project: models.VideoProject, cfg: AmbientConfig) -> Optional[Path]:
+    """One 30 s looping clip; the renderer loops it (with a crossfaded seam)
+    under the music for the full length."""
+    from ..providers.registry import get_sound
+    from .pipeline import _log_provider_call
+
+    prompt = resolve_sound_prompt(cfg)
+    out = sound_path(project)
+    if not prompt:
+        out.unlink(missing_ok=True)
+        return None
+    sound = get_sound()
+    data = sound.generate(prompt=prompt, duration_seconds=30)
+    out.write_bytes(data)
+    _log_provider_call(db, project_id=project.id, provider=type(sound).__name__, endpoint="sound.generate",
+                       request_summary={"sound": cfg.sound, "prompt": prompt[:120]},
+                       response_summary={"bytes": len(data)})
+    return out
+
 _PRESET_BY_ID = {p.id: p for p in SCENE_PRESETS}
 _MOOD_BY_ID = {m.id: m for m in MUSIC_MOODS}
 
@@ -197,6 +304,10 @@ def presets() -> AmbientPresetsOut:
     return AmbientPresetsOut(
         scenes=scenes,
         music_moods=MUSIC_MOODS,
+        sounds=SOUND_PRESETS,
+        looks=[OptionOut(id=k, label=v[0]) for k, v in LOOKS.items()],
+        times_of_day=[OptionOut(id=k, label=v[0]) for k, v in TIMES_OF_DAY.items()],
+        weathers=[OptionOut(id=k, label=v[0]) for k, v in WEATHERS.items()],
         loop_options=list(LOOP_OPTIONS),
         total_options=list(TOTAL_OPTIONS),
         aspect_options=["16:9", "9:16", "1:1"],
@@ -216,9 +327,10 @@ def resolve_scene_prompt(cfg: AmbientConfig) -> str:
         base = preset.prompt if preset else ""
     if not base:
         raise ValueError("scene_prompt is empty and the preset has no default prompt")
+    style = style_phrase(cfg)
     if cfg.source == "image_drift":
-        return base + " Wide establishing shot, no people, no text, photorealistic, highly detailed."
-    return base + _LOOP_DIRECTIVES
+        return f"{base} Wide establishing shot, {style}. No people, no text."
+    return f"{base} Rendered {style}." + _LOOP_DIRECTIVES
 
 
 def resolve_music_prompt(cfg: AmbientConfig) -> str:
@@ -435,6 +547,13 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
             "unit_cost": s.cost_music_per_generation,
             "cost": round(s.cost_music_per_generation * len(parts), 4),
         })
+    if resolve_sound_prompt(cfg):
+        lines.append({
+            "item": "Nature sound (30 s seamless loop)",
+            "qty": 1, "unit": "sound",
+            "unit_cost": s.cost_sound_per_generation,
+            "cost": round(s.cost_sound_per_generation, 4),
+        })
     lines.append({
         "item": f"Loop × {plan.repeats} → {_fmt_duration(cfg.total_seconds)} (FFmpeg stream copy)",
         "qty": plan.repeats, "unit": "repeat",
@@ -519,6 +638,7 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         loop_error=(shot.error if shot else ""),
         loop_shot=ShotOut.model_validate(shot) if shot else None,
         music_ready=bool(music and music.exists()),
+        sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         repeats=plan.repeats,
         plan=plan,
         latest_render=RenderOut.model_validate(latest) if latest else None,
@@ -599,7 +719,8 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
         # flip it back to pending so the UI asks for a regenerate. Pure
         # compositing knobs (crossfade, fade, volume, total) keep it.
         clip_keys = ("scene_preset", "scene_prompt", "source", "loop_seconds",
-                     "model_override", "chain_segments")
+                     "model_override", "chain_segments", "look", "look_strength",
+                     "time_of_day", "weather")
         if any(getattr(old, k) != getattr(cfg, k) for k in clip_keys) and shot.clip_path:
             shot.status = "pending"
             shot.clip_path = ""
@@ -690,7 +811,7 @@ def _start_video_chain(
         img_model = _resolve_model(db, _active_model("image"))
         preset = _PRESET_BY_ID.get(cfg.scene_preset)
         still_prompt = (cfg.scene_prompt.strip() or (preset.prompt if preset else "")) + \
-            " Wide establishing shot, no people, no text, photorealistic, highly detailed."
+            f" Wide establishing shot, {style_phrase(cfg)}. No people, no text."
         png = image.generate(model=img_model, prompt=still_prompt, references=[])
         anchor = frames_dir / "anchor.png"
         anchor.write_bytes(png)
@@ -814,6 +935,9 @@ def _finalize_generation(
         elif project.music_upload_path:
             Path(project.music_upload_path).unlink(missing_ok=True)
             project.music_upload_path = ""
+    # Nature sound: same rule as music.
+    if regenerate_music or (cfg.sound != "none" and not sound_path(project).exists()):
+        generate_sound_bed(db, project, cfg)
     project.status = "planned"
     db.commit()
     if render_after:
@@ -935,6 +1059,8 @@ def render_scene(db: Session, project_id: int) -> models.Render:
                 fade_seconds=cfg.fade_seconds,
                 music_path=_music_path_if_any(project) if cfg.music_mood != "none" else None,
                 music_volume=float(cfg.music_volume),
+                sound_path=(sound_path(project) if cfg.sound != "none" and sound_path(project).exists() else None),
+                sound_volume=float(cfg.sound_volume),
                 clip_is_periodic=(cfg.source == "image_drift"),
                 resolution=cfg.output_resolution,
             )

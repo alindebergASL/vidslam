@@ -73,6 +73,20 @@ Every bed (45–90s, or a couple of minutes with Lyria) is crossfaded into a
 seamless loop under the scene. Prompt presets: spa, zen, soft piano,
 singing bowls, rain, acoustic.
 
+## Nature sound
+
+A second audio bed (rain, thunderstorm, crackling fire, ocean waves,
+stream, waterfall, forest birds, night crickets, soft wind), mixed under the
+music at its own volume, or on its own with music set to "No music".
+"Match the scene" picks one from the weather, then the scene preset.
+
+| Provider | Status in this app | Notes |
+| --- | --- | --- |
+| **ElevenLabs Sound Effects** | ✅ wired (`ELEVENLABS_API_KEY`) | `POST /v1/sound-generation`, one 30 s clip with `loop: true`. Model pinned to `eleven_text_to_sound_v3`, because the API's default (`…_v2`) is deprecated and removed 2027-03-01. About 40 credits/s; the app logs `COST_SOUND_PER_GENERATION` (default $0.10) as a rate-card estimate. |
+| Demo mode | placeholder | Filtered brown noise, so the full audio path renders without an API call. |
+
+The clip is crossfaded into a seamless loop at render, like the music bed.
+
 ### ElevenLabs Music licensing (for ambient channels)
 
 From ElevenLabs' Music Terms (Exhibit A, updated 9 Oct 2026). Check the
