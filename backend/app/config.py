@@ -142,6 +142,9 @@ class Settings(BaseSettings):
     cost_image_per_item: float = 0.04
     # Live average: Wan ~$1.05 per 7 s clip ≈ $0.15/s (first EC2 deploy).
     cost_video_per_second: float = 0.15
+    # Lip-sync (talking-head) clips, billed on the speech they're given.
+    # Live: HeyGen Avatar IV ~$0.23 for a 4.6 s clip ≈ $0.05/s.
+    cost_avatar_per_second: float = 0.05
     cost_tts_per_1k_chars: float = 0.20
     cost_music_per_generation: float = 0.05
     # One 30 s looping sound effect (ElevenLabs bills ~40 credits/s).

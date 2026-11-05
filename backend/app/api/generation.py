@@ -107,17 +107,12 @@ def cost_estimate(project_id: int, db: Session = Depends(get_db)) -> dict:
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
     from ..schemas.storyboard import StoryboardPlan
-    from ..services.cost import estimate_plan_cost
+    from ..services.cost import estimate_for_project
 
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
-    project_dict = {
-        "voiceover_source": project.voiceover_source,
-        # If the project already has uploaded music, no generation cost; otherwise
-        # we can't know intent here, so treat music as already-handled (0) for the
-        # estimate. The Studio/AudioPanel surfaces music-gen cost separately.
-        "music_will_generate": False,
-    }
-    return estimate_plan_cost(project_dict, plan)
+    # Music generation isn't priced here (we can't know intent); the
+    # Studio/AudioPanel surfaces its cost separately.
+    return estimate_for_project(db, project, plan)
 
 
 @router.post("/projects/{project_id}/generate-video", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])

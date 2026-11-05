@@ -142,19 +142,19 @@ def public_url_for_token(token: str) -> str:
     return f"{settings.public_base_url.rstrip('/')}/api/public-assets/{token}"
 
 
-def repair_image_types(db) -> int:
+def repair_image_types(db) -> tuple[int, int]:
     """Correct assets whose recorded type doesn't match the file's contents.
 
     Images saved before types were read from the bytes can be JPEG data
     recorded (and served) as image/png; HeyGen rejects those with "Content
     type not match". Only the header of each file is read. The file name is
     left alone: it's referenced elsewhere, and the served type comes from
-    the record. Returns how many assets were fixed."""
+    the record. Returns (types corrected, sizes filled in)."""
     from sqlalchemy import or_
 
     from .. import models
 
-    fixed = 0
+    types_fixed = sizes_filled = 0
     q = db.query(models.Asset).filter(or_(models.Asset.mime_type.like("image/%"),
                                           models.Asset.mime_type.in_(("", "application/octet-stream"))))
     for asset in q:
@@ -169,14 +169,12 @@ def repair_image_types(db) -> int:
         types = _FORMAT_TYPES.get(fmt or "")
         if types is None:
             continue
-        changed = False
         if asset.mime_type != types[1]:
             asset.mime_type = types[1]
-            changed = True
+            types_fixed += 1
         if not asset.width or not asset.height:
             asset.width, asset.height = size
-            changed = True
-        fixed += changed
-    if fixed:
+            sizes_filled += 1
+    if types_fixed or sizes_filled:
         db.commit()
-    return fixed
+    return types_fixed, sizes_filled

@@ -94,9 +94,11 @@ def _repair_image_types() -> None:
 
     db = SessionLocal()
     try:
-        fixed = storage.repair_image_types(db)
-        if fixed:
-            log.warning("corrected the image type of %d asset(s) to match their files", fixed)
+        types_fixed, sizes_filled = storage.repair_image_types(db)
+        if types_fixed:
+            log.warning("corrected the image type of %d asset(s) to match their files", types_fixed)
+        if sizes_filled:
+            log.info("recorded the missing size of %d image asset(s)", sizes_filled)
     except Exception as e:  # noqa: BLE001
         log.warning("image type check skipped: %s", e)
     finally:
