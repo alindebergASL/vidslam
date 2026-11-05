@@ -322,6 +322,15 @@ function TileCard({
           >
             New Project →
           </button>
+          {tile.imageUrl && (
+            <a
+              href={`/ambient/new?studio_job=${tile.jobId}`}
+              className="chip text-xs py-1 bg-ink-900/85 border-ink-700"
+              title="Make an hour-long ambient scene from this image"
+            >
+              Ambient scene →
+            </a>
+          )}
         </div>
       )}
 
