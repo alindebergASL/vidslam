@@ -539,11 +539,17 @@ def submit_talking_head(
     dur = float(shot.duration_seconds or 5.0)
     body = [s for s in project.shots if s.shot_type != "end_card"]
     audio_url = None
+    speech = dur
     if audio_path and Path(audio_path).exists():
         # Each talking-head shot speaks only its own part of the voiceover,
         # so lips, captions and the voice track stay aligned.
         seg = slice_audio(Path(audio_path), out_dir / f"voice_shot_{shot.id}.m4a", start=start, duration=dur)
         audio_url = public_media.publish(seg, "m4a")
+        # The clip comes back as long as this audio, which is shorter than
+        # the shot when the voiceover ends first: that's what is billed.
+        from .renderer import _probe_duration
+
+        speech = min(dur, _probe_duration(seg) or dur)
     script = (plan.cleaned_voice_script if len(body) == 1 else "") or shot.caption_text \
         or plan.cleaned_voice_script or shot.prompt
     shot.status = "submitted"
@@ -562,7 +568,8 @@ def submit_talking_head(
 
     try:
         video_jobs.submit(db, purpose="avatar", ref_id=shot.id, project_id=project.id, render_id=render_id,
-                          context={"after": after, "duration": dur}, start=start_fn)
+                          context={"after": after, "duration": dur, "speech_seconds": round(speech, 2)},
+                          start=start_fn)
     except Exception as e:  # noqa: BLE001 — submit failed: use the video model
         log.warning("talking-head submit failed for shot %s, falling back: %s", shot.id, e)
         db.rollback()
@@ -720,12 +727,9 @@ def render_project(db: Session, project_id: int) -> models.Render:
         raise ValueError("project has no storyboard plan yet")
 
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
-    from .cost import estimate_plan_cost
+    from .cost import estimate_for_project
 
-    estimate = estimate_plan_cost(
-        {"voiceover_source": project.voiceover_source, "music_will_generate": False},
-        plan,
-    )
+    estimate = estimate_for_project(db, project, plan)
     render = models.Render(
         project_id=project.id,
         status="generating_audio",

@@ -157,9 +157,16 @@ def record_video_job(db: Session, job: models.VideoJob) -> None:
                project_id=job.project_id, render_id=job.render_id, ref=ref,
                generation_id=job.provider_job_id, db=db)
         return
-    secs = float((job.context_json or {}).get("duration") or 5.0)
+    ctx = job.context_json or {}
+    s = get_settings()
+    if kind == "avatar":
+        # Lip-sync bills the speech it was given, at its own rate.
+        secs = float(ctx.get("speech_seconds") or ctx.get("duration") or 5.0)
+        rate = s.cost_avatar_per_second
+    else:
+        secs, rate = float(ctx.get("duration") or 5.0), s.cost_video_per_second
     record(provider=job.provider, kind=kind, model=job.model,
-           cost=secs * get_settings().cost_video_per_second, is_estimate=True, source="rate_card",
+           cost=secs * rate, is_estimate=True, source="rate_card",
            project_id=job.project_id, render_id=job.render_id, ref=ref,
            note="provider reported no cost", db=db)
 

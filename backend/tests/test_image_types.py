@@ -77,10 +77,10 @@ def test_repair_fixes_old_records_once(auth_client, tmp_path):
         db.add(models.Asset(owner_kind="avatar", avatar_id=aid, file_path=str(tmp_path / "gone.png"),
                             mime_type="image/png"))
         db.commit()
-        assert storage.repair_image_types(db) == 1
+        assert storage.repair_image_types(db) == (1, 1)  # type and size
         row = db.get(models.Asset, bad)
         assert (row.mime_type, row.width, row.height) == ("image/jpeg", 96, 64)
-        assert storage.repair_image_types(db) == 0  # already right: nothing to do
+        assert storage.repair_image_types(db) == (0, 0)  # already right: nothing to do
         others = {a.mime_type for a in db.query(models.Asset).filter(models.Asset.id != bad)}
         assert others == {"audio/mpeg", "image/png"}  # non-image and missing file untouched
     finally:
