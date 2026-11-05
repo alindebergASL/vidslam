@@ -56,6 +56,7 @@ def generate_clip(body: StudioRequest, db: Session = Depends(get_db)) -> models.
         owner_kind=body.owner_kind,
         owner_id=body.owner_id,
         output_kind="video_clip",
+        duration_seconds=body.duration_seconds,
         prompt=body.prompt,
         negative_prompt=body.negative_prompt,
         reference_asset_ids_json=body.reference_asset_ids,

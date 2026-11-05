@@ -358,6 +358,7 @@ function PromptBar({
   const [imageModels, setImageModels] = useState<{ id: string; name: string }[]>([]);
   const [videoModels, setVideoModels] = useState<{ id: string; name: string }[]>([]);
   const [model, setModel] = useState<string>("");
+  const [clipSeconds, setClipSeconds] = useState<number>(5);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadOwner, setUploadOwner] = useState<string>("");
 
@@ -440,6 +441,7 @@ function PromptBar({
         prompt,
         reference_asset_ids: selectedRefs,
         ...(model ? { model } : {}),
+        ...(outputKind === "video_clip" ? { duration_seconds: clipSeconds } : {}),
       };
       const job =
         outputKind === "image"
@@ -538,8 +540,23 @@ function PromptBar({
             className="chip text-xs"
             title="Toggle output kind"
           >
-            {outputKind === "image" ? "Image" : "Video · 5s"}
+            {outputKind === "image" ? "Image" : "Video"}
           </button>
+          {outputKind === "video_clip" && (
+            <select
+              value={clipSeconds}
+              onChange={(e) => setClipSeconds(Number(e.target.value))}
+              className="chip text-xs bg-ink-800"
+              title="Clip length (the model snaps it to the nearest length it supports)"
+              aria-label="Clip length"
+            >
+              {[5, 8, 10, 15, 20, 30].map((n) => (
+                <option key={n} value={n}>
+                  {n}s
+                </option>
+              ))}
+            </select>
+          )}
           {currentModels.length > 0 && (
             <select
               value={model}

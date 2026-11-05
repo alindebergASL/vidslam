@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -9,6 +11,8 @@ import httpx
 from ..config import get_settings
 from ..schemas.storyboard import StoryboardPlan
 from .base import CastContext, ChatProvider
+
+log = logging.getLogger("avs.openrouter.chat")
 
 
 def _load_system_prompt() -> str:
@@ -98,6 +102,10 @@ class OpenRouterChatProvider(ChatProvider):
             }})
         if self.json_mode:
             formats.append({"type": "json_object"})
+        # Skip formats this model rejected recently: OpenRouter can take
+        # minutes to say "Schema is too complex", on every single plan.
+        rejected_before = _rejected_formats(self.model)
+        formats = [f for f in formats if f is None or f["type"] not in rejected_before]
         formats.append(None)
         url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
         with httpx.Client(timeout=180.0) as client:
@@ -113,6 +121,7 @@ class OpenRouterChatProvider(ChatProvider):
                 rejected = r.status_code == 400 or (err is not None and err.get("code") == 400)
                 # A route that rejects this format → try the next, simpler one.
                 if rejected and fmt is not None and i < len(formats) - 1:
+                    _remember_rejection(self.model, fmt["type"])
                     continue
                 break
             r.raise_for_status()
@@ -132,6 +141,40 @@ class OpenRouterChatProvider(ChatProvider):
         if isinstance(content, list):  # content-parts shape
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
         return StoryboardPlan.model_validate(extract_json(content))
+
+
+_REJECTIONS_KEY = "chat.rejected_formats"
+REJECTION_TTL = timedelta(days=7)  # models gain support over time: re-try weekly
+
+
+def _rejected_formats(model: str) -> set[str]:
+    """response_format types this model rejected within REJECTION_TTL."""
+    from ..services.model_registry import get_setting
+
+    try:
+        seen = (get_setting(_REJECTIONS_KEY) or {}).get(model) or {}
+    except Exception:  # noqa: BLE001 — a memo, never a reason to fail a plan
+        return set()
+    now = datetime.now(timezone.utc)
+    out = set()
+    for fmt, at in seen.items():
+        try:
+            if now - datetime.fromisoformat(at) < REJECTION_TTL:
+                out.add(fmt)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _remember_rejection(model: str, fmt: str) -> None:
+    from ..services.model_registry import get_setting, put_setting
+
+    try:
+        memo = get_setting(_REJECTIONS_KEY) or {}
+        memo.setdefault(model, {})[fmt] = datetime.now(timezone.utc).isoformat()
+        put_setting(_REJECTIONS_KEY, memo)
+    except Exception:  # noqa: BLE001
+        log.warning("could not remember %s rejecting %s", model, fmt)
 
 
 def _body_error(r: httpx.Response) -> Optional[dict]:

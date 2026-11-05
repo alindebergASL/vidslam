@@ -15,7 +15,6 @@ from .base import (
 if TYPE_CHECKING:
     from .base import VideoCapabilities
 
-_settings = get_settings()
 
 
 def _active(kind: str) -> tuple[str, str]:
@@ -72,7 +71,7 @@ def video_capabilities(model: str = "") -> "VideoCapabilities":
             return fn(model)
         except Exception:  # noqa: BLE001
             pass
-    cap = max(5, _settings.ambient_default_max_clip_seconds)
+    cap = max(5, get_settings().ambient_default_max_clip_seconds)
     return VideoCapabilities(durations=sorted({5, cap}), first_frame=True, known=False)
 
 
@@ -150,7 +149,7 @@ def get_training(kind: str | None = None) -> TrainingProvider:
     listing what kinds are trainable); then the mock impl is the
     canonical truth source."""
     global _training_singleton
-    s = _settings
+    s = get_settings()
     if kind == "voice_clone" and not s.tts_is_mocked():
         from .elevenlabs_voice_lab import ElevenLabsVoiceLabProvider
 
@@ -169,7 +168,7 @@ def get_training(kind: str | None = None) -> TrainingProvider:
 def provider_status() -> dict:
     from ..services import model_registry as reg
 
-    s = _settings
+    s = get_settings()
     snap = reg.snapshot()
     training_lora = (
         "replicate"

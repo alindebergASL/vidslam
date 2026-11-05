@@ -205,12 +205,63 @@ def _check_output_writable(db: Session, project: models.VideoProject) -> CheckRe
     )
 
 
+def _check_models(db: Session, project: models.VideoProject) -> CheckResult:
+    """With live providers, a kind whose active model is still a mock/*
+    placeholder (nothing chosen in Settings → Models, no OPENROUTER_*_MODEL)
+    silently produces placeholder output while the rest is billed."""
+    from . import model_registry as reg
+
+    if get_settings().mock_providers:
+        return CheckResult(id="models_selected", label="Models", status="ok",
+                           message="Mock mode — placeholder models are expected.")
+    mocked = {k: reg.active_model(k) for k in ("chat", "video", "image")}
+    mocked = {k: m for k, m in mocked.items() if m.startswith("mock/")}
+    if not mocked:
+        return CheckResult(id="models_selected", label="Models", status="ok",
+                           message="A real model is selected for planning, video and images.")
+    names = {"chat": "planner", "video": "video", "image": "image"}
+    blocking = [k for k in mocked if k in ("chat", "video")]
+    return CheckResult(
+        id="models_selected", label="Models",
+        status="fail" if blocking else "warn",
+        message="No real " + " / ".join(names[k] for k in mocked) + " model is selected.",
+        detail="These would produce mock placeholders: "
+               + ", ".join(f"{names[k]} → {m}" for k, m in mocked.items())
+               + ". Pick one in Settings → Models, or set "
+               + ", ".join(f"OPENROUTER_{k.upper()}_MODEL" for k in mocked) + ".",
+    )
+
+
+def _check_voice(db: Session, project: models.VideoProject) -> CheckResult:
+    """ElevenLabs needs a voice: the avatar's, or ELEVENLABS_DEFAULT_VOICE_ID.
+    Without one the TTS call fails and the video renders without a voiceover."""
+    from . import model_registry as reg
+
+    s = get_settings()
+    source = (project.voiceover_source or "tts").lower()
+    if source != "tts" or s.mock_providers or reg.provider_for("tts") != "elevenlabs":
+        return CheckResult(id="voice_selected", label="Voice", status="ok",
+                           message="Voiceover source doesn't need an ElevenLabs voice.")
+    avatar = db.get(models.Avatar, project.primary_avatar_id) if project.primary_avatar_id else None
+    if (avatar and avatar.elevenlabs_voice_id) or s.elevenlabs_default_voice_id:
+        return CheckResult(id="voice_selected", label="Voice", status="ok",
+                           message="An ElevenLabs voice is set.")
+    return CheckResult(
+        id="voice_selected", label="Voice", status="warn",
+        message="No ElevenLabs voice is set: the video will have no voiceover.",
+        detail="Give the avatar a voice, set ELEVENLABS_DEFAULT_VOICE_ID, or pick an "
+               "OpenRouter voice model in Settings → Models.",
+    )
+
+
 def run_preflight(db: Session, project: models.VideoProject) -> dict:
     checks = [
         _check_avatar_hero(db, project),
         _check_script_length(db, project),
         _check_cta(db, project),
         _check_providers(db, project),
+        _check_models(db, project),
+        _check_voice(db, project),
         _check_output_writable(db, project),
     ]
     has_fail = any(c.status == "fail" for c in checks)
