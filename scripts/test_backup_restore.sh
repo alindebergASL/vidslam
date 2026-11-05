@@ -117,8 +117,12 @@ grep -q "left stopped" "$root/r2.log" && grep -q "pre-restore-" "$root/r2.log" |
 pass "a failed restore leaves the app stopped and prints how to roll back"
 
 # Roll back with the printed safety dump: the 'live' row is back.
-safety=$(grep -o 'pre-restore-[0-9TZ]*\.dump' "$root/r2.log" | head -1)
+safety=$(grep -o 'pre-restore-[0-9A-Za-z-]*\.dump' "$root/r2.log" | head -1)
+safety_sum=$(sha256sum < "$BACKUP_TARGET/db/$safety")
+# Immediately, as an operator would: the new safety dump taken by this run
+# (same second) must not overwrite the one being restored.
 scripts/restore.sh --db "$safety" --yes > /dev/null
+[[ "$(sha256sum < "$BACKUP_TARGET/db/$safety")" == "$safety_sum" ]] || boom "rollback overwrote its own safety dump"
 [[ "$(q "SELECT count(*) FROM app_settings WHERE key='live'")" == 1 ]] || boom "rollback dump didn't restore"
 pass "the safety dump rolls the failed restore back"
 

@@ -101,15 +101,19 @@ if [[ -n "$db" ]]; then
     -c "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'") || die "can't reach Postgres to check for '$DB_NAME'"
   if [[ "$exists" == 1 ]]; then
     # The current data is about to be dropped: without a stored copy, stop here.
-    safety="pre-restore-$(date -u +%Y%m%dT%H%M%SZ).dump"
+    # Unique name, kept apart from the dump being restored: rolling back with
+    # a safety dump must never overwrite that same file (same-second runs).
+    safety="pre-restore-$(date -u +%Y%m%dT%H%M%SZ)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n').dump"
+    $is_s3 || [[ ! -e "$TARGET/db/$safety" ]] || die "$safety already exists: nothing was changed"
+    mkdir -p "$work/safety"
     log "safety dump of the current database → $safety"
     # shellcheck disable=SC2086
-    $PG_EXEC pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner > "$work/$safety" \
+    $PG_EXEC pg_dump -U "$DB_USER" -d "$DB_NAME" -Fc --no-owner > "$work/safety/$safety" \
       || die "safety dump failed: nothing was changed"
     # shellcheck disable=SC2086
-    $PG_EXEC pg_restore --list < "$work/$safety" > /dev/null || die "safety dump is unreadable: nothing was changed"
-    if $is_s3; then aws s3 cp --only-show-errors "$work/$safety" "$TARGET/db/$safety"
-    else cp "$work/$safety" "$TARGET/db/$safety"; fi || die "couldn't store the safety dump: nothing was changed"
+    $PG_EXEC pg_restore --list < "$work/safety/$safety" > /dev/null || die "safety dump is unreadable: nothing was changed"
+    if $is_s3; then aws s3 cp --only-show-errors "$work/safety/$safety" "$TARGET/db/$safety"
+    else cp -n "$work/safety/$safety" "$TARGET/db/$safety"; fi || die "couldn't store the safety dump: nothing was changed"
   else
     log "database '$DB_NAME' doesn't exist yet: no safety dump needed"
   fi
