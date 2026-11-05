@@ -153,9 +153,12 @@ jobs:
         working-directory: frontend
 
       # Playwright chromium ---
+      # Pinned: an unpinned install picks up a release whose playwright-core
+      # isn't on npm yet (playwright 1.65.0 shipped without it), which fails
+      # ui-smoke on every PR. Bump on purpose.
       - name: Install playwright + chromium
         run: |
-          npm install --no-save --no-audit --no-fund playwright
+          npm install --no-save --no-audit --no-fund playwright@1.64.1
           npx playwright install --with-deps chromium
 
       # Boot the stack ---
