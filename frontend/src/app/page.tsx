@@ -11,8 +11,11 @@ import { formatDuration, modeLabel } from "@/lib/labels";
 const PROVIDER_NAMES: Record<string, string> = {
   openrouter: "OpenRouter", elevenlabs: "ElevenLabs", gemini: "Google", replicate: "Replicate",
 };
+// Every kind that can call a paid provider, or "nothing is billed" could lie
+// (e.g. a live lip-sync model while the video model is still a mock).
 const KIND_NAMES: Record<string, string> = {
   chat: "planner", image: "images", video: "video", tts: "voice", music: "music",
+  lipsync: "lip-sync", training_lora: "LoRA training", training_voice: "voice cloning",
 };
 
 /** One sentence for the provider status instead of raw flags. */
@@ -23,7 +26,11 @@ function providerSummary(st: Record<string, any>): { live: boolean; text: string
     return { live: false, text: "Demo mode: videos use placeholder clips and nothing is billed." };
   }
   const names = [...new Set(real.map((k) => PROVIDER_NAMES[st[k]] || st[k]))].join(" + ");
-  const mocked = kinds.filter((k) => st[k] === "mock").map((k) => KIND_NAMES[k]);
+  // Only the everyday kinds are worth calling out as placeholders; optional
+  // extras (lip-sync off, no training key) would just add noise.
+  const mocked = ["chat", "image", "video", "tts", "music"]
+    .filter((k) => st[k] === "mock")
+    .map((k) => KIND_NAMES[k]);
   return {
     live: true,
     text: `Live with ${names}.` + (mocked.length ? ` Still placeholder: ${mocked.join(", ")}.` : ""),
