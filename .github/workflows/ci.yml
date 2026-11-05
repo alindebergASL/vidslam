@@ -88,6 +88,15 @@ jobs:
           TEST_DATABASE_URL: postgresql+psycopg://avs:avs@localhost:5432/avs_test
         run: pytest -q
 
+      - name: Backup / restore round-trip
+        working-directory: .
+        env:
+          MOCK_PROVIDERS: "true"
+        run: |
+          # pg_dump/pg_restore run inside the Postgres 17 container, as in production.
+          export BACKUP_PG_EXEC="docker exec -i $(docker ps -q --filter ancestor=postgres:17-alpine)"
+          scripts/test_backup_restore.sh
+
   frontend:
     runs-on: ubuntu-latest
     defaults:
