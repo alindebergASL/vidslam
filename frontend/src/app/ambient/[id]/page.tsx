@@ -19,6 +19,8 @@ import {
   presetFor,
   sceneStatusLabel,
   SoundControls,
+  VariantStrip,
+  VarietyControls,
   statusTone,
 } from "@/components/ambient/shared";
 import { api, AmbientConfig, AmbientPresets, AmbientScene } from "@/lib/api";
@@ -296,6 +298,9 @@ function Inner() {
                 <h2 className="text-base font-medium">Loop clip</h2>
                 <div className="mt-1.5">
                   <PlanSummary plan={plan} total={scene.total_seconds} compact />
+                </div>
+                <div className="mt-1.5">
+                  <VariantStrip scene={scene} />
                 </div>
               </div>
               <div className="flex items-center gap-2">
@@ -626,6 +631,8 @@ function SettingsPanel({
     cfg.loop_seconds !== scene.config.loop_seconds ||
     cfg.model_override !== scene.config.model_override ||
     cfg.chain_segments !== scene.config.chain_segments ||
+    cfg.variety !== scene.config.variety ||
+    (cfg.variety !== "none" && cfg.variations !== scene.config.variations) ||
     cfg.look !== scene.config.look ||
     cfg.look_strength !== scene.config.look_strength ||
     cfg.time_of_day !== scene.config.time_of_day ||
@@ -644,6 +651,8 @@ function SettingsPanel({
       </div>
 
       <LookControls cfg={cfg} set={set} presets={presets} idPrefix="set-look" />
+
+      <VarietyControls cfg={cfg} set={set} labels={scene.plan.variant_labels} />
 
       <div>
         <div className="label">Total length</div>
