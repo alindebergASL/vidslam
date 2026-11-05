@@ -2,7 +2,7 @@
 import clsx from "clsx";
 import type { ReactNode } from "react";
 import { api } from "@/lib/api";
-import type { AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, ScenePreset } from "@/lib/api";
+import type { AmbientConfig, AmbientPresets, AmbientScene, Corner, LoopPlan, ScenePreset } from "@/lib/api";
 
 /** "3600" → "1h", "5400" → "1h 30m", "600" → "10m", "20" → "20s". */
 export function fmtDuration(seconds: number): string {
@@ -390,6 +390,110 @@ export function VarietyControls({
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+const CORNERS: { id: Corner; label: string }[] = [
+  { id: "top_left", label: "Top left" },
+  { id: "top_right", label: "Top right" },
+  { id: "bottom_left", label: "Bottom left" },
+  { id: "bottom_right", label: "Bottom right" },
+];
+
+/** Title, watermark and timer drawn over the video (render-time). */
+export function OverlayControls({
+  cfg,
+  set,
+  idPrefix = "overlay",
+}: {
+  cfg: AmbientConfig;
+  set: CfgSetter;
+  idPrefix?: string;
+}) {
+  return (
+    <div className="space-y-3">
+      <div>
+        <label className="label" htmlFor={`${idPrefix}-title`}>
+          Title
+        </label>
+        <input
+          id={`${idPrefix}-title`}
+          className="input w-full"
+          maxLength={120}
+          placeholder="None — e.g. Rainy forest · 1 hour"
+          value={cfg.overlay_title}
+          onChange={(e) => set("overlay_title", e.target.value)}
+        />
+        {cfg.overlay_title.trim() && (
+          <>
+            <label className="label mt-2" htmlFor={`${idPrefix}-title-secs`}>
+              Shown for the first {cfg.title_seconds}s
+            </label>
+            <input
+              id={`${idPrefix}-title-secs`}
+              type="range"
+              min={2}
+              max={30}
+              step={1}
+              value={cfg.title_seconds}
+              onChange={(e) => set("title_seconds", Number(e.target.value))}
+              className="w-full accent-iris"
+            />
+          </>
+        )}
+      </div>
+      <div>
+        <label className="label" htmlFor={`${idPrefix}-wm`}>
+          Watermark
+        </label>
+        <input
+          id={`${idPrefix}-wm`}
+          className="input w-full"
+          maxLength={60}
+          placeholder="None — e.g. @yourchannel"
+          value={cfg.watermark}
+          onChange={(e) => set("watermark", e.target.value)}
+        />
+        {cfg.watermark.trim() && (
+          <ChipRow
+            label="Watermark position"
+            options={CORNERS.map((c) => c.id)}
+            value={cfg.watermark_position}
+            onChange={(v) => set("watermark_position", v)}
+            render={(id) => CORNERS.find((c) => c.id === id)?.label ?? id}
+            className="text-xs mt-2"
+          />
+        )}
+      </div>
+      <div>
+        <div className="label">Timer</div>
+        <ChipRow
+          label="Timer"
+          options={["none", "countdown", "elapsed"] as AmbientConfig["timer"][]}
+          value={cfg.timer}
+          onChange={(v) => set("timer", v)}
+          render={(v) => (v === "none" ? "None" : v === "countdown" ? "Countdown" : "Elapsed")}
+          className="text-xs"
+        />
+        {cfg.timer !== "none" && (
+          <>
+            <ChipRow
+              label="Timer position"
+              options={CORNERS.map((c) => c.id)}
+              value={cfg.timer_position}
+              onChange={(v) => set("timer_position", v)}
+              render={(id) => CORNERS.find((c) => c.id === id)?.label ?? id}
+              className="text-xs mt-2"
+            />
+            <p className="text-xs text-ink-400 mt-2">
+              The clock changes every second, so the finished video is re-encoded once: rendering takes several
+              minutes longer per hour. No provider cost.
+            </p>
+          </>
+        )}
+      </div>
+      <p className="text-[11px] text-ink-400">Title and watermark are free; changing overlays only needs a re-render.</p>
     </div>
   );
 }

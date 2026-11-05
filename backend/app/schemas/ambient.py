@@ -34,6 +34,8 @@ PictureOrigin = Literal["", "upload", "generated", "studio", "asset"]
 # Less repetition over a long video: "takes" = several clips of the same
 # scene, cycled; "day_night" = the scene at several times of day, in order.
 Variety = Literal["none", "takes", "day_night"]
+Corner = Literal["top_left", "top_right", "bottom_left", "bottom_right"]
+Timer = Literal["none", "countdown", "elapsed"]
 
 
 class AmbientConfig(BaseModel):
@@ -94,9 +96,22 @@ class AmbientConfig(BaseModel):
     # per variation; the full-length render is still local.
     variety: Variety = "none"
     variations: int = Field(default=3, ge=2, le=5)
+    # Overlays, applied at render time (changing them keeps the loop).
+    # Title: shown over the opening seconds, fading in and out. Watermark:
+    # small text in a corner for the whole video. Both are drawn on pieces
+    # that are encoded anyway, so they cost nothing extra. Timer: a
+    # countdown or elapsed clock; it changes every second, so the whole
+    # video is re-encoded once (longer render, no provider cost).
+    overlay_title: str = Field(default="", max_length=120)
+    title_seconds: float = Field(default=8.0, ge=2.0, le=30.0)
+    watermark: str = Field(default="", max_length=60)
+    watermark_position: Corner = "bottom_right"
+    watermark_opacity: float = Field(default=0.6, ge=0.1, le=1.0)
+    timer: Timer = "none"
+    timer_position: Corner = "top_right"
 
     @field_validator("scene_prompt", "music_prompt", "scene_preset", "music_mood", "model_override",
-                     "sound", "sound_prompt")
+                     "sound", "sound_prompt", "overlay_title", "watermark")
     @classmethod
     def _strip(cls, v: str) -> str:
         return (v or "").strip()

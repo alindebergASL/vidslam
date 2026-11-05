@@ -10,6 +10,7 @@ import {
   ChipRow,
   LookControls,
   MUSIC_LENGTHS,
+  OverlayControls,
   PlanSummary,
   SceneArt,
   SoundControls,
@@ -527,6 +528,12 @@ function Inner() {
             <div className="mt-5">
               <SoundControls cfg={cfg} set={set} presets={presets} idPrefix="new-sound" />
             </div>
+          </section>
+
+          {/* 5. Overlays */}
+          <section className="card p-5">
+            <StepHeading n={5} title="Overlays" hint="Optional title, watermark or timer." />
+            <OverlayControls cfg={cfg} set={set} idPrefix="new-overlay" />
           </section>
 
           {/* Advanced */}
