@@ -84,6 +84,9 @@ function Inner() {
     try {
       await fn();
       if (okMsg) toast.success(okMsg);
+      // A regenerated bed keeps the same URL and "ready" flag, so reload()
+      // sees no change: bump the version or the player keeps the old audio.
+      if (key === "music" || key === "sound") setCacheBust(Date.now());
       await reload();
     } catch (e: any) {
       toast.error(e.message || "Request failed");
