@@ -322,6 +322,9 @@ class AmbientRenderInputs:
     fade_seconds: float = 4.0
     music_path: Optional[Path] = None
     music_volume: float = 0.7
+    # Nature-sound bed (rain, waves…), looped and mixed with the music.
+    sound_path: Optional[Path] = None
+    sound_volume: float = 0.6
     # When the clip is already periodic (image_drift), skip the video
     # crossfade: it would only soften a seam that doesn't exist.
     clip_is_periodic: bool = False
@@ -485,21 +488,34 @@ def _tile_and_mux(
     music_unit: Optional[Path],
     music_volume: float,
     fade: float,
+    sound_unit: Optional[Path] = None,
+    sound_volume: float = 0.6,
 ) -> str:
     listfile = out.parent / "ambient_concat.txt"
     listfile.write_text(
         "\n".join(f"file '{p.as_posix()}'" for p in pieces) + "\n", encoding="utf-8"
     )
     cmd: list[str] = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile)]
-    if music_unit is not None:
-        cmd += ["-stream_loop", "-1", "-i", str(music_unit)]
-        vol = max(0.0, min(1.0, music_volume))
-        af = [f"volume={vol:.3f}"]
+    # Each audio bed (music, nature sound) loops forever at its own volume;
+    # with both, they're mixed. Fades apply to the mix.
+    beds = [(p, v) for p, v in ((music_unit, music_volume), (sound_unit, sound_volume)) if p is not None]
+    if beds:
+        chains: list[str] = []
+        for i, (bed, vol) in enumerate(beds, start=1):
+            cmd += ["-stream_loop", "-1", "-i", str(bed)]
+            chains.append(f"[{i}:a]volume={max(0.0, min(1.0, vol)):.3f}[b{i}]")
+        fades = []
         if fade > 0:
-            af.append(f"afade=t=in:st=0:d={fade:.3f}")
-            af.append(f"afade=t=out:st={max(0.0, total - fade):.3f}:d={fade:.3f}")
+            fades = [f"afade=t=in:st=0:d={fade:.3f}",
+                     f"afade=t=out:st={max(0.0, total - fade):.3f}:d={fade:.3f}"]
+        post = ",".join(fades) or "anull"
+        if len(beds) == 1:
+            graph = ";".join(chains) + f";[b1]{post}[a]"
+        else:
+            # normalize=0: keep each bed at the volume the user set.
+            graph = ";".join(chains) + f";[b1][b2]amix=inputs=2:duration=longest:normalize=0,{post}[a]"
         cmd += [
-            "-filter_complex", f"[1:a]{','.join(af)}[a]",
+            "-filter_complex", graph,
             "-map", "0:v:0", "-map", "[a]",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         ]
@@ -579,6 +595,13 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         )
         logs.append(mlog)
 
+    # 4b. Nature-sound unit (optional), seam-crossfaded like the music.
+    sound_unit: Optional[Path] = None
+    if inputs.sound_path is not None and inputs.sound_path.exists():
+        sound_unit = out / "ambient_sound_unit.m4a"
+        slog, _ = _make_seamless_audio_unit(inputs.sound_path, sound_unit, crossfade=1.5)
+        logs.append(slog)
+
     # 5. Tile + mux. The tail piece's fade-out lands at the end of the last
     #    repeat; -t trims any overshoot past `total` (stream-copy cuts land
     #    on packet boundaries, so expect ≤1 frame of slack).
@@ -589,6 +612,8 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         music_unit=music_unit,
         music_volume=inputs.music_volume,
         fade=fade,
+        sound_unit=sound_unit,
+        sound_volume=inputs.sound_volume,
     ))
 
     # 6. Thumbnail — sample past the fade-in so it isn't a black frame.

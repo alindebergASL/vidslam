@@ -120,6 +120,18 @@ def get_music() -> MusicProvider:
     return ElevenLabsMusicProvider(model_id=model.split("/", 1)[1] if model.startswith("elevenlabs/") else None)
 
 
+def get_sound():
+    """Nature-sound beds for ambient scenes: ElevenLabs sound effects when a
+    key is set and providers are live, else a generated noise placeholder."""
+    if get_settings().music_is_mocked():
+        from .sound import MockSoundProvider
+
+        return MockSoundProvider()
+    from .sound import ElevenLabsSoundProvider
+
+    return ElevenLabsSoundProvider()
+
+
 def get_avatar():
     """Portrait → talking-head clip provider, or None when lip-sync is off."""
     model, provider = _active("lipsync")

@@ -2,7 +2,7 @@
 import clsx from "clsx";
 import type { ReactNode } from "react";
 import { api } from "@/lib/api";
-import type { AmbientScene, LoopPlan, ScenePreset } from "@/lib/api";
+import type { AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, ScenePreset } from "@/lib/api";
 
 /** "3600" → "1h", "5400" → "1h 30m", "600" → "10m", "20" → "20s". */
 export function fmtDuration(seconds: number): string {
@@ -224,3 +224,149 @@ export const MUSIC_LENGTHS: { secs: number; label: string }[] = [
   { secs: 600, label: "10 min" },
   { secs: 1200, label: "20 min" },
 ];
+
+// ---------- Look, light & weather, nature sound (shared by new + scene pages) ----------
+
+type CfgSetter = <K extends keyof AmbientConfig>(k: K, v: AmbientConfig[K]) => void;
+
+const FALLBACK_LOOKS = [
+  { id: "photoreal", label: "Photoreal" }, { id: "cinematic", label: "Cinematic film" },
+  { id: "painterly", label: "Painterly" }, { id: "watercolor", label: "Watercolor" },
+  { id: "anime", label: "Hand-drawn anime" }, { id: "claymation", label: "Claymation" },
+  { id: "dreamy", label: "Dreamy" },
+];
+
+function strengthLabel(v: number): string {
+  return v < 0.34 ? "Subtle" : v <= 0.67 ? "Balanced" : "Strong";
+}
+
+/** Art style (realistic → stylized), its strength, and light/weather. */
+export function LookControls({
+  cfg,
+  set,
+  presets,
+  idPrefix = "look",
+}: {
+  cfg: AmbientConfig;
+  set: CfgSetter;
+  presets: AmbientPresets | null;
+  idPrefix?: string;
+}) {
+  const looks = presets?.looks?.length ? presets.looks : FALLBACK_LOOKS;
+  const times = presets?.times_of_day ?? [];
+  const weathers = presets?.weathers ?? [];
+  return (
+    <div className="space-y-3">
+      <div>
+        <div className="label">Look</div>
+        <ChipRow
+          label="Look"
+          options={looks.map((l) => l.id as AmbientConfig["look"])}
+          value={cfg.look}
+          onChange={(v) => set("look", v)}
+          render={(id) => looks.find((l) => l.id === id)?.label ?? id}
+          className="text-xs"
+        />
+        {cfg.look !== "photoreal" && (
+          <>
+            <label className="label mt-3" htmlFor={`${idPrefix}-strength`}>
+              Style strength · {strengthLabel(cfg.look_strength)}
+            </label>
+            <input
+              id={`${idPrefix}-strength`}
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={cfg.look_strength}
+              onChange={(e) => set("look_strength", Number(e.target.value))}
+              className="w-full accent-iris"
+              aria-valuetext={strengthLabel(cfg.look_strength)}
+            />
+            <div className="flex justify-between text-[10px] text-ink-400">
+              <span>Mostly realistic</span>
+              <span>Fully stylized</span>
+            </div>
+          </>
+        )}
+      </div>
+      {times.length > 0 && (
+        <div>
+          <div className="label">Time of day</div>
+          <ChipRow
+            label="Time of day"
+            options={times.map((t) => t.id)}
+            value={cfg.time_of_day}
+            onChange={(v) => set("time_of_day", v)}
+            render={(id) => times.find((t) => t.id === id)?.label ?? id}
+            className="text-xs"
+          />
+        </div>
+      )}
+      {weathers.length > 0 && (
+        <div>
+          <div className="label">Weather</div>
+          <ChipRow
+            label="Weather"
+            options={weathers.map((w) => w.id)}
+            value={cfg.weather}
+            onChange={(v) => set("weather", v)}
+            render={(id) => weathers.find((w) => w.id === id)?.label ?? id}
+            className="text-xs"
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Nature-sound bed (rain, waves, fire…), separate from the music. */
+export function SoundControls({
+  cfg,
+  set,
+  presets,
+  idPrefix = "sound",
+}: {
+  cfg: AmbientConfig;
+  set: CfgSetter;
+  presets: AmbientPresets | null;
+  idPrefix?: string;
+}) {
+  const sounds = presets?.sounds ?? [];
+  const options = ["none", "auto", ...sounds.map((s) => s.id)];
+  const label = (id: string) =>
+    id === "none" ? "Off" : id === "auto" ? "Match the scene" : sounds.find((s) => s.id === id)?.label ?? id;
+  return (
+    <div>
+      <div className="label">Nature sound</div>
+      <ChipRow
+        label="Nature sound"
+        options={options}
+        value={cfg.sound}
+        onChange={(v) => set("sound", v)}
+        render={label}
+        className="text-xs"
+      />
+      {cfg.sound !== "none" && (
+        <>
+          <label className="label mt-3" htmlFor={`${idPrefix}-volume`}>
+            Sound volume · {Math.round(cfg.sound_volume * 100)}%
+          </label>
+          <input
+            id={`${idPrefix}-volume`}
+            type="range"
+            min={0}
+            max={1}
+            step={0.05}
+            value={cfg.sound_volume}
+            onChange={(e) => set("sound_volume", Number(e.target.value))}
+            className="w-full accent-iris"
+          />
+          <p className="text-[11px] text-ink-400 mt-1">
+            Mixed under the music, or on its own with music set to &ldquo;No music&rdquo;.
+          </p>
+        </>
+      )}
+    </div>
+  );
+}

@@ -110,6 +110,14 @@ dominates (≈2–3 min total). Nothing in that time touches a provider. Scenes 
 storyboard projects (`mode=ambient_loop`, config in `ambient_config_json`), so
 render history, share links, export and S3 delivery all apply unchanged.
 
+**Look & light:** a scene can be photoreal (the default), cinematic film,
+painterly, watercolor, hand-drawn anime, claymation or dreamy, with a
+strength slider from "mostly realistic" to "fully stylized", plus time of
+day (dawn … night) and weather (clear, rain, snow, fog). These go into both
+the anchor still and the video prompt; changing them asks for a new loop.
+**Nature sound:** a separate looping bed (rain, fire, waves, birds…) mixed
+under the music or on its own.
+
 Extras: **preset preview images** (one image call per preset, cached),
 **long music beds** (3–20 min, generated in parts and crossfaded when
 longer than a provider's per-call limit), **4K output** (a lanczos upscale
@@ -353,7 +361,7 @@ whole pipeline.
 | Generation | `POST /api/projects/{id}/generate-plan` · `GET /api/projects/{id}/preflight` · `GET /api/projects/{id}/cost-estimate` · `POST /api/projects/{id}/generate-video[?force=true]` · `POST /api/projects/{id}/recompose` · `POST /api/projects/{id}/retry` (smart retry after a failed render — recomposes when all clips+audio survived, otherwise resumes) · `GET /api/projects/{id}/status` · `GET /api/projects/{id}/renders` · `GET /api/projects/{id}/renders/export` (zip of all completed renders) · `GET /api/renders/recent` (latest completed across all projects) · `POST /api/projects/{id}/shots/{shot_id}/regenerate[?recompose=true]` · `POST /api/projects/{id}/shots/regenerate-bulk` · `GET /api/renders/{id}/download` |
 | Public share | `GET /api/public-renders/{token}` · `GET /api/public-renders/{token}/thumbnail` · `GET /api/public-renders/{token}/meta` — **unauthenticated**, token-gated; backs the branded `/share/{token}` landing page so a finished video can be shared without exposing the app login |
 | Studio    | `POST /api/studio/generate-image` · `POST /api/studio/generate-clip` · `GET /api/studio/jobs[/{id}]` · `POST /api/studio/jobs/{id}/save` |
-| Ambient   | `GET /api/ambient/presets` · `POST /api/ambient/estimate` · `GET/POST /api/ambient` · `GET/PATCH /api/ambient/{id}` · `POST /api/ambient/{id}/generate-loop[?regenerate_music=false]` · `POST /api/ambient/{id}/render` — scenes are `VideoProject`s with `mode=ambient_loop`, so delete / cancel / renders / share / music preview reuse the project endpoints |
+| Ambient   | `GET /api/ambient/presets` · `POST /api/ambient/estimate` · `GET/POST /api/ambient` · `GET/PATCH /api/ambient/{id}` · `POST /api/ambient/{id}/generate-loop[?regenerate_music=false]` · `POST /api/ambient/{id}/render` · `POST/GET /api/ambient/{id}/sound` (regenerate / preview the nature sound) — scenes are `VideoProject`s with `mode=ambient_loop`, so delete / cancel / renders / share / music preview reuse the project endpoints |
 | Publishing | `GET /api/youtube/status` · `GET /api/youtube/connect` · `GET /api/youtube/callback` · `POST /api/youtube/disconnect` · `POST /api/renders/{id}/publish/youtube` · `GET /api/renders/{id}/publish-jobs` · `GET /api/publish-jobs` · `POST /api/publish-jobs/{id}/retry` · `GET /api/projects/{id}/publish-meta` (drafted title/description/tags) |
 | Ambient extras | `POST /api/ambient/batch` · `POST /api/ambient/{id}/music` · `GET /api/ambient/presets/{id}/preview` · `POST /api/ambient/presets/previews` |
 | Models | `GET /api/models/catalog[?kind=…&refresh=true]` · `POST /api/models/refresh` · `GET /api/models/active` · `PUT /api/models/active {kind, model, options?, allow_unlisted?}` — live catalog polled from OpenRouter (`/models`, `/images/models`, `/videos/models`) and Gemini, plus runtime switching of the active chat / image / video / voice / music / lip-sync model (stored in the DB, `.env` values are the defaults) |

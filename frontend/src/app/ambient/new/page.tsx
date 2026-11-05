@@ -5,7 +5,17 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { useToast } from "@/components/Toaster";
-import { ChipRow, MUSIC_LENGTHS, PlanSummary, SceneArt, fmtDuration, presetFor, previewSrc } from "@/components/ambient/shared";
+import {
+  ChipRow,
+  LookControls,
+  MUSIC_LENGTHS,
+  PlanSummary,
+  SceneArt,
+  SoundControls,
+  fmtDuration,
+  presetFor,
+  previewSrc,
+} from "@/components/ambient/shared";
 import {
   api,
   AmbientConfig,
@@ -236,9 +246,15 @@ function Inner() {
             </div>
           </section>
 
-          {/* 2. Length */}
+          {/* 2. Look & light */}
           <section className="card p-5">
-            <StepHeading n={2} title="Length" hint="One loop, repeated." />
+            <StepHeading n={2} title="Look & light" hint="Realistic or artsy, any time of day." />
+            <LookControls cfg={cfg} set={set} presets={presets} idPrefix="new-look" />
+          </section>
+
+          {/* 3. Length */}
+          <section className="card p-5">
+            <StepHeading n={3} title="Length" hint="One loop, repeated." />
             <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
               <div>
                 <div className="label">Loop clip</div>
@@ -354,9 +370,9 @@ function Inner() {
             </div>
           </section>
 
-          {/* 3. Music */}
+          {/* 4. Music & sound */}
           <section className="card p-5">
-            <StepHeading n={3} title="Music" hint="Spa, zen, or nothing at all." />
+            <StepHeading n={4} title="Music & sound" hint="Spa music, nature sounds, both, or silence." />
             <ChipRow
               label="Music mood"
               options={(presets?.music_moods ?? []).map((m) => m.id)}
@@ -406,6 +422,9 @@ function Inner() {
                 </p>
               </>
             )}
+            <div className="mt-5">
+              <SoundControls cfg={cfg} set={set} presets={presets} idPrefix="new-sound" />
+            </div>
           </section>
 
           {/* Advanced */}
@@ -565,12 +584,12 @@ function Inner() {
 
 function StepHeading({ n, title, hint }: { n: number; title: string; hint: string }) {
   return (
-    <div className="flex items-baseline gap-3 mb-4">
+    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 mb-4">
       <span className="grad text-ink-950 text-[11px] font-bold rounded-full w-5 h-5 inline-flex items-center justify-center">
         {n}
       </span>
-      <h2 className="text-base font-medium">{title}</h2>
-      <span className="text-xs text-ink-400">{hint}</span>
+      <h2 className="text-base font-medium whitespace-nowrap">{title}</h2>
+      <span className="text-xs text-ink-400 basis-full sm:basis-auto">{hint}</span>
     </div>
   );
 }
