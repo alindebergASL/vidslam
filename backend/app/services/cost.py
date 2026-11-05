@@ -7,11 +7,12 @@ even while running in mock mode; the actual cost recorded on a Render is 0
 when MOCK_PROVIDERS is on (nothing was billed)."""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, get_args
 
 from ..config import get_settings
-from ..schemas.storyboard import StoryboardPlan
+from ..schemas.storyboard import ShotPlan, ShotType, StoryboardPlan
 
+_SHOT_TYPES = set(get_args(ShotType))
 # TTS speaking rate used to guess the voiceover's length before one exists.
 CHARS_PER_SECOND = 15.0
 
@@ -125,6 +126,15 @@ def estimate_for_project(db, project, plan: StoryboardPlan, *, music_will_genera
     from .pipeline import _hero_portrait, _latest_voiceover
     from .renderer import _probe_duration
 
+    # The project's shots as they are now (reordered / re-timed in the
+    # editor), not as first planned: a talking head's share of the
+    # voiceover depends on where it plays, and the render uses these rows.
+    rows = sorted(project.shots, key=lambda r: r.shot_order)
+    if rows:
+        plan = plan.model_copy(update={"shots": [
+            ShotPlan(order=r.shot_order, shot_type=r.shot_type, duration_seconds=float(r.duration_seconds or 0),
+                     visual_prompt=r.prompt or "-")
+            for r in rows if r.shot_type in _SHOT_TYPES]})
     lipsync = get_avatar() is not None and _hero_portrait(db, project) is not None
     voice: Optional[float] = None
     if lipsync:

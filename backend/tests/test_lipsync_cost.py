@@ -98,3 +98,50 @@ def test_rate_card_fallback_bills_lip_sync_on_its_speech(client):
         db.close()
     (row,) = _entries(kind="avatar")
     assert row["cost_usd"] == pytest.approx(0.23) and row["source"] == "rate_card"
+
+
+def test_estimate_follows_the_current_shot_order(auth_client, tmp_path):
+    """Review: with a 6 s voiceover, a 5 s hero then a 7 s talking head
+    gives the talking head 1 s; moved first, it gets 6 s. The estimate must
+    use the shots as they are now, not the original storyboard."""
+    import subprocess
+
+    from app import models
+    from app.db import SessionLocal
+
+    _lipsync_on(auth_client)
+    pid = _talking_project(auth_client)
+    voice = tmp_path / "voice.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=220:d=6",
+                    str(voice)], check=True)
+
+    def lip_secs():
+        est = auth_client.get(f"/api/projects/{pid}/cost-estimate").json()
+        return next(ln["qty"] for ln in est["lines"] if ln["item"].startswith("Lip-sync"))
+
+    db = SessionLocal()
+    try:
+        p = db.get(models.VideoProject, pid)
+        p.voiceover_source, p.voiceover_upload_path = "upload", str(voice)
+        body = sorted((s for s in p.shots if s.shot_type != "end_card"), key=lambda s: s.shot_order)
+        th = next(s for s in body if s.shot_type == "talking_head")
+        others = [s for s in body if s is not th]
+        if not others:  # a talking-head-only plan: add a hero shot to play before it
+            hero = models.VideoShot(project_id=pid, shot_order=0, shot_type="hero", prompt="hero")
+            db.add(hero)
+            others = [hero]
+        th.duration_seconds = 7.0
+        for s in others:
+            s.duration_seconds = 5.0 / len(others)
+        # Talking head last: it starts at 5 s and gets the last 1 s.
+        for i, s in enumerate([*others, th], start=1):
+            s.shot_order = i
+        db.commit()
+        assert lip_secs() == pytest.approx(1.0, abs=0.1)
+        # Moved first: it gets all 6 s.
+        for i, s in enumerate([th, *others], start=1):
+            s.shot_order = i
+        db.commit()
+        assert lip_secs() == pytest.approx(6.0, abs=0.1)
+    finally:
+        db.close()
