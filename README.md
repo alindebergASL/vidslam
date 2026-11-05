@@ -179,6 +179,10 @@ notes that the thumbnail wasn't set.
   endpoints return 402 at 100%; FFmpeg-only work (recompose, ambient
   render) is never blocked. API: `GET /api/spend/summary|entries|openrouter`,
   `GET|PUT /api/spend/budget`.
+- **Backups** (`scripts/backup.sh`, nightly via cron): a verified
+  `pg_dump` plus a mirror of `./data`, written to an Amazon S3 Files mount (or
+  `s3://`). `scripts/restore.sh` restores either or both, taking a safety dump
+  first. Setup, schedule and restore steps: [docs/backups.md](docs/backups.md).
 - **Alerts** (`ALERT_WEBHOOK_URL`, Slack/Discord-compatible): render, loop
   and upload failures, a burst of provider errors (default 5 in 10 min),
   and an active model disappearing from the polled catalog. Duplicates are
