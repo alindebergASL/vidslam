@@ -17,6 +17,11 @@ class UploadError(ValueError):
     pass
 
 
+# Pillow format → (extension, mime type): what a file really is.
+_FORMAT_TYPES = {"PNG": ("png", "image/png"), "JPEG": ("jpg", "image/jpeg"),
+                 "WEBP": ("webp", "image/webp"), "GIF": ("gif", "image/gif")}
+
+
 def _ext_for_mime(mime: str) -> str:
     return {
         "image/png": "png",
@@ -70,7 +75,10 @@ def save_uploaded_image(
     checksum = hashlib.sha256(cleaned).hexdigest()
     subdir = settings.data_path / "uploads" / owner_kind / str(owner_id)
     subdir.mkdir(parents=True, exist_ok=True)
-    ext = _ext_for_mime(mime_type)
+    # Name and type the file by what it is, not what the browser claimed
+    # (a JPEG sent as image/png would be served as PNG, and providers such
+    # as HeyGen reject the mismatch).
+    ext, mime_type = _FORMAT_TYPES[fmt]
     filename = f"{uuid.uuid4().hex}.{ext}"
     out_path = subdir / filename
     out_path.write_bytes(cleaned)
@@ -94,11 +102,9 @@ def save_uploaded_image(
 def image_info(raw: bytes) -> tuple[str, str, int, int]:
     """(extension, mime type, width, height) read from the bytes themselves.
     Providers return PNG, JPEG or WebP regardless of what was asked for."""
-    fmt_map = {"PNG": ("png", "image/png"), "JPEG": ("jpg", "image/jpeg"),
-               "WEBP": ("webp", "image/webp"), "GIF": ("gif", "image/gif")}
     try:
         with Image.open(io.BytesIO(raw)) as img:
-            ext, mime = fmt_map.get(img.format or "", ("png", "image/png"))
+            ext, mime = _FORMAT_TYPES.get(img.format or "", ("png", "image/png"))
             return ext, mime, img.size[0], img.size[1]
     except Exception:  # noqa: BLE001 — unreadable: keep the old default
         return "png", "image/png", 0, 0
@@ -134,3 +140,43 @@ def render_subdir(project_id: int) -> Path:
 
 def public_url_for_token(token: str) -> str:
     return f"{settings.public_base_url.rstrip('/')}/api/public-assets/{token}"
+
+
+def repair_image_types(db) -> int:
+    """Correct assets whose recorded type doesn't match the file's contents.
+
+    Images saved before types were read from the bytes can be JPEG data
+    recorded (and served) as image/png; HeyGen rejects those with "Content
+    type not match". Only the header of each file is read. The file name is
+    left alone: it's referenced elsewhere, and the served type comes from
+    the record. Returns how many assets were fixed."""
+    from sqlalchemy import or_
+
+    from .. import models
+
+    fixed = 0
+    q = db.query(models.Asset).filter(or_(models.Asset.mime_type.like("image/%"),
+                                          models.Asset.mime_type.in_(("", "application/octet-stream"))))
+    for asset in q:
+        path = Path(asset.file_path or "")
+        if not path.is_file():
+            continue
+        try:
+            with Image.open(path) as img:
+                fmt, size = img.format, img.size
+        except Exception:  # noqa: BLE001 — not an image: leave it alone
+            continue
+        types = _FORMAT_TYPES.get(fmt or "")
+        if types is None:
+            continue
+        changed = False
+        if asset.mime_type != types[1]:
+            asset.mime_type = types[1]
+            changed = True
+        if not asset.width or not asset.height:
+            asset.width, asset.height = size
+            changed = True
+        fixed += changed
+    if fixed:
+        db.commit()
+    return fixed

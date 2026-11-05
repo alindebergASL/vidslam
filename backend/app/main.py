@@ -86,6 +86,23 @@ if settings.database_url.startswith("sqlite") and not settings.mock_providers:
     log.warning("DATABASE_URL is SQLite with live providers — use Postgres in production (docs/postgres.md)")
 
 
+def _repair_image_types() -> None:
+    """Fix asset records whose image type doesn't match the file (see
+    storage.repair_image_types). Never blocks startup."""
+    from .db import SessionLocal
+    from .services import storage
+
+    db = SessionLocal()
+    try:
+        fixed = storage.repair_image_types(db)
+        if fixed:
+            log.warning("corrected the image type of %d asset(s) to match their files", fixed)
+    except Exception as e:  # noqa: BLE001
+        log.warning("image type check skipped: %s", e)
+    finally:
+        db.close()
+
+
 def create_app() -> FastAPI:
     from contextlib import asynccontextmanager
 
@@ -93,6 +110,7 @@ def create_app() -> FastAPI:
     async def lifespan(app: FastAPI):
         log.info("initializing database at %s", settings.database_url)
         init_db()
+        _repair_image_types()
         # Keep the model catalog fresh in the background (skipped under
         # pytest so tests never make network calls).
         import sys
