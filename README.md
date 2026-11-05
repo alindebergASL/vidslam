@@ -545,7 +545,7 @@ echo "Sign-in password: ${MVP_PASSWORD}"
 
 The prod compose overlay swaps the frontend from `next dev` (HMR, source
 mounted) to a built `next start`, drops `--reload` on the backend, and
-unpublishes the 8000/3000 ports so only Nginx can reach them.
+binds the 8000/3000 ports to 127.0.0.1 so only host Nginx can reach them.
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
@@ -571,8 +571,8 @@ sudo certbot --nginx -d ${DOMAIN} --non-interactive --agree-tos -m you@example.c
 ### 6. Verify
 
 ```bash
-curl -sf https://${DOMAIN}/api/healthz   # {"status":"ok"}
-curl -sf https://${DOMAIN}/api/readyz    # 200 + per-check breakdown
+curl -sf https://${DOMAIN}/healthz       # {"status":"ok"}
+curl -sf https://${DOMAIN}/readyz        # 200 + per-check breakdown
 # Browser: https://${DOMAIN}/ → sign in with the password from step 3.
 ```
 

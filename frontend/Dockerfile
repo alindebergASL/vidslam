@@ -17,6 +17,9 @@ WORKDIR /app
 COPY package.json ./
 RUN npm install --no-audit --no-fund
 COPY . .
+# The repo ships no static assets yet; make sure public/ exists so the prod
+# stage's COPY doesn't fail.
+RUN mkdir -p public
 # NEXT_PUBLIC_* are inlined at build time. Default to a reasonable in-cluster
 # value; the compose file or runtime --build-arg can override.
 ARG NEXT_PUBLIC_API_BASE=/api

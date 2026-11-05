@@ -23,7 +23,7 @@ from __future__ import annotations
 import contextvars
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator, Optional
 
 import httpx
@@ -170,6 +170,10 @@ def render_actual_cost(db: Session, render: models.Render) -> float:
     return round(float(total or 0.0), 4)
 
 
+# How long a pending entry may 404 on GET /generation before we give up.
+PENDING_GIVE_UP = timedelta(hours=1)
+
+
 def reconcile_pending(limit: int = 20) -> int:
     """Swap rate-card placeholders for OpenRouter's reported cost once the
     generation is queryable. Returns how many entries were settled."""
@@ -192,7 +196,14 @@ def reconcile_pending(limit: int = 20) -> int:
                 except httpx.HTTPError:
                     break
                 if r.status_code == 404:
-                    continue  # not queryable yet
+                    # Usually "not queryable yet". A generation that errored is
+                    # never queryable, though, so stop polling after a while and
+                    # keep the rate-card estimate.
+                    if e.created_at and datetime.utcnow() - e.created_at > PENDING_GIVE_UP:
+                        e.source = "rate_card"
+                        e.note = (e.note + " · " if e.note else "") + "generation lookup 404; kept estimate"
+                        settled += 1
+                    continue
                 if r.status_code >= 400:
                     continue
                 cost = (r.json().get("data") or {}).get("total_cost")
