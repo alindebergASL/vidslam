@@ -183,7 +183,7 @@ def test_variation_prompts():
 
     cfg = _cfg(variety="day_night", variations=4)
     prompts = [ambient.variant_prompt(cfg, i) for i in range(4)]
-    assert "midday" in prompts[0] and "hour before sunset" in prompts[1] and "At night" in prompts[3]
+    assert "midday" in prompts[0] and "Late-afternoon sun" in prompts[1] and "At night" in prompts[3]
     takes = _cfg(variety="takes", variations=3)
     assert len({ambient.variant_prompt(takes, i) for i in range(3)}) == 3  # each take differs
 
@@ -237,7 +237,7 @@ def test_day_night_scene_makes_a_still_per_time_of_day(auth_client, monkeypatch)
     assert len(images) == 3
     assert not images[0]["references"]
     # Dusk and night are made from the first still: same place, new light.
-    for call, when in zip(images[1:], ("twilight", "At night"), strict=True):
+    for call, when in zip(images[1:], ("after sunset", "At night"), strict=True):
         assert len(call["references"]) == 1 and when in call["prompt"]
         assert "only the time of day and the light change" in call["prompt"]
     assert "At night" in scene["variant_shots"][1]["prompt"]

@@ -58,7 +58,7 @@ def test_look_strength_time_and_weather_shape_the_prompt():
     # A stylized look drops the camera line; it's a photograph only for photoreal.
     assert "lens" not in p
     drift = resolve_scene_prompt(_cfg(source="image_drift", look="painterly", time_of_day="golden_hour"))
-    assert "hour before sunset" in drift and "oil painting" in drift and "photograph" not in drift
+    assert "Late-afternoon sun" in drift and "oil painting" in drift and "photograph" not in drift
 
 
 def test_time_of_day_replaces_the_presets_own_light():

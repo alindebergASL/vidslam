@@ -121,6 +121,12 @@ cinematic image", because words like "photorealistic, highly detailed" and
 "golden hour" pulled every model toward a glossy AI look in a blind test.
 Each preset keeps its scene, light and camera apart, so a chosen time of day
 replaces the preset's light instead of contradicting it.
+**Your own description** is rewritten as a real photograph by the planner
+model (Settings → Models → Planner; one short call, about $0.001) when the
+look is photoreal: hype words like "magical", "8k" or "crystal clear
+turquoise" are dropped and the place is described plainly, with its light
+and a camera. The typed text is kept; the scene page shows what the picture
+model reads. Untick *Rewrite it as a real photograph* to send it as typed.
 **Models:** step 2 has a *Picture model* (the still the video starts from)
 and a *Video model*. Suggested choices come first, with notes; any other
 catalog model can be picked. By default stills use GPT Image 2.6 Sunburst at

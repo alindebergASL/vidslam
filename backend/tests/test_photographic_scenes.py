@@ -296,7 +296,7 @@ def test_weather_replaces_the_presets_sky_and_stays_outside_indoors():
     assert light_phrase(_cfg(weather="clear")) == "A clear sky."
     assert PRESET_LIGHT["waterfall"] not in light_phrase(_cfg(weather="heavy_rain"))
     # A chosen time of day still comes first, with the weather after it.
-    assert light_phrase(_cfg(time_of_day="dusk", weather="fog")).startswith("Dim blue twilight")
+    assert light_phrase(_cfg(time_of_day="dusk", weather="fog")).startswith("About twenty minutes after sunset")
     # Indoors the fire stays the light; time and weather are outside.
     fire = light_phrase(_cfg(scene_preset="fireplace", time_of_day="night", weather="heavy_rain"))
     assert fire.startswith(PRESET_LIGHT["fireplace"])

@@ -22,8 +22,17 @@ def _chunk_caption(text: str, max_words: int = 5) -> list[str]:
     return chunks
 
 
+_HYPE = re.compile(r"\b(photorealistic|realistic|8k|4k|ultra|hd|cinematic|epic|breathtaking|stunning|"
+                   r"beautiful|magical|ethereal|dreamy|vibrant|glowing|masterpiece)\b,?\s*", re.I)
+
+
 class MockChatProvider(ChatProvider):
     """Deterministic storyboard generator used in MOCK_PROVIDERS mode and tests."""
+
+    def rewrite_scene(self, text: str) -> dict:
+        scene = re.sub(r"\s{2,}", " ", _HYPE.sub("", text)).strip(" ,.") or text.strip()
+        return {"scene": f"{scene[0].upper()}{scene[1:]}.", "light": "Soft, ordinary daylight.",
+                "camera": "Shot on a full-frame camera with a 35 mm lens at f/8 from a tripod."}
 
     def generate_storyboard(self, *, project: dict, cast: CastContext) -> StoryboardPlan:
         script = (project.get("original_script") or "").strip() or "Sample script."

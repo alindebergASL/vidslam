@@ -294,9 +294,15 @@ export type CustomModel = {
 export type AmbientSource = "video" | "image_drift";
 export type AmbientLook = "photoreal" | "cinematic" | "painterly" | "watercolor" | "anime" | "claymation" | "dreamy";
 
+/** A typed scene description rewritten as a real photograph (server-made). */
+export type PhotoRewrite = { source: string; scene: string; light: string; camera: string };
+
 export type AmbientConfig = {
   scene_preset: string;
   scene_prompt: string;
+  /** Photoreal: rewrite a typed description as a photograph for the image model. */
+  rewrite_prompt: boolean;
+  photo?: PhotoRewrite | null;
   source: AmbientSource;
   loop_seconds: number;
   total_seconds: number;
@@ -406,6 +412,8 @@ export type AmbientScene = {
 export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   scene_preset: "waterfall",
   scene_prompt: "",
+  rewrite_prompt: true,
+  photo: null,
   source: "video",
   loop_seconds: 30,
   total_seconds: 3600,

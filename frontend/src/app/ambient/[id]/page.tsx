@@ -12,6 +12,7 @@ import {
   ChipRow,
   LookControls,
   ModelControls,
+  PhotoRewriteControl,
   type ModelOption,
   OverlayControls,
   MUSIC_LENGTHS,
@@ -637,6 +638,9 @@ function SettingsPanel({
   const invalidates =
     cfg.scene_prompt !== scene.config.scene_prompt ||
     cfg.scene_preset !== scene.config.scene_preset ||
+    // Turning the rewrite off (or on) changes the prompt only when a rewrite applies.
+    (cfg.rewrite_prompt !== scene.config.rewrite_prompt && !!scene.config.photo?.scene && cfg.look === "photoreal" &&
+      !["upload", "studio", "asset"].includes(cfg.picture_origin)) ||
     cfg.source !== scene.config.source ||
     cfg.loop_seconds !== scene.config.loop_seconds ||
     cfg.model_override !== scene.config.model_override ||
@@ -822,6 +826,7 @@ function SettingsPanel({
               placeholder={preset?.prompt || ""}
               onChange={(e) => set("scene_prompt", e.target.value)}
             />
+            <PhotoRewriteControl cfg={cfg} set={set} idPrefix="set-rewrite" saved={scene.config} />
           </div>
           <ModelControls
             cfg={cfg}

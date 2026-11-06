@@ -11,6 +11,7 @@ import {
   LookControls,
   MUSIC_LENGTHS,
   ModelControls,
+  PhotoRewriteControl,
   type ModelOption,
   OverlayControls,
   PlanSummary,
@@ -133,10 +134,15 @@ function Inner() {
     setSubmitting(true);
     setError(null);
     try {
-      const config =
-        picture && cfg.scene_preset === "custom" && !cfg.scene_prompt.trim()
-          ? { ...cfg, scene_prompt: "the scene in the given image" }
-          : cfg;
+      // With your own picture the text only describes motion: don't rewrite it as a place.
+      const config = picture
+        ? {
+            ...cfg,
+            rewrite_prompt: false,
+            scene_prompt:
+              cfg.scene_preset === "custom" && !cfg.scene_prompt.trim() ? "the scene in the given image" : cfg.scene_prompt,
+          }
+        : cfg;
       // With a picture: create without generating, attach it, then generate,
       // so the loop is built from the picture rather than a generated still.
       const scene = await api.createAmbient({
@@ -298,6 +304,11 @@ function Inner() {
                 : "Leave blank to use the preset text."}{" "}
               We add &ldquo;static camera, no cuts, no people, seamless loop&rdquo; directives automatically.
             </p>
+            <PhotoRewriteControl
+              cfg={{ ...cfg, picture_origin: picture ? (picture.file ? "upload" : picture.picked!.kind) : "" }}
+              set={set}
+              idPrefix="new-rewrite"
+            />
 
             <div className="label mt-5">Start from a picture (optional)</div>
             <div className="flex flex-col sm:flex-row gap-3 sm:items-center">

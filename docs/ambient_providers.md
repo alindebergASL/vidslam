@@ -75,6 +75,13 @@ Blind tests in Nov 2026 (AI judges, one image per model and prompt):
 - **Sunburst at "max" made the most realistic stills**, about $0.13 and
   2 minutes each, with a 1536×864 cap through OpenRouter. Nano Banana 2.1 at
   2K was a close second at about $0.05. FLUX.3 and FLUX.3 Klein trailed.
+- Follow-up test: rewriting a typed description as a photograph (planner
+  model) lifted hype-heavy descriptions from 4.7–5.7 to 6.3–7.0 and left a
+  plain one unchanged. Close-up framings fixed the weakest presets: a
+  firebox close-up (no grate or poker, which models malformed), two candles
+  with uneven wear (not rows of identical drips), and rain landing on one
+  banana leaf (not a flat rain overlay). Night from a day still still reads
+  as a "day-for-night" grade whatever the wording.
 - OpenRouter reserves a request's maximum cost up front. Several Sunburst
   "max" stills at once on a low balance return 402; the fallback covers that.
 
