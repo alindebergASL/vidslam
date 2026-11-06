@@ -322,7 +322,17 @@ export type AmbientConfig = {
   /** Less repetition: several takes of the scene, or day → night. */
   variety: "none" | "takes" | "day_night";
   variations: number;
+  /** Overlays (render-time; changing them keeps the loop). */
+  overlay_title: string;
+  title_seconds: number;
+  watermark: string;
+  watermark_position: Corner;
+  watermark_opacity: number;
+  timer: "none" | "countdown" | "elapsed";
+  timer_position: Corner;
 };
+
+export type Corner = "top_left" | "top_right" | "bottom_left" | "bottom_right";
 
 export type ScenePreset = {
   id: string;
@@ -401,6 +411,13 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   picture_origin: "",
   variety: "none",
   variations: 3,
+  overlay_title: "",
+  title_seconds: 8,
+  watermark: "",
+  watermark_position: "bottom_right",
+  watermark_opacity: 0.6,
+  timer: "none",
+  timer_position: "top_right",
 };
 
 export type PublishMeta = {

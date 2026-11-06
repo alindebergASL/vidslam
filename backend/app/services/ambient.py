@@ -528,6 +528,21 @@ def variant_prompt(cfg: AmbientConfig, i: int) -> str:
     return prompt
 
 
+def overlay_summary(cfg: AmbientConfig) -> str:
+    """e.g. "title+watermark+countdown" ("" when there are none)."""
+    parts = [n for n, on in (("title", cfg.overlay_title), ("watermark", cfg.watermark)) if on]
+    if cfg.timer != "none":
+        parts.append(cfg.timer)
+    return "+".join(parts)
+
+
+def overlay_note(cfg: AmbientConfig) -> Optional[str]:
+    if cfg.timer == "none":
+        return None
+    return ("Timer: the finished video is re-encoded once to draw the clock, so rendering takes "
+            "several minutes longer per hour of video. No provider cost.")
+
+
 def transition_seconds(cfg: AmbientConfig) -> float:
     """Dissolve between variations: short between takes of the same scene,
     long and gentle when the light changes."""
@@ -649,6 +664,7 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
     notes: list[str] = []
     k = variant_count(cfg)
     labels = variant_labels(cfg)
+    timer_note = overlay_note(cfg)
     if cfg.variety == "takes" and cfg.source == "image_drift":
         notes.append("Mix of takes needs a video scene; Still + drift uses one still. "
                      "Try Day to night instead.")
@@ -663,7 +679,7 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
             max_clip_seconds=cfg.loop_seconds, caps_known=True, supports_last_frame=False,
             strategy="drift", segments=[cfg.loop_seconds], anchored=False, closed=True,
             join_crossfade=0.0, seam_crossfade=0.0, loop_seconds=loop, unit_seconds=loop,
-            repeats=repeats, provider_calls=k, notes=notes,
+            repeats=repeats, provider_calls=k, notes=notes + ([timer_note] if timer_note else []),
             variants=k, variant_labels=labels, repeat_every_seconds=loop,
         )
 
@@ -730,7 +746,7 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
         unit_seconds=round(unit, 2),
         repeats=max(1, math.ceil(cfg.total_seconds / unit)),
         provider_calls=n * k + anchor_calls,
-        notes=notes,
+        notes=notes + ([timer_note] if timer_note else []),
         variants=k,
         variant_labels=labels,
         repeat_every_seconds=round(repeat_every, 2),
@@ -1419,6 +1435,13 @@ def render_scene(db: Session, project_id: int) -> models.Render:
                 extra_clips=extra,
                 variety=str(gen.get("variety") or "none"),
                 transition_seconds=transition_seconds(cfg),
+                overlay_title=cfg.overlay_title,
+                title_seconds=cfg.title_seconds,
+                watermark=cfg.watermark,
+                watermark_position=cfg.watermark_position,
+                watermark_opacity=cfg.watermark_opacity,
+                timer=cfg.timer,
+                timer_position=cfg.timer_position,
             )
         )
         _check_cancel(db, render)
@@ -1436,7 +1459,7 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         render.render_log = (
             f"ambient: clips={len(segs) or 1} variations={k} unit={outputs.unit_seconds:.2f}s "
             f"repeats={outputs.repeats} total={project.target_duration_seconds}s "
-            f"res={cfg.output_resolution} "
+            f"res={cfg.output_resolution} overlays={overlay_summary(cfg) or 'none'} "
             f"seam={'closed' if closed else 'crossfade'}\n" + outputs.log[-7000:]
         )
         render.actual_cost = 0.0

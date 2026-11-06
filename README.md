@@ -132,6 +132,12 @@ stays put) and plays each for an equal share of the video, with a slow
 dissolve between them; it also works with Still + drift. Each variation is
 its own loop clip, so the video cost scales with the count; the full-length
 render is still local FFmpeg work.
+**Overlays:** an optional title over the opening seconds (fading in and out),
+a corner watermark, and a countdown or elapsed timer. Title and watermark
+are drawn on pieces that are encoded anyway, so they're free; the timer
+changes every second, so the finished video is re-encoded once (about 8 min
+longer per hour of video on a small server; no provider cost). Overlays are
+render-time settings: changing them keeps the loop.
 
 Extras: **preset preview images** (one image call per preset, cached),
 **long music beds** (3–20 min, generated in parts and crossfaded when

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -336,6 +337,15 @@ class AmbientRenderInputs:
     extra_clips: list[Path] = field(default_factory=list)
     variety: str = "none"
     transition_seconds: float = 2.0
+    # Overlays (see AmbientConfig). Title and watermark ride on pieces that
+    # are encoded anyway; a timer re-encodes the final video once.
+    overlay_title: str = ""
+    title_seconds: float = 8.0
+    watermark: str = ""
+    watermark_position: str = "bottom_right"
+    watermark_opacity: float = 0.6
+    timer: str = "none"
+    timer_position: str = "top_right"
 
 
 @dataclass
@@ -352,8 +362,105 @@ class AmbientRenderOutputs:
 _X264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20"]
 
 
+_FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+
+
+def _corner_xy(position: str, margin: int) -> str:
+    x = f"w-tw-{margin}" if position.endswith("right") else str(margin)
+    y = f"h-th-{margin}" if position.startswith("bottom") else str(margin)
+    return f"x={x}:y={y}"
+
+
+def _text_file(out: Path, name: str, text: str) -> Path:
+    path = out / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _text_width(text: str, font: str, size: int) -> float:
+    from PIL import ImageFont
+
+    return ImageFont.truetype(font, size).getlength(text)
+
+
+def fit_lines(text: str, *, font: str, size: int, max_width: float, max_lines: int,
+              min_size: int = 12) -> tuple[list[str], int]:
+    """Wrap `text` on words into at most `max_lines` lines no wider than
+    `max_width`, shrinking the font from `size` until it fits (drawtext
+    neither wraps nor fits on its own, so long text would run off the
+    frame). A single word too long for a line is kept whole at min_size."""
+    words = text.split()
+    while True:
+        lines: list[str] = []
+        for word in words:
+            if lines and _text_width(f"{lines[-1]} {word}", font, size) <= max_width:
+                lines[-1] = f"{lines[-1]} {word}"
+            else:
+                lines.append(word)
+        fits = len(lines) <= max_lines and all(_text_width(ln, font, size) <= max_width for ln in lines)
+        if fits or size <= min_size:
+            return lines[:max_lines] if fits else [" ".join(words)], size
+        size = max(min_size, int(size * 0.9))
+
+
+def watermark_filter(out: Path, text: str, *, height: int, position: str, opacity: float,
+                     width: Optional[int] = None) -> str:
+    """drawtext for a small corner watermark ("" when there's none), shrunk
+    to fit one line within the frame."""
+    if not text:
+        return ""
+    width = width or height * 16 // 9
+    m = int(height * 0.035)
+    lines, size = fit_lines(text, font=_FONT, size=max(12, int(height * 0.032)),
+                            max_width=width - 2 * m, max_lines=1, min_size=10)
+    tf = _text_file(out, "overlay_watermark.txt", lines[0])
+    return (f"drawtext=fontfile={_FONT}:{textfile_arg(tf)}:fontsize={size}:"
+            f"fontcolor=white@{opacity:.2f}:shadowcolor=black@{opacity * 0.6:.2f}:shadowx=2:shadowy=2:"
+            f"{_corner_xy(position, m)}")
+
+
+def title_filter(out: Path, text: str, *, height: int, seconds: float,
+                 width: Optional[int] = None) -> str:
+    """drawtext for a centered title over the first `seconds`, fading in and
+    out: wrapped onto up to 3 lines (each centered) and shrunk to fit."""
+    if not text or seconds <= 0:
+        return ""
+    width = width or height * 16 // 9
+    lines, size = fit_lines(text, font=_FONT_BOLD, size=max(18, int(height * 0.075)),
+                            max_width=width * 0.88, max_lines=3)
+    f = min(1.0, seconds / 4)
+    alpha = f"if(lt(t,{f:.2f}),t/{f:.2f},if(lt(t,{seconds - f:.2f}),1,max(0,({seconds:.2f}-t)/{f:.2f})))"
+    gap = int(size * 1.25)
+    top = f"(h-{gap * len(lines)})/2"
+    parts = []
+    for i, line in enumerate(lines):
+        tf = _text_file(out, f"overlay_title_{i}.txt", line)
+        parts.append(f"drawtext=fontfile={_FONT_BOLD}:{textfile_arg(tf)}:fontsize={size}:fontcolor=white:"
+                     f"shadowcolor=black@0.6:shadowx=3:shadowy=3:x=(w-tw)/2:y={top}+{i * gap}:"
+                     f"alpha='{alpha}':enable='lt(t,{seconds:.2f})'")
+    return ",".join(parts)
+
+
+def timer_filter(out: Path, mode: str, *, total: float, height: int, position: str) -> str:
+    """drawtext for a countdown / elapsed clock, mm:ss (h:mm:ss from an hour)."""
+    if mode not in ("countdown", "elapsed"):
+        return ""
+    r = f"max(0,{total:.3f}-t)" if mode == "countdown" else "t"
+    if total >= 3600:
+        expr = (f"%{{eif:trunc({r}/3600):d:1}}:%{{eif:mod(trunc({r}/60),60):d:2}}:"
+                f"%{{eif:mod(trunc({r}),60):d:2}}")
+    else:
+        expr = f"%{{eif:trunc({r}/60):d:2}}:%{{eif:mod(trunc({r}),60):d:2}}"
+    tf = _text_file(out, "overlay_timer.txt", expr)
+    size, m = max(16, int(height * 0.06)), int(height * 0.04)
+    arg = textfile_arg(tf).replace("expansion=none", "expansion=normal")
+    return (f"drawtext=fontfile={_FONT_BOLD}:{arg}:fontsize={size}:fontcolor=white@0.9:"
+            f"shadowcolor=black@0.6:shadowx=2:shadowy=2:{_corner_xy(position, m)}")
+
+
 def _encode_normalized(
-    src: Path, dst: Path, *, width: int, height: int, slow_factor: float
+    src: Path, dst: Path, *, width: int, height: int, slow_factor: float, extra_vf: str = ""
 ) -> str:
     vf = (
         f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,"
@@ -363,6 +470,8 @@ def _encode_normalized(
         # Slow the clip down; fps= re-samples so the output stays constant-rate.
         vf += f",setpts={slow_factor:.4f}*PTS"
     vf += f",fps={FPS}"
+    if extra_vf:
+        vf += "," + extra_vf
     cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-an", *_X264, "-r", str(FPS), str(dst)]
     rc, log = _run(cmd)
     if rc != 0:
@@ -422,8 +531,9 @@ def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: flo
     return log
 
 
-def _faded_copy(unit: Path, dst: Path, *, unit_len: float, fade_in: float, fade_out: float) -> str:
-    parts: list[str] = []
+def _faded_copy(unit: Path, dst: Path, *, unit_len: float, fade_in: float, fade_out: float,
+                extra_vf: str = "") -> str:
+    parts: list[str] = [extra_vf] if extra_vf else []
     if fade_in > 0:
         parts.append(f"fade=t=in:st=0:d={fade_in:.3f}")
     if fade_out > 0:
@@ -439,13 +549,15 @@ def _faded_copy(unit: Path, dst: Path, *, unit_len: float, fade_in: float, fade_
 
 
 def _end_piece(unit: Path, dst: Path, *, unit_len: float, length: float,
-               fade_in: float, fade_out: float) -> str:
+               fade_in: float, fade_out: float, extra_vf: str = "") -> str:
     """The last `length` seconds of the tiled video, i.e. the unit (twice
     over if needed) cut to `length`, with the fade-out ending exactly at its
     end."""
     loops = 1 if length <= unit_len + 1e-3 else 2
     flt = ("[0:v][1:v]concat=n=2:v=1:a=0," if loops == 2 else "[0:v]")
     flt += f"trim=duration={length:.3f},setpts=PTS-STARTPTS"
+    if extra_vf:
+        flt += "," + extra_vf
     if fade_in > 0:
         flt += f",fade=t=in:st=0:d={fade_in:.3f}"
     if fade_out > 0:
@@ -497,7 +609,11 @@ def _tile_and_mux(
     fade: float,
     sound_unit: Optional[Path] = None,
     sound_volume: float = 0.6,
+    video_vf: str = "",
 ) -> str:
+    # A timer changes every frame, so the tiled video is re-encoded once;
+    # otherwise it is stream-copied.
+    vcodec = ["-vf", video_vf, *_X264, "-r", str(FPS)] if video_vf else ["-c:v", "copy"]
     listfile = out.parent / "ambient_concat.txt"
     listfile.write_text(
         "\n".join(f"file '{p.as_posix()}'" for p in pieces) + "\n", encoding="utf-8"
@@ -524,10 +640,10 @@ def _tile_and_mux(
         cmd += [
             "-filter_complex", graph,
             "-map", "0:v:0", "-map", "[a]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            *vcodec, "-c:a", "aac", "-b:a", "192k",
         ]
     else:
-        cmd += ["-map", "0:v:0", "-c:v", "copy", "-an"]
+        cmd += ["-map", "0:v:0", *vcodec, "-an"]
     cmd += ["-t", f"{total:.3f}", "-movflags", "+faststart", str(out)]
     rc, log = _run(cmd)
     if rc != 0:
@@ -559,11 +675,13 @@ def _transition_piece(a: Path, b: Path, dst: Path, *, b_len: float, dissolve: fl
 
 
 def _end_piece_from(sources: list[Path], dst: Path, *, length: float,
-                    fade_in: float, fade_out: float) -> str:
+                    fade_in: float, fade_out: float, extra_vf: str = "") -> str:
     """`sources` played back to back, cut to `length`, with the fades."""
     n = len(sources)
     flt = "".join(f"[{i}:v]" for i in range(n)) + (f"concat=n={n}:v=1:a=0," if n > 1 else "")
     flt += f"trim=duration={length:.3f},setpts=PTS-STARTPTS"
+    if extra_vf:
+        flt += "," + extra_vf
     if fade_in > 0:
         flt += f",fade=t=in:st=0:d={fade_in:.3f}"
     if fade_out > 0:
@@ -630,7 +748,8 @@ def variety_plan(variety: str, lengths: list[float], total: float) -> list[Piece
 
 
 def _variety_pieces(units: list[Path], lengths: list[float], out: Path, *, variety: str,
-                    total: float, fade: float, dissolve: float) -> tuple[list[Path], list[str]]:
+                    total: float, fade: float, dissolve: float, title_vf: str = "",
+                    title_seconds: float = 0.0) -> tuple[list[Path], list[str]]:
     """Files that cover exactly `total` for a multi-variant scene (see
     variety_plan). Transitions and cut-short plays are encoded once each;
     whole plays of a unit are stream-copied."""
@@ -664,20 +783,31 @@ def _variety_pieces(units: list[Path], lengths: list[float], out: Path, *, varie
     if tail_from >= 1 and remainder < fade + 0.5:
         tail_from -= 1
         remainder += plens[tail_from]
+    # The title can outlast the first piece: the opening spans as many
+    # pieces as it needs; if that reaches the end piece, it is all one piece.
+    n_head = 1
+    if title_vf:
+        while n_head < len(plens) and sum(plens[:n_head]) < title_seconds - 1e-6:
+            n_head += 1
+        if n_head > tail_from:
+            tail_from, remainder = 0, total
     head_in_tail = tail_from == 0
     end = out / "ambient_tail.mp4"
     logs.append(_end_piece_from(pieces[tail_from:], end, length=remainder,
-                                fade_in=fade if head_in_tail else 0.0, fade_out=fade))
+                                fade_in=fade if head_in_tail else 0.0, fade_out=fade,
+                                extra_vf=title_vf if head_in_tail else ""))
     body = pieces[:tail_from]
-    if body and fade > 0:
+    if body and (fade > 0 or title_vf):
         head = out / "ambient_head.mp4"
-        logs.append(_faded_copy(body[0], head, unit_len=plens[0], fade_in=fade, fade_out=0.0))
-        body = [head, *body[1:]]
+        logs.append(_end_piece_from(body[:n_head], head, length=sum(plens[:n_head]), fade_in=fade,
+                                    fade_out=0.0, extra_vf=title_vf))
+        body = [head, *body[n_head:]]
     return [*body, end], logs
 
 
 def _single_unit_pieces(unit: Path, unit_len: float, out: Path, *, total: float,
-                        fade_seconds: float, logs: list[str]) -> tuple[list[Path], int, float]:
+                        fade_seconds: float, logs: list[str], title_vf: str = "",
+                        title_seconds: float = 0.0) -> tuple[list[Path], int, float]:
     """Pieces covering exactly `total` for one loop unit."""
     # Tile plan. The pieces cover exactly `total`: head (fade-in), plain
     #    units, and an end piece cut to the remaining time whose fade-out
@@ -694,15 +824,26 @@ def _single_unit_pieces(unit: Path, unit_len: float, out: Path, *, total: float,
     repeats = full + 1
     if full == 0:
         single = out / "ambient_single.mp4"
-        logs.append(_end_piece(unit, single, unit_len=unit_len, length=remainder, fade_in=fade, fade_out=fade))
+        logs.append(_end_piece(unit, single, unit_len=unit_len, length=remainder, fade_in=fade, fade_out=fade,
+                               extra_vf=title_vf))
         pieces = [single]
     else:
         end = out / "ambient_tail.mp4"
         logs.append(_end_piece(unit, end, unit_len=unit_len, length=remainder, fade_in=0.0, fade_out=fade))
-        if fade > 0:
+        # The title can outlast one unit: the opening piece is then that
+        # many units, encoded once.
+        n = max(1, math.ceil(title_seconds / unit_len - 1e-6)) if title_vf else 1
+        if n > full:
+            # The title runs into the end piece (a short video): one piece.
+            single = out / "ambient_single.mp4"
+            logs.append(_end_piece_from([unit] * math.ceil(total / unit_len + 1e-6), single, length=total,
+                                        fade_in=fade, fade_out=fade, extra_vf=title_vf))
+            pieces = [single]
+        elif fade > 0 or title_vf:
             head = out / "ambient_head.mp4"
-            logs.append(_faded_copy(unit, head, unit_len=unit_len, fade_in=fade, fade_out=0.0))
-            pieces = [head, *([unit] * (full - 1)), end]
+            logs.append(_end_piece_from([unit] * n, head, length=n * unit_len, fade_in=fade,
+                                        fade_out=0.0, extra_vf=title_vf))
+            pieces = [head, *([unit] * (full - n)), end]
         else:
             pieces = [*([unit] * full), end]
     return pieces, repeats, fade
@@ -719,10 +860,16 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     out.mkdir(parents=True, exist_ok=True)
     logs: list[str] = []
 
+    # Overlays. The watermark is drawn on each normalized clip, so every
+    # tiled copy carries it for free.
+    wm_vf = watermark_filter(out, inputs.watermark.strip(), height=height, width=width,
+                             position=inputs.watermark_position, opacity=inputs.watermark_opacity)
+
     # 1. Normalize (size/fps/codec, optional slow-down).
     norm = out / "ambient_norm.mp4"
     logs.append(_encode_normalized(
-        inputs.clip_path, norm, width=width, height=height, slow_factor=inputs.slow_factor
+        inputs.clip_path, norm, width=width, height=height, slow_factor=inputs.slow_factor,
+        extra_vf=wm_vf,
     ))
     length = _probe_duration(norm)
     if length <= 0.5:
@@ -746,7 +893,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         for i, clip in enumerate(inputs.extra_clips, start=1):
             n_i = out / f"ambient_norm_{i}.mp4"
             logs.append(_encode_normalized(clip, n_i, width=width, height=height,
-                                           slow_factor=inputs.slow_factor))
+                                           slow_factor=inputs.slow_factor, extra_vf=wm_vf))
             l_i = _probe_duration(n_i)
             if l_i <= 0.5:
                 raise RuntimeError(f"normalized loop clip {i + 1} is empty or unreadable")
@@ -758,13 +905,23 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
             units.append(u_i)
             lengths.append(_probe_duration(u_i) or (l_i - cf))
         fade = max(0.0, min(inputs.fade_seconds, min(lengths) / 2.5, total / 2.5))
+        # The title is drawn on the opening piece (a unit, or the whole
+        # video when it is shorter than one).
+        title_secs = min(inputs.title_seconds, max(1.0, total - 0.3))
+        title_vf = title_filter(out, inputs.overlay_title.strip(), height=height, width=width,
+                                seconds=title_secs)
         pieces, plogs = _variety_pieces(units, lengths, out, variety=inputs.variety, total=total,
-                                        fade=fade, dissolve=inputs.transition_seconds)
+                                        fade=fade, dissolve=inputs.transition_seconds, title_vf=title_vf,
+                                        title_seconds=title_secs)
         logs.extend(plogs)
         repeats = len(pieces)
     else:
+        title_secs = min(inputs.title_seconds, max(1.0, total - 0.3))
+        title_vf = title_filter(out, inputs.overlay_title.strip(), height=height, width=width,
+                                seconds=title_secs)
         pieces, repeats, fade = _single_unit_pieces(unit, unit_len, out, total=total,
-                                                    fade_seconds=inputs.fade_seconds, logs=logs)
+                                                    fade_seconds=inputs.fade_seconds, logs=logs,
+                                                    title_vf=title_vf, title_seconds=title_secs)
 
     # 4. Music unit (optional).
     music_unit: Optional[Path] = None
@@ -794,6 +951,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         fade=fade,
         sound_unit=sound_unit,
         sound_volume=inputs.sound_volume,
+        video_vf=timer_filter(out, inputs.timer, total=total, height=height, position=inputs.timer_position),
     ))
 
     # 6. Thumbnail — sample past the fade-in so it isn't a black frame.

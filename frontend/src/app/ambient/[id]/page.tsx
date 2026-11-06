@@ -11,6 +11,7 @@ import { ScenePicture } from "@/components/ambient/ScenePicture";
 import {
   ChipRow,
   LookControls,
+  OverlayControls,
   MUSIC_LENGTHS,
   PlanSummary,
   previewSrc,
@@ -696,6 +697,8 @@ function SettingsPanel({
       </div>
 
       <SoundControls cfg={cfg} set={set} presets={presets} idPrefix="set-sound" />
+
+      <OverlayControls cfg={cfg} set={set} idPrefix="set-overlay" />
       {cfg.sound !== scene.config.sound && (
         <p className="text-[11px] text-ink-400 -mt-2">Save, then Generate sound to apply.</p>
       )}
