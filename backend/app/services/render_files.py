@@ -28,7 +28,12 @@ log = logging.getLogger("avs.render_files")
 _SCRATCH = (
     "norm_*.mp4", "silent.mp4", "endcard.mp4", "concat.txt",
     "ambient_norm.mp4", "ambient_unit.mp4", "ambient_head.mp4", "ambient_tail.mp4",
-    "ambient_single.mp4", "ambient_concat.txt", "ambient_music_unit.m4a",
+    "ambient_single.mp4", "ambient_concat.txt",
+    # Audio loop units: .wav now (gapless looping); .m4a from older renders.
+    "ambient_music_unit.*", "ambient_sound_unit.*",
+    # Multi-clip ("variety") renders: per-clip normalized/unit clips, and the
+    # tiled parts / dissolves (named by offset and length, so they'd pile up).
+    "ambient_norm_*.mp4", "ambient_unit_*.mp4", "ambient_part_*.mp4", "ambient_trans_*.mp4",
 )
 
 
