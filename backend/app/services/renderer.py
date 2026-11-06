@@ -570,28 +570,54 @@ def _end_piece(unit: Path, dst: Path, *, unit_len: float, length: float,
     return log
 
 
+# Equal-power (quarter-sine) curves for every audio crossfade. The two sides
+# of a seam are different stretches of sound (the bed's tail vs its head, or
+# two separately generated parts), i.e. uncorrelated, so a linear ("tri")
+# fade sums to half power mid-overlap: a ~3 dB dip you can hear on steady
+# beds like rain or a waterfall, once per loop for the whole video.
+AUDIO_XFADE_CURVES = "c1=qsin:c2=qsin"
+
+# Loop units are written as uncompressed PCM (.wav), not AAC: an AAC file
+# carries encoder padding at its edges, and `-stream_loop` replays it on
+# every pass, so an AAC unit drops out for ~10–30 ms at each loop point.
+# PCM loops sample-exactly. Float, because an equal-power seam can peak up
+# to ~3 dB above the source on a brickwalled master and 16-bit would clip it
+# (volume is applied later, in _tile_and_mux). Render scratch, deleted after.
+AUDIO_UNIT_CODEC = ("-c:a", "pcm_f32le")
+
+
 def _make_seamless_audio_unit(music: Path, dst: Path, *, crossfade: float) -> tuple[str, float]:
-    """Same trick for audio: acrossfade the bed against itself, trim the
-    overlap so the file loops cleanly. Returns (log, unit_seconds)."""
+    """Same trick for audio: crossfade the bed's tail into its own head so the
+    file loops cleanly. `dst` should be a .wav (see AUDIO_UNIT_CODEC).
+    Returns (log, unit_seconds).
+
+    The unit is source[cf:] with its last `cf` seconds crossfaded into
+    source[:cf], so it ends on the sample just before the one it starts on.
+    Both cuts are at the same time `cf` in the decoded audio. The container's
+    reported duration is never used as a cut point: for MP3/AAC it counts
+    encoder delay and padding the decoder drops (ElevenLabs' 30 s MP3 probes
+    as 30.04 s), and cutting there replayed or skipped 10–50 ms at every loop
+    point — a click on tonal music."""
     length = _probe_duration(music)
     if length <= 0:
         raise RuntimeError("music bed has no readable duration")
     cf = min(crossfade, max(0.0, length / 3.0))
     if cf < 0.05:
         # Too short to crossfade meaningfully — just transcode as-is.
-        cmd = ["ffmpeg", "-y", "-i", str(music), "-vn", "-c:a", "aac", "-b:a", "192k", str(dst)]
+        cmd = ["ffmpeg", "-y", "-i", str(music), "-vn", *AUDIO_UNIT_CODEC, str(dst)]
         rc, log = _run(cmd)
         if rc != 0:
             raise RuntimeError(f"ffmpeg audio unit failed: {log[-2000:]}")
         return log, _probe_duration(dst) or length
     flt = (
-        f"[0:a][1:a]acrossfade=d={cf:.3f}:c1=tri:c2=tri,"
-        f"atrim=start={cf:.3f}:end={length:.3f},asetpts=PTS-STARTPTS[a]"
+        f"[0:a]asetpts=PTS-STARTPTS,atrim=start={cf:.3f},asetpts=PTS-STARTPTS[body];"
+        f"[1:a]asetpts=PTS-STARTPTS,atrim=end={cf:.3f},asetpts=PTS-STARTPTS[head];"
+        f"[body][head]acrossfade=d={cf:.3f}:{AUDIO_XFADE_CURVES}[a]"
     )
     cmd = [
         "ffmpeg", "-y", "-i", str(music), "-i", str(music),
         "-filter_complex", flt, "-map", "[a]",
-        "-c:a", "aac", "-b:a", "192k", str(dst),
+        *AUDIO_UNIT_CODEC, str(dst),
     ]
     rc, log = _run(cmd)
     if rc != 0:
@@ -926,7 +952,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     # 4. Music unit (optional).
     music_unit: Optional[Path] = None
     if inputs.music_path is not None and inputs.music_path.exists():
-        music_unit = out / "ambient_music_unit.m4a"
+        music_unit = out / "ambient_music_unit.wav"
         mlog, _ = _make_seamless_audio_unit(
             inputs.music_path, music_unit, crossfade=max(1.0, inputs.crossfade_seconds)
         )
@@ -935,7 +961,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     # 4b. Nature-sound unit (optional), seam-crossfaded like the music.
     sound_unit: Optional[Path] = None
     if inputs.sound_path is not None and inputs.sound_path.exists():
-        sound_unit = out / "ambient_sound_unit.m4a"
+        sound_unit = out / "ambient_sound_unit.wav"
         slog, _ = _make_seamless_audio_unit(inputs.sound_path, sound_unit, crossfade=1.5)
         logs.append(slog)
 
@@ -1087,7 +1113,7 @@ def join_audio(parts: list[Path], dst: Path, *, crossfade: float = 6.0) -> tuple
         flt, prev = [], "0:a"
         for i in range(1, len(parts)):
             out = f"a{i}"
-            flt.append(f"[{prev}][{i}:a]acrossfade=d={crossfade:.2f}:c1=tri:c2=tri[{out}]")
+            flt.append(f"[{prev}][{i}:a]acrossfade=d={crossfade:.2f}:{AUDIO_XFADE_CURVES}[{out}]")
             prev = out
         cmd = ["ffmpeg", "-y"]
         for p in parts:
