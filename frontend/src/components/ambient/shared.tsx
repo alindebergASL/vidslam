@@ -578,6 +578,56 @@ export function SoundControls({
   );
 }
 
+/** "Rewrite it as a real photograph" for a typed description (photoreal only),
+ *  and, on a saved scene, what the image model actually receives. */
+export function PhotoRewriteControl({
+  cfg,
+  set,
+  idPrefix = "rewrite",
+  saved,
+}: {
+  cfg: AmbientConfig;
+  set: CfgSetter;
+  idPrefix?: string;
+  /** The saved scene's config: shows what the picture model reads while it matches. */
+  saved?: AmbientConfig;
+}) {
+  // A picture you brought (not a generated preview) sets the scene; the text only describes motion.
+  const ownPicture = ["upload", "studio", "asset"].includes(cfg.picture_origin);
+  if (cfg.look !== "photoreal" || !cfg.scene_prompt.trim() || ownPicture) return null;
+  const rw = saved?.photo;
+  const current =
+    !!saved && saved.rewrite_prompt && cfg.rewrite_prompt && saved.scene_prompt === cfg.scene_prompt && !!rw?.scene;
+  const chosenLight = cfg.time_of_day !== "any" || cfg.weather !== "any";
+  const showResult = !!saved;
+  return (
+    <div className="mt-2 space-y-1.5">
+      <label className="flex items-start gap-2 text-xs text-ink-200" htmlFor={`${idPrefix}-on`}>
+        <input
+          id={`${idPrefix}-on`}
+          type="checkbox"
+          className="accent-iris mt-0.5"
+          checked={cfg.rewrite_prompt}
+          onChange={(e) => set("rewrite_prompt", e.target.checked)}
+        />
+        <span>
+          Rewrite it as a real photograph for the picture model (recommended). Words like
+          &ldquo;magical&rdquo;, &ldquo;8k&rdquo; or &ldquo;turquoise&rdquo; make images look AI-made; your text is kept as typed.
+        </span>
+      </label>
+      {showResult && current && rw && (
+        <p className="text-xs text-ink-400 border-l-2 border-ink-700 pl-2">
+          <span className="text-ink-300">The picture model reads:</span> {rw.scene}{" "}
+          {chosenLight ? "(light from your time of day and weather)" : rw.light} {rw.camera}
+        </p>
+      )}
+      {showResult && !current && cfg.rewrite_prompt && (
+        <p className="text-xs text-ink-400">The rewrite is made when you save.</p>
+      )}
+    </div>
+  );
+}
+
 /** A catalog model, as the model dropdowns list it. */
 export type ModelOption = { id: string; name: string };
 

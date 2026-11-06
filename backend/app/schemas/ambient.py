@@ -38,12 +38,27 @@ Corner = Literal["top_left", "top_right", "bottom_left", "bottom_right"]
 Timer = Literal["none", "countdown", "elapsed"]
 
 
+class PhotoRewrite(BaseModel):
+    """The scene description rewritten as a plain description of a real
+    photograph (by the planner model), so hype words like "magical, 8k,
+    turquoise" don't reach the image model. Made by the server."""
+
+    source: str = ""  # fingerprint of the scene_prompt it was made from
+    scene: str = Field(default="", max_length=3000)
+    light: str = Field(default="", max_length=1000)
+    camera: str = Field(default="", max_length=1000)
+
+
 class AmbientConfig(BaseModel):
     """Everything that shapes an ambient scene other than title/aspect (which
     live on the VideoProject columns)."""
 
     scene_preset: str = "waterfall"
     scene_prompt: str = Field(default="", max_length=2000)
+    # Photoreal scenes: rewrite a typed scene_prompt as a photograph for the
+    # image/video model (kept in `photo`; the typed text stays as typed).
+    rewrite_prompt: bool = True
+    photo: Optional[PhotoRewrite] = None
     # "video": ask the video provider for the loop clip.
     # "image_drift": generate one still and give it a slow, periodic
     #   zoom/drift — perfectly seamless by construction and ~10× cheaper.

@@ -35,6 +35,7 @@ from ..schemas.ambient import (
     ModelChoiceOut,
     MusicMoodOut,
     OptionOut,
+    PhotoRewrite,
     ScenePresetOut,
     SoundPresetOut,
 )
@@ -82,10 +83,11 @@ SCENE_PRESETS: list[ScenePresetOut] = [
     ),
     ScenePresetOut(
         id="fireplace", label="Fireplace", emoji="🔥",
-        tagline="Crackling logs in a stone hearth.",
-        prompt="A fieldstone fireplace in an old farmhouse living room. Split oak logs burn on an iron grate "
-               "with small, uneven flames, glowing coals and a few drifting sparks; soot on the firebox "
-               "bricks, a worn stone hearth with a few wood chips, an iron poker leaning at the side.",
+        tagline="Logs burning down in a stone firebox.",
+        prompt="A close view into the firebox of an old stone fireplace. Three split logs of different sizes "
+               "burn on a bed of ash; one has burned through and broken into glowing chunks. Small, "
+               "irregular flames, blackened bark, white ash on the ends of the logs, soot-stained bricks "
+               "behind.",
         music_mood="piano", palette=("#4a1a0a", "#ff9a3c"),
     ),
     ScenePresetOut(
@@ -98,10 +100,10 @@ SCENE_PRESETS: list[ScenePresetOut] = [
     ),
     ScenePresetOut(
         id="rainforest", label="Rain on leaves", emoji="🌧️",
-        tagline="Soft rain in a green canopy.",
-        prompt="Rain falling on broad leaves in a tropical rainforest understory: monstera, elephant-ear and "
-               "fern fronds of different sizes, some torn or speckled, water beading and running off the "
-               "leaf tips, darker foliage receding into the forest behind.",
+        tagline="Rain landing on a banana leaf.",
+        prompt="A close view of rain on a single large banana leaf and the ferns around it in a rainforest. "
+               "Raindrops land and burst on the leaf, small beads of water collect along its ribs and drip "
+               "from its torn edge; behind it, dark wet foliage out of focus.",
         music_mood="rain", palette=("#143d2b", "#8fd19e"),
     ),
     ScenePresetOut(
@@ -139,10 +141,10 @@ SCENE_PRESETS: list[ScenePresetOut] = [
     ),
     ScenePresetOut(
         id="candles", label="Candlelight", emoji="🕯️",
-        tagline="A spa table of soft flames.",
-        prompt="Lit pillar candles of different heights on a dark slate shelf in a quiet spa, with melted "
-               "wax drips, a few smooth river stones and a small white orchid beside them, a plain dark "
-               "plaster wall behind.",
+        tagline="Two candles on a quiet spa shelf.",
+        prompt="Two white pillar candles burning on a slate shelf, one shorter and burned unevenly with a "
+               "cracked rim, a little black soot on the inside of its well. Beside them a single smooth grey "
+               "stone and a folded linen towel.",
         music_mood="spa", palette=("#2a1608", "#f2c27b"),
     ),
     ScenePresetOut(
@@ -195,11 +197,14 @@ LOOKS: dict[str, tuple[str, str]] = {
 # "golden hour" and "glow" brought sunstars and god rays with every model.
 TIMES_OF_DAY: dict[str, tuple[str, str]] = {
     "any": ("As written", ""),
-    "dawn": ("Dawn", "Soft, cool light at dawn, just before sunrise, with a faint pink in the sky."),
-    "golden_hour": ("Golden hour", "Low, warm late-afternoon sunlight from one side in the hour before "
-                                   "sunset, with long shadows; the sun itself is out of frame."),
+    "dawn": ("Dawn", "Early morning before sunrise: cool, dim light from a pale sky, a little low mist, "
+                     "no direct sun."),
+    "golden_hour": ("Golden hour", "Late-afternoon sun low in the sky from one side, warm light on the "
+                                   "upper parts of the scene while the lower parts are in shade; the sun "
+                                   "itself is out of frame, and there are no visible rays."),
     "midday": ("Midday", "Bright, even midday light."),
-    "dusk": ("Dusk", "Dim blue twilight just after sunset."),
+    "dusk": ("Dusk", "About twenty minutes after sunset: dim, even blue-grey light with no direct sun, "
+                     "colours muted."),
     "night": ("Night", "At night, lit only by moonlight, with deep blue shadows and much of the scene "
                        "in darkness."),
 }
@@ -218,30 +223,32 @@ INDOOR_PRESETS = frozenset({"fireplace", "candles"})
 # time replaces it instead of contradicting it) and camera (photoreal only).
 PRESET_LIGHT: dict[str, str] = {
     "waterfall": "Soft, even light on a bright overcast day, with deep natural shadows under the trees.",
-    "fireplace": "The fire is the main light, warm and uneven, with the room falling off into darkness.",
+    "fireplace": "Lit only by the fire, warm and uneven, with deep shadows at the edges of the frame.",
     "ocean": "Soft late-afternoon light under thin high cloud, with a little sea haze over the water.",
-    "rainforest": "Soft, diffuse grey light from an overcast sky, with a little mist between the trees.",
+    "rainforest": "Dim, flat light under heavy cloud.",
     "snowfall": "Flat, cool light on an overcast winter afternoon.",
     "zen_garden": "Soft overcast daylight.",
     "night_sky": "No moon; the landscape is lit only by starlight.",
     "lavender": "Warm late-afternoon sun from the side, with light haze over the hills.",
-    "candles": "The candle flames are the only light, warm and soft, with darkness around them.",
+    "candles": "Warm, dim candlelight only, with soft falloff into a dark background.",
 }
 PRESET_CAMERA: dict[str, str] = {
     "waterfall": "Shot on a full-frame camera with a 24 mm lens at f/8 and 1/250 s from a tripod at eye "
                  "level, so the falling water keeps its texture rather than a silky blur.",
-    "fireplace": "Shot on a full-frame camera with a 35 mm lens at f/4 from a tripod at seated height.",
+    "fireplace": "Shot on a full-frame camera with a 50 mm lens at f/2.8 and 1/125 s from a tripod, slightly "
+                 "underexposed with natural sensor noise in the shadows.",
     "ocean": "Shot on a full-frame camera with a 24 mm lens at f/8 and 1/250 s from a tripod at standing "
              "height, horizon level.",
-    "rainforest": "Shot on a full-frame camera with a 50 mm lens at f/4 and 1/500 s, so raindrops show as "
-                  "short streaks.",
+    "rainforest": "Shot on a full-frame camera with a 100 mm macro lens at f/4 and 1/1000 s from a tripod, "
+                  "so the nearest drops are frozen and the background rain is invisible.",
     "snowfall": "Shot on a full-frame camera with a 35 mm lens at f/5.6 and 1/250 s from a tripod.",
     "zen_garden": "Shot on a full-frame camera with a 35 mm lens at f/8 from a tripod at seated height.",
     "night_sky": "Shot on a full-frame camera with a 20 mm f/1.8 lens, a 15-second exposure at ISO 3200 "
                  "on a tripod, with natural sensor noise.",
     "lavender": "Shot on a full-frame camera with a 35 mm lens at f/8 and 1/500 s from a tripod at waist "
                 "height.",
-    "candles": "Shot on a full-frame camera with a 50 mm lens at f/2.8 from a tripod, the flames sharp.",
+    "candles": "Shot on a full-frame camera with a 85 mm lens at f/2 and 1/60 s from a tripod, natural "
+               "sensor noise in the dark areas.",
 }
 # Closing lines for the photoreal look: what a real photo / real footage is,
 # and what to avoid (OpenAI's own realism guidance uses the same wording).
@@ -306,6 +313,77 @@ def light_phrase(cfg: AmbientConfig, *, preset_light: bool = True) -> str:
 def style_phrase(cfg: AmbientConfig) -> str:
     """Light + weather + look, as one phrase (for summaries and stylized looks)."""
     return " ".join(x for x in (light_phrase(cfg, preset_light=False), look_phrase(cfg)) if x)
+
+
+def _text_fingerprint(text: str) -> str:
+    return hashlib.sha1(text.strip().encode()).hexdigest()[:16]
+
+
+def active_rewrite(cfg: AmbientConfig) -> Optional[PhotoRewrite]:
+    """The photo rewrite of the typed description, when it applies: a
+    photoreal scene with its own text, rewriting on, and a rewrite made from
+    exactly this text (an edited description waits for a new one)."""
+    text = cfg.scene_prompt.strip()
+    rw = cfg.photo
+    if (cfg.look != "photoreal" or not cfg.rewrite_prompt or not text or rw is None
+            or cfg.picture_origin in OWN_PICTURE or not rw.scene.strip()
+            or rw.source != _text_fingerprint(text)):
+        return None
+    return rw
+
+
+# Pictures the user brought: their text describes motion, not a place to invent.
+OWN_PICTURE = frozenset({"upload", "studio", "asset"})
+
+
+def _with_current_rewrite(project: models.VideoProject, cfg: AmbientConfig) -> AmbientConfig:
+    """Before generating: make a rewrite the scene doesn't have yet (one that
+    failed at save time, or a scene from before rewrites) and store it, so
+    the new clip or picture and the stored prompt agree. The caller commits."""
+    new = ensure_photo_rewrite(cfg)
+    if new.photo != cfg.photo:
+        data = dict(project.ambient_config_json or {})
+        data["photo"] = new.photo.model_dump() if new.photo else None
+        project.ambient_config_json = data
+    return new
+
+
+def _rewrite_key(cfg: AmbientConfig) -> Optional[tuple[str, str, str]]:
+    rw = active_rewrite(cfg)
+    return (rw.scene, rw.light, rw.camera) if rw else None
+
+
+def ensure_photo_rewrite(cfg: AmbientConfig) -> AmbientConfig:
+    """Make (or keep) the photo rewrite of a typed description: one short
+    call to the planner model, only when the text changed. On any failure
+    the scene just uses the text as typed."""
+    text = cfg.scene_prompt.strip()
+    if cfg.look != "photoreal" or not cfg.rewrite_prompt or not text or cfg.picture_origin in OWN_PICTURE:
+        return cfg
+    if cfg.photo is not None and cfg.photo.source == _text_fingerprint(text) and cfg.photo.scene.strip():
+        return cfg
+    try:
+        from ..providers import get_chat
+
+        out = get_chat().rewrite_scene(text)
+        rw = PhotoRewrite(source=_text_fingerprint(text), scene=out.get("scene", "")[:3000],
+                          light=out.get("light", "")[:1000], camera=out.get("camera", "")[:1000])
+    except Exception as e:  # noqa: BLE001 — the typed text still works
+        log.warning("scene description rewrite failed (%s); using it as typed", str(e)[:300])
+        return cfg.model_copy(update={"photo": None})
+    return cfg.model_copy(update={"photo": rw if rw.scene.strip() else None})
+
+
+def _light_with_rewrite(cfg: AmbientConfig, rw: Optional[PhotoRewrite]) -> str:
+    """A chosen time of day or weather replaces the rewrite's light, except
+    indoors, where the fire or candles stay the light and time and weather
+    are what's outside."""
+    chosen = light_phrase(cfg)
+    if not rw:
+        return chosen
+    if cfg.scene_preset in INDOOR_PRESETS:
+        return " ".join(x for x in (_sentence(rw.light), chosen) if x)
+    return chosen or _sentence(rw.light)
 
 
 def _scene_text(cfg: AmbientConfig) -> str:
@@ -611,10 +689,14 @@ def still_prompt(cfg: AmbientConfig) -> str:
     """Prompt for the scene's still. Photoreal is written as a photograph
     (scene, then its light, then the camera, then what real photos look
     like); other looks are the scene, its light and the style."""
-    base = _sentence(_scene_text(cfg))
-    light = light_phrase(cfg)
+    rw = active_rewrite(cfg)
+    base = _sentence(rw.scene if rw else _scene_text(cfg))
+    light = _light_with_rewrite(cfg, rw)
     if cfg.look == "photoreal":
-        camera = "" if cfg.scene_prompt.strip() else PRESET_CAMERA.get(cfg.scene_preset, "")
+        if rw:
+            camera = _sentence(rw.camera)
+        else:
+            camera = "" if cfg.scene_prompt.strip() else PRESET_CAMERA.get(cfg.scene_preset, "")
         parts = ["A real, unedited photograph.", base, light, camera, PHOTO_STILL,
                  "No people, no text, no watermark."]
     else:
@@ -625,7 +707,7 @@ def still_prompt(cfg: AmbientConfig) -> str:
 def generate_picture(db: Session, project: models.VideoProject) -> models.VideoProject:
     """Generate the scene's picture now (one image call), so it can be
     previewed and regenerated before any video is made."""
-    cfg = _config_of(project)
+    cfg = _with_current_rewrite(project, _config_of(project))
     # Same model choice as the loop path (still_model_chain), so the picture
     # previewed here is what the scene would have made anyway.
     png, _ = generate_still(db, cfg, prompt=still_prompt(cfg), aspect_ratio=project.aspect_ratio,
@@ -670,9 +752,10 @@ def resolve_scene_prompt(cfg: AmbientConfig) -> str:
         raise ValueError("scene_prompt is empty and the preset has no default prompt")
     if cfg.source == "image_drift":
         return still_prompt(cfg)
-    light = light_phrase(cfg)
+    rw = active_rewrite(cfg)
+    light = _light_with_rewrite(cfg, rw)
     if cfg.look == "photoreal":
-        parts = ["Real, unedited camera footage.", _sentence(base), light, PHOTO_VIDEO]
+        parts = ["Real, unedited camera footage.", _sentence(rw.scene if rw else base), light, PHOTO_VIDEO]
     else:
         parts = [_sentence(base), light, f"Rendered {look_phrase(cfg)}."]
     return " ".join(x for x in parts if x) + _LOOP_DIRECTIVES
@@ -1175,7 +1258,7 @@ def list_scenes(db: Session) -> list[models.VideoProject]:
 
 
 def create_scene(db: Session, body: AmbientCreate) -> models.VideoProject:
-    cfg = body.config
+    cfg = ensure_photo_rewrite(body.config)
     # Validate the prompt resolves before we persist anything.
     resolve_scene_prompt(cfg)
     preset = _PRESET_BY_ID.get(cfg.scene_preset)
@@ -1224,10 +1307,22 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
         cfg = body.config
         resolve_scene_prompt(cfg)
         old = _config_of(project)
-        generated = _generated_of(project)
         # The picture is set through its own endpoints; a settings save
         # (maybe from a page loaded before the upload) must not clear it.
         cfg = cfg.model_copy(update={"picture_origin": old.picture_origin})
+        # Keep a rewrite the page didn't send back (an older page, a partial edit).
+        if cfg.photo is None and old.photo is not None:
+            cfg = cfg.model_copy(update={"photo": old.photo})
+        # Rewrite only when what it depends on changed, so an unrelated save
+        # never swaps the prompt the existing clip was made from.
+        if (cfg.scene_prompt.strip() != old.scene_prompt.strip() or cfg.rewrite_prompt != old.rewrite_prompt
+                or cfg.look != old.look):
+            cfg = ensure_photo_rewrite(cfg)
+            # That was a network call: pick up anything the worker saved meanwhile.
+            db.refresh(project)
+            old = _config_of(project)
+            cfg = cfg.model_copy(update={"picture_origin": old.picture_origin})
+        generated = _generated_of(project)
         data = cfg.model_dump()
         if generated:
             data[_GENERATED_KEY] = generated
@@ -1243,7 +1338,10 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
                      "time_of_day", "weather", "variety", "variations")
         # The still model only matters when the scene makes stills.
         still_changed = old.still_model != cfg.still_model and makes_stills(cfg)
-        if (any(getattr(old, k) != getattr(cfg, k) for k in clip_keys) or still_changed) and shot.clip_path:
+        # The rewrite changes the prompt only when one applies before or after.
+        rewrite_changed = _rewrite_key(old) != _rewrite_key(cfg)
+        if ((any(getattr(old, k) != getattr(cfg, k) for k in clip_keys) or still_changed or rewrite_changed)
+                and shot.clip_path):
             _reset_clips(project)
             data.pop(_GENERATED_KEY, None)
             project.ambient_config_json = data
@@ -1517,7 +1615,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
     project = db.get(models.VideoProject, project_id)
     if project is None or project.mode != AMBIENT_MODE:
         raise ValueError(f"ambient scene {project_id} not found")
-    cfg = _config_of(project)
+    cfg = _with_current_rewrite(project, _config_of(project))
     shot = _ensure_loop_shot(db, project, cfg)
     _reset_clips(project)
     project.status = "generating"

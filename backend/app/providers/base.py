@@ -98,6 +98,11 @@ class ChatProvider(Protocol):
         cast: CastContext,
     ) -> StoryboardPlan: ...
 
+    def rewrite_scene(self, text: str) -> dict:
+        """A typed scene description as a real photograph:
+        {"scene": str, "light": str, "camera": str}."""
+        ...
+
 
 class ImageProvider(Protocol):
     def list_models(self) -> list[ModelInfo]: ...
