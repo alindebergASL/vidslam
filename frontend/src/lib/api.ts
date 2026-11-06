@@ -306,7 +306,10 @@ export type AmbientConfig = {
   music_mood: string;
   music_prompt: string;
   music_volume: number;
+  /** Video model for the loop clip ("" = the deployment default). */
   model_override: string;
+  /** Image model for the scene's stills ("" = recommended, with a fallback). */
+  still_model: string;
   chain_segments: boolean;
   music_bed_seconds: number;
   output_resolution: "1080p" | "4k";
@@ -348,6 +351,16 @@ export type ScenePreset = {
 export type MusicMood = { id: string; label: string; prompt: string };
 export type AmbientOption = { id: string; label: string };
 
+/** A model offered up front in the scene builder, with what it's like. */
+export type ModelChoice = {
+  id: string;
+  label: string;
+  note: string;
+  est_cost: number | null;
+  recommended: boolean;
+  experimental: boolean;
+};
+
 export type AmbientPresets = {
   scenes: ScenePreset[];
   music_moods: MusicMood[];
@@ -358,6 +371,11 @@ export type AmbientPresets = {
   loop_options: number[];
   total_options: number[];
   aspect_options: string[];
+  still_models?: ModelChoice[];
+  video_models?: ModelChoice[];
+  /** What "" means on this deployment. */
+  default_still_model?: string;
+  default_video_model?: string;
 };
 
 export type AmbientScene = {
@@ -398,6 +416,7 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   music_prompt: "",
   music_volume: 0.7,
   model_override: "",
+  still_model: "",
   chain_segments: true,
   music_bed_seconds: 0,
   output_resolution: "1080p",

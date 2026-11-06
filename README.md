@@ -115,6 +115,19 @@ painterly, watercolor, hand-drawn anime, claymation or dreamy, with a
 strength slider from "mostly realistic" to "fully stylized", plus time of
 day (dawn … night) and weather (clear, rain, snow, fog). These go into both
 the anchor still and the video prompt; changing them asks for a new loop.
+Photoreal prompts are written as a real photograph: the place, its light,
+the camera (lens, aperture, shutter) and "natural colour, not an enhanced or
+cinematic image", because words like "photorealistic, highly detailed" and
+"golden hour" pulled every model toward a glossy AI look in a blind test.
+Each preset keeps its scene, light and camera apart, so a chosen time of day
+replaces the preset's light instead of contradicting it.
+**Models:** step 2 has a *Picture model* (the still the video starts from)
+and a *Video model*. Suggested choices come first, with notes; any other
+catalog model can be picked. By default stills use GPT Image 2.6 Sunburst at
+quality "max" (most realistic in a blind test, ~$0.13 each), falling back to
+Nano Banana 2.1 at 2K if a call fails; video uses the deployment's video
+model (Wan 3.0). Every still is requested at the model's best settings,
+read from OpenRouter's per-model parameter list.
 **Nature sound:** a separate looping bed (rain, fire, waves, birds…) mixed
 under the music or on its own.
 **Your own picture:** upload one, pick a Studio or Cast image (or use

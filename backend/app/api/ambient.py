@@ -26,6 +26,7 @@ from ..schemas.ambient import (
     PictureFrom,
 )
 from ..services import ambient as svc
+from ..services import storage
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from ..workers.jobs import (
@@ -80,14 +81,17 @@ def preset_preview(preset_id: str) -> FileResponse:
     path = svc.preview_path(preset_id)
     if not path.exists():
         raise HTTPException(404, "no preview yet")
-    return FileResponse(path, media_type="image/png")
+    # Previews come back as PNG or JPEG depending on the model.
+    _, mime, _, _ = storage.image_info(path.read_bytes()[:65536])
+    return FileResponse(path, media_type=mime)
 
 
 @router.post("/presets/previews", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_previews(missing_only: bool = True) -> dict:
     """Generate preview stills for presets (one image call each)."""
+    # "Missing" includes a preview made from an older version of the prompt.
     ids = [p.id for p in svc.SCENE_PRESETS if p.prompt
-           and not (missing_only and svc.preview_path(p.id).exists())]
+           and not (missing_only and svc.preview_is_current(p.id))]
     job_id = enqueue(generate_previews_job, ids) if ids else None
     return {"presets": ids, "job_id": job_id, "status": "enqueued" if ids else "nothing_to_do"}
 

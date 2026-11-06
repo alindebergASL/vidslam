@@ -60,8 +60,12 @@ class AmbientConfig(BaseModel):
     music_mood: str = "spa"  # id from MUSIC_MOODS, or "none"
     music_prompt: str = Field(default="", max_length=1000)
     music_volume: float = Field(default=0.7, ge=0.0, le=1.0)
-    # Optional provider model id (or custom:<id>) for the loop clip / still.
+    # Optional provider model id (or custom:<id>) for the loop clip (video
+    # scenes). Older Still + drift scenes keep their image model here too.
     model_override: str = Field(default="", max_length=300)
+    # Image model for this scene's stills (anchor frame, generated picture,
+    # Still + drift). "" = AMBIENT_STILL_MODEL with its fallback.
+    still_model: str = Field(default="", max_length=300)
     # When loop_seconds exceeds the model's per-call cap: True = chain
     # several clips (each starting on the previous one's last frame) to
     # reach the full loop length; False = one clip at the model's max and
@@ -174,6 +178,17 @@ class OptionOut(BaseModel):
     label: str
 
 
+class ModelChoiceOut(BaseModel):
+    """A model offered up front in the scene builder, with what it's like."""
+
+    id: str
+    label: str
+    note: str = ""
+    est_cost: Optional[float] = None
+    recommended: bool = False
+    experimental: bool = False
+
+
 class SoundPresetOut(BaseModel):
     id: str
     label: str
@@ -190,6 +205,12 @@ class AmbientPresetsOut(BaseModel):
     loop_options: list[int]
     total_options: list[int]
     aspect_options: list[str]
+    # Curated model choices; any other catalog model can still be picked.
+    still_models: list[ModelChoiceOut] = Field(default_factory=list)
+    video_models: list[ModelChoiceOut] = Field(default_factory=list)
+    # What "" (default) means on this deployment.
+    default_still_model: str = ""
+    default_video_model: str = ""
 
 
 class LoopPlanOut(BaseModel):

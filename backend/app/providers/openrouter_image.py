@@ -42,6 +42,25 @@ class OpenRouterImageProvider(ImageProvider):
             for m in data.get("data", []) if m.get("id")
         ]
 
+    def parameters(self, model: str) -> dict:
+        """What `model` accepts on POST /images, from GET
+        /images/models/{id}/endpoints: {name: {"type": "enum", "values": [...]}
+        or a range}. Enum values are merged across the model's endpoints."""
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/images/models/{model}/endpoints"
+        with httpx.Client(timeout=15.0) as client:
+            r = client.get(url, headers=self._headers())
+            r.raise_for_status()
+            data = r.json()
+        merged: dict = {}
+        for ep in data.get("endpoints") or []:
+            for name, spec in (ep.get("supported_parameters") or {}).items():
+                if isinstance(spec, dict) and isinstance(spec.get("values"), list):
+                    cur = merged.setdefault(name, {"type": "enum", "values": []})
+                    cur["values"] += [v for v in spec["values"] if v not in cur["values"]]
+                else:
+                    merged.setdefault(name, spec)
+        return merged
+
     def generate(
         self,
         *,
@@ -66,7 +85,8 @@ class OpenRouterImageProvider(ImageProvider):
             ]
         if settings:
             body.update(settings)
-        with httpx.Client(timeout=180.0) as client:
+        # Quality "max" on GPT Image 2.6 takes ~2 minutes.
+        with httpx.Client(timeout=300.0) as client:
             r = client.post(url, headers=self._headers(), json=body)
             r.raise_for_status()
             data = r.json()

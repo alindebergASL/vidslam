@@ -235,7 +235,7 @@ def test_update_scene_prompt_invalidates_clip_but_fade_does_not(auth_client):
     assert body["title"] == "Night"
     assert body["loop_status"] == "pending"
     assert body["loop_shot"]["clip_path"] == ""
-    assert "starry" in body["loop_shot"]["prompt"]
+    assert "Milky Way" in body["loop_shot"]["prompt"]
     assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 409
 
 

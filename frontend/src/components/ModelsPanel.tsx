@@ -6,7 +6,7 @@ import { api, ActiveModel, CatalogEntry, ModelCatalog, ModelKind } from "@/lib/a
 
 const KINDS: { id: ModelKind; label: string; hint: string }[] = [
   { id: "video", label: "Video", hint: "Shot clips and ambient loops." },
-  { id: "image", label: "Image", hint: "Studio images, ambient anchor stills and Still + drift." },
+  { id: "image", label: "Image", hint: "Studio images. Ambient scene stills use each scene's Picture model (default: AMBIENT_STILL_MODEL, GPT Image 2.6 Sunburst); this model is used for them only when AMBIENT_STILL_MODEL is empty." },
   { id: "chat", label: "Planner", hint: "Writes storyboards (script, shots, captions)." },
   { id: "tts", label: "Voice", hint: "Voiceovers. ElevenLabs, or an OpenRouter speech / gpt-audio model." },
   { id: "music", label: "Music", hint: "Music beds. ElevenLabs, or Google Lyria — Lyria 3 Pro / Clip through OpenRouter (same key), Lyria 3.5 through Google (GEMINI_API_KEY)." },

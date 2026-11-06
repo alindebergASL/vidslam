@@ -2,7 +2,7 @@
 import clsx from "clsx";
 import type { ReactNode } from "react";
 import { api } from "@/lib/api";
-import type { AmbientConfig, AmbientPresets, AmbientScene, Corner, LoopPlan, ScenePreset } from "@/lib/api";
+import type { AmbientConfig, AmbientPresets, AmbientScene, Corner, LoopPlan, ModelChoice, ScenePreset } from "@/lib/api";
 
 /** "3600" → "1h", "5400" → "1h 30m", "600" → "10m", "20" → "20s". */
 export function fmtDuration(seconds: number): string {
@@ -573,6 +573,143 @@ export function SoundControls({
             Mixed under the music, or on its own with music set to &ldquo;No music&rdquo;.
           </p>
         </>
+      )}
+    </div>
+  );
+}
+
+/** A catalog model, as the model dropdowns list it. */
+export type ModelOption = { id: string; name: string };
+
+function choiceLabel(c: ModelChoice): string {
+  const tags = [c.recommended && "recommended", c.experimental && "experimental"].filter(Boolean).join(", ");
+  return tags ? `${c.label} (${tags})` : c.label;
+}
+
+function others(list: ModelOption[], curated: ModelChoice[]): ModelOption[] {
+  return list.filter((m) => !curated.some((c) => c.id === m.id));
+}
+
+/** Picture (still) model and video model for a scene: a few suggested
+ *  choices with notes first, then every other model in the catalog. */
+export function ModelControls({
+  cfg,
+  set,
+  presets,
+  imageModels,
+  videoModels,
+  idPrefix = "models",
+}: {
+  cfg: AmbientConfig;
+  set: CfgSetter;
+  presets: AmbientPresets | null;
+  imageModels: ModelOption[];
+  videoModels: ModelOption[];
+  idPrefix?: string;
+}) {
+  const stills = presets?.still_models ?? [];
+  const videos = presets?.video_models ?? [];
+  const drift = cfg.source === "image_drift";
+  // Older Still + drift scenes kept their image model in model_override.
+  const stillValue = cfg.still_model || (drift ? cfg.model_override : "");
+  const defaultStill = stills.find((c) => c.id === presets?.default_still_model);
+  const defaultVideo = videos.find((c) => c.id === presets?.default_video_model);
+  const stillChoice = stills.find((c) => c.id === stillValue) ?? (stillValue ? undefined : defaultStill);
+  const videoChoice = videos.find((c) => c.id === cfg.model_override) ?? (cfg.model_override ? undefined : defaultVideo);
+  const known = (v: string, curated: ModelChoice[], list: ModelOption[]) =>
+    !v || curated.some((c) => c.id === v) || list.some((m) => m.id === v);
+  const dayNight = cfg.variety === "day_night" && cfg.variations > 1;
+  const usage = !cfg.picture_origin
+    ? ""
+    : dayNight
+      ? "Makes the other times of day from your picture."
+      : cfg.picture_origin === "generated"
+        ? "Used when you regenerate the scene picture."
+        : "Not used: the scene starts from your picture.";
+  const stillHelp = [
+    usage,
+    usage.startsWith("Not used") ? "" : stillChoice?.note,
+    usage.startsWith("Not used") || stillValue ? "" : "If a call fails, the scene retries with the cheaper model.",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <div className="grid md:grid-cols-2 gap-4">
+      <div>
+        <label className="label" htmlFor={`${idPrefix}-still`}>
+          Picture model
+        </label>
+        <select
+          id={`${idPrefix}-still`}
+          className="input"
+          value={stillValue}
+          onChange={(e) => {
+            set("still_model", e.target.value);
+            if (drift && cfg.model_override) set("model_override", "");
+          }}
+        >
+          <option value="">Recommended{defaultStill ? ` · ${defaultStill.label}` : ""}</option>
+          {stills.length > 0 && (
+            <optgroup label="Suggested">
+              {stills.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {choiceLabel(c)}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          {others(imageModels, stills).length > 0 && (
+            <optgroup label="All image models">
+              {others(imageModels, stills).map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          {!known(stillValue, stills, imageModels) && <option value={stillValue}>{stillValue}</option>}
+        </select>
+        {stillHelp && <p className="text-xs text-ink-400 mt-1">{stillHelp}</p>}
+      </div>
+      {!drift && (
+        <div>
+          <label className="label" htmlFor={`${idPrefix}-video`}>
+            Video model
+          </label>
+          <select
+            id={`${idPrefix}-video`}
+            className="input"
+            value={cfg.model_override}
+            onChange={(e) => set("model_override", e.target.value)}
+          >
+            <option value="">
+              Default{defaultVideo ? ` · ${defaultVideo.label}` : presets?.default_video_model ? ` · ${presets.default_video_model}` : ""}
+            </option>
+            {videos.length > 0 && (
+              <optgroup label="Suggested">
+                {videos.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {choiceLabel(c)}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {others(videoModels, videos).length > 0 && (
+              <optgroup label="All video models">
+                {others(videoModels, videos).map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {!known(cfg.model_override, videos, videoModels) && (
+              <option value={cfg.model_override}>{cfg.model_override}</option>
+            )}
+          </select>
+          {videoChoice?.note && <p className="text-xs text-ink-400 mt-1">{videoChoice.note}</p>}
+        </div>
       )}
     </div>
   );

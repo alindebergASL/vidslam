@@ -101,6 +101,10 @@ def generate_previews_job(preset_ids: list[str]) -> None:
     db = SessionLocal()
     try:
         for pid in preset_ids:
+            # A second request queued behind this one (or a retry) finds the
+            # preview already made from the current prompt: nothing to pay for.
+            if ambient.preview_is_current(pid):
+                continue
             try:
                 with spend.scope(ref=f"preview:{pid}"):
                     ambient.generate_preview(db, pid)

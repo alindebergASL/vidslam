@@ -27,11 +27,17 @@ def _mean_volume_db(path: Path) -> float:
 # ---------- prompts ----------
 
 
-def test_default_look_is_photoreal_and_unchanged_in_meaning():
-    from app.services.ambient import resolve_scene_prompt
+def test_default_look_is_written_as_a_real_photograph():
+    from app.services.ambient import resolve_scene_prompt, still_prompt
 
-    p = resolve_scene_prompt(_cfg())
-    assert "photorealistic" in p and "Locked-off static camera" in p
+    still = still_prompt(_cfg())
+    video = resolve_scene_prompt(_cfg())
+    assert still.startswith("A real, unedited photograph.") and "24 mm lens" in still
+    assert video.startswith("Real, unedited camera footage.") and "Locked-off static camera" in video
+    # Words that pulled every model toward the glossy AI look in a blind test.
+    for p in (still, video):
+        for word in ("photorealistic", "highly detailed", "High detail", "turquoise", "golden hour"):
+            assert word not in p, word
 
 
 def test_look_strength_time_and_weather_shape_the_prompt():
@@ -43,14 +49,31 @@ def test_look_strength_time_and_weather_shape_the_prompt():
     assert "mostly realistic" in subtle and "watercolor" in subtle
     assert mid.startswith("in a watercolor style")
     assert "fully stylized" in strong
-    assert "photorealistic" not in strong
+    assert "real, unedited photograph" not in strong
     # Strength is meaningless for photoreal.
     assert style_phrase(_cfg(look_strength=0.1)) == style_phrase(_cfg(look_strength=0.9))
 
     p = resolve_scene_prompt(_cfg(look="anime", time_of_day="night", weather="snow"))
-    assert "at night" in p and "snow falling" in p and "anime" in p
+    assert "At night" in p and "snow is falling" in p and "anime" in p
+    # A stylized look drops the camera line; it's a photograph only for photoreal.
+    assert "lens" not in p
     drift = resolve_scene_prompt(_cfg(source="image_drift", look="painterly", time_of_day="golden_hour"))
-    assert "golden hour" in drift and "oil painting" in drift and "photorealistic" not in drift
+    assert "hour before sunset" in drift and "oil painting" in drift and "photograph" not in drift
+
+
+def test_time_of_day_replaces_the_presets_own_light():
+    from app.services.ambient import PRESET_LIGHT, still_prompt
+
+    own = PRESET_LIGHT["waterfall"]
+    assert own in still_prompt(_cfg())
+    night = still_prompt(_cfg(time_of_day="night"))
+    assert own not in night and "At night" in night
+    # Indoors the fire stays the light; the time of day is only outside.
+    fire = still_prompt(_cfg(scene_preset="fireplace", time_of_day="night"))
+    assert PRESET_LIGHT["fireplace"] in fire and "It is night outside." in fire and "moonlight" not in fire
+    # Custom text describes its own light and gets no preset camera.
+    custom = still_prompt(_cfg(scene_preset="custom", scene_prompt="a misty fjord with a red boathouse"))
+    assert "A misty fjord with a red boathouse." in custom and "lens" not in custom
 
 
 def test_changing_look_or_weather_invalidates_the_loop(auth_client):

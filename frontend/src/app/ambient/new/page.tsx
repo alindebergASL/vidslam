@@ -10,6 +10,8 @@ import {
   ChipRow,
   LookControls,
   MUSIC_LENGTHS,
+  ModelControls,
+  type ModelOption,
   OverlayControls,
   PlanSummary,
   SceneArt,
@@ -53,11 +55,13 @@ function Inner() {
   const [promptTouched, setPromptTouched] = useState(false);
   const [musicTouched, setMusicTouched] = useState(false);
   const [estimate, setEstimate] = useState<CostEstimate | null>(null);
-  const [models, setModels] = useState<{ id: string; name: string }[]>([]);
+  const [imageModels, setImageModels] = useState<ModelOption[]>([]);
+  const [videoModels, setVideoModels] = useState<ModelOption[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [genPreviews, setGenPreviews] = useState(false);
+  const [previewProgress, setPreviewProgress] = useState<{ done: number; total: number } | null>(null);
   // Optional picture to build the scene from: a file to upload, or a
   // Studio/Cast image. Attached right after the scene is created.
   const [picture, setPicture] = useState<{ file?: File; picked?: PickedImage; url: string } | null>(null);
@@ -80,11 +84,12 @@ function Inner() {
     api.ambientPresets().then(setPresets).catch((e) => setError(e.message));
   }, []);
 
-  // Model list follows the source: video models for clips, image models for stills.
+  // Every image and video model, after the suggested ones (see ModelControls).
   useEffect(() => {
-    const load = cfg.source === "image_drift" ? api.imageModels() : api.videoModels();
-    load.then((m) => setModels(m.map((x) => ({ id: x.id, name: x.name })))).catch(() => setModels([]));
-  }, [cfg.source]);
+    const pick = (m: { id: string; name: string }[]) => m.map((x) => ({ id: x.id, name: x.name }));
+    api.imageModels().then((m) => setImageModels(pick(m))).catch(() => setImageModels([]));
+    api.videoModels().then((m) => setVideoModels(pick(m))).catch(() => setVideoModels([]));
+  }, []);
 
   // Debounced live cost preview.
   const estTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -201,23 +206,38 @@ function Inner() {
                     try {
                       const r = await api.generatePresetPreviews();
                       const want = new Set(r.presets);
-                      // Inline in dev; with a worker it runs in the background — poll.
-                      for (let i = 0; i < 40; i++) {
+                      // Inline in dev; with a worker it runs in the background, one
+                      // image at a time (about 2 minutes each on the best model), so
+                      // keep checking until every requested preview is there.
+                      let done = 0;
+                      setPreviewProgress({ done: 0, total: want.size });
+                      for (let i = 0; i < 360 && want.size > 0; i++) {
                         const p = await api.ambientPresets();
                         setPresets(p);
-                        if (p.scenes.every((x) => !want.has(x.id) || x.preview_url)) break;
-                        await new Promise((res) => setTimeout(res, 3000));
+                        done = p.scenes.filter((x) => want.has(x.id) && x.preview_url).length;
+                        setPreviewProgress({ done, total: want.size });
+                        if (done === want.size) break;
+                        await new Promise((res) => setTimeout(res, 5000));
                       }
-                      toast.success(`Generated ${r.presets.length} preview image${r.presets.length === 1 ? "" : "s"}`);
+                      if (done === want.size) {
+                        toast.success(`Generated ${done} preview image${done === 1 ? "" : "s"}`);
+                      } else {
+                        toast.success(`${done} of ${want.size} previews ready; the rest are still being made`);
+                      }
                     } catch (e: any) {
                       toast.error(e.message || "Preview generation failed");
                     } finally {
                       setGenPreviews(false);
+                      setPreviewProgress(null);
                     }
                   }}
                   title="One image-model call per preset; cached afterwards"
                 >
-                  {genPreviews ? "Generating…" : "Generate preview images"}
+                  {genPreviews
+                    ? previewProgress
+                      ? `Generating… ${previewProgress.done} of ${previewProgress.total}`
+                      : "Generating…"
+                    : "Generate preview images"}
                 </button>
               )}
             </div>
@@ -331,14 +351,14 @@ function Inner() {
             <div role="radiogroup" aria-label="Scene source" className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <SourceOption
                 active={cfg.source === "video"}
-                onClick={() => set("source", "video")}
+                onClick={() => { set("source", "video"); set("model_override", ""); }}
                 title="Video clip"
                 desc="Real motion (water, flames). Long loops are chained clips; they close on an anchor frame when the model supports it."
                 badge="Best look"
               />
               <SourceOption
                 active={cfg.source === "image_drift"}
-                onClick={() => set("source", "image_drift")}
+                onClick={() => { set("source", "image_drift"); set("model_override", ""); }}
                 title="Still + slow drift"
                 desc="One generated image with a gentle, periodic push-in. Perfectly seamless by construction, ~10× cheaper."
                 badge="Cheapest"
@@ -348,8 +368,18 @@ function Inner() {
 
           {/* 2. Look & light */}
           <section className="card p-5">
-            <StepHeading n={2} title="Look & light" hint="Realistic or artsy, any time of day." />
+            <StepHeading n={2} title="Look & light" hint="Realistic or artsy, any time of day, and the models that make it." />
             <LookControls cfg={cfg} set={set} presets={presets} idPrefix="new-look" />
+            <div className="mt-5 pt-4 border-t border-ink-800">
+              <ModelControls
+                cfg={{ ...cfg, picture_origin: picture ? (picture.file ? "upload" : picture.picked!.kind) : "" }}
+                set={set}
+                presets={presets}
+                imageModels={imageModels}
+                videoModels={videoModels}
+                idPrefix="new-models"
+              />
+            </div>
           </section>
 
           {/* 3. Length */}
@@ -585,24 +615,6 @@ function Inner() {
                     className="w-full accent-iris"
                   />
                   <p className="text-xs text-ink-400 mt-1">From and to black (and silence) at the very ends.</p>
-                </div>
-                <div className="md:col-span-2">
-                  <label className="label" htmlFor="amb-model">
-                    {cfg.source === "image_drift" ? "Image model" : "Video model"}
-                  </label>
-                  <select
-                    id="amb-model"
-                    className="input"
-                    value={cfg.model_override}
-                    onChange={(e) => set("model_override", e.target.value)}
-                  >
-                    <option value="">Provider default</option>
-                    {models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.name}
-                      </option>
-                    ))}
-                  </select>
                 </div>
               </div>
             )}
