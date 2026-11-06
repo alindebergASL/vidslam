@@ -11,6 +11,8 @@ import { ScenePicture } from "@/components/ambient/ScenePicture";
 import {
   ChipRow,
   LookControls,
+  ModelControls,
+  type ModelOption,
   OverlayControls,
   MUSIC_LENGTHS,
   PlanSummary,
@@ -616,10 +618,17 @@ function SettingsPanel({
 }) {
   const [cfg, setCfg] = useState<AmbientConfig>(scene.config);
   const [aspect, setAspect] = useState(scene.aspect_ratio);
+  const [imageModels, setImageModels] = useState<ModelOption[]>([]);
+  const [videoModels, setVideoModels] = useState<ModelOption[]>([]);
   useEffect(() => {
     setCfg(scene.config);
     setAspect(scene.aspect_ratio);
   }, [scene.config, scene.aspect_ratio]);
+  useEffect(() => {
+    const pick = (m: { id: string; name: string }[]) => m.map((x) => ({ id: x.id, name: x.name }));
+    api.imageModels().then((m) => setImageModels(pick(m))).catch(() => setImageModels([]));
+    api.videoModels().then((m) => setVideoModels(pick(m))).catch(() => setVideoModels([]));
+  }, []);
 
   const set = <K extends keyof AmbientConfig>(k: K, v: AmbientConfig[K]) =>
     setCfg((c) => ({ ...c, [k]: v }));
@@ -631,6 +640,8 @@ function SettingsPanel({
     cfg.source !== scene.config.source ||
     cfg.loop_seconds !== scene.config.loop_seconds ||
     cfg.model_override !== scene.config.model_override ||
+    ((cfg.still_model ?? "") !== (scene.config.still_model ?? "") &&
+      (!cfg.picture_origin || (cfg.variety === "day_night" && cfg.variations > 1))) ||
     cfg.chain_segments !== scene.config.chain_segments ||
     cfg.variety !== scene.config.variety ||
     (cfg.variety !== "none" && cfg.variations !== scene.config.variations) ||
@@ -812,6 +823,14 @@ function SettingsPanel({
               onChange={(e) => set("scene_prompt", e.target.value)}
             />
           </div>
+          <ModelControls
+            cfg={cfg}
+            set={set}
+            presets={presets}
+            imageModels={imageModels}
+            videoModels={videoModels}
+            idPrefix="set-models"
+          />
           <div>
             <div className="label">Loop clip</div>
             <ChipRow
@@ -829,7 +848,7 @@ function SettingsPanel({
               label="Scene source"
               options={["video", "image_drift"] as const}
               value={cfg.source}
-              onChange={(v) => set("source", v)}
+              onChange={(v) => { set("source", v); set("model_override", ""); }}
               render={(v) => (v === "video" ? "Video clip" : "Still + drift")}
               className="text-xs"
             />

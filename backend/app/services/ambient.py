@@ -8,6 +8,7 @@ bed, and a seamless-loop compositor (renderer.compose_ambient).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import re
@@ -31,6 +32,7 @@ from ..schemas.ambient import (
     AmbientPresetsOut,
     AmbientUpdate,
     LoopPlanOut,
+    ModelChoiceOut,
     MusicMoodOut,
     OptionOut,
     ScenePresetOut,
@@ -38,6 +40,7 @@ from ..schemas.ambient import (
 )
 from ..schemas.api import RenderOut, ShotOut
 from . import alerts, render_files, storage
+from .image_settings import best_image_settings
 from .model_registry import active_model as _active_model
 from .renderer import (
     AmbientRenderInputs,
@@ -63,71 +66,83 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,64}")
 _LOOP_DIRECTIVES = (
     " Locked-off static camera, no camera movement, no cuts, no people, no text. "
     "Very slow, gentle, continuous motion only. Consistent lighting and style from "
-    "first frame to last so the clip loops seamlessly. High detail, serene."
+    "first frame to last so the clip loops seamlessly."
 )
 
 SCENE_PRESETS: list[ScenePresetOut] = [
     ScenePresetOut(
         id="waterfall", label="Waterfall", emoji="🏞️",
         tagline="Mist, moss and a steady cascade.",
-        prompt="A tall forest waterfall pouring into a clear turquoise pool, soft mist drifting, "
-               "ferns and moss-covered rocks, dappled morning light through tall trees.",
+        prompt="A tall waterfall in an old-growth temperate rainforest in the Pacific Northwest. A creek "
+               "spills over the top of a dark basalt cliff about 30 metres high and falls into a shallow, "
+               "clear pool of grey and brown stones of irregular sizes, then flows out between mossy "
+               "boulders. Damp, muted green moss, sword ferns, a crooked fallen log, leaf litter, Douglas "
+               "firs and western red cedars.",
         music_mood="spa", palette=("#1b5e5a", "#9fd9c8"),
     ),
     ScenePresetOut(
         id="fireplace", label="Fireplace", emoji="🔥",
         tagline="Crackling logs in a stone hearth.",
-        prompt="A cozy stone fireplace with glowing logs and gently flickering flames, warm amber "
-               "light on the hearth, a few embers rising, dark quiet room around it.",
+        prompt="A fieldstone fireplace in an old farmhouse living room. Split oak logs burn on an iron grate "
+               "with small, uneven flames, glowing coals and a few drifting sparks; soot on the firebox "
+               "bricks, a worn stone hearth with a few wood chips, an iron poker leaning at the side.",
         music_mood="piano", palette=("#4a1a0a", "#ff9a3c"),
     ),
     ScenePresetOut(
         id="ocean", label="Ocean", emoji="🌊",
         tagline="Slow waves rolling onto an empty shore.",
-        prompt="Calm ocean waves rolling slowly onto a wide empty sandy beach at golden hour, "
-               "soft foam, distant horizon, pastel sky, gentle sea haze.",
+        prompt="A quiet stretch of ocean beach. Low waves break and wash up the wet sand in thin sheets of "
+               "foam, with a few strands of kelp and small shells on the sand, a rocky headland in the "
+               "distance and a flat, level horizon.",
         music_mood="zen", palette=("#0b3a66", "#7fc8ff"),
     ),
     ScenePresetOut(
         id="rainforest", label="Rain on leaves", emoji="🌧️",
         tagline="Soft rain in a green canopy.",
-        prompt="Gentle rain falling on broad tropical leaves in a lush rainforest, water droplets "
-               "sliding and dripping, soft grey-green light, slight fog between the trees.",
+        prompt="Rain falling on broad leaves in a tropical rainforest understory: monstera, elephant-ear and "
+               "fern fronds of different sizes, some torn or speckled, water beading and running off the "
+               "leaf tips, darker foliage receding into the forest behind.",
         music_mood="rain", palette=("#143d2b", "#8fd19e"),
     ),
     ScenePresetOut(
         id="snowfall", label="Snowfall", emoji="❄️",
         tagline="Quiet snow over a pine valley.",
-        prompt="Slow heavy snowflakes falling over a silent pine forest and a frozen lake at dusk, "
-               "blue-hour light, soft shadows, no wind.",
+        prompt="A quiet pine forest beside a frozen lake in winter. Large, slow snowflakes falling; "
+               "snow-laden spruce and pine of uneven heights, a snow-covered shoreline with a few dark rocks "
+               "and reeds poking through, the far shore fading into the falling snow.",
         music_mood="piano", palette=("#1d2a4a", "#dfe8ff"),
     ),
     ScenePresetOut(
         id="zen_garden", label="Zen garden", emoji="🪨",
         tagline="Raked sand, still water, one maple.",
-        prompt="A Japanese zen garden with raked white gravel, a still koi pond, a single red "
-               "maple tree, soft overcast light, a leaf drifting slowly on the water.",
+        prompt="A small Japanese zen garden at a temple in Kyoto. Raked white gravel in parallel lines "
+               "around moss-edged rocks, a still pond with a few koi just below the surface, a Japanese "
+               "maple with red leaves, some fallen on the moss and water, the weathered edge of a wooden "
+               "veranda in the foreground.",
         music_mood="singing_bowls", palette=("#3b2f2f", "#d98b6a"),
     ),
     ScenePresetOut(
         id="night_sky", label="Night sky", emoji="🌌",
         tagline="Stars slowly turning over the ridge.",
-        prompt="A vast starry night sky over a dark mountain ridge, the Milky Way faintly glowing, "
-               "stars drifting almost imperceptibly, deep indigo and violet tones.",
+        prompt="The night sky over a dark mountain ridge in a remote desert. The Milky Way rises above the "
+               "ridge in faint, natural colour, with thousands of stars of different brightness, a few "
+               "silhouetted pines on the ridge and faint airglow near the horizon.",
         music_mood="zen", palette=("#0a0a2e", "#7c5cff"),
     ),
     ScenePresetOut(
         id="lavender", label="Lavender field", emoji="💜",
         tagline="Rows of lavender in late sun.",
-        prompt="Endless rows of lavender swaying very gently in a warm breeze under a soft late-"
-               "afternoon sun, hazy hills in the distance, bees out of focus.",
+        prompt="A lavender field in Provence: long, slightly uneven rows of lavender running toward low "
+               "hills, bare dry soil between them, a stone farmhouse and a line of trees in the distance, a "
+               "few bees on the nearest stems.",
         music_mood="acoustic", palette=("#4b2a6b", "#e9c6ff"),
     ),
     ScenePresetOut(
         id="candles", label="Candlelight", emoji="🕯️",
         tagline="A spa table of soft flames.",
-        prompt="A row of soft candles on a dark spa table beside smooth stones and a white orchid, "
-               "flames flickering very slowly, warm bokeh, shallow depth of field.",
+        prompt="Lit pillar candles of different heights on a dark slate shelf in a quiet spa, with melted "
+               "wax drips, a few smooth river stones and a small white orchid beside them, a plain dark "
+               "plaster wall behind.",
         music_mood="spa", palette=("#2a1608", "#f2c27b"),
     ),
     ScenePresetOut(
@@ -163,9 +178,11 @@ MUSIC_MOODS: list[MusicMoodOut] = [
 # ---------- look, light, weather, sound ----------
 
 # Look → the style phrase sent to the image/video model. Photoreal is the
-# default and ignores strength.
+# default and ignores strength; its prompt is built as a photograph (see
+# still_prompt), because "photorealistic, highly detailed" and stacked
+# adjectives pulled every model toward the glossy AI look in a blind test.
 LOOKS: dict[str, tuple[str, str]] = {
-    "photoreal": ("Photoreal", "photorealistic, natural light, highly detailed"),
+    "photoreal": ("Photoreal", "a real, unedited photograph with natural, true-to-life colour"),
     "cinematic": ("Cinematic film", "cinematic film still, rich color grade, shallow depth of field, "
                                     "subtle 35mm film grain"),
     "painterly": ("Painterly", "oil painting, visible brush strokes, impressionist palette"),
@@ -174,22 +191,65 @@ LOOKS: dict[str, tuple[str, str]] = {
     "claymation": ("Claymation", "stop-motion claymation miniature diorama, handcrafted clay textures"),
     "dreamy": ("Dreamy", "dreamy and ethereal, soft focus, gentle glow, pastel haze"),
 }
+# Light and weather as plain descriptions of the light, not mood words:
+# "golden hour" and "glow" brought sunstars and god rays with every model.
 TIMES_OF_DAY: dict[str, tuple[str, str]] = {
     "any": ("As written", ""),
-    "dawn": ("Dawn", "at dawn, soft pink early light"),
-    "golden_hour": ("Golden hour", "at golden hour, warm low sunlight, long soft shadows"),
-    "midday": ("Midday", "in bright, even midday light"),
-    "dusk": ("Dusk", "at dusk, blue-hour twilight"),
-    "night": ("Night", "at night, moonlight and deep blue shadows"),
+    "dawn": ("Dawn", "Soft, cool light at dawn, just before sunrise, with a faint pink in the sky."),
+    "golden_hour": ("Golden hour", "Low, warm late-afternoon sunlight from one side in the hour before "
+                                   "sunset, with long shadows; the sun itself is out of frame."),
+    "midday": ("Midday", "Bright, even midday light."),
+    "dusk": ("Dusk", "Dim blue twilight just after sunset."),
+    "night": ("Night", "At night, lit only by moonlight, with deep blue shadows and much of the scene "
+                       "in darkness."),
 }
 WEATHERS: dict[str, tuple[str, str]] = {
     "any": ("As written", ""),
-    "clear": ("Clear", "clear sky"),
-    "light_rain": ("Light rain", "light, gentle rain falling"),
-    "heavy_rain": ("Heavy rain", "heavy, steady rain falling"),
-    "snow": ("Snow", "soft snow falling"),
-    "fog": ("Fog", "drifting fog and mist"),
+    "clear": ("Clear", "A clear sky."),
+    "light_rain": ("Light rain", "Light, gentle rain is falling."),
+    "heavy_rain": ("Heavy rain", "Heavy, steady rain is falling."),
+    "snow": ("Snow", "Soft snow is falling."),
+    "fog": ("Fog", "Fog drifts slowly through the scene."),
 }
+
+# Scenes lit by their own fire or candles: a time of day describes outside.
+INDOOR_PRESETS = frozenset({"fireplace", "candles"})
+# Each preset's own light (used when no time of day is chosen, so a chosen
+# time replaces it instead of contradicting it) and camera (photoreal only).
+PRESET_LIGHT: dict[str, str] = {
+    "waterfall": "Soft, even light on a bright overcast day, with deep natural shadows under the trees.",
+    "fireplace": "The fire is the main light, warm and uneven, with the room falling off into darkness.",
+    "ocean": "Soft late-afternoon light under thin high cloud, with a little sea haze over the water.",
+    "rainforest": "Soft, diffuse grey light from an overcast sky, with a little mist between the trees.",
+    "snowfall": "Flat, cool light on an overcast winter afternoon.",
+    "zen_garden": "Soft overcast daylight.",
+    "night_sky": "No moon; the landscape is lit only by starlight.",
+    "lavender": "Warm late-afternoon sun from the side, with light haze over the hills.",
+    "candles": "The candle flames are the only light, warm and soft, with darkness around them.",
+}
+PRESET_CAMERA: dict[str, str] = {
+    "waterfall": "Shot on a full-frame camera with a 24 mm lens at f/8 and 1/250 s from a tripod at eye "
+                 "level, so the falling water keeps its texture rather than a silky blur.",
+    "fireplace": "Shot on a full-frame camera with a 35 mm lens at f/4 from a tripod at seated height.",
+    "ocean": "Shot on a full-frame camera with a 24 mm lens at f/8 and 1/250 s from a tripod at standing "
+             "height, horizon level.",
+    "rainforest": "Shot on a full-frame camera with a 50 mm lens at f/4 and 1/500 s, so raindrops show as "
+                  "short streaks.",
+    "snowfall": "Shot on a full-frame camera with a 35 mm lens at f/5.6 and 1/250 s from a tripod.",
+    "zen_garden": "Shot on a full-frame camera with a 35 mm lens at f/8 from a tripod at seated height.",
+    "night_sky": "Shot on a full-frame camera with a 20 mm f/1.8 lens, a 15-second exposure at ISO 3200 "
+                 "on a tripod, with natural sensor noise.",
+    "lavender": "Shot on a full-frame camera with a 35 mm lens at f/8 and 1/500 s from a tripod at waist "
+                "height.",
+    "candles": "Shot on a full-frame camera with a 50 mm lens at f/2.8 from a tripod, the flames sharp.",
+}
+# Closing lines for the photoreal look: what a real photo / real footage is,
+# and what to avoid (OpenAI's own realism guidance uses the same wording).
+PHOTO_STILL = ("Off-centre, natural composition. Natural, true-to-life colours with no colour grading. "
+               "It should look like a real photograph someone could have taken, not an enhanced, "
+               "retouched or cinematic image.")
+PHOTO_VIDEO = ("Natural, true-to-life colour with no colour grading, like real camera footage, not an "
+               "enhanced or cinematic video.")
 
 SOUND_PRESETS: list[SoundPresetOut] = [
     SoundPresetOut(id="rain", label="Rain", prompt="steady gentle rain on leaves and ground, close and calm, no thunder"),
@@ -214,19 +274,51 @@ _AUTO_SOUND_BY_SCENE = {
 }
 
 
-def style_phrase(cfg: AmbientConfig) -> str:
-    """Look + light + weather, as one phrase for image and video prompts."""
+def look_phrase(cfg: AmbientConfig) -> str:
+    """The look alone, shaped by its strength (photoreal ignores strength)."""
     name, phrase = LOOKS.get(cfg.look, LOOKS["photoreal"])
     if cfg.look == "photoreal":
-        look = phrase
-    elif cfg.look_strength < 0.34:
-        look = f"mostly realistic with a subtle {name.lower()} touch ({phrase})"
-    elif cfg.look_strength <= 0.67:
-        look = f"in a {name.lower()} style: {phrase}"
-    else:
-        look = f"fully stylized, {phrase}, strongly {name.lower()}"
-    extras = [TIMES_OF_DAY.get(cfg.time_of_day, ("", ""))[1], WEATHERS.get(cfg.weather, ("", ""))[1]]
-    return ", ".join([x for x in extras if x] + [look])
+        return phrase
+    if cfg.look_strength < 0.34:
+        return f"mostly realistic with a subtle {name.lower()} touch ({phrase})"
+    if cfg.look_strength <= 0.67:
+        return f"in a {name.lower()} style: {phrase}"
+    return f"fully stylized, {phrase}, strongly {name.lower()}"
+
+
+def light_phrase(cfg: AmbientConfig, *, preset_light: bool = True) -> str:
+    """Time of day and weather as sentences. With neither chosen, a preset
+    scene keeps its own light (custom text describes its own). A preset's
+    light describes its sky, so a chosen weather replaces it too. Indoor
+    presets stay lit by their fire or candles; time and weather are outside."""
+    time_of_day = TIMES_OF_DAY.get(cfg.time_of_day, ("", ""))[1]
+    weather = WEATHERS.get(cfg.weather, ("", ""))[1]
+    own = PRESET_LIGHT.get(cfg.scene_preset, "") if preset_light and not cfg.scene_prompt.strip() else ""
+    if cfg.scene_preset in INDOOR_PRESETS:
+        label = TIMES_OF_DAY.get(cfg.time_of_day, ("", ""))[0].lower() if time_of_day else ""
+        outside = [f"It is {label} outside." if label else "",
+                   f"Outside, {weather[0].lower()}{weather[1:]}" if weather else ""]
+        return " ".join(x for x in (own, *outside) if x)
+    light = time_of_day or (own if not weather else "")
+    return " ".join(x for x in (light, weather) if x)
+
+
+def style_phrase(cfg: AmbientConfig) -> str:
+    """Light + weather + look, as one phrase (for summaries and stylized looks)."""
+    return " ".join(x for x in (light_phrase(cfg, preset_light=False), look_phrase(cfg)) if x)
+
+
+def _scene_text(cfg: AmbientConfig) -> str:
+    preset = _PRESET_BY_ID.get(cfg.scene_preset)
+    return cfg.scene_prompt.strip() or (preset.prompt if preset else "")
+
+
+def _sentence(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return text
+    text = text[0].upper() + text[1:]
+    return text if text[-1] in ".!?" else text + "."
 
 
 def resolve_sound_prompt(cfg: AmbientConfig) -> str:
@@ -275,25 +367,133 @@ def preview_path(preset_id: str) -> Path:
     return d / f"{re.sub(r'[^a-z0-9_]', '', preset_id)}.png"
 
 
-def generate_preview(db: Session, preset_id: str) -> Path:
-    """Generate (or regenerate) a preset's preview still with the active
-    image model and cache it."""
+def _preview_fingerprint(preset_id: str) -> str:
+    """Changes whenever the preset's still prompt does, so a preview made
+    from an older prompt isn't shown as what the preset looks like now."""
+    return hashlib.sha1(still_prompt(AmbientConfig(scene_preset=preset_id)).encode()).hexdigest()[:16]
+
+
+def preview_is_current(preset_id: str) -> bool:
+    path = preview_path(preset_id)
+    stamp = path.with_suffix(".prompt")
+    return path.exists() and stamp.exists() and stamp.read_text().strip() == _preview_fingerprint(preset_id)
+
+
+# ---------- models for stills and loop clips ----------
+
+# Shown first in the scene builder, with what they're like in practice
+# (blind realism tests, Nov 2026). Every other catalog model stays selectable.
+STILL_MODEL_CHOICES: list[ModelChoiceOut] = [
+    ModelChoiceOut(id="openai/gpt-image-2.6-sunburst", label="GPT Image 2.6 Sunburst",
+                   note="Most realistic in a blind test. About $0.13 and 2 minutes per still.",
+                   est_cost=0.13, recommended=True),
+    ModelChoiceOut(id="google/gemini-nano-banana-2.1", label="Nano Banana 2.1",
+                   note="A close second, faster and cheaper: about $0.05 per still at 2K.", est_cost=0.055),
+    ModelChoiceOut(id="black-forest-labs/flux-3-image", label="FLUX.3",
+                   note="A different look, about $0.10 per still. Less realistic in the test.", est_cost=0.10),
+]
+VIDEO_MODEL_CHOICES: list[ModelChoiceOut] = [
+    ModelChoiceOut(id="alibaba/wan-3.0", label="Wan 3.0",
+                   note="Keeps the still's look, with the steadiest background. About $0.15–0.20 per second.",
+                   recommended=True),
+    ModelChoiceOut(id="google/gemini-omni-1.2-flash", label="Gemini Omni 1.2 Flash",
+                   note="New and untested here: it was failing on OpenRouter in Nov 2026. Clips up to 15 s.",
+                   experimental=True),
+    ModelChoiceOut(id="google/gemini-omni-1.1-flash", label="Gemini Omni 1.1 Flash",
+                   note="Livelier water, but it redrew rock with an embossed texture in a test.",
+                   experimental=True),
+]
+_STILL_COST = {c.id: c.est_cost for c in STILL_MODEL_CHOICES if c.est_cost is not None}
+
+
+def still_model_chain(cfg: AmbientConfig) -> list[str]:
+    """Image models to try for this scene's stills, in order: the scene's
+    own choice (or, for an older Still + drift scene, its image-model
+    override), else AMBIENT_STILL_MODEL, else the active image model; then
+    the fallback model if that call fails."""
+    s = get_settings()
+    active = _active_model("image")
+    legacy = cfg.model_override if cfg.source == "image_drift" else ""
+    if legacy and _is_video_model(legacy):
+        legacy = ""  # a video model left over from before the switch to Still + drift
+    primary = cfg.still_model or legacy or s.ambient_still_model or active
+    if primary.startswith("custom:"):
+        return [primary]  # the scene's own trained model: a different model isn't a substitute
+    chain = [primary, s.ambient_still_fallback_model or active]
+    return [m for i, m in enumerate(chain) if m and m not in chain[:i]]
+
+
+def makes_stills(cfg: AmbientConfig) -> bool:
+    """Whether the still model is used: always without a picture of the
+    scene's own; with one, only for Day to night's other times of day."""
+    return not cfg.picture_origin or (cfg.variety == "day_night" and variant_count(cfg) > 1)
+
+
+def _is_video_model(model: str) -> bool:
+    if model in {c.id for c in VIDEO_MODEL_CHOICES} or model == _active_model("video"):
+        return True
+    try:
+        from . import model_catalog
+
+        return model_catalog.find("video", model) is not None
+    except Exception:  # noqa: BLE001 — catalog unavailable: assume it's an image model
+        return False
+
+
+def still_cost(cfg: AmbientConfig) -> float:
+    """Rate-card cost of one still on this scene's primary still model."""
+    s = get_settings()
+    chain = still_model_chain(cfg)
+    model = chain[0] if chain else ""
+    if model and model == s.ambient_still_model:
+        return s.cost_ambient_still
+    return _STILL_COST.get(model, s.cost_image_per_item)
+
+
+def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio: str,
+                   references: Optional[list[ImageRef]] = None, negative_prompt: str = "",
+                   project_id: Optional[int] = None, endpoint: str = "image.generate(still)",
+                   summary: Optional[dict] = None) -> tuple[bytes, str]:
+    """One still for this scene, at the model's best settings. If the
+    primary model fails (an error, a timeout, a refused prompt), retry once
+    with the fallback model. Returns (image bytes, model used)."""
     from .pipeline import _log_provider_call, _resolve_model
 
+    image = get_image()
+    last: Optional[Exception] = None
+    for model in still_model_chain(cfg):
+        model = _resolve_model(db, model)
+        try:
+            png = image.generate(model=model, prompt=prompt, references=references or [],
+                                 negative_prompt=negative_prompt,
+                                 settings=best_image_settings(model, aspect_ratio))
+        except Exception as e:  # noqa: BLE001 — try the fallback model
+            last = e
+            log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
+            # Recorded (status=error) so the provider-error alerts see it.
+            _log_provider_call(db, project_id=project_id, provider=type(image).__name__, endpoint=endpoint,
+                               request_summary={"model": model, **(summary or {})},
+                               response_summary={"error": str(e)[:500]}, status="error")
+            continue
+        _log_provider_call(db, project_id=project_id, provider=type(image).__name__, endpoint=endpoint,
+                           request_summary={"model": model, **(summary or {})},
+                           response_summary={"bytes": len(png)})
+        return png, model
+    raise last or RuntimeError("no image model configured for scene stills")
+
+
+def generate_preview(db: Session, preset_id: str) -> Path:
+    """Generate (or regenerate) a preset's preview still with the scene-still
+    model (see still_model_chain) and cache it."""
     preset = _PRESET_BY_ID.get(preset_id)
     if preset is None or not preset.prompt:
         raise ValueError(f"preset {preset_id!r} has no prompt")
-    image = get_image()
-    model = _resolve_model(db, _active_model("image"))
-    png = image.generate(
-        model=model, references=[],
-        prompt=preset.prompt + " Wide establishing shot, 16:9, photorealistic, no people, no text.",
-        settings={"aspect_ratio": "16:9"},
-    )
+    cfg = AmbientConfig(scene_preset=preset_id)
+    png, _ = generate_still(db, cfg, prompt=still_prompt(cfg), aspect_ratio="16:9",
+                            endpoint="image.generate(preview)", summary={"preset": preset_id})
     out = preview_path(preset_id)
     out.write_bytes(png)
-    _log_provider_call(db, project_id=None, provider=type(image).__name__, endpoint="image.generate(preview)",
-                       request_summary={"preset": preset_id, "model": model}, response_summary={"bytes": len(png)})
+    out.with_suffix(".prompt").write_text(_preview_fingerprint(preset_id))
     return out
 
 
@@ -301,7 +501,8 @@ def presets() -> AmbientPresetsOut:
     scenes = []
     for p in SCENE_PRESETS:
         path = preview_path(p.id)
-        url = f"/api/ambient/presets/{p.id}/preview?v={int(path.stat().st_mtime)}" if path.exists() else None
+        url = (f"/api/ambient/presets/{p.id}/preview?v={int(path.stat().st_mtime)}"
+               if preview_is_current(p.id) else None)
         scenes.append(p.model_copy(update={"preview_url": url}))
     return AmbientPresetsOut(
         scenes=scenes,
@@ -313,6 +514,10 @@ def presets() -> AmbientPresetsOut:
         loop_options=list(LOOP_OPTIONS),
         total_options=list(TOTAL_OPTIONS),
         aspect_options=["16:9", "9:16", "1:1"],
+        still_models=STILL_MODEL_CHOICES,
+        video_models=VIDEO_MODEL_CHOICES,
+        default_still_model=still_model_chain(AmbientConfig())[0] if still_model_chain(AmbientConfig()) else "",
+        default_video_model=_active_model("video"),
     )
 
 
@@ -403,29 +608,28 @@ def clear_picture(db: Session, project: models.VideoProject) -> models.VideoProj
 
 
 def still_prompt(cfg: AmbientConfig) -> str:
-    """Prompt for the scene's still: preset/user text + look, light, weather."""
-    preset = _PRESET_BY_ID.get(cfg.scene_preset)
-    base = cfg.scene_prompt.strip() or (preset.prompt if preset else "")
-    return f"{base} Wide establishing shot, {style_phrase(cfg)}. No people, no text."
+    """Prompt for the scene's still. Photoreal is written as a photograph
+    (scene, then its light, then the camera, then what real photos look
+    like); other looks are the scene, its light and the style."""
+    base = _sentence(_scene_text(cfg))
+    light = light_phrase(cfg)
+    if cfg.look == "photoreal":
+        camera = "" if cfg.scene_prompt.strip() else PRESET_CAMERA.get(cfg.scene_preset, "")
+        parts = ["A real, unedited photograph.", base, light, camera, PHOTO_STILL,
+                 "No people, no text, no watermark."]
+    else:
+        parts = [base, light, f"Wide establishing shot, {look_phrase(cfg)}.", "No people, no text."]
+    return " ".join(x for x in parts if x)
 
 
 def generate_picture(db: Session, project: models.VideoProject) -> models.VideoProject:
     """Generate the scene's picture now (one image call), so it can be
     previewed and regenerated before any video is made."""
-    from .pipeline import _log_provider_call, _resolve_model
-
     cfg = _config_of(project)
-    image = get_image()
-    # A Still + drift scene's model override is an image model, and this
-    # preview becomes its still: honor it, as the loop path would. For video
-    # scenes the override is a video model, so use the active image model.
-    override = cfg.model_override if cfg.source == "image_drift" else ""
-    model = _resolve_model(db, override or _active_model("image"))
-    png = image.generate(model=model, prompt=still_prompt(cfg), references=[],
-                         settings={"aspect_ratio": project.aspect_ratio})
-    _log_provider_call(db, project_id=project.id, provider=type(image).__name__,
-                       endpoint="image.generate(picture)", request_summary={"model": model},
-                       response_summary={"bytes": len(png)})
+    # Same model choice as the loop path (still_model_chain), so the picture
+    # previewed here is what the scene would have made anyway.
+    png, _ = generate_still(db, cfg, prompt=still_prompt(cfg), aspect_ratio=project.aspect_ratio,
+                            project_id=project.id, endpoint="image.generate(picture)")
     return set_picture(db, project, png, "generated")
 
 
@@ -457,21 +661,21 @@ def resolve_scene_prompt(cfg: AmbientConfig) -> str:
         # it is rather than describing the preset or restyling it. Light and
         # weather still guide the motion (falling snow, drifting fog).
         what = cfg.scene_prompt.strip() or "the scene in the given image"
-        extras = ", ".join(x for x in (TIMES_OF_DAY.get(cfg.time_of_day, ("", ""))[1],
-                                       WEATHERS.get(cfg.weather, ("", ""))[1]) if x)
-        return (f"Bring the given image to life exactly as it is: {what}"
-                + (f", {extras}" if extras else "")
-                + ". Keep its composition, colors and art style unchanged." + _LOOP_DIRECTIVES)
-    base = cfg.scene_prompt.strip()
-    if not base:
-        preset = _PRESET_BY_ID.get(cfg.scene_preset)
-        base = preset.prompt if preset else ""
+        extras = light_phrase(cfg, preset_light=False)
+        return (f"Bring the given image to life exactly as it is: {_sentence(what)}"
+                + (f" {extras}" if extras else "")
+                + " Keep its composition, colors and art style unchanged." + _LOOP_DIRECTIVES)
+    base = _scene_text(cfg)
     if not base:
         raise ValueError("scene_prompt is empty and the preset has no default prompt")
-    style = style_phrase(cfg)
     if cfg.source == "image_drift":
-        return f"{base} Wide establishing shot, {style}. No people, no text."
-    return f"{base} Rendered {style}." + _LOOP_DIRECTIVES
+        return still_prompt(cfg)
+    light = light_phrase(cfg)
+    if cfg.look == "photoreal":
+        parts = ["Real, unedited camera footage.", _sentence(base), light, PHOTO_VIDEO]
+    else:
+        parts = [_sentence(base), light, f"Rendered {look_phrase(cfg)}."]
+    return " ".join(x for x in parts if x) + _LOOP_DIRECTIVES
 
 
 # ---------- less repetition: variations ----------
@@ -675,7 +879,7 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
                      if k == 1 else f"{k} stills ({', '.join(labels)}) + periodic drift, "
                      "each dissolving into the next.")
         return LoopPlanOut(
-            model=cfg.model_override or _active_model("image"),
+            model=(still_model_chain(cfg) or [""])[0],
             max_clip_seconds=cfg.loop_seconds, caps_known=True, supports_last_frame=False,
             strategy="drift", segments=[cfg.loop_seconds], anchored=False, closed=True,
             join_crossfade=0.0, seam_crossfade=0.0, loop_seconds=loop, unit_seconds=loop,
@@ -769,14 +973,14 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
         lines.append({
             "item": "Your picture (no image call)" if own else "Scene still (image)",
             "qty": 1, "unit": "image",
-            "unit_cost": 0.0 if own else s.cost_image_per_item,
-            "cost": 0.0 if own else round(s.cost_image_per_item, 4),
+            "unit_cost": 0.0 if own else still_cost(cfg),
+            "cost": 0.0 if own else round(still_cost(cfg), 4),
         })
         if more_stills:
             lines.append({
                 "item": f"Stills for {', '.join(plan.variant_labels[1:])}",
-                "qty": more_stills, "unit": "image", "unit_cost": s.cost_image_per_item,
-                "cost": round(s.cost_image_per_item * more_stills, 4),
+                "qty": more_stills, "unit": "image", "unit_cost": still_cost(cfg),
+                "cost": round(still_cost(cfg) * more_stills, 4),
             })
     else:
         if own:
@@ -789,14 +993,14 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
                 "item": "Anchor still (first = last frame)" if plan.anchored
                         else "Shared first frame (image)",
                 "qty": 1, "unit": "image",
-                "unit_cost": s.cost_image_per_item,
-                "cost": round(s.cost_image_per_item, 4),
+                "unit_cost": still_cost(cfg),
+                "cost": round(still_cost(cfg), 4),
             })
         if more_stills and plan.first_frame_still:
             lines.append({
                 "item": f"Anchor stills for {', '.join(plan.variant_labels[1:])}",
-                "qty": more_stills, "unit": "image", "unit_cost": s.cost_image_per_item,
-                "cost": round(s.cost_image_per_item * more_stills, 4),
+                "qty": more_stills, "unit": "image", "unit_cost": still_cost(cfg),
+                "cost": round(still_cost(cfg) * more_stills, 4),
             })
         secs = float(sum(plan.segments))
         n = len(plan.segments)
@@ -1037,7 +1241,9 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
         clip_keys = ("scene_preset", "scene_prompt", "source", "loop_seconds",
                      "model_override", "chain_segments", "look", "look_strength",
                      "time_of_day", "weather", "variety", "variations")
-        if any(getattr(old, k) != getattr(cfg, k) for k in clip_keys) and shot.clip_path:
+        # The still model only matters when the scene makes stills.
+        still_changed = old.still_model != cfg.still_model and makes_stills(cfg)
+        if (any(getattr(old, k) != getattr(cfg, k) for k in clip_keys) or still_changed) and shot.clip_path:
             _reset_clips(project)
             data.pop(_GENERATED_KEY, None)
             project.ambient_config_json = data
@@ -1120,8 +1326,6 @@ def _start_video_chain(
     Variations share the first one's anchor ("takes": every loop closes on
     the same frame) or get their own still made from it ("day_night": the
     same place in different light)."""
-    from .pipeline import _log_provider_call, _resolve_model
-
     out_dir = storage.render_subdir(project.id)
     frames_dir = out_dir / "frames"
     frames_dir.mkdir(exist_ok=True)
@@ -1136,18 +1340,12 @@ def _start_video_chain(
             if picture and variant == 0:
                 shutil.copyfile(picture_path(project), anchor)
             else:
-                image = get_image()
-                img_model = _resolve_model(db, _active_model("image"))
                 refs = [ImageRef(url=anchor0_url, role="scene")] if variant > 0 and anchor0_url else []
                 prompt = still_prompt(variant_config(cfg, variant)) + (_SAME_PLACE if refs else "")
-                png = image.generate(model=img_model, prompt=prompt, references=refs)
+                png, _ = generate_still(db, cfg, prompt=prompt, aspect_ratio=project.aspect_ratio,
+                                        references=refs, project_id=project.id,
+                                        endpoint="image.generate(anchor)", summary={"variant": variant})
                 anchor.write_bytes(png)
-                _log_provider_call(
-                    db, project_id=project.id, provider=type(image).__name__,
-                    endpoint="image.generate(anchor)",
-                    request_summary={"model": img_model, "variant": variant},
-                    response_summary={"bytes": len(png)},
-                )
             _, anchor_url = _save_frame_public(anchor)
     if variant == 0:
         anchor0_url = anchor_url
@@ -1314,7 +1512,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
     loop is submitted segment by segment and finishes asynchronously
     (webhook / sweeper) — the scene goes "planned" when it's ready, and is
     rendered then if `render_after`."""
-    from .pipeline import _log_provider_call, _resolve_model
+    from .pipeline import _log_provider_call
 
     project = db.get(models.VideoProject, project_id)
     if project is None or project.mode != AMBIENT_MODE:
@@ -1347,14 +1545,15 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
                 db.commit()
                 png = picture_path(project).read_bytes()
             else:
-                image = get_image()
-                img_model = _resolve_model(db, cfg.model_override or _active_model("image"))
                 target.provider = "mock" if settings.image_is_mocked() else "openrouter"
-                target.provider_model = img_model
+                target.provider_model = still_model_chain(cfg)[0]
                 db.commit()
                 refs = [ImageRef(url=first_url, role="scene")] if first_url else []
-                png = image.generate(model=img_model, prompt=target.prompt + (_SAME_PLACE if refs else ""),
-                                     references=refs, negative_prompt=target.negative_prompt or "")
+                png, used = generate_still(db, cfg, prompt=target.prompt + (_SAME_PLACE if refs else ""),
+                                           aspect_ratio=project.aspect_ratio, references=refs,
+                                           negative_prompt=target.negative_prompt or "",
+                                           project_id=project.id, endpoint="image.generate(drift)")
+                target.provider_model = used
             still.write_bytes(png)
             if i == 0:
                 model = target.provider_model

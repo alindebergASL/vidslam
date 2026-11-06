@@ -79,6 +79,14 @@ class Settings(BaseSettings):
     # (OpenRouter /videos/models unreachable, or a model it doesn't list).
     # Ambient loops longer than this are built from chained segments.
     ambient_default_max_clip_seconds: int = 10
+    # Image model for ambient scene stills (the anchor frame, a generated
+    # scene picture, Still + drift, preset previews), and the model to retry
+    # with if that call fails. A blind panel ranked GPT Image 2.6 Sunburst at
+    # quality "max" first for realism (Nov 2026), with Nano Banana 2.1 at 2K
+    # a close, cheaper second. Empty = the active image model (Settings →
+    # Models). A scene's own "Picture model" choice wins over both.
+    ambient_still_model: str = "openai/gpt-image-2.6-sunburst"
+    ambient_still_fallback_model: str = "google/gemini-nano-banana-2.1"
 
     # Google Gemini API (Lyria music). Optional; enables google/lyria-* music
     # models in the catalog.
@@ -140,6 +148,9 @@ class Settings(BaseSettings):
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01
     cost_image_per_item: float = 0.04
+    # Ambient stills at their best settings cost more than a default image:
+    # GPT Image 2.6 Sunburst at quality "max" bills ~$0.13 (Nov 2026).
+    cost_ambient_still: float = 0.13
     # Live average: Wan ~$1.05 per 7 s clip ≈ $0.15/s (first EC2 deploy).
     cost_video_per_second: float = 0.15
     # Lip-sync (talking-head) clips, billed on the speech they're given.

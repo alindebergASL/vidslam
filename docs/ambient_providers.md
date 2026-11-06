@@ -38,6 +38,7 @@ Prices change often, so check each model's `pricing_skus` on that listing.
 | `x-ai/grok-imagine-video(-1.5)` | 1–15s | ❌ first only | 2 × 15s, open | |
 | `minimax/hailuo-2.3`, `alibaba/wan-2.6` | 5/6–10s | ❌ first only | 3 × 10s, open | |
 
+| `google/gemini-omni-1.2-flash` / `-1.1-flash` | 3–15s | ✅ | 2 × 15s, closed | Always generates audio and rejects `generate_audio: false`; the app retries without the flag (clip audio is never used). In a Nov 2026 test, 1.1 redrew rock with an embossed texture and blob-like water (Wan kept the still's look); 1.2 was failing on OpenRouter at the time. |
 | `heygen/heygen-video-1` | 5–15s (live listing has shown up to 30s) | ❌ first only | 2 × 15s, open | General scene model (released Sep 30 2026), very cheap (~$0.01–0.015/s), but 480p/768p only, so it gets upscaled to 1080p. Good for cheap drafts. |
 
 Not suitable for scenes: `heygen/avatar-iv` (a talking-head model that
@@ -53,10 +54,29 @@ gardens, candles and misty landscapes.
 
 ## Images (anchor still, Still + drift)
 
-Any OpenRouter image model works (`OPENROUTER_IMAGE_MODEL`). For anchors,
-pick one that is strong on photoreal landscapes at 16:9. The anchor only
-needs to be a convincing frame of the scene. I haven't verified this
-month's OpenRouter image catalogue, so choose from its image-model listing.
+Scene stills use `AMBIENT_STILL_MODEL` (default **openai/gpt-image-2.6-sunburst**),
+or the scene's own *Picture model* (builder step 2). If a call fails, it is
+retried once with `AMBIENT_STILL_FALLBACK_MODEL` (default
+**google/gemini-nano-banana-2.1**). Leave `AMBIENT_STILL_MODEL` empty to use
+the active image model instead (`OPENROUTER_IMAGE_MODEL` / Settings → Models).
+
+Every still is requested at the model's best settings, read from
+`GET /images/models/{id}/endpoints`: the highest `quality` it offers (GPT
+Image: "max"; the default, "auto", is a cheap tier), `resolution` "2K" where
+offered (Gemini, FLUX; 4K came out crunchier, not better), and the scene's
+aspect ratio.
+
+Blind tests in Nov 2026 (AI judges, one image per model and prompt):
+- **The prompt mattered more than the model.** With the app's earlier
+  prompt ("photorealistic, highly detailed", turquoise water, golden hour),
+  every model looked AI-made. A prompt written as a real photograph (place,
+  one plain light, lens/aperture/shutter, "natural colour, not an enhanced
+  or cinematic image") won on all 11 models and all 9 presets.
+- **Sunburst at "max" made the most realistic stills**, about $0.13 and
+  2 minutes each, with a 1536×864 cap through OpenRouter. Nano Banana 2.1 at
+  2K was a close second at about $0.05. FLUX.3 and FLUX.3 Klein trailed.
+- OpenRouter reserves a request's maximum cost up front. Several Sunburst
+  "max" stills at once on a low balance return 402; the fallback covers that.
 
 ## Music bed
 
@@ -128,8 +148,10 @@ defaults that **Reset to default** returns to.
 ```bash
 MOCK_PROVIDERS=false
 OPENROUTER_API_KEY=sk-or-...
-OPENROUTER_VIDEO_MODEL=alibaba/wan-3.0      # or per scene: Advanced → Video model
-OPENROUTER_IMAGE_MODEL=<image model id>     # anchor stills + Still+drift
+OPENROUTER_VIDEO_MODEL=alibaba/wan-3.0      # or per scene: step 2 → Video model
+OPENROUTER_IMAGE_MODEL=<image model id>     # Studio images (and scene stills if AMBIENT_STILL_MODEL is empty)
+AMBIENT_STILL_MODEL=openai/gpt-image-2.6-sunburst          # scene stills; per scene: step 2 → Picture model
+AMBIENT_STILL_FALLBACK_MODEL=google/gemini-nano-banana-2.1 # retried if a still fails
 ELEVENLABS_API_KEY=...                      # ElevenLabs voices / music
 GEMINI_API_KEY=...                          # Lyria 3.5 (Lyria 3 Pro/Clip work via OpenRouter)
 PUBLIC_BASE_URL=https://your-host           # providers fetch anchor/first frames from here

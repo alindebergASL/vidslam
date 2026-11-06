@@ -22,6 +22,8 @@ log = logging.getLogger("avs.openrouter.video")
 # cost preview (called on every keystroke in the ambient builder) doesn't
 # hit OpenRouter each time.
 _MODELS_TTL_SECONDS = 3600
+# Models found to reject generate_audio=false (they always make audio).
+_ALWAYS_AUDIO: set[str] = set()
 _models_cache: tuple[float, list[dict]] | None = None
 
 
@@ -166,8 +168,17 @@ class OpenRouterVideoProvider(VideoProvider):
                 ]
         if settings:
             body.update({k: v for k, v in settings.items() if v not in (None, "")})
+        if model in _ALWAYS_AUDIO:
+            body.pop("generate_audio", None)
         with httpx.Client(timeout=120.0) as client:
             r = client.post(f"{self._base}/videos", headers=self._headers(), json=body)
+            if r.status_code == 400 and body.get("generate_audio") is False and "generate_audio" in r.text:
+                # Some models (Gemini Omni) always make audio and reject
+                # generate_audio=false. The clip's audio is never used (the
+                # renderer lays in voice/music/sound), so send it without.
+                _ALWAYS_AUDIO.add(model)
+                body.pop("generate_audio")
+                r = client.post(f"{self._base}/videos", headers=self._headers(), json=body)
             if r.status_code >= 400:
                 raise RuntimeError(f"video submit {r.status_code}: {r.text[:500]}")
             data = r.json()
