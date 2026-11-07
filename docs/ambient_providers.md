@@ -185,3 +185,60 @@ chained or anchored clips:
 ```
 
 `last_frame` is only sent on the final clip, and only to models that list it.
+
+## Sogni (image + video, paid in Spark)
+
+With `SOGNI_API_KEY` set, every image and video model Sogni's workflow API
+accepts appears in the pickers as `sogni/<selector>`. Sogni has no endpoint
+that lists them; the list comes from its published tool schemas
+(`SOGNI_TOOLS_MANIFEST_URL`, synced with the model catalog, with a copy
+bundled in `backend/app/providers/sogni_tools.json`). Our notes and documented
+prices are in `backend/app/providers/sogni.py`; a newly listed model shows up
+with estimated defaults until it gets its own notes. The synced list is a file
+in `DATA_DIR`, so every worker process picks up a sync; a manifest missing any
+of the three tools' model lists is refused and the last good list kept (the
+catalog shows the error). An empty `SOGNI_TOOLS_MANIFEST_URL` uses only the
+bundled copy.
+
+- **Next-Gen Diffusion** (Sogni's own category, listed first): Krea 2 Turbo,
+  MOSS-Image (50-step and 8-step), Dark Beast Krea 2 / Z-Image Turbo,
+  Z-Image (Turbo), Chroma (v48 Detail, 1 HD, v46 Flash), Qwen Image 2512.
+  Then FLUX.3 Klein, the vendor models, and SDXL community checkpoints.
+- **Free vs Premium Spark.** Sogni's own models run on Free Spark. Vendor
+  models (GPT Image, Seedream, Seedance, HappyHorse, Wan 3.0 via Sogni) need
+  bought Premium Spark; Free Spark gets a 402 "requires Premium Spark Points".
+  The "uncensored" vendor models also need the one-time likeness agreement in
+  the Sogni app.
+- **Closed loops on Free Spark.** LTX 2.5 (`sogni/ltx25`) and the MiniMax H3
+  first + last frame models (`sogni/minimax-h3-*flf2v*`) pin both ends of a
+  clip (`animate_photo`, `frameRole: "both"`), so ambient loops close on the
+  anchor still. Tested Nov 2026: the last frame came back within 3.0x (LTX)
+  and 1.9x (H3 FastH3 flf2v) of a normal frame step, as close as Wan 3.0.
+- **Which tool lists a model decides how it's used:** `animate_photo` models
+  take an exact first frame; models listed only there need a starting picture
+  (the app says so instead of sending an invalid request). MiniMax H3 `r2v`
+  models need at least one reference picture. Ambient scenes handle these:
+  a picture-only model starts from the scene's picture or a still made first;
+  an `r2v` model gets that picture or still as its (loose) reference; a first
+  + last frame only model makes one closed clip (up to 15 s) instead of a
+  chain, since the open middle clips of a chain have no last frame.
+- **Request fields follow the schema's per-model rules:** `negativePrompt`
+  only to LTX and Wan 2.2 (not MiniMax H3, Seedance, HappyHorse or Wan 3),
+  and no `generateAudio` to Wan 2.2 or HappyHorse. HappyHorse 1.1 `i2v`
+  needs a first frame and `r2v` reference pictures, although Sogni lists
+  both under text-to-video too. The "uncensored" tag follows the schema's
+  list of NSFW-capable image models, and the video models named uncensored /
+  spicy.
+- **No image-to-image yet.** The schema documents a source image for Z-Image,
+  Z-Image Turbo and Krea 2 Turbo, but through the workflow API it isn't
+  applied (tested Nov 2026 on three models at two strengths: nothing of the
+  source came through, and Sogni's billing request showed
+  `startingImageStrength: null`). So Sogni picture models get text only, and
+  an ambient scene's "same place, other time of day" stills try the fallback
+  picture model (`AMBIENT_STILL_FALLBACK_MODEL`) first, which takes the
+  reference, and the scene's Sogni model (from the text alone) if that fails.
+  The estimate prices those stills at the fallback model.
+- **Spend** is recorded from Sogni's price table (1 Spark = $0.005) as an
+  estimate: Sogni's workflow results carry no cost. Free-Spark jobs didn't
+  change the account balance (`/v2/account/balance`) in our tests.
+

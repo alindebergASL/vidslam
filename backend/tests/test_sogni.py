@@ -97,7 +97,21 @@ def test_image_start_poll_download(client, live_sogni, where):
     assert "authorization" not in dl.calls[0].request.headers
 
 
-def test_image_img2img_uses_media_references_and_records_estimate(client, live_sogni):
+@pytest.fixture
+def krea_img2img(monkeypatch):
+    """No Sogni model is marked image-to-image today (the workflow API
+    doesn't apply the source): mark one to keep that path tested."""
+    from dataclasses import replace
+
+    from app.providers import sogni
+
+    monkeypatch.setitem(sogni._IMAGE_INFO, "krea-2-turbo", replace(sogni._IMAGE_INFO["krea-2-turbo"], img2img=True))
+    sogni._reset_listed()
+    yield
+    sogni._reset_listed()
+
+
+def test_image_img2img_uses_media_references_and_records_estimate(client, live_sogni, krea_img2img):
     from app import models
     from app.db import SessionLocal
     from app.providers.base import ImageRef
@@ -310,7 +324,8 @@ def test_capabilities():
     from app.providers import sogni
 
     ltx = sogni.capabilities_for("sogni/ltx25")
-    assert ltx.known and ltx.first_frame and not ltx.last_frame
+    # LTX 2.5 interpolates first -> last frame on animate_photo (frameRole "both").
+    assert ltx.known and ltx.first_frame and ltx.last_frame
     assert (min(ltx.durations), ltx.max_seconds) == (2, 20)
     s25 = sogni.capabilities_for("sogni/seedance2-5")
     assert not s25.first_frame and (min(s25.durations), s25.max_seconds) == (4, 30)
@@ -483,7 +498,7 @@ def test_requested_duration_survives_submit_for_cost(client, live_sogni, monkeyp
         db.close()
 
 
-def test_scene_reference_is_the_img2img_source(client, live_sogni):
+def test_scene_reference_is_the_img2img_source(client, live_sogni, krea_img2img):
     """Ambient drift/anchor variants pass the first still as role="scene"
     with no frame_type: on a Sogni still model it must be sent as img2img."""
     from app.providers.base import ImageRef
@@ -542,7 +557,8 @@ def test_catalog_lists_sogni_models(client, monkeypatch):
     sogni = {(e["kind"], e["id"]): e for e in snap["entries"] if e["provider"] == "sogni"}
     assert ("image", "sogni/krea-2-turbo") in sogni and ("video", "sogni/seedance2-5") in sogni
     v = sogni[("video", "sogni/ltx25")]
-    assert v["max_seconds"] == 20 and v["frame_images"] == ["first_frame"] and "first frame" in v["notes"]
+    assert v["max_seconds"] == 20 and v["frame_images"] == ["first_frame", "last_frame"]
+    assert "first + last frame" in v["notes"]
     assert sogni[("video", "sogni/seedance2-5")]["frame_images"] == []
     assert all(not e["usable"] for e in sogni.values())  # no key yet
     assert model_catalog.find("video", "sogni/wan3.0-video") is not None
