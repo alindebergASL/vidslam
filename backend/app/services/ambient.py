@@ -573,22 +573,46 @@ def _is_video_model(model: str) -> bool:
 
 
 def _takes_reference(model: str) -> bool:
-    """False for Sogni picture models: Sogni's workflow API doesn't apply a
-    source image yet (see sogni.ImageModel.img2img)."""
-    return not (_sogni.is_sogni(model) and not _sogni.takes_source_image(model))
+    """Whether a still model applies a reference picture. Sogni models do
+    through Sogni's edit_image tool (sogni.edit_route), unless that's off."""
+    return not _sogni.is_sogni(model) or _sogni.can_use_references(model)
 
 
-def reference_still_chain(cfg: AmbientConfig) -> list[str]:
-    """still_model_chain for a still made from a reference picture (Day to
-    night's "same place, other light"): the models that apply the reference
-    first, if a real provider serves them; the others, which would make it
-    from the text alone, after, as the last resort."""
+def reference_still_attempts(cfg: AmbientConfig) -> list[tuple[str, bool]]:
+    """(model, with the reference picture), in the order generate_still
+    tries them for a still made from a reference (Day to night's "same
+    place, other light"). Models that apply the reference come first, if a
+    real provider serves them: the fallback picture model (most realistic
+    relight in a blind test) before a Sogni edit (most faithful, free),
+    unless SOGNI_SAME_PLACE_FIRST. Then, as the last resort, the text alone
+    on the scene's models, so a scene still finishes."""
     from .model_registry import provider_for
 
     chain = still_model_chain(cfg)
     mock = get_settings().mock_providers
-    first = [m for m in chain if _takes_reference(m) and (mock or provider_for("image", m) != "mock")]
-    return first + [m for m in chain if m not in first]
+    usable = [m for m in chain if _takes_reference(m) and (mock or provider_for("image", m) != "mock")]
+    # Sogni first only for a scene whose own Picture model is a Sogni one.
+    sogni_first = bool(get_settings().sogni_same_place_first) and bool(chain) and _sogni.is_sogni(chain[0])
+    usable.sort(key=lambda m: _sogni.is_sogni(m) != sogni_first)
+    # Two Sogni models can share an editor: one edit attempt each editor.
+    editors: set[str] = set()
+    with_refs: list[str] = []
+    for m in usable:
+        route = _sogni.edit_route(m, [_PROBE_REF], "same_place") if _sogni.is_sogni(m) else None
+        if route is not None:
+            if route.model.selector in editors:
+                continue
+            editors.add(route.model.selector)
+        with_refs.append(m)
+    return [(m, True) for m in with_refs] + [(m, False) for m in chain if m not in usable or _sogni.is_sogni(m)]
+
+
+_PROBE_REF = ImageRef(url="https://example.invalid/still.png", role="scene")
+
+
+def reference_still_chain(cfg: AmbientConfig) -> list[str]:
+    """The models reference_still_attempts tries, in order."""
+    return list(dict.fromkeys(m for m, _ in reference_still_attempts(cfg)))
 
 
 def still_cost(cfg: AmbientConfig) -> float:
@@ -598,9 +622,17 @@ def still_cost(cfg: AmbientConfig) -> float:
 
 
 def reference_still_cost(cfg: AmbientConfig) -> float:
-    """Rate-card cost of a "same place" still (see reference_still_chain)."""
-    chain = reference_still_chain(cfg)
-    return _still_model_cost(chain[0] if chain else "")
+    """Rate-card cost of a "same place" still: its first attempt (see
+    reference_still_attempts). A Sogni edit is priced as the edit."""
+    attempts = reference_still_attempts(cfg)
+    if not attempts:
+        return _still_model_cost("")
+    model, with_refs = attempts[0]
+    if with_refs and _sogni.is_sogni(model):
+        route = _sogni.edit_route(model, [_PROBE_REF], "same_place")
+        if route is not None:
+            return _sogni.edit_spend_usd(route.model.selector, 1)
+    return _still_model_cost(model)
 
 
 def _still_model_cost(model: str) -> float:
@@ -621,38 +653,55 @@ def _video_rate(model: str) -> float:
 
 def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio: str,
                    references: Optional[list[ImageRef]] = None, negative_prompt: str = "",
-                   project_id: Optional[int] = None, endpoint: str = "image.generate(still)",
+                   edit_prompt: str = "", project_id: Optional[int] = None,
+                   endpoint: str = "image.generate(still)",
                    summary: Optional[dict] = None) -> tuple[bytes, str]:
     """One still for this scene, at the model's best settings. If the
     primary model fails (an error, a timeout, a refused prompt), retry once
-    with the fallback model. Returns (image bytes, model used)."""
+    with the fallback model. Returns (image bytes, model used).
+
+    With `references` (Day to night's "same place"), `prompt` is the full
+    still prompt and `edit_prompt` an instruction to change only the light
+    (same_place_prompt). A Sogni edit gets the instruction; another model
+    that applies the reference gets the full prompt plus _SAME_PLACE; the
+    text-only last resort gets the full prompt."""
     from .pipeline import _log_provider_call, _resolve_model
 
     last: Optional[Exception] = None
-    for model in (reference_still_chain(cfg) if references else still_model_chain(cfg)):
+    attempts = reference_still_attempts(cfg) if references else [(m, False) for m in still_model_chain(cfg)]
+    for model, with_refs in attempts:
         model = _resolve_model(db, model)
         image = None
-        # A model that can't apply the reference makes the still from text:
-        # don't describe a reference it never sees.
-        call_prompt = prompt if not references or _takes_reference(model) else prompt.replace(_SAME_PLACE, "")
+        settings = best_image_settings(model, aspect_ratio)
+        if with_refs and _sogni.is_sogni(model):
+            settings = {**(settings or {}), "reference_intent": "same_place"}
+        if not with_refs:
+            call_prompt = prompt
+        elif edit_prompt and _sogni.is_sogni(model):
+            call_prompt = edit_prompt
+        else:
+            call_prompt = prompt + _SAME_PLACE
         try:
             # Per model: a sogni/ primary can fall back to an OpenRouter model.
             image = get_image(model) if routes_per_model("image", model) else get_image()
-            png = image.generate(model=model, prompt=call_prompt, references=references or [],
-                                 negative_prompt=negative_prompt,
-                                 settings=best_image_settings(model, aspect_ratio))
+            png = image.generate(model=model, prompt=call_prompt, references=(references or []) if with_refs else [],
+                                 negative_prompt=negative_prompt, settings=settings)
         except Exception as e:  # noqa: BLE001 — try the fallback model
             last = e
             log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
             # Recorded (status=error) so the provider-error alerts see it.
+            route = getattr(image, "last_route", None)
             _log_provider_call(db, project_id=project_id,
                                provider=type(image).__name__ if image is not None else "image",
                                endpoint=endpoint,
-                               request_summary={"model": model, **(summary or {})},
+                               request_summary={"model": model, "reference": with_refs, **(summary or {}),
+                                                **({"edit_model": route.model.selector} if route else {})},
                                response_summary={"error": str(e)[:500]}, status="error")
             continue
+        route = getattr(image, "last_route", None)
         _log_provider_call(db, project_id=project_id, provider=type(image).__name__, endpoint=endpoint,
-                           request_summary={"model": model, **(summary or {})},
+                           request_summary={"model": model, "reference": with_refs, **(summary or {}),
+                                            **({"edit_model": route.model.selector} if route else {})},
                            response_summary={"bytes": len(png)})
         return png, model
     raise last or RuntimeError("no image model configured for scene stills")
@@ -876,6 +925,24 @@ _TAKE_HINTS = (
     " A little mist drifts slowly across the scene.",
     " Small details stir gently: leaves, ripples, a slow flicker of light.",
 )
+# An edit model's instruction for a "same place, other light" still: only
+# the light changes. (Blind panels, Nov 2026, 3 presets: a "real long-exposure
+# night" wording made Nano Banana's night read as night 9/9 votes against 3/9,
+# but changed still water and lost on fidelity; on FLUX.3 Klein it cost
+# fidelity with no gain. So edits get this plain wording, and the fallback
+# picture model keeps the full still prompt plus _SAME_PLACE.)
+_KEEP_PLACE = "Keep exactly the same place, framing and composition, and every object in it."
+
+
+def same_place_prompt(cfg: AmbientConfig) -> str:
+    """The edit instruction for a still made from the scene's first still in
+    `cfg`'s light (a Day to night variant): keep the place, change the light."""
+    kind = ("It is still a real, unedited photograph." if cfg.look == "photoreal"
+            else f"Keep its look unchanged: {look_phrase(cfg)}.")
+    return (f"{_KEEP_PLACE} Change only the time of day and its light: {light_phrase(cfg)} "
+            f"{kind} No people, no text.")
+
+
 _SAME_PLACE = (" Exactly the same place, framing and composition as the reference image; "
                "only the time of day and the light change.")
 
@@ -1560,9 +1627,10 @@ def _start_video_chain(
                 shutil.copyfile(picture_path(project), anchor)
             else:
                 refs = [ImageRef(url=anchor0_url, role="scene")] if variant > 0 and anchor0_url else []
-                prompt = still_prompt(variant_config(cfg, variant)) + (_SAME_PLACE if refs else "")
-                png, _ = generate_still(db, cfg, prompt=prompt, aspect_ratio=project.aspect_ratio,
-                                        references=refs, project_id=project.id,
+                vcfg = variant_config(cfg, variant)
+                png, _ = generate_still(db, cfg, prompt=still_prompt(vcfg), aspect_ratio=project.aspect_ratio,
+                                        references=refs, edit_prompt=same_place_prompt(vcfg) if refs else "",
+                                        project_id=project.id,
                                         endpoint="image.generate(anchor)", summary={"variant": variant})
                 anchor.write_bytes(png)
             _, anchor_url = _save_frame_public(anchor)
@@ -1771,8 +1839,9 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
                 target.provider = provider_label("image", target.provider_model)
                 db.commit()
                 refs = [ImageRef(url=first_url, role="scene")] if first_url else []
-                png, used = generate_still(db, cfg, prompt=target.prompt + (_SAME_PLACE if refs else ""),
-                                           aspect_ratio=project.aspect_ratio, references=refs,
+                png, used = generate_still(db, cfg, prompt=target.prompt, aspect_ratio=project.aspect_ratio,
+                                           references=refs,
+                                           edit_prompt=same_place_prompt(variant_config(cfg, i)) if refs else "",
                                            negative_prompt=target.negative_prompt or "",
                                            project_id=project.id, endpoint="image.generate(drift)")
                 target.provider_model = used
