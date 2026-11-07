@@ -166,32 +166,45 @@ def _resolve_references_for_shot(
                 continue
             for a in owner.assets[:2]:
                 asset_ids.append(a.id)
+    # Shots keep asset-id order (what IN() gave before): a frame_images shot
+    # pins refs[0] as its first frame, and the shot picker shows no order.
+    return _asset_refs(db, sorted(_asset_ids(asset_ids)))
+
+
+def _asset_ids(raw) -> list[int]:
+    """Stored asset ids as ints (an API client may have stored "12")."""
+    out = []
+    for x in raw or []:
+        text = str(x).strip()
+        if text.isascii() and text.isdecimal():
+            out.append(int(text))
+    return out
+
+
+def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
+    """Assets as reference pictures, in the order given (Studio: the order
+    the user picked them; IN() returns database order), each with its role
+    (a Cast character, or an ingredient's kind) and name."""
+    ids = _asset_ids(asset_ids)
+    if not ids:
+        return []
+    rows = {r.id: r for r in db.query(models.Asset).filter(models.Asset.id.in_(ids)).all()}
     refs: list[ImageRef] = []
-    if not asset_ids:
-        return refs
-    rows = db.query(models.Asset).filter(models.Asset.id.in_(asset_ids)).all()
-    for row in rows:
-        role = "character" if row.owner_kind == "avatar" else "scene"
-        if row.owner_kind == "ingredient" and row.ingredient is not None:
-            kind = row.ingredient.kind
-            role = {
-                "scene": "scene",
-                "style": "style",
-                "object": "object",
-                "prop": "object",
-            }.get(kind, "scene")
-        name = ""
+    for aid in dict.fromkeys(ids):
+        row = rows.get(aid)
+        if row is None:
+            continue
+        role, name = "character" if row.owner_kind == "avatar" else "scene", ""
+        if row.owner_kind == "avatar" and row.asset_type == "logo":
+            role = "object"  # a character's logo is a thing to include, not a likeness
         if row.owner_kind == "avatar" and row.avatar is not None:
-            name = row.avatar.name
+            name = row.avatar.name if role == "character" else f"{row.avatar.name}'s logo"
         elif row.owner_kind == "ingredient" and row.ingredient is not None:
+            role = {"scene": "scene", "style": "style", "object": "object", "prop": "object"}.get(
+                row.ingredient.kind, "scene")
             name = row.ingredient.name
-        refs.append(
-            ImageRef(
-                url=storage.public_url_for_token(row.public_token),
-                role=role,  # type: ignore[arg-type]
-                name=name,
-            )
-        )
+        refs.append(ImageRef(url=storage.public_url_for_token(row.public_token),
+                             role=role, name=name))  # type: ignore[arg-type]
     return refs
 
 
@@ -1072,18 +1085,9 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
     job.status = "submitted"
     db.commit()
     try:
-        refs: list[ImageRef] = []
-        if job.reference_asset_ids_json:
-            rows = (
-                db.query(models.Asset)
-                .filter(models.Asset.id.in_(job.reference_asset_ids_json))
-                .all()
-            )
-            for row in rows:
-                role = "character" if row.owner_kind == "avatar" else "scene"
-                refs.append(
-                    ImageRef(url=storage.public_url_for_token(row.public_token), role=role)
-                )
+        # The user's order, each with its role and name (an ingredient was
+        # always sent as a "scene" before, in database order).
+        refs = _asset_refs(db, list(job.reference_asset_ids_json or []))
 
         if job.output_kind == "image":
             from ..providers import get_image

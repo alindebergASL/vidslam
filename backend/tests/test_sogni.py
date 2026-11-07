@@ -65,7 +65,6 @@ def _started(request):
 
 @pytest.mark.parametrize("where", ["steps", "artifacts", "events"])
 def test_image_start_poll_download(client, live_sogni, where):
-    from app.providers.base import ImageRef
     from app.providers.sogni import SogniImageProvider
 
     done: dict = {"steps": [{"id": "s1", "toolName": "generate_image"}], "artifacts": []}
@@ -89,8 +88,7 @@ def test_image_start_poll_download(client, live_sogni, where):
         dl = router.get(ART_IMG).mock(return_value=httpx.Response(200, content=PNG))
         out = SogniImageProvider().generate(
             model="sogni/krea-2-turbo", prompt="a misty lake", negative_prompt="people",
-            references=[ImageRef(url="https://x/char.png", role="character")],
-            settings={"aspect_ratio": "16:9"})
+            references=[], settings={"aspect_ratio": "16:9"})  # references: test_sogni_edit.py
     assert out == PNG
     assert polls.call_count == 2 and dl.called
     assert events.called == (where == "events")
