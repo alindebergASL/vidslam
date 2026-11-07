@@ -147,7 +147,7 @@ def estimate_for_project(db, project, plan: StoryboardPlan, *, music_will_genera
     for r in rows:
         m = (r.model_override or active_video or "").strip()
         if m.startswith(sogni.PREFIX):
-            video_rates[r.shot_order] = sogni.video_rate_usd(m)
+            video_rates[r.shot_order] = sogni.video_spend_rate_usd(m)
     lipsync = get_avatar() is not None and _hero_portrait(db, project) is not None
     voice: Optional[float] = None
     if lipsync:

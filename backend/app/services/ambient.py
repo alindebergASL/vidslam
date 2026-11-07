@@ -608,14 +608,14 @@ def _still_model_cost(model: str) -> float:
     if model and model == s.ambient_still_model:
         return s.cost_ambient_still
     if _sogni.is_sogni(model):
-        return _sogni.image_cost_usd(model)
+        return _sogni.image_spend_usd(model)
     return _STILL_COST.get(model, s.cost_image_per_item)
 
 
 def _video_rate(model: str) -> float:
     """Rate-card USD per second of loop video on `model`."""
     if _sogni.is_sogni(model):
-        return _sogni.video_rate_usd(model)
+        return _sogni.video_spend_rate_usd(model)
     return get_settings().cost_video_per_second
 
 

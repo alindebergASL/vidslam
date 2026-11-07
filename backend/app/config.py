@@ -159,6 +159,10 @@ class Settings(BaseSettings):
     # Off: the app has no NSFW gate. Vendor models (GPT Image, standard
     # Seedance, HappyHorse, standard Wan 3) refuse mature prompts anyway.
     sogni_safe_content_filter: bool = False
+    # Native Sogni models run on Free Spark: by default only vendor (Premium
+    # Spark) models count toward Spend and the monthly cap. True counts the
+    # free ones at their list price too.
+    sogni_count_free_spark: bool = False
     # Image calls start a workflow and poll it (2 s, backing off to 5 s)
     # until it finishes or this many seconds pass.
     sogni_image_timeout_seconds: float = 300.0

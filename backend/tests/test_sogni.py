@@ -17,6 +17,20 @@ PNG = b"\x89PNG\r\n\x1a\nfake-sogni"
 MP4 = b"\x00\x00\x00\x18ftypmp42fake"
 
 
+
+@pytest.fixture(autouse=True)
+def _count_free_spark(monkeypatch):
+    """These tests check the Spark price-table plumbing, which by default
+    records Free Spark models at $0 (see test_sogni_spend_rules.py). Count
+    them at list price here so the prices stay checked."""
+    from app import config
+
+    monkeypatch.setenv("SOGNI_COUNT_FREE_SPARK", "true")
+    config.get_settings.cache_clear()
+    yield
+    config.get_settings.cache_clear()
+
+
 def _reset():
     from app import config
     from app.services import provider_keys

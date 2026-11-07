@@ -183,10 +183,10 @@ def _record_sogni_video(db: Session, job: models.VideoJob, kind: str, ref: str) 
 
     cost = job.cost_usd
     if cost is None:
-        cost = sogni.video_cost_usd(job.model, float((job.context_json or {}).get("duration") or 5.0))
+        cost = sogni.video_spend_usd(job.model, float((job.context_json or {}).get("duration") or 5.0))
     record(provider="sogni", kind=kind, model=job.model, cost=cost, is_estimate=True,
            source="rate_card", project_id=job.project_id, render_id=job.render_id, ref=ref,
-           generation_id=job.provider_job_id, note="Sogni Spark price-table estimate", db=db)
+           generation_id=job.provider_job_id, note=sogni.spend_note(job.model, "video"), db=db)
 
 
 def render_actual_cost(db: Session, render: models.Render) -> float:
