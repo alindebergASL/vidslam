@@ -789,8 +789,8 @@ def _crop_to_aspect(raw: bytes, aspect: str) -> bytes:
         img = ImageOps.exif_transpose(img).convert("RGB")
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as e:
         raise PictureError("not a readable image") from e
-    if max(img.size) > storage.MAX_IMAGE_SIDE:
-        img.thumbnail((storage.MAX_IMAGE_SIDE, storage.MAX_IMAGE_SIDE), Image.LANCZOS)
+    # Crop first, then cap the size (below): a panorama's centered crop keeps
+    # its full height instead of being shrunk with the whole frame.
     if min(img.size) < PICTURE_MIN_SIDE:
         raise PictureError(f"picture is too small ({img.size[0]}×{img.size[1]}); "
                            f"use at least {PICTURE_MIN_SIDE}px on the short side")

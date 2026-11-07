@@ -292,3 +292,12 @@ def test_mpo_ambient_picture_upload(auth_client):
                          files={"file": ("IMG_0101.jpg", make_mpo_bytes((1600, 900)), "image/jpeg")})
     assert r.status_code == 200, r.text
     assert r.json()["picture_ready"] is True
+
+
+def test_panorama_scene_picture_is_cropped_before_the_size_cap():
+    """A 10000×1000 panorama keeps its full height: the 16:9 crop is taken
+    from the original, not from a frame first shrunk to 4096 px wide."""
+    from app.services.ambient import _crop_to_aspect
+
+    out = Image.open(io.BytesIO(_crop_to_aspect(make_png_bytes((10000, 1000)), "16:9")))
+    assert out.size == (1778, 1000)
