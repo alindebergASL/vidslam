@@ -15,7 +15,7 @@ import re
 import secrets
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -336,16 +336,27 @@ def active_rewrite(cfg: AmbientConfig) -> Optional[PhotoRewrite]:
 OWN_PICTURE = frozenset({"upload", "studio", "asset"})
 
 
-def _with_current_rewrite(project: models.VideoProject, cfg: AmbientConfig) -> AmbientConfig:
+def _with_current_rewrite(db: Session, project: models.VideoProject, cfg: AmbientConfig) -> AmbientConfig:
     """Before generating: make a rewrite the scene doesn't have yet (one that
     failed at save time, or a scene from before rewrites) and store it, so
-    the new clip or picture and the stored prompt agree. The caller commits."""
+    the new clip or picture and the stored prompt agree. The caller commits.
+
+    The rewrite can take up to a minute, so the row is re-read before the
+    rewrite is written into it: a copy loaded earlier would overwrite
+    whatever was saved meanwhile."""
     new = ensure_photo_rewrite(cfg)
-    if new.photo != cfg.photo:
-        data = dict(project.ambient_config_json or {})
-        data["photo"] = new.photo.model_dump() if new.photo else None
-        project.ambient_config_json = data
-    return new
+    if new.photo == cfg.photo:
+        return cfg
+    db.refresh(project)
+    fresh = _config_of(project)
+    if _rewrite_inputs(fresh) != _rewrite_inputs(cfg):
+        return fresh  # the text changed meanwhile: this rewrite is for the old one
+    _set_state(project, "photo", new.photo.model_dump() if new.photo else None)
+    return fresh.model_copy(update={"photo": new.photo})
+
+
+def _rewrite_inputs(cfg: AmbientConfig) -> tuple:
+    return (cfg.scene_prompt.strip(), cfg.look, cfg.rewrite_prompt, cfg.picture_origin)
 
 
 def _rewrite_key(cfg: AmbientConfig) -> Optional[tuple[str, str, str]]:
@@ -353,15 +364,43 @@ def _rewrite_key(cfg: AmbientConfig) -> Optional[tuple[str, str, str]]:
     return (rw.scene, rw.light, rw.camera) if rw else None
 
 
-def ensure_photo_rewrite(cfg: AmbientConfig) -> AmbientConfig:
-    """Make (or keep) the photo rewrite of a typed description: one short
-    call to the planner model, only when the text changed. On any failure
-    the scene just uses the text as typed."""
+def needs_photo_rewrite(cfg: AmbientConfig) -> bool:
+    """Whether ensure_photo_rewrite would call the planner for this config."""
     text = cfg.scene_prompt.strip()
     if cfg.look != "photoreal" or not cfg.rewrite_prompt or not text or cfg.picture_origin in OWN_PICTURE:
+        return False
+    return not (cfg.photo is not None and cfg.photo.source == _text_fingerprint(text)
+                and cfg.photo.scene.strip())
+
+
+def _rewrite_affordable() -> bool:
+    """The planner call is paid: none once the monthly budget cap is hit
+    (the same check budget_guard makes)."""
+    from ..db import SessionLocal
+    from . import spend
+
+    db = SessionLocal()
+    try:
+        return spend.over_budget(db) is None
+    except Exception as e:  # noqa: BLE001 — an unreadable budget shouldn't block a ~$0.001 call
+        log.warning("couldn't read the budget before a scene rewrite (%s)", str(e)[:200])
+        return True
+    finally:
+        db.close()
+
+
+def ensure_photo_rewrite(cfg: AmbientConfig, *, allow: Optional[Callable[[], bool]] = None) -> AmbientConfig:
+    """Make (or keep) the photo rewrite of a typed description: one short
+    call to the planner model, only when the text changed. On any failure
+    the scene just uses the text as typed. Over budget, or when `allow`
+    (asked only right before a call) says no, it is skipped the same way:
+    generating later makes the missing rewrite."""
+    if not needs_photo_rewrite(cfg):
         return cfg
-    if cfg.photo is not None and cfg.photo.source == _text_fingerprint(text) and cfg.photo.scene.strip():
-        return cfg
+    if not _rewrite_affordable() or (allow is not None and not allow()):
+        log.info("scene description rewrite skipped (budget or rate limit); using it as typed")
+        return cfg.model_copy(update={"photo": None})
+    text = cfg.scene_prompt.strip()
     try:
         from ..providers import get_chat
 
@@ -502,9 +541,23 @@ def still_model_chain(cfg: AmbientConfig) -> list[str]:
 
 
 def makes_stills(cfg: AmbientConfig) -> bool:
-    """Whether the still model is used: always without a picture of the
-    scene's own; with one, only for Day to night's other times of day."""
+    """Whether the scene's stills come from the still model rather than its
+    own picture: always without a picture of the scene's own; with one, only
+    for Day to night's other times of day. (A video scene also has to make
+    stills at all: see uses_still_model.)"""
     return not cfg.picture_origin or (cfg.variety == "day_night" and variant_count(cfg) > 1)
+
+
+def uses_still_model(cfg: AmbientConfig) -> bool:
+    """Whether generating this scene calls the still model. Still + drift
+    always makes its stills (except where its own picture is the still); a
+    video scene only when its plan starts clips from a still (an anchor or
+    a first frame), as _start_video_chain does. Takes share the first
+    still, so with the scene's own picture they make none."""
+    if cfg.source == "image_drift":
+        return makes_stills(cfg)
+    plan = plan_loop(cfg)
+    return (plan.first_frame_still or plan.anchored) and makes_stills(cfg)
 
 
 def _is_video_model(model: str) -> bool:
@@ -707,7 +760,7 @@ def still_prompt(cfg: AmbientConfig) -> str:
 def generate_picture(db: Session, project: models.VideoProject) -> models.VideoProject:
     """Generate the scene's picture now (one image call), so it can be
     previewed and regenerated before any video is made."""
-    cfg = _with_current_rewrite(project, _config_of(project))
+    cfg = _with_current_rewrite(db, project, _config_of(project))
     # Same model choice as the loop path (still_model_chain), so the picture
     # previewed here is what the scene would have made anyway.
     png, _ = generate_still(db, cfg, prompt=still_prompt(cfg), aspect_ratio=project.aspect_ratio,
@@ -1288,7 +1341,35 @@ def create_scene(db: Session, body: AmbientCreate) -> models.VideoProject:
     return project
 
 
-def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate) -> models.VideoProject:
+class SceneBusy(Exception):
+    """The scene started generating while a save was in progress (the API answers 409)."""
+
+
+def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate, *,
+                 allow_rewrite: Optional[Callable[[], bool]] = None) -> models.VideoProject:
+    cfg: Optional[AmbientConfig] = None
+    if body.config is not None:
+        cfg = body.config
+        resolve_scene_prompt(cfg)
+        old = _config_of(project)
+        # Keep a rewrite the page didn't send back (an older page, a partial edit).
+        if cfg.photo is None and old.photo is not None:
+            cfg = cfg.model_copy(update={"photo": old.photo})
+        # Rewrite only when what it depends on changed, so an unrelated save
+        # never swaps the prompt the existing clip was made from. This is a
+        # network call of up to a minute, so it comes before anything is
+        # changed here, and the row is re-read after it.
+        if (cfg.scene_prompt.strip() != old.scene_prompt.strip() or cfg.rewrite_prompt != old.rewrite_prompt
+                or cfg.look != old.look):
+            probe = cfg.model_copy(update={"picture_origin": old.picture_origin})
+            if needs_photo_rewrite(probe):
+                cfg = cfg.model_copy(update={"photo": ensure_photo_rewrite(probe, allow=allow_rewrite).photo})
+                db.expire_all()
+    # A generation that started meanwhile (the API checked before the call)
+    # owns the scene's state now.
+    if project.status == "generating":
+        raise SceneBusy("scene is generating; wait or cancel first")
+
     if body.title is not None:
         project.title = body.title.strip()
     aspect_changed = body.aspect_ratio is not None and body.aspect_ratio != project.aspect_ratio
@@ -1300,32 +1381,16 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
         shot = _loop_shot(project)
         if shot is not None and shot.clip_path:
             _reset_clips(project)
-            data = dict(project.ambient_config_json or {})
-            data.pop(_GENERATED_KEY, None)
-            project.ambient_config_json = data
-    if body.config is not None:
-        cfg = body.config
-        resolve_scene_prompt(cfg)
+            _set_state(project, _GENERATED_KEY, None)
+    if cfg is not None:
         old = _config_of(project)
         # The picture is set through its own endpoints; a settings save
         # (maybe from a page loaded before the upload) must not clear it.
         cfg = cfg.model_copy(update={"picture_origin": old.picture_origin})
-        # Keep a rewrite the page didn't send back (an older page, a partial edit).
-        if cfg.photo is None and old.photo is not None:
-            cfg = cfg.model_copy(update={"photo": old.photo})
-        # Rewrite only when what it depends on changed, so an unrelated save
-        # never swaps the prompt the existing clip was made from.
-        if (cfg.scene_prompt.strip() != old.scene_prompt.strip() or cfg.rewrite_prompt != old.rewrite_prompt
-                or cfg.look != old.look):
-            cfg = ensure_photo_rewrite(cfg)
-            # That was a network call: pick up anything the worker saved meanwhile.
-            db.refresh(project)
-            old = _config_of(project)
-            cfg = cfg.model_copy(update={"picture_origin": old.picture_origin})
-        generated = _generated_of(project)
-        data = cfg.model_dump()
-        if generated:
-            data[_GENERATED_KEY] = generated
+        # Internal state (_generated, _chain, ...) isn't part of the config
+        # the page sends; keep it.
+        data = {k: v for k, v in (project.ambient_config_json or {}).items() if k.startswith("_")}
+        data.update(cfg.model_dump())
         project.ambient_config_json = data
         project.target_duration_seconds = int(cfg.total_seconds)
         project.music_volume = float(cfg.music_volume)
@@ -1336,15 +1401,14 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate)
         clip_keys = ("scene_preset", "scene_prompt", "source", "loop_seconds",
                      "model_override", "chain_segments", "look", "look_strength",
                      "time_of_day", "weather", "variety", "variations")
-        # The still model only matters when the scene makes stills.
-        still_changed = old.still_model != cfg.still_model and makes_stills(cfg)
+        # The still model only matters when generating this scene calls it.
+        still_changed = old.still_model != cfg.still_model and uses_still_model(cfg)
         # The rewrite changes the prompt only when one applies before or after.
         rewrite_changed = _rewrite_key(old) != _rewrite_key(cfg)
         if ((any(getattr(old, k) != getattr(cfg, k) for k in clip_keys) or still_changed or rewrite_changed)
                 and shot.clip_path):
             _reset_clips(project)
-            data.pop(_GENERATED_KEY, None)
-            project.ambient_config_json = data
+            _set_state(project, _GENERATED_KEY, None)
     db.commit()
     db.refresh(project)
     return project
@@ -1615,14 +1679,18 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
     project = db.get(models.VideoProject, project_id)
     if project is None or project.mode != AMBIENT_MODE:
         raise ValueError(f"ambient scene {project_id} not found")
-    cfg = _with_current_rewrite(project, _config_of(project))
-    shot = _ensure_loop_shot(db, project, cfg)
+    # Mark the scene generating before anything slow (the rewrite below is a
+    # planner call of up to a minute), so the API's 409 turns away a second
+    # Generate and a settings save in the meantime.
     _reset_clips(project)
     project.status = "generating"
     _set_state(project, _CHAIN_KEY, None)  # supersede any in-flight chain
     db.commit()
     settings = get_settings()
     try:
+        cfg = _with_current_rewrite(db, project, _config_of(project))
+        shot = _ensure_loop_shot(db, project, cfg)
+        db.commit()
         plan = plan_loop(cfg)
         if cfg.source != "image_drift":
             _start_video_chain(db, project, shot, cfg, plan,

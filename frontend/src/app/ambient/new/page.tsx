@@ -112,6 +112,10 @@ function Inner() {
   const plan = estimate?.plan;
   const set = <K extends keyof AmbientConfig>(k: K, v: AmbientConfig[K]) =>
     setCfg((c) => ({ ...c, [k]: v }));
+  // A video model isn't a still model: clear it only on a real switch, so
+  // re-clicking the current source keeps the chosen model.
+  const pickSource = (source: AmbientSource) =>
+    setCfg((c) => (c.source === source ? c : { ...c, source, model_override: "" }));
 
   const choosePreset = (id: string) => {
     const p = presetFor(presets?.scenes ?? null, id);
@@ -362,14 +366,14 @@ function Inner() {
             <div role="radiogroup" aria-label="Scene source" className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <SourceOption
                 active={cfg.source === "video"}
-                onClick={() => { set("source", "video"); set("model_override", ""); }}
+                onClick={() => pickSource("video")}
                 title="Video clip"
                 desc="Real motion (water, flames). Long loops are chained clips; they close on an anchor frame when the model supports it."
                 badge="Best look"
               />
               <SourceOption
                 active={cfg.source === "image_drift"}
-                onClick={() => { set("source", "image_drift"); set("model_override", ""); }}
+                onClick={() => pickSource("image_drift")}
                 title="Still + slow drift"
                 desc="One generated image with a gentle, periodic push-in. Perfectly seamless by construction, ~10× cheaper."
                 badge="Cheapest"
