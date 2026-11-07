@@ -36,7 +36,8 @@ def speech_seconds(plan: StoryboardPlan, voice_seconds: Optional[float]) -> dict
 
 
 def estimate_plan_cost(project: dict, plan: StoryboardPlan, *, lipsync: bool = False,
-                       voice_seconds: Optional[float] = None) -> dict:
+                       voice_seconds: Optional[float] = None,
+                       video_rates: Optional[dict[int, float]] = None) -> dict:
     """Return a per-line breakdown + total for generating `plan` for `project`.
 
     `project` is a plain dict with keys: voiceover_source, music_upload_path
@@ -62,12 +63,15 @@ def estimate_plan_cost(project: dict, plan: StoryboardPlan, *, lipsync: bool = F
     speech = speech_seconds(plan, voice_seconds) if lipsync else {}
     billable_shots = [sh for sh in billable_shots if sh.order not in speech]
     video_seconds = sum(sh.duration_seconds for sh in billable_shots)
-    video_cost = video_seconds * s.cost_video_per_second
+    # Per-shot rates when shots run on models priced differently (e.g. a
+    # Sogni model); otherwise the flat COST_VIDEO_PER_SECOND.
+    rates = video_rates or {}
+    video_cost = sum(sh.duration_seconds * rates.get(sh.order, s.cost_video_per_second) for sh in billable_shots)
     lines.append({
         "item": f"Video clips ({len(billable_shots)} shots, {video_seconds:.0f}s)",
         "qty": round(video_seconds, 1),
         "unit": "sec",
-        "unit_cost": s.cost_video_per_second,
+        "unit_cost": round(video_cost / video_seconds, 4) if video_seconds else s.cost_video_per_second,
         "cost": round(video_cost, 4),
     })
 
@@ -135,6 +139,15 @@ def estimate_for_project(db, project, plan: StoryboardPlan, *, music_will_genera
             ShotPlan(order=r.shot_order, shot_type=r.shot_type, duration_seconds=float(r.duration_seconds or 0),
                      visual_prompt=r.prompt or "-")
             for r in rows if r.shot_type in _SHOT_TYPES]})
+    from ..providers import sogni
+    from .model_registry import active_model
+
+    active_video = active_model("video") or ""
+    video_rates = {}
+    for r in rows:
+        m = (r.model_override or active_video or "").strip()
+        if m.startswith(sogni.PREFIX):
+            video_rates[r.shot_order] = sogni.video_rate_usd(m)
     lipsync = get_avatar() is not None and _hero_portrait(db, project) is not None
     voice: Optional[float] = None
     if lipsync:
@@ -146,5 +159,5 @@ def estimate_for_project(db, project, plan: StoryboardPlan, *, music_will_genera
             voice = len(plan.cleaned_voice_script) / CHARS_PER_SECOND
     return estimate_plan_cost(
         {"voiceover_source": project.voiceover_source, "music_will_generate": music_will_generate},
-        plan, lipsync=lipsync, voice_seconds=voice,
+        plan, lipsync=lipsync, voice_seconds=voice, video_rates=video_rates,
     )

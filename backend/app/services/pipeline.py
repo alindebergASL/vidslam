@@ -10,7 +10,14 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..config import get_settings
 from ..db import SessionLocal
-from ..providers import get_chat, get_tts, get_video
+from ..providers import (
+    get_chat,
+    get_tts,
+    get_video,
+    is_sogni_model,
+    provider_label,
+    routes_per_model,
+)
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
 from . import alerts, render_files, storage
@@ -320,15 +327,17 @@ def submit_shot_clip(
     lip-sync shot fell back to the video model)."""
     from . import video_jobs
 
-    video = get_video()
     refs = references if references is not None else _resolve_references_for_shot(db, project, shot)
     # Per-shot override (raw id or custom:<id> trained-LoRA selector) wins
     # over the deployment-wide default.
     model = _resolve_model(db, shot.model_override or _active_model("video"))
+    # A sogni/ model is served by Sogni whatever video model is active.
+    per_model = routes_per_model("video", model)
+    video = get_video(model) if per_model else get_video()
     shot.status = "submitted"
     shot.error = note
     shot.clip_path = ""
-    shot.provider = "mock" if get_settings().video_is_mocked() else "openrouter"
+    shot.provider = provider_label("video", model)
     shot.provider_model = model
     db.commit()
 
@@ -352,6 +361,7 @@ def submit_shot_clip(
         job = video_jobs.submit(
             db, purpose=purpose, ref_id=shot.id, project_id=project.id, render_id=render_id,
             context={"after": after, **({"note": note} if note else {}), **(context or {})}, start=start,
+            webhooks=not is_sogni_model(model),
         )
     except Exception as e:  # noqa: BLE001 — submit itself failed
         shot.status = "failed"
@@ -1078,12 +1088,12 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
         if job.output_kind == "image":
             from ..providers import get_image
 
-            image = get_image()
             model = _resolve_model(
                 db,
                 job.provider_model or _active_model("image"),
             )
-            job.provider = "mock" if settings.image_is_mocked() else "openrouter"
+            image = get_image(model) if routes_per_model("image", model) else get_image()
+            job.provider = provider_label("image", model)
             job.provider_model = model
             db.commit()
             data = image.generate(model=model, prompt=job.prompt, references=refs,
@@ -1110,9 +1120,9 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
         else:  # video_clip — async: completes via webhook / sweeper
             from . import video_jobs
 
-            video = get_video()
             model = _resolve_model(db, job.provider_model or _active_model("video"))
-            job.provider = "mock" if settings.video_is_mocked() else "openrouter"
+            video = get_video(model) if routes_per_model("video", model) else get_video()
+            job.provider = provider_label("video", model)
             job.provider_model = model
             job.status = "polling"
             db.commit()
@@ -1128,7 +1138,8 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             if _studio_job_deleted(db, job.id):
                 db.rollback()
                 return job
-            vj = video_jobs.submit(db, purpose="studio", ref_id=job.id, project_id=None, start=start)
+            vj = video_jobs.submit(db, purpose="studio", ref_id=job.id, project_id=None, start=start,
+                                   webhooks=not is_sogni_model(model))
             job.provider_job_id = vj.provider_job_id
             db.refresh(job)
             return job

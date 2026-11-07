@@ -12,6 +12,8 @@ provider whenever it reports one:
     `total_cost` from `GET /generation?id=…`
   * ElevenLabs, Gemini (Lyria) → no per-call cost in the API; recorded from
     the COST_* rate card and flagged `is_estimate`
+  * Sogni → no per-job cost in the workflow API; recorded from the Spark
+    price table in providers/sogni.py and flagged `is_estimate`
 
 Mock providers never record anything (nothing is billed).
 
@@ -152,6 +154,9 @@ def record_video_job(db: Session, job: models.VideoJob) -> None:
     ref = f"video_job:{job.id}"
     if db.query(models.SpendEntry.id).filter_by(ref=ref).first():
         return  # already recorded (a retried completion)
+    if job.provider == "sogni":
+        _record_sogni_video(db, job, kind, ref)
+        return
     if job.cost_usd is not None:
         record(provider=job.provider, kind=kind, model=job.model, cost=job.cost_usd,
                project_id=job.project_id, render_id=job.render_id, ref=ref,
@@ -169,6 +174,19 @@ def record_video_job(db: Session, job: models.VideoJob) -> None:
            cost=secs * rate, is_estimate=True, source="rate_card",
            project_id=job.project_id, render_id=job.render_id, ref=ref,
            note="provider reported no cost", db=db)
+
+
+def _record_sogni_video(db: Session, job: models.VideoJob, kind: str, ref: str) -> None:
+    """Sogni reports no per-job cost: the job's cost is our Spark price-table
+    estimate (set at poll time), so it's recorded as one, never as billed."""
+    from ..providers import sogni
+
+    cost = job.cost_usd
+    if cost is None:
+        cost = sogni.video_cost_usd(job.model, float((job.context_json or {}).get("duration") or 5.0))
+    record(provider="sogni", kind=kind, model=job.model, cost=cost, is_estimate=True,
+           source="rate_card", project_id=job.project_id, render_id=job.render_id, ref=ref,
+           generation_id=job.provider_job_id, note="Sogni Spark price-table estimate", db=db)
 
 
 def render_actual_cost(db: Session, render: models.Render) -> float:

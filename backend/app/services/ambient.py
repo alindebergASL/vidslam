@@ -21,7 +21,8 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import get_settings
-from ..providers import get_image, video_capabilities
+from ..providers import get_image, provider_label, routes_per_model, video_capabilities
+from ..providers import sogni as _sogni
 from ..providers.base import ImageRef, VideoCapabilities
 from ..schemas.ambient import (
     LOOP_OPTIONS,
@@ -578,7 +579,16 @@ def still_cost(cfg: AmbientConfig) -> float:
     model = chain[0] if chain else ""
     if model and model == s.ambient_still_model:
         return s.cost_ambient_still
+    if _sogni.is_sogni(model):
+        return _sogni.image_cost_usd(model)
     return _STILL_COST.get(model, s.cost_image_per_item)
+
+
+def _video_rate(model: str) -> float:
+    """Rate-card USD per second of loop video on `model`."""
+    if _sogni.is_sogni(model):
+        return _sogni.video_rate_usd(model)
+    return get_settings().cost_video_per_second
 
 
 def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio: str,
@@ -590,11 +600,13 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
     with the fallback model. Returns (image bytes, model used)."""
     from .pipeline import _log_provider_call, _resolve_model
 
-    image = get_image()
     last: Optional[Exception] = None
     for model in still_model_chain(cfg):
         model = _resolve_model(db, model)
+        image = None
         try:
+            # Per model: a sogni/ primary can fall back to an OpenRouter model.
+            image = get_image(model) if routes_per_model("image", model) else get_image()
             png = image.generate(model=model, prompt=prompt, references=references or [],
                                  negative_prompt=negative_prompt,
                                  settings=best_image_settings(model, aspect_ratio))
@@ -602,7 +614,9 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
             last = e
             log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
             # Recorded (status=error) so the provider-error alerts see it.
-            _log_provider_call(db, project_id=project_id, provider=type(image).__name__, endpoint=endpoint,
+            _log_provider_call(db, project_id=project_id,
+                               provider=type(image).__name__ if image is not None else "image",
+                               endpoint=endpoint,
                                request_summary={"model": model, **(summary or {})},
                                response_summary={"error": str(e)[:500]}, status="error")
             continue
@@ -1150,8 +1164,8 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
         lines.append({
             "item": label,
             "qty": secs, "unit": "sec",
-            "unit_cost": s.cost_video_per_second,
-            "cost": round(secs * s.cost_video_per_second, 4),
+            "unit_cost": _video_rate(plan.model),
+            "cost": round(secs * _video_rate(plan.model), 4),
         })
     if cfg.music_mood != "none":
         parts = music_parts(cfg)
@@ -1627,9 +1641,9 @@ def _finalize_generation(
 ) -> None:
     """Record the loop, make the music bed, mark the scene ready (and
     render it when a batch asked for that)."""
-    settings = get_settings()
     generated["estimated_cost"] = estimate_ambient_cost(cfg, plan)["total"]
-    generated["billed"] = 0.0 if settings.video_is_mocked() else generated["estimated_cost"]
+    mocked = provider_label("image" if plan.strategy == "drift" else "video", plan.model) == "mock"
+    generated["billed"] = 0.0 if mocked else generated["estimated_cost"]
     _set_state(project, _GENERATED_KEY, generated)
     db.commit()
     # Music: (re)generate when asked, and always when the scene wants a bed
@@ -1686,7 +1700,6 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
     project.status = "generating"
     _set_state(project, _CHAIN_KEY, None)  # supersede any in-flight chain
     db.commit()
-    settings = get_settings()
     try:
         cfg = _with_current_rewrite(db, project, _config_of(project))
         shot = _ensure_loop_shot(db, project, cfg)
@@ -1711,8 +1724,8 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
                 db.commit()
                 png = picture_path(project).read_bytes()
             else:
-                target.provider = "mock" if settings.image_is_mocked() else "openrouter"
                 target.provider_model = still_model_chain(cfg)[0]
+                target.provider = provider_label("image", target.provider_model)
                 db.commit()
                 refs = [ImageRef(url=first_url, role="scene")] if first_url else []
                 png, used = generate_still(db, cfg, prompt=target.prompt + (_SAME_PLACE if refs else ""),

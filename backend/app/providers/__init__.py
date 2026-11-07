@@ -6,8 +6,13 @@ from .registry import (
     get_training,
     get_tts,
     get_video,
+    image_provider_for,
+    is_sogni_model,
+    provider_label,
     provider_status,
+    routes_per_model,
     video_capabilities,
+    video_provider_for,
 )
 
 __all__ = [
@@ -18,6 +23,11 @@ __all__ = [
     "get_training",
     "get_tts",
     "get_video",
+    "image_provider_for",
+    "is_sogni_model",
+    "provider_label",
     "provider_status",
+    "routes_per_model",
     "video_capabilities",
+    "video_provider_for",
 ]

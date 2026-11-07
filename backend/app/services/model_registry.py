@@ -6,7 +6,8 @@ to its .env default. Every generation path reads the active model at call
 time, so a switch applies to the next job.
 
 Model id conventions per kind:
-  chat · image · video   OpenRouter model ids ("anthropic/claude-…").
+  chat · image · video   OpenRouter model ids ("anthropic/claude-…");
+                         image/video also "sogni/<selector>" (Sogni).
   tts                    "elevenlabs" (ElevenLabs voices) or an OpenRouter
                          audio-output model ("openai/gpt-audio-mini").
   music                  "elevenlabs" or a Google Lyria model
@@ -37,6 +38,8 @@ MOCK_DEFAULTS = {
 }
 
 LYRIA_PREFIX = "google/lyria"
+# Sogni image/video models: "sogni/<selector>" (providers/sogni.py).
+SOGNI_PREFIX = "sogni/"
 # Lyria models OpenRouter serves (openrouter.ai/google/lyria-3-*), used when
 # the catalog hasn't been polled yet.
 OPENROUTER_LYRIA = {"google/lyria-3-pro-preview", "google/lyria-3-clip-preview"}
@@ -139,7 +142,7 @@ def set_active(kind: str, model: Optional[str], options: Optional[dict] = None) 
 
 def provider_for(kind: str, model: Optional[str] = None) -> str:
     """Provider that will serve `kind` with the active (or given) model:
-    "mock" | "openrouter" | "elevenlabs" | "gemini" | "off"."""
+    "mock" | "openrouter" | "elevenlabs" | "gemini" | "sogni" | "off"."""
     from .provider_keys import has
 
     s = get_settings()
@@ -162,6 +165,9 @@ def provider_for(kind: str, model: Optional[str] = None) -> str:
                 return "gemini"
             return "mock"
         return "elevenlabs" if has("elevenlabs") else "mock"
+    if m.startswith(SOGNI_PREFIX) and kind in ("image", "video"):
+        # Sogni image/video models: served by Sogni whatever else is active.
+        return "sogni" if has("sogni") else "mock"
     if m.startswith("mock/"):
         return "mock"
     return "openrouter" if has("openrouter") else "mock"

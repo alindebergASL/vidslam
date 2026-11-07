@@ -101,6 +101,8 @@ export type ApiKeyStatus = {
   source: ApiKeySource;
   last4: string | null;
   updated_at: string | null;
+  /** A problem visible from the key's shape alone (e.g. a Sogni worker key). */
+  warning?: string | null;
 };
 
 export type ApiKeysResponse = {

@@ -150,6 +150,10 @@ class Settings(BaseSettings):
     # Settings → API keys overrides this one.
     sogni_api_key: str = ""
     sogni_base_url: str = "https://api.sogni.ai"
+    # Sogni's own content filter (safe_content_filter on every workflow).
+    # Off: the app has no NSFW gate. Vendor models (GPT Image, standard
+    # Seedance, HappyHorse, standard Wan 3) refuse mature prompts anyway.
+    sogni_safe_content_filter: bool = False
     # Image calls start a workflow and poll it (2 s, backing off to 5 s)
     # until it finishes or this many seconds pass.
     sogni_image_timeout_seconds: float = 300.0

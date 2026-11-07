@@ -186,6 +186,11 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
           )}
         </div>
       </div>
+      {row.warning && (
+        <p role="note" className="text-[11px] text-amber-300 mt-1">
+          {row.warning}
+        </p>
+      )}
       <p id={helpId} className="text-[11px] text-ink-400 mt-1">
         Powers {row.powers}.
         {updated && <> Saved {updated}.</>}

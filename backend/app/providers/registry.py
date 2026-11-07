@@ -38,35 +38,99 @@ def get_chat() -> ChatProvider:
     return OpenRouterChatProvider(model=model)
 
 
-def get_image() -> ImageProvider:
-    model, provider = _active("image")
+def is_sogni_model(model: str | None) -> bool:
+    return bool(model) and str(model).startswith("sogni/")
+
+
+def routes_per_model(kind: str, model: str | None) -> bool:
+    """True when a call for a concrete `model` must pick its provider from
+    that model rather than from the active one: a `sogni/` id, or any id
+    while a Sogni model is active. Everything else keeps the old routing
+    (the active model's provider, with the per-call model passed to it)."""
+    if not model:
+        return False
+    if is_sogni_model(model):
+        return True
+    from ..services import model_registry as reg
+
+    return is_sogni_model(reg.active_model(kind))
+
+
+def _route(kind: str, model: str | None) -> tuple[str, str]:
+    """(model, provider) to build for `kind`, given the call's model if any."""
+    if routes_per_model(kind, model):
+        from ..services import model_registry as reg
+
+        return str(model), reg.provider_for(kind, model)
+    return _active(kind)
+
+
+def get_image(model: str | None = None) -> ImageProvider:
+    """Image provider for `model` (a `sogni/` id goes to Sogni whatever is
+    active), or for the active image model when no model is given."""
+    model, provider = _route("image", model)
     if provider == "mock":
         from .mock_image import MockImageProvider
 
         return MockImageProvider()
+    if provider == "sogni":
+        from .sogni import SogniImageProvider
+
+        return SogniImageProvider(model=model)
     from .openrouter_image import OpenRouterImageProvider
 
     return OpenRouterImageProvider(model=model)
 
 
-def get_video() -> VideoProvider:
-    model, provider = _active("video")
+def get_video(model: str | None = None) -> VideoProvider:
+    """Video provider for `model` (see get_image), else the active one."""
+    model, provider = _route("video", model)
     if provider == "mock":
         from .mock_video import get_singleton
 
         return get_singleton()
+    if provider == "sogni":
+        from .sogni import SogniVideoProvider
+
+        return SogniVideoProvider(model=model)
     from .openrouter_video import OpenRouterVideoProvider
 
     return OpenRouterVideoProvider(model=model)
 
 
+# Explicit names for call sites that always hold a concrete model.
+def image_provider_for(model: str | None) -> ImageProvider:
+    return get_image(model)
+
+
+def video_provider_for(model: str | None) -> VideoProvider:
+    return get_video(model)
+
+
+def provider_label(kind: str, model: str | None) -> str:
+    """What to store as shot/job `provider` for a call with `model`:
+    "sogni" / "mock" for routed models, else the old mock/openrouter label."""
+    if routes_per_model(kind, model):
+        from ..services import model_registry as reg
+
+        p = reg.provider_for(kind, model)
+        return p if p in ("mock", "sogni") else "openrouter"
+    s = get_settings()
+    mocked = s.image_is_mocked() if kind == "image" else s.video_is_mocked()
+    return "mock" if mocked else "openrouter"
+
+
 def video_capabilities(model: str = "") -> "VideoCapabilities":
-    """Capabilities of `model` on the active video provider, falling back to
-    the configured default cap when the provider can't say."""
+    """Capabilities of `model` on the provider that serves it, falling back
+    to the configured default cap when the provider can't say."""
     from .base import VideoCapabilities
 
-    provider = get_video()
-    fn = getattr(provider, "capabilities", None)
+    fn = None
+    try:
+        provider = get_video(model or None)
+        fn = getattr(provider, "capabilities", None)
+    except Exception:  # noqa: BLE001 — e.g. a key missing: use the defaults
+        pass
     if callable(fn):
         try:
             return fn(model)
