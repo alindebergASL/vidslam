@@ -71,6 +71,8 @@ def _catalog_entries(kind: str) -> list[dict]:
             bits.append("first+last frame")
         elif "first_frame" in frames:
             bits.append("first frame")
+        if e.get("provider") == "sogni":
+            bits = []  # the Sogni name already says how long and which frames
         name = e.get("name") or e["id"]
         out.append({
             "id": e["id"],

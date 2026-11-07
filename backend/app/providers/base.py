@@ -58,6 +58,12 @@ class VideoCapabilities:
     first_frame: bool = False
     last_frame: bool = False
     known: bool = True  # False = fell back to defaults (model not listed)
+    # Models that can't work from text alone: a first frame is required
+    # (picture-only), first AND last frame are required (so open clips
+    # can't be chained), or a loose reference picture is required.
+    needs_first_frame: bool = False
+    both_frames_only: bool = False
+    needs_reference: bool = False
 
     @property
     def max_seconds(self) -> int:

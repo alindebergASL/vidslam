@@ -25,11 +25,15 @@ per-job cost, so spend is recorded from the price table below, as an estimate.
 """
 from __future__ import annotations
 
+import json
 import logging
 import random
+import re
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -72,14 +76,34 @@ def selector(model: str) -> str:
 # 1 Spark = $0.005 (docs.sogni.ai pricing).
 SPARK_USD = 0.005
 
+# Families group models in the pickers. "Next-Gen" is Sogni's own category
+# (the "Next-Gen Diffusion" model picker in app.sogni.ai).
+NEXT_GEN = "Next-Gen"
+OPEN = "open"
+COMMUNITY = "SDXL community"
+VENDOR = "vendor"
+FAMILY_ORDER = {NEXT_GEN: 0, OPEN: 1, VENDOR: 2, COMMUNITY: 3}
+
 
 @dataclass(frozen=True)
 class ImageModel:
     selector: str
     name: str
     note: str
-    spark: float  # per image, estimate unless noted
-    premium: bool = False  # vendor model: always bills Premium Spark
+    spark: float  # per image at ~1024px; documented where noted, else an estimate
+    premium: bool = False  # vendor model: always bills (bought) Premium Spark
+    family: str = OPEN
+    uncensored: bool = False  # Sogni tags it uncensored (needs the content filter off)
+    keep: bool = False  # offer it even when the published schema doesn't list it yet
+    # Takes a source image (sourceImageIndex + starting_image_strength).
+    # Sogni's schema documents it for Z-Image, Z-Image Turbo and Krea 2
+    # Turbo, but through the workflow API the uploaded image isn't applied:
+    # tested 2026-11-07 on Krea 2 Turbo, MOSS-Image 8-Step and Chroma v46
+    # Flash at strength 0.35 and 0.75, nothing of the source came through
+    # and Sogni's billing request showed startingImageStrength null. So no
+    # model is marked yet, and ambient's "same place" stills go to the
+    # fallback picture model instead.
+    img2img: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,80 +114,450 @@ class VideoModel:
     min_s: int
     max_s: int
     spark_per_second: float  # estimate at 720p unless noted
-    animate: bool = False  # available in animate_photo (exact first frame)
-    last_frame: bool = False  # documented end-frame pinning we rely on
+    animate: bool = False  # in animate_photo: exact first frame
+    last_frame: bool = False  # also pins the last frame (frameRole "both"): closed loops
     references: bool = False  # takes loose reference images (referenceImageIndices)
     negative: bool = False  # accepts negativePrompt (LTX / WAN only)
     premium: bool = False
+    text: bool = True  # in generate_video: works without a picture
+    flf_only: bool = False  # needs first AND last frame (MiniMax H3 flf2v)
+    needs_reference: bool = False  # needs at least one reference picture (MiniMax H3 r2v)
+    uncensored: bool = False
+    audio_toggle: bool = True  # accepts generateAudio (HappyHorse doesn't)
 
 
-# Documented example: Krea 2 Turbo 1024px ≈ 2.43 Spark. The rest are
-# conservative estimates (vendor models bill Premium Spark and cost more).
-IMAGE_MODELS: tuple[ImageModel, ...] = (
-    ImageModel("krea-2-turbo", "Krea 2 Turbo", "Fast and cheap; the only model on free-API accounts. ~2.4 Spark.", 2.43),
-    ImageModel("flux-3-klein", "FLUX.3 Klein", "Small FLUX.3. Estimate ~3 Spark.", 3.0),
-    ImageModel("z-turbo", "Z-Image Turbo", "Fast photoreal. Estimate ~3 Spark.", 3.0),
-    ImageModel("z-image", "Z-Image", "Estimate ~5 Spark.", 5.0),
-    ImageModel("qwen-2512", "Qwen Image 2512", "Good with text in images. Estimate ~6 Spark.", 6.0),
-    ImageModel("qwen-2512-lightning", "Qwen Image 2512 Lightning", "Faster Qwen. Estimate ~3 Spark.", 3.0),
-    ImageModel("chroma-v46-flash", "Chroma v46 Flash", "Estimate ~3 Spark.", 3.0),
-    ImageModel("chroma1-hd", "Chroma1 HD", "Estimate ~5 Spark.", 5.0),
-    ImageModel("gpt-image-2", "GPT Image 2 (via Sogni)", "Premium Spark. Estimate ~12 Spark.", 12.0, premium=True),
-    ImageModel("gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst (via Sogni)",
-               "Premium Spark. Estimate ~30 Spark.", 30.0, premium=True),
-    ImageModel("gpt-image-2.5-flare", "GPT Image 2.5 Flare (via Sogni)",
-               "Premium Spark. Estimate ~20 Spark.", 20.0, premium=True),
-    ImageModel("seedream-5-0-pro-uncensored", "Seedream 5.0 Pro (uncensored)",
-               "Premium Spark; needs the one-time likeness agreement in the Sogni app. Estimate ~10 Spark.",
-               10.0, premium=True),
+# Prices: documented figures from docs.sogni.ai/pricing and the model pages
+# (Nov 2026) where marked "documented"; the rest are estimates. Vendor models
+# bill Premium Spark, which Free Spark can't pay for.
+_IMAGES: tuple[ImageModel, ...] = (
+    # Next-Gen Diffusion
+    ImageModel("krea-2-turbo", "Krea 2 Turbo", "Fast and cheap. 2.43 Spark at 1024px (documented).", 2.43,
+               family=NEXT_GEN),
+    ImageModel("moss-image", "MOSS-Image", "OpenMOSS 5B, 50 steps. ~8.9 Spark at 1024px (documented); more "
+               "at larger sizes.", 8.86, family=NEXT_GEN, uncensored=True),
+    ImageModel("moss-image-8step", "MOSS-Image 8-Step", "Fast distilled MOSS-Image. ~1.3 Spark at 1024px "
+               "(documented). Punchier colour than the 50-step model.", 1.25, family=NEXT_GEN, uncensored=True),
+    ImageModel("dark-beast-krea2", "Dark Beast Krea 2", "Community fine-tune of Krea 2. 5.87 Spark at 1024px "
+               "(documented).", 5.87, family=NEXT_GEN, uncensored=True),
+    ImageModel("dark-beast-z-turbo", "Dark Beast Z-Image Turbo", "Community fine-tune of Z-Image Turbo. 1.60 "
+               "Spark at 1024px (documented).", 1.60, family=NEXT_GEN, uncensored=True),
+    ImageModel("z-turbo", "Z-Image Turbo", "Fast photoreal. 1.60 Spark at 1024px (documented).", 1.60,
+               family=NEXT_GEN, uncensored=True),
+    ImageModel("z-image", "Z-Image", "4.00 Spark at 1024px (documented).", 4.00, family=NEXT_GEN),
+    ImageModel("chroma-detail", "Chroma v48 Detail", "Detail-calibrated Chroma. 4.18 Spark at 1024px "
+               "(documented).", 4.18, family=NEXT_GEN, uncensored=True),
+    ImageModel("chroma1-hd", "Chroma1 HD", "Final high-resolution Chroma. Estimate ~4 Spark.", 4.0,
+               family=NEXT_GEN, uncensored=True),
+    ImageModel("chroma-v46-flash", "Chroma v46 Flash", "Fast Chroma. 2.20 Spark at 1024px (documented).", 2.20,
+               family=NEXT_GEN, uncensored=True),
+    ImageModel("qwen-2512", "Qwen Image 2512", "Good with text in images. 4.15 Spark at 1024px (documented).",
+               4.15, family=NEXT_GEN),
+    ImageModel("qwen-2512-lightning", "Qwen Image 2512 Lightning", "Faster Qwen. 2.07 Spark at 1024px "
+               "(documented).", 2.07, family=NEXT_GEN),
+    # other open models
+    ImageModel("flux-3-klein", "FLUX.3 Klein", "Small FLUX.3. 1.80 Spark at 1024px (documented).", 1.80),
+    # vendor models: bought Premium Spark only
+    ImageModel("gpt-image-2", "GPT Image 2 (via Sogni)", "Premium Spark. Estimate ~12 Spark.", 12.0,
+               premium=True, family=VENDOR),
+    ImageModel("gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst (via Sogni)", "Premium Spark. Estimate ~30 "
+               "Spark.", 30.0, premium=True, family=VENDOR),
+    ImageModel("gpt-image-2.5-flare", "GPT Image 2.5 Flare (via Sogni)", "Premium Spark. Estimate ~20 Spark.",
+               20.0, premium=True, family=VENDOR),
+    ImageModel("gpt-image-2.6-sunburst", "GPT Image 2.6 Sunburst (via Sogni)", "Premium Spark. Estimate ~30 "
+               "Spark.", 30.0, premium=True, family=VENDOR),
+    ImageModel("gpt-image-2.6-flare", "GPT Image 2.6 Flare (via Sogni)", "Premium Spark. Estimate ~20 Spark.",
+               20.0, premium=True, family=VENDOR),
+    # Not in the published schema, but Sogni knows it: on Free Spark it
+    # answers 402 "requires Premium Spark Points" naming this model (Nov 2026).
+    ImageModel("seedream-5-0-pro-uncensored", "Seedream 5.0 Pro (uncensored)", "Premium Spark; needs the "
+               "one-time likeness agreement in the Sogni app. Estimate ~10 Spark.", 10.0, premium=True,
+               family=VENDOR, uncensored=True, keep=True),
+    # community checkpoints (SDXL / Pony / Illustrious): ~1 Spark each (documented tier)
+    ImageModel("one-obsession-v22", "One Obsession v2.2", "Anime community checkpoint. 1.07 Spark "
+               "(documented).", 1.07, family=COMMUNITY),
+    ImageModel("pony-v7", "CyberRealistic Pony v7", "Community checkpoint. ~1 Spark.", 1.0, family=COMMUNITY,
+               uncensored=True),
+    ImageModel("hyphoria-real", "Hyphoria Real", "Photoreal community checkpoint. ~1 Spark.", 1.0,
+               family=COMMUNITY),
 )
 
 # Durations from the docs: LTX 2-20; Seedance 2.0/Mini 4-15; Seedance 2.5
-# 4-30; HappyHorse 3-15; Wan 3 2-30; H3 clamps to ~5.2-15.1 s. Wan 2.2 has no
-# documented range: 2-10 is a conservative guess. Prices: documented
-# examples (LTX-2.3 5 s ≈ 17.5; LTX-2.5 i2v 14 s ≈ 102.7; Seedance 2.5 720p ≈
-# 60.1/s; Seedance 2.0 720p 5 s ≈ 196.6; Seedance 2.0 Mini 720p 5 s ≈ 98.3;
-# HappyHorse 720p ≈ 182 per clip; H3 FastH3 Turbo 8 s ≈ 32), else estimates.
-VIDEO_MODELS: tuple[VideoModel, ...] = (
-    VideoModel("ltx25", "LTX-2.5", "Sogni's default video model. First frame. 2–20 s.", 2, 20, 7.4,
+# 4-30; HappyHorse 3-15; Wan 3 2-30; MiniMax H3 5.17-15.08 (a 17-frame grid
+# at 24 fps, so 6-15 whole seconds). Wan 2.2 has no documented range: 2-10.
+# animate/text below describe the bundled listing (they only apply when no
+# listing can be read; otherwise the tools that list a model decide).
+# negativePrompt: LTX and Wan 2.2 only (the manifest: not H3, Seedance,
+# HappyHorse or Wan 3). generateAudio: LTX, MiniMax H3, Seedance, Wan 3
+# (not Wan 2.2 or HappyHorse). "uncensored" only where Sogni says so.
+_H3 = dict(min_s=6, max_s=15)
+_I2V = dict(animate=True, text=False, **_H3)
+_FLF = dict(animate=True, text=False, last_frame=True, flf_only=True, **_H3)
+_R2V = dict(references=True, needs_reference=True, **_H3)
+_VIDEOS: tuple[VideoModel, ...] = (
+    VideoModel("ltx25", "LTX-2.5", "Sogni's default video model. Text, first frame, or first + last frame "
+               "(closed loops). 2–20 s.", 2, 20, 7.4, animate=True, last_frame=True, negative=True),
+    VideoModel("ltx23", "LTX-2.3", "Previous LTX. Text or first frame. 2–20 s. ~17.5 Spark per 5 s.", 2, 20, 3.5,
                animate=True, negative=True),
-    VideoModel("ltx23", "LTX-2.3", "Previous LTX. First frame. 2–20 s. ~17.5 Spark per 5 s.", 2, 20, 3.5,
-               animate=True, negative=True),
-    VideoModel("wan22", "Wan 2.2", "First frame. 2–10 s (assumed).", 2, 10, 4.0, animate=True, negative=True),
-    VideoModel("minimax-h3-t2v-turbo", "MiniMax H3 Turbo", "Text to video. ~5–15 s.", 5, 15, 4.0),
+    VideoModel("wan22", "Wan 2.2", "Text or first frame, no audio. 2–10 s (assumed).", 2, 10, 4.0, animate=True,
+               negative=True, audio_toggle=False),
+    # MiniMax H3: text (t2v), first frame (i2v), first + last frame (flf2v), reference (r2v)
+    VideoModel("minimax-h3-t2v", "MiniMax H3", "Text to video, 20 steps. ~16 Spark/s (documented).",
+               spark_per_second=16.0, **_H3),
+    VideoModel("minimax-h3-t2v-turbo", "MiniMax H3 Turbo", "Text to video, 4-step. ~6 Spark/s.",
+               spark_per_second=6.0, **_H3),
+    VideoModel("minimax-h3-fasth3-t2v-turbo", "MiniMax H3 FastH3", "Text to video, fastest H3. 4 Spark/s "
+               "(documented).", spark_per_second=4.0, **_H3),
+    VideoModel("minimax-h3-fasth3-t2v-turbo-2stage", "MiniMax H3 FastH3 Two-Stage", "Text to video, rendered "
+               "then upscaled 2x. 16 Spark/s at 2K (documented).", spark_per_second=16.0, **_H3),
+    VideoModel("minimax-h3-i2v", "MiniMax H3", "Needs a first frame. ~16 Spark/s (documented).",
+               spark_per_second=16.0, **_I2V),
+    VideoModel("minimax-h3-i2v-turbo", "MiniMax H3 Turbo", "Needs a first frame. 4-step. ~6 Spark/s "
+               "(documented).", spark_per_second=6.0, **_I2V),
+    VideoModel("minimax-h3-fasth3-i2v-turbo", "MiniMax H3 FastH3", "Needs a first frame. Fastest H3. "
+               "4 Spark/s (documented).", spark_per_second=4.0, **_I2V),
+    VideoModel("minimax-h3-fasth3-i2v-turbo-2stage", "MiniMax H3 FastH3 Two-Stage", "Needs a first frame. "
+               "Upscaled 2x. 16 Spark/s at 2K (documented).", spark_per_second=16.0, **_I2V),
+    VideoModel("minimax-h3-flf2v", "MiniMax H3", "First and last frame: closed loops (one picture is both "
+               "ends). ~16 Spark/s (documented).", spark_per_second=16.0, **_FLF),
+    VideoModel("minimax-h3-flf2v-turbo", "MiniMax H3 Turbo", "First and last frame, 4-step. ~6 Spark/s "
+               "(documented).", spark_per_second=6.0, **_FLF),
+    VideoModel("minimax-h3-fasth3-flf2v-turbo", "MiniMax H3 FastH3", "First and last frame: closed loops on "
+               "Free Spark. 4 Spark/s (documented).", spark_per_second=4.0, **_FLF),
+    VideoModel("minimax-h3-fasth3-flf2v-turbo-2stage", "MiniMax H3 FastH3 Two-Stage", "First and last frame, "
+               "upscaled 2x. 16 Spark/s at 2K (documented).", spark_per_second=16.0, **_FLF),
+    VideoModel("minimax-h3-r2v", "MiniMax H3 Reference", "Needs at least one reference picture (a loose "
+               "guide, not an exact frame). ~16 Spark/s plus reference input.", spark_per_second=16.0, **_R2V),
+    VideoModel("minimax-h3-r2v-turbo", "MiniMax H3 Turbo Reference", "Needs a reference picture. ~6 Spark/s.",
+               spark_per_second=6.0, **_R2V),
+    VideoModel("minimax-h3-r2v-2stage", "MiniMax H3 Two-Stage Reference", "Needs a reference picture. ~16+ "
+               "Spark/s.", spark_per_second=18.0, **_R2V),
+    VideoModel("minimax-h3-r2v-balanced-2stage", "MiniMax H3 Balanced Two-Stage Reference", "Needs a reference "
+               "picture. ~10+ Spark/s.", spark_per_second=12.0, **_R2V),
+    VideoModel("minimax-h3-fasth3-r2v-turbo", "MiniMax H3 FastH3 Reference", "Needs a reference picture. "
+               "~6 Spark/s.", spark_per_second=6.0, **_R2V),
+    VideoModel("minimax-h3-fasth3-r2v-turbo-2stage", "MiniMax H3 FastH3 Two-Stage Reference", "Needs a "
+               "reference picture. 6-26 Spark/s by size.", spark_per_second=12.0, **_R2V),
+    # vendor models: bought Premium Spark only
     VideoModel("seedance2-5", "Seedance 2.5", "Premium Spark. 4–30 s. Picture is a loose reference, not an exact "
                "first frame. ~60 Spark/s at 720p.", 4, 30, 60.1, references=True, premium=True),
+    VideoModel("seedance2-5-uncensored", "Seedance 2.5 Uncensored", "Premium Spark; needs the likeness "
+               "agreement. 4–30 s. Loose picture reference. ~69 Spark/s at 720p (documented).", 4, 30, 69.3,
+               references=True, premium=True, uncensored=True),
     VideoModel("seedance2", "Seedance 2.0", "Premium Spark. 4–15 s. Loose picture reference. ~39 Spark/s.",
                4, 15, 39.3, references=True, premium=True),
     VideoModel("seedance2-mini", "Seedance 2.0 Mini", "Premium Spark. 4–15 s. Loose picture reference. ~20 Spark/s.",
                4, 15, 19.7, references=True, premium=True),
-    VideoModel("happyhorse-1.1-i2v", "HappyHorse 1.1", "Premium Spark. First frame. 3–15 s. ~182 Spark per clip.",
-               3, 15, 36.4, animate=True, premium=True),
+    VideoModel("seedance2-mini-uncensored", "Seedance 2.0 Mini Uncensored", "Premium Spark; needs the likeness "
+               "agreement. 4–15 s. ~38 Spark/s at 720p (documented).", 4, 15, 37.8, references=True,
+               premium=True, uncensored=True),
+    # HappyHorse: Sogni lists i2v and r2v under both video tools, but i2v
+    # needs its first frame and r2v 1-9 reference pictures (its schema text).
+    VideoModel("happyhorse-1.1-i2v", "HappyHorse 1.1", "Premium Spark. Needs a first frame. 3–15 s. ~182 Spark "
+               "per clip.", 3, 15, 36.4, animate=True, text=False, premium=True, audio_toggle=False),
+    VideoModel("happyhorse-1.1-t2v", "HappyHorse 1.1 Text", "Premium Spark. Text to video. 3–15 s. ~182 Spark "
+               "per 5 s at 720p (documented).", 3, 15, 36.4, premium=True, audio_toggle=False),
+    VideoModel("happyhorse-1.1-r2v", "HappyHorse 1.1 Reference", "Premium Spark. Needs 1-9 reference pictures "
+               "(loose guides). 3–15 s.", 3, 15, 36.4, references=True, needs_reference=True, premium=True,
+               audio_toggle=False),
     VideoModel("wan3.0-video", "Wan 3.0 (via Sogni)", "Premium Spark. First frame. 2–30 s. Estimate ~40 Spark/s.",
-               2, 30, 40.0, animate=True, negative=True, premium=True),
+               2, 30, 40.0, animate=True, premium=True),
+    VideoModel("wan3.0-spicy-video", "Wan 3.0 Enhanced (uncensored, via Sogni)", "Premium Spark; needs the "
+               "likeness agreement. First frame. 2–30 s. 32 Spark/s at 720p (documented).", 2, 30, 32.0,
+               animate=True, premium=True, uncensored=True),
 )
+_IMAGE_INFO = {m.selector: m for m in _IMAGES}
+_VIDEO_INFO = {m.selector: m for m in _VIDEOS}
 
-_IMAGE_BY_SEL = {m.selector: m for m in IMAGE_MODELS}
-_VIDEO_BY_SEL = {m.selector: m for m in VIDEO_MODELS}
+
+# ---------- which selectors Sogni accepts (synced) ----------
+
+# Sogni has no endpoint that lists workflow model selectors; its published
+# tool schemas (@sogni-ai/sogni-protocol, manifests/generation-tools.json)
+# carry them as enums, and the API validates against the same enums. The
+# list is refreshed with the model catalog (SOGNI_TOOLS_MANIFEST_URL), kept
+# in DATA_DIR, and falls back to the copy bundled here.
+LISTED_TOOLS = ("generate_image", "generate_video", "animate_photo")
+_BUNDLED = Path(__file__).with_name("sogni_tools.json")
+_SELECTOR_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_listed: Optional[dict] = None
+_listed_key: object = None  # which cache file state _listed was read from
+_models: Optional[tuple] = None  # (listing, image_models, video_models, by selector, by selector)
+_listed_lock = threading.Lock()
+
+
+def _reset_listed() -> None:
+    """Forget the loaded list (tests)."""
+    global _listed, _listed_key, _models
+    with _listed_lock:
+        _listed = _listed_key = _models = None
+
+
+def _cache_path() -> Path:
+    return Path(get_settings().data_dir) / "sogni_tools.json"
+
+
+def _valid_listing(data: object) -> bool:
+    """All three tools listed, each a list of selectors. A tool that comes
+    back empty is far more likely a schema change we can't parse than Sogni
+    dropping it, so that's refused rather than kept as the last good list."""
+    tools = data.get("tools") if isinstance(data, dict) else None
+    return (isinstance(tools, dict) and all(tools.get(t) for t in LISTED_TOOLS)
+            and all(isinstance(v, list) and all(isinstance(s, str) for s in v) for v in tools.values()))
+
+
+def _read_listing(path: Path) -> Optional[dict]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if _valid_listing(data) else None
+
+
+def _version(data: dict, field: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", str(data.get(field) or "")))
+
+
+def _newer(synced: Optional[dict], bundled: Optional[dict]) -> Optional[dict]:
+    """The synced list unless the bundled one is newer: a later package
+    release (a CDN that lagged behind a deploy), then a later manifest
+    version, then (nothing to compare) a later fetch."""
+    if not synced or not bundled:
+        return synced or bundled
+    for field in ("package", "version"):
+        vs, vb = _version(synced, field), _version(bundled, field)
+        if vs and vb and len(vs) == len(vb) and vs != vb:
+            return synced if vs > vb else bundled
+    return synced if str(synced.get("fetched_at") or "") >= str(bundled.get("fetched_at") or "") else bundled
+
+
+def _cache_state() -> object:
+    """Identifies the synced file as it is now (None: syncing is off or
+    there's no file), so every process picks up another one's sync."""
+    if not get_settings().sogni_tools_manifest_url:
+        return None
+    try:
+        path = _cache_path()
+        st = path.stat()
+    except OSError:
+        return None
+    return (str(path), st.st_mtime_ns, st.st_size)
+
+
+def listed() -> dict:
+    """{"tools": {tool: [selector, ...]}, "source": ..., "fetched_at": ...}:
+    the newer of the last successful sync (DATA_DIR, shared by every
+    process) and the snapshot bundled here."""
+    global _listed, _listed_key
+    key = _cache_state()
+    with _listed_lock:
+        if _listed is not None and key == _listed_key:
+            return _listed
+        _listed = _newer(_read_listing(Path(key[0])) if key else None, _read_listing(_BUNDLED)) or {"tools": {}}
+        _listed_key = key
+        return _listed
+
+
+def parse_manifest(doc: dict) -> dict[str, list[str]]:
+    """The model enums of the tools we use, from a generation-tools manifest."""
+    tools: dict[str, list[str]] = {}
+    for t in (doc or {}).get("tools") or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else {}
+        name = t.get("name") or fn.get("name")
+        if name not in LISTED_TOOLS:
+            continue
+        params = t.get("parameters") or t.get("input_schema") or fn.get("parameters") or {}
+        key = "model" if name == "generate_image" else "videoModel"
+        enum = ((params.get("properties") or {}).get(key) or {}).get("enum") or []
+        tools[name] = [s for s in enum if isinstance(s, str) and _SELECTOR_RE.fullmatch(s)]
+    return tools
+
+
+def refresh_listed(client: Optional[httpx.Client] = None) -> dict:
+    """Fetch Sogni's current tool manifest and keep its model lists. Raises
+    (and keeps the previous list) when it can't be read or looks wrong."""
+    global _listed, _listed_key
+    url = get_settings().sogni_tools_manifest_url
+    if not url:
+        return listed()
+    own = client is None
+    client = client or httpx.Client(timeout=20.0)
+    try:
+        r = client.get(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        r.raise_for_status()
+        doc = r.json()
+    finally:
+        if own:
+            client.close()
+    tools = parse_manifest(doc)
+    # The release actually served (jsDelivr names it; else a pinned @version).
+    pinned = re.search(r"@(\d[^/]*)/", url)
+    package = r.headers.get("x-jsd-version") or (pinned.group(1) if pinned else "")
+    data = {"source": url, "package": package, "version": str((doc or {}).get("version") or ""),
+            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "tools": tools}
+    if not _valid_listing(data):
+        counts = ", ".join(f"{t} {len(tools.get(t) or [])}" for t in LISTED_TOOLS)
+        raise ValueError(f"Sogni tool manifest is missing model lists ({counts})")
+    # Written whole, then swapped in: readers never see half a file. If it
+    # can't be stored, nothing changes anywhere (every process reads the
+    # file) and the catalog reports the error.
+    path = _cache_path()
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise OSError(f"couldn't store the Sogni model list: {e}") from e
+    with _listed_lock:
+        _listed = _listed_key = None  # re-read: the same choice every process makes
+    return data
+
+
+def _pretty(sel: str) -> str:
+    words = re.sub(r"[-_]+", " ", sel).split()
+    return " ".join(w.upper() if w in {"xl", "sdxl", "hd"} else (w if any(c.isdigit() for c in w) else
+                                                                    w.capitalize()) for w in words)
+
+
+def _generic_image(sel: str) -> ImageModel:
+    """A selector Sogni lists that we have no notes for yet."""
+    if sel.startswith(("gpt-image", "seedream", "nano-banana", "imagen", "ideogram", "midjourney")):
+        return ImageModel(sel, f"{_pretty(sel)} (via Sogni)", "Newly listed by Sogni. Premium Spark; price "
+                          "is an estimate.", 20.0, premium=True, family=VENDOR)
+    if sel.endswith("-xl") or "pony" in sel or "sdxl" in sel:
+        return ImageModel(sel, _pretty(sel), "Community checkpoint. ~1 Spark.", 1.0, family=COMMUNITY)
+    return ImageModel(sel, _pretty(sel), "Newly listed by Sogni; price is an estimate.", 5.0)
+
+
+def _generic_video(sel: str) -> VideoModel:
+    """A selector Sogni lists that we have no notes for yet (which tools
+    list it still decides first frame / text, in video_models)."""
+    flf = "flf2v" in sel
+    r2v = "r2v" in sel
+    i2v = "i2v" in sel  # needs its first frame, even if listed under generate_video too
+    vendor = sel.startswith(("seedance", "happyhorse", "wan3", "kling", "veo", "sora", "runway"))
+    note = "Newly listed by Sogni; length and price are estimates."
+    if sel.startswith("minimax-h3"):
+        return VideoModel(sel, _pretty(sel), note, spark_per_second=16.0, last_frame=flf, flf_only=flf,
+                          references=r2v, needs_reference=r2v, text=not (i2v or flf), **_H3)
+    return VideoModel(sel, _pretty(sel), ("Premium Spark. " if vendor else "") + note, 2, 10,
+                      40.0 if vendor else 8.0, last_frame=flf, flf_only=flf, premium=vendor, text=not (i2v or flf),
+                      references=r2v or sel.startswith("seedance"), needs_reference=r2v,
+                      audio_toggle=not sel.startswith(("happyhorse", "wan2")))
+
+
+def _build_images(tools: dict) -> tuple[ImageModel, ...]:
+    sels = list(dict.fromkeys(tools.get("generate_image") or []))
+    if not sels:  # no listing at all: the curated table
+        models = list(_IMAGES)
+    else:
+        seen = set(sels)
+        models = [_IMAGE_INFO.get(s) or _generic_image(s) for s in sels]
+        models += [m for m in _IMAGES if m.keep and m.selector not in seen]
+    pos = {m.selector: i for i, m in enumerate(_IMAGES)}
+    return tuple(sorted(models, key=lambda m: (FAMILY_ORDER.get(m.family, 9), pos.get(m.selector, 999))))
+
+
+def _build_videos(tools: dict) -> tuple[VideoModel, ...]:
+    gen = list(tools.get("generate_video") or [])
+    ani = list(tools.get("animate_photo") or [])
+    if not gen and not ani:  # no listing at all: the curated table, as bundled
+        return _VIDEOS
+    out = []
+    for sel in dict.fromkeys(gen + ani):
+        base = _VIDEO_INFO.get(sel) or _generic_video(sel)
+        # Listed under animate_photo = takes an exact first frame, except
+        # reference models (their pictures are loose guides); listed under
+        # generate_video = works from text, unless our notes say it needs
+        # a picture (HappyHorse i2v is listed there too).
+        animate = sel in ani and not base.needs_reference
+        out.append(replace(base, animate=animate, text=sel in gen and base.text,
+                           last_frame=animate and base.last_frame, flf_only=animate and base.flf_only))
+    pos = {m.selector: i for i, m in enumerate(_VIDEOS)}
+    return tuple(sorted(out, key=lambda m: (m.premium, pos.get(m.selector, 999))))
+
+
+def _model_tables() -> tuple:
+    """(image models, video models, images by selector, videos by selector)
+    for the current listing, built once per listing."""
+    global _models
+    data = listed()
+    cached = _models
+    if cached is not None and cached[0] is data:
+        return cached[1:]
+    images, videos = _build_images(data["tools"]), _build_videos(data["tools"])
+    cached = (data, images, videos, {m.selector: m for m in images}, {m.selector: m for m in videos})
+    _models = cached
+    return cached[1:]
+
+
+def image_models() -> tuple[ImageModel, ...]:
+    """Every image model Sogni accepts on generate_image, Next-Gen first."""
+    return _model_tables()[0]
+
+
+def video_models() -> tuple[VideoModel, ...]:
+    """Every video model on generate_video or animate_photo. Which tool
+    lists it decides whether it takes an exact first frame (animate_photo)
+    and whether it works from text alone (generate_video)."""
+    return _model_tables()[1]
+
+
+def video_frames(m: VideoModel) -> str:
+    """What a video model starts from, in a few words."""
+    if m.flf_only:
+        return "first + last frame, needs a picture"
+    if m.last_frame:
+        return "first + last frame"
+    if m.animate and not m.text:
+        return "first frame, needs a picture"
+    if m.animate:
+        return "first frame"
+    if m.needs_reference:
+        return "needs a reference picture"
+    if m.references:
+        return "reference pictures"
+    return "text only"
+
+
+def display_name(m: "ImageModel | VideoModel") -> str:
+    """How pickers show a Sogni model: name, family and what it needs."""
+    bits = ["Sogni"]
+    if isinstance(m, ImageModel) and m.family in (NEXT_GEN, COMMUNITY):
+        bits.append(m.family)
+    if isinstance(m, VideoModel):
+        bits += [f"{m.min_s}–{m.max_s}s", video_frames(m)]
+    if m.premium:
+        bits.append("Premium Spark")
+    if m.uncensored:
+        bits.append("uncensored")
+    return f"{m.name} ({' · '.join(bits)})"
 
 
 def image_model(model: str) -> Optional[ImageModel]:
-    return _IMAGE_BY_SEL.get(selector(model))
+    return _model_tables()[2].get(selector(model))
 
 
 def video_model(model: str) -> Optional[VideoModel]:
-    return _VIDEO_BY_SEL.get(selector(model))
+    return _model_tables()[3].get(selector(model))
 
 
 def image_cost_usd(model: str) -> float:
-    """Estimated USD for one image; COST_IMAGE_PER_ITEM for unlisted models."""
-    m = image_model(model)
+    """Estimated USD for one image; COST_IMAGE_PER_ITEM for unknown models.
+    (Our notes still price a model Sogni has stopped listing: its last jobs.)"""
+    m = image_model(model) or _IMAGE_INFO.get(selector(model))
     return round(m.spark * SPARK_USD, 6) if m else get_settings().cost_image_per_item
 
 
 def video_rate_usd(model: str) -> float:
-    """Estimated USD per second of video; COST_VIDEO_PER_SECOND if unlisted."""
-    m = video_model(model)
+    """Estimated USD per second of video; COST_VIDEO_PER_SECOND if unknown."""
+    m = video_model(model) or _VIDEO_INFO.get(selector(model))
     return round(m.spark_per_second * SPARK_USD, 6) if m else get_settings().cost_video_per_second
 
 
@@ -171,12 +565,24 @@ def video_cost_usd(model: str, seconds: float) -> float:
     return round(video_rate_usd(model) * max(float(seconds or 0.0), 0.0), 6)
 
 
+def takes_source_image(model: str) -> bool:
+    m = image_model(model)
+    return bool(m and m.img2img)
+
+
 def capabilities_for(model: str) -> VideoCapabilities:
     m = video_model(model)
     if m is None:
         return VideoCapabilities(durations=[5], first_frame=False, last_frame=False, known=False)
+    return model_capabilities(m)
+
+
+def model_capabilities(m: VideoModel) -> VideoCapabilities:
     return VideoCapabilities(durations=list(range(m.min_s, m.max_s + 1)),
-                             first_frame=m.animate, last_frame=m.animate and m.last_frame)
+                             first_frame=m.animate, last_frame=m.animate and m.last_frame,
+                             needs_first_frame=m.animate and not m.text,
+                             both_frames_only=m.animate and m.flf_only,
+                             needs_reference=m.needs_reference)
 
 
 # ---------- HTTP client ----------
@@ -439,11 +845,11 @@ class SogniImageProvider(ImageProvider):
 
     def __init__(self, *, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         self.client = SogniClient(api_key)
-        self.model = model or f"{PREFIX}{IMAGE_MODELS[0].selector}"
+        self.model = model or f"{PREFIX}krea-2-turbo"
 
     def list_models(self) -> list[ModelInfo]:
-        return [ModelInfo(id=f"{PREFIX}{m.selector}", name=f"{m.name} (Sogni)", modality="image",
-                          description=m.note) for m in IMAGE_MODELS]
+        return [ModelInfo(id=f"{PREFIX}{m.selector}", name=display_name(m), modality="image",
+                          description=m.note) for m in image_models()]
 
     def generate(
         self,
@@ -470,10 +876,17 @@ class SogniImageProvider(ImageProvider):
         # A frame or a "scene" reference (same place, other time of day — the
         # ambient drift/anchor variants) is the img2img source; character /
         # style / object references have no input on generate_image.
+        spec = image_model(model)
         source = next((r for r in references or [] if r.frame_type), None) or next(
             (r for r in references or [] if r.role == "scene"), None)
         if source is None and settings.get("img2img") and references:
             source = references[0]
+        if source is not None and not (spec and spec.img2img):
+            # No source image is applied on generate_image (see
+            # ImageModel.img2img): send text only rather than unused fields.
+            log.info("sogni %s: no image-to-image through the workflow API; ignoring the source image", model)
+            source = None
+            references = []
         if source is not None:
             media.append({"kind": "image", "url": source.url})
             args["sourceImageIndex"] = -1
@@ -531,13 +944,12 @@ class SogniVideoProvider(VideoProvider):
 
     def __init__(self, *, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         self.client = SogniClient(api_key)
-        self.model = model or f"{PREFIX}{VIDEO_MODELS[0].selector}"
+        self.model = model or f"{PREFIX}ltx25"
 
     def list_models(self) -> list[ModelInfo]:
         out = []
-        for m in VIDEO_MODELS:
-            tag = f"{m.min_s}–{m.max_s}s" + (" · first frame" if m.animate else "")
-            out.append(ModelInfo(id=f"{PREFIX}{m.selector}", name=f"{m.name} (Sogni, {tag})",
+        for m in video_models():
+            out.append(ModelInfo(id=f"{PREFIX}{m.selector}", name=display_name(m),
                                  modality="video", description=m.note))
         return out
 
@@ -561,11 +973,12 @@ class SogniVideoProvider(VideoProvider):
         caps = self.capabilities(model)
         settings = settings or {}  # callback_url is ignored: Sogni has no webhooks
         duration = caps.snap(duration_seconds)
-        args: dict = {"prompt": prompt, "videoModel": sel, "duration": duration,
-                      "generateAudio": bool(settings.get("generate_audio", False))}
+        args: dict = {"prompt": prompt, "videoModel": sel, "duration": duration}
+        if spec is None or spec.audio_toggle:
+            args["generateAudio"] = bool(settings.get("generate_audio", False))
         if settings.get("aspect_ratio"):
             args["aspectRatio"] = str(settings["aspect_ratio"])
-        if negative_prompt and (spec.negative if spec else sel.startswith(("ltx", "wan"))):
+        if negative_prompt and (spec.negative if spec else sel.startswith(("ltx", "wan2"))):
             args["negativePrompt"] = negative_prompt
         media: list[dict] = []
         tool = "generate_video"
@@ -578,14 +991,24 @@ class SogniVideoProvider(VideoProvider):
                     first = r
                 elif ft == "last_frame" and last is None:
                     last = r
+        if first is None and refs and spec is not None and spec.animate and not spec.text:
+            first = refs[0]  # a picture-only model: a loose reference is its first frame
+        if first is None and spec is not None and spec.animate and not spec.text:
+            raise SogniError(f"{spec.name} needs a starting picture (it makes video from a first frame)")
+        if spec is not None and spec.needs_reference and not refs:
+            raise SogniError(f"{spec.name} needs at least one reference picture")
         if first is not None and caps.first_frame:
             tool = "animate_photo"
             media.append({"kind": "image", "url": first.url})
             args["sourceImageIndex"] = -1  # -1 = the first media_references image
             args["frameRole"] = "start"
+            if last is None and spec is not None and spec.flf_only:
+                last = first  # first + last frame only: the picture is both ends
             if last is not None and caps.last_frame:
+                # "both" interpolates first -> last; the end image is always named.
+                args["frameRole"] = "both"
                 if last.url == first.url:
-                    args["frameRole"] = "both"
+                    args["endImageIndex"] = -1
                 else:
                     media.append({"kind": "image", "url": last.url})
                     args["endImageIndex"] = -2
@@ -595,7 +1018,11 @@ class SogniVideoProvider(VideoProvider):
                 media += [{"kind": "image", "url": r.url} for r in loose[:9]]
                 args["referenceImageIndices"] = [-(i + 1) for i in range(len(media))]
                 if first is not None:
-                    args["prompt"] = f"Use @Image1 as the first frame. {prompt}"
+                    # MiniMax H3 names references <Picture N>, HappyHorse
+                    # [Image N], Seedance @ImageN (Sogni's tool schema).
+                    tag = ("<Picture 1>" if sel.startswith("minimax-h3") else
+                           "[Image 1]" if sel.startswith("happyhorse") else "@Image1")
+                    args["prompt"] = f"Use {tag} as the first frame. {prompt}"
             elif loose:
                 log.info("sogni %s: ignoring %d reference image(s) (model takes none)", model, len(loose))
         wf = self.client.start(title=prompt[:80], tool=tool, arguments=args, media_references=media or None)

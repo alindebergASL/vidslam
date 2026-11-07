@@ -150,6 +150,11 @@ class Settings(BaseSettings):
     # Settings → API keys overrides this one.
     sogni_api_key: str = ""
     sogni_base_url: str = "https://api.sogni.ai"
+    # Sogni's published tool schemas, which list the model selectors its
+    # workflow API accepts (no API endpoint lists them). Synced with the model
+    # catalog; empty = use the copy bundled with the app.
+    sogni_tools_manifest_url: str = (
+        "https://cdn.jsdelivr.net/npm/@sogni-ai/sogni-protocol@alpha/manifests/generation-tools.json")
     # Sogni's own content filter (safe_content_filter on every workflow).
     # Off: the app has no NSFW gate. Vendor models (GPT Image, standard
     # Seedance, HappyHorse, standard Wan 3) refuse mature prompts anyway.

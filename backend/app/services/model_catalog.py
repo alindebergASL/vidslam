@@ -237,28 +237,31 @@ def _static_entries() -> list[dict]:
 
 
 def _sogni_entries() -> list[dict]:
-    """Sogni's documented tool-level selectors (providers/sogni.py). Static:
-    Sogni's public catalog lists worker ids, which workflows don't take."""
+    """Every Sogni model selector the workflow API accepts (providers/sogni.py:
+    synced from Sogni's published tool schemas, with our notes and prices)."""
     from ..providers import sogni
 
     usable = provider_keys.has("sogni")
     out: list[dict] = []
-    for m in sogni.IMAGE_MODELS:
+    for m in sogni.image_models():
         usd = round(m.spark * sogni.SPARK_USD, 4)
+        tags = [t for t in (m.family if m.family in (sogni.NEXT_GEN, sogni.COMMUNITY) else "",
+                            "Premium Spark" if m.premium else "", "uncensored" if m.uncensored else "") if t]
         out.append({
-            "id": f"{sogni.PREFIX}{m.selector}", "kind": "image", "name": f"{m.name} (Sogni)",
-            "provider": "sogni", "description": m.note,
-            "notes": ("Premium Spark · " if m.premium else "") + f"~{m.spark:g} Spark (${usd:.3f}) per image",
+            "id": f"{sogni.PREFIX}{m.selector}", "kind": "image", "name": sogni.display_name(m),
+            "provider": "sogni", "description": m.note, "family": m.family,
+            "notes": " · ".join([*tags, f"~{m.spark:g} Spark (${usd:.3f}) per image"]),
             "pricing": {"image": usd}, "usable": usable,
         })
-    for v in sogni.VIDEO_MODELS:
-        caps = sogni.capabilities_for(v.selector)
+    for v in sogni.video_models():
+        caps = sogni.model_capabilities(v)
         frames = (["first_frame"] if caps.first_frame else []) + (["last_frame"] if caps.last_frame else [])
-        bits = (["Premium Spark"] if v.premium else []) + [f"{v.min_s}–{v.max_s} s"]
-        bits.append("first frame" if v.animate else ("loose picture reference" if v.references else "text only"))
+        bits = (["Premium Spark"] if v.premium else []) + [f"{v.min_s}–{v.max_s} s", sogni.video_frames(v)]
+        if v.uncensored:
+            bits.append("uncensored")
         bits.append(f"~{v.spark_per_second:g} Spark/s")
         out.append({
-            "id": f"{sogni.PREFIX}{v.selector}", "kind": "video", "name": f"{v.name} (Sogni)",
+            "id": f"{sogni.PREFIX}{v.selector}", "kind": "video", "name": sogni.display_name(v),
             "provider": "sogni", "description": v.note, "notes": " · ".join(bits),
             "durations": caps.durations, "max_seconds": caps.max_seconds, "frame_images": frames,
             "resolutions": [], "aspect_ratios": [], "generate_audio": None,
@@ -300,6 +303,16 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
         finally:
             if own:
                 client.close()
+        # Sogni has no listing endpoint: its published tool schemas are the
+        # list. Only with a Sogni key (and never in mock mode / offline tests).
+        if provider_keys.has("sogni") and not get_settings().mock_providers:
+            try:
+                from ..providers import sogni
+
+                sogni.refresh_listed(None if own else client)
+            except Exception as e:  # noqa: BLE001 — keeps the last good list
+                log.warning("catalog source sogni_tools failed: %s", e)
+                errors["sogni_tools"] = str(e)[:300]
         entries += _static_entries()
         entries += _sogni_entries()
         # A Lyria model served by both OpenRouter and Google appears once,
@@ -326,6 +339,10 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
         return snap
 
 
+_SOURCE_PROVIDER = {"openrouter_models": "openrouter", "openrouter_videos": "openrouter",
+                    "gemini_models": "gemini"}
+
+
 def _alert_missing_active(snap: dict, prev_entries: list[dict]) -> None:
     """Alert when a model someone selected was listed last poll but isn't
     now (retired / renamed) and its source answered this time."""
@@ -334,13 +351,16 @@ def _alert_missing_active(snap: dict, prev_entries: list[dict]) -> None:
     if not prev_entries:
         return
     now = {(e["kind"], e["id"]) for e in snap["entries"]}
-    before = {(e["kind"], e["id"]) for e in prev_entries}
-    failed = snap.get("errors") or {}
+    before = {(e["kind"], e["id"]): e.get("provider") for e in prev_entries}
+    # Only a failed source that feeds the model's provider can hide it (a
+    # failed Sogni list sync keeps the last good list, so it hides nothing).
+    failed = {_SOURCE_PROVIDER.get(k, "*") for k in (snap.get("errors") or {}) if k != "sogni_tools"}
     for kind in reg.KINDS:
         sel = reg.selected(kind)
         if not sel or sel.startswith("mock/"):
             continue
-        if (kind, sel) in before and (kind, sel) not in now and not failed:
+        hidden = "*" in failed or before.get((kind, sel)) in failed
+        if (kind, sel) in before and (kind, sel) not in now and not hidden:
             alerts.send(
                 f"model-gone:{kind}:{sel}",
                 f"Active {kind} model {sel} is no longer listed",
@@ -373,12 +393,23 @@ def _live_usable(snap: Optional[dict]) -> Optional[dict]:
 
 
 def _with_sogni(snap: Optional[dict]) -> Optional[dict]:
-    """A snapshot stored before Sogni existed gets its static entries now,
-    rather than at the next poll."""
-    if snap and not any(e.get("provider") == "sogni" for e in snap.get("entries") or []):
-        snap = {**snap, "entries": [*(snap.get("entries") or []),
-                                    *({**e, "new": False} for e in _sogni_entries())]}
-    return snap
+    """Serve the current Sogni entries (built locally from the synced list)
+    rather than the copy stored with the snapshot, so a newer list or newer
+    notes show up without waiting for the next poll."""
+    if not snap:
+        return snap
+    entries = snap.get("entries") or []
+    stored = {(e.get("kind"), e.get("id")): e for e in entries if e.get("provider") == "sogni"}
+    fresh = []
+    for e in _sogni_entries():
+        key = (e["kind"], e["id"])
+        # Keep the poll's own "new" flag; one it hasn't seen yet is new.
+        new = bool(stored[key].get("new")) if key in stored else bool(stored)
+        fresh.append({**e, "new": new})
+    merged = [*(e for e in entries if e.get("provider") != "sogni"), *fresh]
+    return {**snap, "entries": merged,
+            "counts": {k: sum(1 for e in merged if e.get("kind") == k) for k in reg.KINDS},
+            "new_count": sum(1 for e in merged if e.get("new"))}
 
 
 def get_snapshot() -> Optional[dict]:
