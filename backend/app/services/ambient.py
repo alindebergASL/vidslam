@@ -572,11 +572,39 @@ def _is_video_model(model: str) -> bool:
         return False
 
 
+def _takes_reference(model: str) -> bool:
+    """False for Sogni picture models: Sogni's workflow API doesn't apply a
+    source image yet (see sogni.ImageModel.img2img)."""
+    return not (_sogni.is_sogni(model) and not _sogni.takes_source_image(model))
+
+
+def reference_still_chain(cfg: AmbientConfig) -> list[str]:
+    """still_model_chain for a still made from a reference picture (Day to
+    night's "same place, other light"): the models that apply the reference
+    first, if a real provider serves them; the others, which would make it
+    from the text alone, after, as the last resort."""
+    from .model_registry import provider_for
+
+    chain = still_model_chain(cfg)
+    mock = get_settings().mock_providers
+    first = [m for m in chain if _takes_reference(m) and (mock or provider_for("image", m) != "mock")]
+    return first + [m for m in chain if m not in first]
+
+
 def still_cost(cfg: AmbientConfig) -> float:
     """Rate-card cost of one still on this scene's primary still model."""
-    s = get_settings()
     chain = still_model_chain(cfg)
-    model = chain[0] if chain else ""
+    return _still_model_cost(chain[0] if chain else "")
+
+
+def reference_still_cost(cfg: AmbientConfig) -> float:
+    """Rate-card cost of a "same place" still (see reference_still_chain)."""
+    chain = reference_still_chain(cfg)
+    return _still_model_cost(chain[0] if chain else "")
+
+
+def _still_model_cost(model: str) -> float:
+    s = get_settings()
     if model and model == s.ambient_still_model:
         return s.cost_ambient_still
     if _sogni.is_sogni(model):
@@ -601,13 +629,16 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
     from .pipeline import _log_provider_call, _resolve_model
 
     last: Optional[Exception] = None
-    for model in still_model_chain(cfg):
+    for model in (reference_still_chain(cfg) if references else still_model_chain(cfg)):
         model = _resolve_model(db, model)
         image = None
+        # A model that can't apply the reference makes the still from text:
+        # don't describe a reference it never sees.
+        call_prompt = prompt if not references or _takes_reference(model) else prompt.replace(_SAME_PLACE, "")
         try:
             # Per model: a sogni/ primary can fall back to an OpenRouter model.
             image = get_image(model) if routes_per_model("image", model) else get_image()
-            png = image.generate(model=model, prompt=prompt, references=references or [],
+            png = image.generate(model=model, prompt=call_prompt, references=references or [],
                                  negative_prompt=negative_prompt,
                                  settings=best_image_settings(model, aspect_ratio))
         except Exception as e:  # noqa: BLE001 — try the fallback model
@@ -1044,13 +1075,17 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
             f"Couldn't read this model's limits; assuming {caps.max_seconds}s per clip "
             "(AMBIENT_DEFAULT_MAX_CLIP_SECONDS)."
         )
-    if cfg.picture_origin and cfg.source == "video" and not caps.first_frame:
+    if cfg.picture_origin and cfg.source == "video" and not caps.first_frame and not caps.needs_reference:
         notes.append("This model can't start a clip from an image, so your picture isn't used "
                      "for the video. Pick a model that takes a first frame, or use Still + drift.")
-    chain_ok = cfg.chain_segments and caps.first_frame
+    # First + last frame only models can't make the open middle clips of a chain.
+    chain_ok = cfg.chain_segments and caps.first_frame and not caps.both_frames_only
     if cfg.loop_seconds > caps.max_seconds and cfg.chain_segments and not caps.first_frame:
         notes.append("This model can't start from a given frame, so clips can't be chained; "
                      f"using one {caps.max_seconds}s clip.")
+    elif cfg.loop_seconds > caps.max_seconds and cfg.chain_segments and caps.both_frames_only:
+        notes.append("This model needs a first and a last frame for every clip, so clips can't be "
+                     f"chained; using one {caps.max_seconds}s clip.")
     if chain_ok:
         segments = _segments_for(cfg.loop_seconds, caps)
     else:
@@ -1073,9 +1108,17 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
     elif n >= 1:
         notes.append(f"Open loop: hidden with a {seam_cf:g}s tail→head crossfade.")
     # With variations, a first-frame-only model still gets a shared start
-    # still, so the takes / times of day show the same view.
-    first_still = anchored or (caps.first_frame and (bool(cfg.picture_origin) or k > 1))
-    anchor_calls = 1 if (anchored or (k > 1 and first_still)) else 0
+    # still, so the takes / times of day show the same view. A model that
+    # can't work from text alone always gets one: as its first frame, or
+    # (reference models) as its reference picture.
+    first_still = (anchored or (caps.first_frame and (bool(cfg.picture_origin) or k > 1 or caps.needs_first_frame))
+                   or caps.needs_reference)
+    anchor_calls = 1 if (anchored or (first_still and (k > 1 or not cfg.picture_origin))) else 0
+    if caps.needs_reference:
+        notes.append(("Your picture" if cfg.picture_origin else "A still of the scene") + " is this model's "
+                     "reference picture: a loose guide, not an exact first frame.")
+    elif caps.needs_first_frame and not anchored and not cfg.picture_origin:
+        notes.append("This model needs a starting picture, so a still of the scene is made first.")
     repeat_every = unit
     if k > 1 and cfg.variety == "takes":
         repeat_every = unit * k
@@ -1129,8 +1172,8 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
         if more_stills:
             lines.append({
                 "item": f"Stills for {', '.join(plan.variant_labels[1:])}",
-                "qty": more_stills, "unit": "image", "unit_cost": still_cost(cfg),
-                "cost": round(still_cost(cfg) * more_stills, 4),
+                "qty": more_stills, "unit": "image", "unit_cost": reference_still_cost(cfg),
+                "cost": round(reference_still_cost(cfg) * more_stills, 4),
             })
     else:
         if own:
@@ -1138,10 +1181,10 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
                 "item": "Your picture as the first frame" + (" = last frame" if plan.anchored else ""),
                 "qty": 1, "unit": "image", "unit_cost": 0.0, "cost": 0.0,
             })
-        elif plan.anchored or (k > 1 and plan.first_frame_still):
+        elif plan.anchored or plan.first_frame_still:
             lines.append({
                 "item": "Anchor still (first = last frame)" if plan.anchored
-                        else "Shared first frame (image)",
+                        else "Shared first frame (image)" if k > 1 else "Starting still (image)",
                 "qty": 1, "unit": "image",
                 "unit_cost": still_cost(cfg),
                 "cost": round(still_cost(cfg), 4),
@@ -1149,8 +1192,8 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
         if more_stills and plan.first_frame_still:
             lines.append({
                 "item": f"Anchor stills for {', '.join(plan.variant_labels[1:])}",
-                "qty": more_stills, "unit": "image", "unit_cost": still_cost(cfg),
-                "cost": round(still_cost(cfg) * more_stills, 4),
+                "qty": more_stills, "unit": "image", "unit_cost": reference_still_cost(cfg),
+                "cost": round(reference_still_cost(cfg) * more_stills, 4),
             })
         secs = float(sum(plan.segments))
         n = len(plan.segments)
