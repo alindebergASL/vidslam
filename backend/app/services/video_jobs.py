@@ -37,6 +37,8 @@ from ..providers.base import SubmittedJob
 log = logging.getLogger("avs.video_jobs")
 
 ACTIVE = ("submitted", "running")
+# Providers with no completion callbacks: their jobs are always polled.
+NO_WEBHOOK_PROVIDERS = frozenset({"sogni"})
 TERMINAL = ("completed", "failed")
 
 
@@ -80,17 +82,20 @@ def submit(
     context: Optional[dict] = None,
     start: Callable[[Optional[str]], SubmittedJob],
     provider_label: str = "",
+    webhooks: bool = True,
 ) -> models.VideoJob:
     """Create the job row, call `start(callback_url)` to submit to the
     provider, and return without waiting. `start` gets the webhook URL (or
-    None when webhooks are off) and returns the provider's SubmittedJob."""
+    None when webhooks are off) and returns the provider's SubmittedJob.
+    `webhooks=False` for providers without callbacks (Sogni): no URL is
+    handed out and the job is polled at the VIDEO_POLL_SECONDS cadence."""
     s = get_settings()
     job = models.VideoJob(
         purpose=purpose, ref_id=ref_id, project_id=project_id, render_id=render_id,
         context_json=context or {}, status="submitted",
         deadline_at=_now() + timedelta(minutes=s.video_job_timeout_minutes),
     )
-    use_hook = webhooks_enabled()
+    use_hook = webhooks and webhooks_enabled()
     job.uses_webhook = use_hook
     db.add(job)
     db.flush()  # assigns callback_token default
@@ -105,7 +110,14 @@ def submit(
         db.commit()
         raise
     job.provider = provider_label or submitted.provider
+    if job.provider in NO_WEBHOOK_PROVIDERS:
+        job.uses_webhook = False  # nothing will call back: poll at the normal cadence
     job.model = submitted.model or ""
+    sent = (submitted.raw or {}).get("duration") if isinstance(submitted.raw, dict) else None
+    if job.provider == "sogni" and sent:
+        # The length actually requested (Sogni snaps it): poll() and the spend
+        # estimate use it when the result does not report its own duration.
+        job.context_json = {**(job.context_json or {}), "duration": sent}
     job.provider_job_id = submitted.job_id
     job.polling_url = submitted.polling_url or ""
     job.next_check_at = _now() + timedelta(seconds=_poll_interval(job))
@@ -124,6 +136,10 @@ def provider_for(job: models.VideoJob):
         from ..providers.mock_video import get_singleton
 
         return get_singleton()
+    if job.provider == "sogni":
+        from ..providers.sogni import SogniVideoProvider
+
+        return SogniVideoProvider(model=job.model or None)
     from ..providers.openrouter_video import OpenRouterVideoProvider
 
     return OpenRouterVideoProvider(model=job.model or None)
@@ -131,7 +147,8 @@ def provider_for(job: models.VideoJob):
 
 def _submitted(job: models.VideoJob) -> SubmittedJob:
     return SubmittedJob(provider=job.provider, model=job.model, job_id=job.provider_job_id,
-                        polling_url=job.polling_url)
+                        polling_url=job.polling_url,
+                        raw={"duration": (job.context_json or {}).get("duration")})
 
 
 # ---------- check / complete / fail ----------

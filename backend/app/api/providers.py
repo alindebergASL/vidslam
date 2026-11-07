@@ -11,6 +11,7 @@ from ..config import get_settings
 from ..db import get_db
 from ..providers import get_image, get_video, provider_status
 from ..providers.base import ModelInfo
+from ..services import provider_keys
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -147,8 +148,10 @@ def health_check() -> dict:
     'mock' without making any external request."""
     s = get_settings()
     results: list[dict] = []
+    or_key = provider_keys.resolve("openrouter")
+    el_key = provider_keys.resolve("elevenlabs")
 
-    if s.mock_providers or not s.openrouter_api_key:
+    if s.mock_providers or not or_key:
         results.append({
             "group": "openrouter",
             "mode": "mock",
@@ -159,10 +162,10 @@ def health_check() -> dict:
         results.append(_probe(
             "openrouter",
             f"{s.openrouter_base_url.rstrip('/')}/models",
-            {"Authorization": f"Bearer {s.openrouter_api_key}"},
+            {"Authorization": f"Bearer {or_key}"},
         ))
 
-    if s.mock_providers or not s.elevenlabs_api_key:
+    if s.mock_providers or not el_key:
         results.append({
             "group": "elevenlabs",
             "mode": "mock",
@@ -173,7 +176,7 @@ def health_check() -> dict:
         results.append(_probe(
             "elevenlabs",
             f"{s.elevenlabs_base_url.rstrip('/')}/voices",
-            {"xi-api-key": s.elevenlabs_api_key},
+            {"xi-api-key": el_key},
         ))
 
     return {"ok": all(r["ok"] for r in results), "results": results}

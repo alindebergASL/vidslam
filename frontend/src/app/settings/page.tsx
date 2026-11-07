@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
+import { ApiKeysPanel } from "@/components/ApiKeysPanel";
 import { ModelsPanel } from "@/components/ModelsPanel";
 import { SpendPanel } from "@/components/SpendPanel";
 import { YouTubeCard } from "@/components/YouTubeCard";
@@ -44,7 +45,7 @@ function Inner() {
     <div className="p-4 sm:p-8 max-w-4xl">
       <header className="mb-4">
         <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">Settings & Status</h1>
-        <p className="text-ink-300 mt-1">Models, spend, publishing, provider keys and deployment.</p>
+        <p className="text-ink-300 mt-1">Models, spend, publishing, API keys and deployment.</p>
       </header>
 
       {/* Section menu: the page is long, so jump straight to what you need. */}
@@ -56,7 +57,7 @@ function Inner() {
           ["models", "Models"],
           ["spend", "Spend"],
           ["youtube", "YouTube"],
-          ["keys", "Provider keys"],
+          ["keys", "API keys"],
           ["deployment", "Deployment"],
           ["library", "Library"],
         ].map(([id, label]) => (
@@ -81,12 +82,14 @@ function Inner() {
       </div>
 
       <div id="keys" className="scroll-mt-16">
+        <ApiKeysPanel />
+
         {/* Provider connectivity */}
       <section className="card p-4 mb-6">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-lg font-medium">Provider connectivity</h2>
           <button className="btn-ghost text-xs" disabled={busy} onClick={runHealth}>
-            {busy ? "Testing…" : "Test provider keys"}
+            {busy ? "Testing…" : "Test all providers"}
           </button>
         </div>
         {!health ? (
@@ -119,40 +122,6 @@ function Inner() {
 
       {info && (
         <>
-          <section className="card p-4 mb-6">
-            <h2 className="text-lg font-medium mb-3">Provider keys</h2>
-            <p className="text-xs text-ink-400 mb-3">
-              For security, API keys are set via environment variables and
-              never via this page — the server reports presence only, never
-              values. See the deploy section of the README for rotation.
-            </p>
-            <div className="space-y-2 text-sm">
-              <KeyRow
-                name="OPENROUTER_API_KEY"
-                set={info.keys.openrouter}
-                surface="planner, image, video, OpenRouter voices, Avatar IV lip-sync"
-                warn={!info.keys.openrouter && !info.mock_providers}
-              />
-              <KeyRow
-                name="ELEVENLABS_API_KEY"
-                set={info.keys.elevenlabs}
-                surface="ElevenLabs voices / ElevenLabs music"
-                warn={false}
-                note={
-                  info.keys.elevenlabs
-                    ? undefined
-                    : "Voiceover falls back to silent mock; music to a mock generator."
-                }
-              />
-              <KeyRow
-                name="GEMINI_API_KEY"
-                set={!!info.keys.gemini}
-                surface="Google Lyria music"
-                warn={false}
-              />
-            </div>
-          </section>
-
           <section id="deployment" className="card p-4 mb-6 scroll-mt-16">
             <h2 className="text-lg font-medium mb-3">Deployment</h2>
             <dl className="grid grid-cols-2 md:grid-cols-3 gap-y-3 gap-x-4 text-sm">
@@ -178,45 +147,6 @@ function Inner() {
           </section>
         </>
       )}
-    </div>
-  );
-}
-
-function KeyRow({
-  name,
-  set,
-  surface,
-  warn,
-  note,
-}: {
-  name: string;
-  set: boolean;
-  surface: string;
-  warn: boolean;
-  note?: string;
-}) {
-  return (
-    <div
-      className={`rounded-md border px-3 py-2 ${
-        warn
-          ? "border-accent/40 bg-accent/5"
-          : set
-          ? "border-emerald-500/30 bg-emerald-500/5"
-          : "border-ink-800 bg-ink-900"
-      }`}
-    >
-      <div className="flex items-center justify-between gap-3">
-        <code className="text-xs">{name}</code>
-        <span
-          className={`text-[11px] font-medium ${
-            set ? "text-emerald-300" : warn ? "text-accent" : "text-ink-400"
-          }`}
-        >
-          {set ? "set" : warn ? "missing — required" : "not set"}
-        </span>
-      </div>
-      <div className="text-[11px] text-ink-400 mt-1">Powers {surface}.</div>
-      {note && <div className="text-[11px] text-ink-300 mt-1">{note}</div>}
     </div>
   );
 }

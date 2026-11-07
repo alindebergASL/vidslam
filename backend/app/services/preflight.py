@@ -136,10 +136,12 @@ def _check_providers(db: Session, project: models.VideoProject) -> CheckResult:
             status="ok",
             message="MOCK_PROVIDERS=true — running without external API calls.",
         )
+    from . import provider_keys
+
     missing: list[str] = []
-    if not s.openrouter_api_key:
+    if not provider_keys.has("openrouter"):
         missing.append("OPENROUTER_API_KEY (chat + image + video)")
-    if not s.elevenlabs_api_key:
+    if not provider_keys.has("elevenlabs"):
         # ElevenLabs is optional: mock TTS will be used.
         pass
     if missing:
@@ -148,10 +150,10 @@ def _check_providers(db: Session, project: models.VideoProject) -> CheckResult:
             label="Providers",
             status="fail",
             message="Required provider keys are missing.",
-            detail="Missing: " + ", ".join(missing) + ". Set them in .env or enable MOCK_PROVIDERS.",
+            detail="Missing: " + ", ".join(missing) + ". Add them in Settings → API keys (or .env), or enable MOCK_PROVIDERS.",
         )
     detail_bits = []
-    if not s.elevenlabs_api_key:
+    if not provider_keys.has("elevenlabs"):
         detail_bits.append("ElevenLabs not configured — mock silent audio will be used")
     msg = "OpenRouter configured."
     if detail_bits:

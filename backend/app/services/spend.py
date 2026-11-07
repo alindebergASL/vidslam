@@ -12,6 +12,8 @@ provider whenever it reports one:
     `total_cost` from `GET /generation?id=…`
   * ElevenLabs, Gemini (Lyria) → no per-call cost in the API; recorded from
     the COST_* rate card and flagged `is_estimate`
+  * Sogni → no per-job cost in the workflow API; recorded from the Spark
+    price table in providers/sogni.py and flagged `is_estimate`
 
 Mock providers never record anything (nothing is billed).
 
@@ -152,6 +154,9 @@ def record_video_job(db: Session, job: models.VideoJob) -> None:
     ref = f"video_job:{job.id}"
     if db.query(models.SpendEntry.id).filter_by(ref=ref).first():
         return  # already recorded (a retried completion)
+    if job.provider == "sogni":
+        _record_sogni_video(db, job, kind, ref)
+        return
     if job.cost_usd is not None:
         record(provider=job.provider, kind=kind, model=job.model, cost=job.cost_usd,
                project_id=job.project_id, render_id=job.render_id, ref=ref,
@@ -171,6 +176,19 @@ def record_video_job(db: Session, job: models.VideoJob) -> None:
            note="provider reported no cost", db=db)
 
 
+def _record_sogni_video(db: Session, job: models.VideoJob, kind: str, ref: str) -> None:
+    """Sogni reports no per-job cost: the job's cost is our Spark price-table
+    estimate (set at poll time), so it's recorded as one, never as billed."""
+    from ..providers import sogni
+
+    cost = job.cost_usd
+    if cost is None:
+        cost = sogni.video_cost_usd(job.model, float((job.context_json or {}).get("duration") or 5.0))
+    record(provider="sogni", kind=kind, model=job.model, cost=cost, is_estimate=True,
+           source="rate_card", project_id=job.project_id, render_id=job.render_id, ref=ref,
+           generation_id=job.provider_job_id, note="Sogni Spark price-table estimate", db=db)
+
+
 def render_actual_cost(db: Session, render: models.Render) -> float:
     total = db.query(func.coalesce(func.sum(models.SpendEntry.cost_usd), 0.0)) \
         .filter(models.SpendEntry.render_id == render.id).scalar()
@@ -185,7 +203,10 @@ def reconcile_pending(limit: int = 20) -> int:
     """Swap rate-card placeholders for OpenRouter's reported cost once the
     generation is queryable. Returns how many entries were settled."""
     s = get_settings()
-    if not s.openrouter_api_key:
+    from . import provider_keys
+
+    key = provider_keys.resolve("openrouter")
+    if not key:
         return 0
     db = SessionLocal()
     settled = 0
@@ -199,7 +220,7 @@ def reconcile_pending(limit: int = 20) -> int:
                 try:
                     r = client.get(f"{s.openrouter_base_url.rstrip('/')}/generation",
                                    params={"id": e.generation_id},
-                                   headers={"Authorization": f"Bearer {s.openrouter_api_key}"})
+                                   headers={"Authorization": f"Bearer {key}"})
                 except httpx.HTTPError:
                     break
                 if r.status_code == 404:
@@ -392,13 +413,16 @@ def openrouter_account(*, refresh: bool = False) -> dict:
     import time
 
     s = get_settings()
-    if not s.openrouter_api_key:
+    from . import provider_keys
+
+    key = provider_keys.resolve("openrouter")
+    if not key:
         return {"available": False, "reason": "OPENROUTER_API_KEY not set"}
     if not refresh and _account_cache.get("at", 0) > time.time() - 60:
         return _account_cache["data"]
     try:
         r = httpx.get(f"{s.openrouter_base_url.rstrip('/')}/key", timeout=10.0,
-                      headers={"Authorization": f"Bearer {s.openrouter_api_key}"})
+                      headers={"Authorization": f"Bearer {key}"})
         r.raise_for_status()
         d = r.json().get("data") or {}
         data = {"available": True, **{k: d.get(k) for k in (

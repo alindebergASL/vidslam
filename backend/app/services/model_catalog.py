@@ -6,7 +6,8 @@ Sources
   OpenRouter GET /models          chat / image / audio-output (tts) models
   OpenRouter GET /videos/models   video generators + avatar (lip-sync) models
   Gemini     GET /models          Lyria music models (needs GEMINI_API_KEY)
-  static                          ElevenLabs voice + music, Lyria fallbacks
+  static                          ElevenLabs voice + music, Lyria fallbacks,
+                                  Sogni image + video selectors ("sogni/…")
 
 Both OpenRouter listings are public, so the catalog can be browsed before
 any key is configured; entries carry `usable` to say whether the app can
@@ -24,6 +25,7 @@ import httpx
 from ..config import get_settings
 from ..providers.base import expand_durations
 from . import model_registry as reg
+from . import provider_keys
 
 log = logging.getLogger("avs.catalog")
 CATALOG_KEY = "catalog.snapshot"
@@ -44,8 +46,9 @@ def _now_iso() -> str:
 def _or_headers() -> dict:
     s = get_settings()
     h = {"HTTP-Referer": s.openrouter_site_url, "X-Title": s.openrouter_app_title}
-    if s.openrouter_api_key:
-        h["Authorization"] = f"Bearer {s.openrouter_api_key}"
+    key = provider_keys.resolve("openrouter")
+    if key:
+        h["Authorization"] = f"Bearer {key}"
     return h
 
 
@@ -103,7 +106,7 @@ def _paged(client: httpx.Client, url: str, params: dict) -> list[dict]:
 
 def _fetch_openrouter_models(client: httpx.Client) -> list[dict]:
     base = get_settings().openrouter_base_url.rstrip("/")
-    usable = bool(get_settings().openrouter_api_key)
+    usable = provider_keys.has("openrouter")
     out = []
     for m in _paged(client, f"{base}/models", {"output_modalities": "all"}):
         mid = m.get("id") or ""
@@ -149,7 +152,7 @@ def _fetch_openrouter_videos(client: httpx.Client) -> list[dict]:
     base = get_settings().openrouter_base_url.rstrip("/")
     r = client.get(f"{base}/videos/models", headers=_or_headers())
     r.raise_for_status()
-    usable = bool(get_settings().openrouter_api_key)
+    usable = provider_keys.has("openrouter")
     out = []
     for m in r.json().get("data", []) or []:
         mid = m.get("id") or ""
@@ -182,16 +185,17 @@ def _fetch_openrouter_videos(client: httpx.Client) -> list[dict]:
 
 def _fetch_lyria(client: httpx.Client) -> list[dict]:
     s = get_settings()
-    usable = bool(s.gemini_api_key)
+    gemini_key = provider_keys.resolve("gemini")
+    usable = bool(gemini_key)
     found: dict[str, dict] = {}
-    if s.gemini_api_key:
+    if gemini_key:
         url = f"{s.gemini_base_url.rstrip('/')}/models"
         token = None
         for _ in range(10):  # paginate defensively
             params = {"pageSize": 1000}
             if token:
                 params["pageToken"] = token
-            r = client.get(url, headers={"x-goog-api-key": s.gemini_api_key}, params=params)
+            r = client.get(url, headers={"x-goog-api-key": gemini_key}, params=params)
             r.raise_for_status()
             data = r.json()
             for m in data.get("models", []) or []:
@@ -217,7 +221,7 @@ def _fetch_lyria(client: httpx.Client) -> list[dict]:
 
 def _static_entries() -> list[dict]:
     s = get_settings()
-    el = bool(s.elevenlabs_api_key)
+    el = provider_keys.has("elevenlabs")
     return [
         {"id": "elevenlabs", "kind": "tts", "name": "ElevenLabs voices", "provider": "elevenlabs",
          "description": f"Per-avatar ElevenLabs voices (model {s.elevenlabs_model_id}).", "usable": el},
@@ -230,6 +234,38 @@ def _static_entries() -> list[dict]:
         {"id": "elevenlabs/music_v2", "kind": "music", "name": "ElevenLabs Music v2", "provider": "elevenlabs",
          "description": "Previous Eleven Music model.", "usable": el},
     ]
+
+
+def _sogni_entries() -> list[dict]:
+    """Sogni's documented tool-level selectors (providers/sogni.py). Static:
+    Sogni's public catalog lists worker ids, which workflows don't take."""
+    from ..providers import sogni
+
+    usable = provider_keys.has("sogni")
+    out: list[dict] = []
+    for m in sogni.IMAGE_MODELS:
+        usd = round(m.spark * sogni.SPARK_USD, 4)
+        out.append({
+            "id": f"{sogni.PREFIX}{m.selector}", "kind": "image", "name": f"{m.name} (Sogni)",
+            "provider": "sogni", "description": m.note,
+            "notes": ("Premium Spark · " if m.premium else "") + f"~{m.spark:g} Spark (${usd:.3f}) per image",
+            "pricing": {"image": usd}, "usable": usable,
+        })
+    for v in sogni.VIDEO_MODELS:
+        caps = sogni.capabilities_for(v.selector)
+        frames = (["first_frame"] if caps.first_frame else []) + (["last_frame"] if caps.last_frame else [])
+        bits = (["Premium Spark"] if v.premium else []) + [f"{v.min_s}–{v.max_s} s"]
+        bits.append("first frame" if v.animate else ("loose picture reference" if v.references else "text only"))
+        bits.append(f"~{v.spark_per_second:g} Spark/s")
+        out.append({
+            "id": f"{sogni.PREFIX}{v.selector}", "kind": "video", "name": f"{v.name} (Sogni)",
+            "provider": "sogni", "description": v.note, "notes": " · ".join(bits),
+            "durations": caps.durations, "max_seconds": caps.max_seconds, "frame_images": frames,
+            "resolutions": [], "aspect_ratios": [], "generate_audio": None,
+            "pricing_skus": {}, "price_per_second": round(v.spark_per_second * sogni.SPARK_USD, 4),
+            "usable": usable,
+        })
+    return out
 
 
 _refresh_lock = threading.Lock()
@@ -265,6 +301,7 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
             if own:
                 client.close()
         entries += _static_entries()
+        entries += _sogni_entries()
         # A Lyria model served by both OpenRouter and Google appears once,
         # as the OpenRouter entry (one key for everything); the Google route
         # stays available as a fallback for it.
@@ -312,8 +349,40 @@ def _alert_missing_active(snap: dict, prev_entries: list[dict]) -> None:
             )
 
 
+def _live_usable(snap: Optional[dict]) -> Optional[dict]:
+    """`usable` is baked in at poll time; re-derive it from the keys now
+    configured, so a key saved in Settings → API keys (or cleared) shows at
+    once without waiting for the next poll."""
+    if not snap:
+        return snap
+    known = set(provider_keys.KEYS)
+    have: dict[str, bool] = {}
+
+    def _has(p: str) -> bool:
+        if p not in have:
+            have[p] = provider_keys.has(p)
+        return have[p]
+
+    for e in snap.get("entries") or []:
+        p = e.get("provider")
+        if p not in known:
+            continue
+        alt = e.get("also_via")
+        e["usable"] = _has(p) or bool(alt in known and _has(alt))
+    return snap
+
+
+def _with_sogni(snap: Optional[dict]) -> Optional[dict]:
+    """A snapshot stored before Sogni existed gets its static entries now,
+    rather than at the next poll."""
+    if snap and not any(e.get("provider") == "sogni" for e in snap.get("entries") or []):
+        snap = {**snap, "entries": [*(snap.get("entries") or []),
+                                    *({**e, "new": False} for e in _sogni_entries())]}
+    return snap
+
+
 def get_snapshot() -> Optional[dict]:
-    return reg.get_setting(CATALOG_KEY)
+    return _live_usable(_with_sogni(reg.get_setting(CATALOG_KEY)))
 
 
 def find(kind: str, model_id: str) -> Optional[dict]:

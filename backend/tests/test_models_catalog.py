@@ -82,13 +82,22 @@ def _ids(snap, kind):
 
 @respx.mock
 def test_catalog_groups_models_by_capability(auth_client, monkeypatch):
-    _real(monkeypatch)
+    # A (fake) Sogni key so the static Sogni entries are usable too.
+    _real(monkeypatch, SOGNI_API_KEY="sk-test-123456789")
     _mock_sources()
     snap = auth_client.post("/api/models/refresh").json()
     assert _ids(snap, "chat") == {"anthropic/claude-sonnet-x", "openai/gpt-4o-mini"}
     assert _ids(snap, "tts") == {"openai/gpt-audio-mini", "openai/gpt-4o-mini-tts", "elevenlabs"}
-    assert _ids(snap, "image") == {"google/gemini-2.5-flash-image", "openai/gpt-image-2"}
-    assert _ids(snap, "video") == {"alibaba/wan-3.0", "heygen/heygen-video-1"}
+    # The refresh also adds the static Sogni catalog (spec: Sogni provider);
+    # the OpenRouter-sourced sets are unchanged.
+    assert {i for i in _ids(snap, "image") if not i.startswith("sogni/")} == \
+        {"google/gemini-2.5-flash-image", "openai/gpt-image-2"}
+    assert {i for i in _ids(snap, "video") if not i.startswith("sogni/")} == \
+        {"alibaba/wan-3.0", "heygen/heygen-video-1"}
+    sogni = {e["id"]: e for e in snap["entries"] if e["id"].startswith("sogni/")}
+    assert {"sogni/krea-2-turbo", "sogni/ltx25"} <= set(sogni)
+    assert sogni["sogni/krea-2-turbo"]["kind"] == "image" and sogni["sogni/ltx25"]["kind"] == "video"
+    assert {e["provider"] for e in sogni.values()} == {"sogni"}
     assert _ids(snap, "lipsync") == {"heygen/avatar-iv"}
     assert _ids(snap, "music") == {"google/lyria-3-pro-preview", "google/lyria-3-clip-preview",
                                    "google/lyria-3.5", "elevenlabs", "elevenlabs/music_v2_5",

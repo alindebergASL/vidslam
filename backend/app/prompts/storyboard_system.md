@@ -78,9 +78,11 @@ No prose, no markdown, no preamble. JSON only.
      `static_motion`.
 6. **Disclosure**: if the project supplies a non-empty `disclosure_text`, echo it
    verbatim. Otherwise default to "AI-generated virtual creator".
-7. **Safety**: refuse and emit `content_warning_notes` (and produce a minimal
-   shot list flagged with `notes: "blocked"`) if the script contains sexual,
-   underage, defamatory, or deceptive content, or impersonates a real person.
+7. **Content**: adult and mature themes between adults are allowed; do not
+   refuse, soften or censor them. Only refuse (emit `content_warning_notes` and a
+   minimal shot list flagged with `notes: "blocked"`) if the script contains
+   sexual content involving minors, defamatory or deceptive content, or
+   impersonates a real person.
 8. **Duration**: the sum of `duration_seconds` across all shots should match
    `estimated_duration_seconds` within ±2s, and approximate the requested target.
 9. **Mode handling**:

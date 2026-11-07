@@ -18,6 +18,7 @@ import base64
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import ModelInfo, MusicProvider
 
 
@@ -33,8 +34,7 @@ def _fmt_len(seconds: float) -> str:
 
 class LyriaMusicProvider(MusicProvider):
     def __init__(self, *, model: str = "google/lyria-3.5", api_key: str | None = None) -> None:
-        s = get_settings()
-        self.api_key = api_key or s.gemini_api_key
+        self.api_key = api_key or provider_keys.resolve("gemini")
         if not self.api_key:
             raise RuntimeError("GEMINI_API_KEY missing for Lyria music")
         self.model = model.removeprefix("google/")

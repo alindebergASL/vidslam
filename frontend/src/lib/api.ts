@@ -89,6 +89,29 @@ export type Ingredient = {
   assets: Asset[];
 };
 
+export type ApiKeySource = "app" | "env" | "none" | "unreadable";
+
+export type ApiKeyStatus = {
+  name: string;
+  label: string;
+  env_var: string;
+  powers: string;
+  docs_url: string;
+  set: boolean;
+  source: ApiKeySource;
+  last4: string | null;
+  updated_at: string | null;
+  /** A problem visible from the key's shape alone (e.g. a Sogni worker key). */
+  warning?: string | null;
+};
+
+export type ApiKeysResponse = {
+  mock_providers: boolean;
+  keys: ApiKeyStatus[];
+};
+
+export type ApiKeyTestResult = { ok: boolean; detail: string };
+
 export type SystemInfo = {
   version: string;
   mock_providers: boolean;
@@ -97,7 +120,7 @@ export type SystemInfo = {
   data_dir: string;
   public_base_url: string;
   redis_configured: boolean;
-  keys: { openrouter: boolean; elevenlabs: boolean; gemini?: boolean };
+  keys: { openrouter: boolean; elevenlabs: boolean; gemini?: boolean; replicate?: boolean; sogni?: boolean };
   models: {
     chat: string | null;
     image: string | null;
@@ -490,7 +513,7 @@ export type CatalogEntry = {
   id: string;
   kind: ModelKind;
   name: string;
-  provider: "openrouter" | "gemini" | "elevenlabs";
+  provider: "openrouter" | "gemini" | "elevenlabs" | "sogni" | (string & {});
   description: string;
   usable: boolean;
   new: boolean;
@@ -507,6 +530,8 @@ export type CatalogEntry = {
   resolutions?: string[];
   pricing_skus?: Record<string, string>;
   also_via?: string;
+  /** Short catalog note (e.g. Sogni: "Premium Spark", "first frame"). */
+  notes?: string;
 };
 
 export type ActiveModel = {
@@ -731,6 +756,18 @@ export const api = {
       }[];
     }>("/api/providers/health-check", { method: "POST" }),
   systemInfo: () => req<SystemInfo>("/api/system/info"),
+
+  // in-app API keys (values are write-only: the server never returns them)
+  listApiKeys: () => req<ApiKeysResponse>("/api/settings/keys"),
+  setApiKey: (name: string, value: string) =>
+    req<ApiKeyStatus>(`/api/settings/keys/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ value }),
+    }),
+  clearApiKey: (name: string) =>
+    req<ApiKeyStatus>(`/api/settings/keys/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  testApiKey: (name: string) =>
+    req<ApiKeyTestResult>(`/api/settings/keys/${encodeURIComponent(name)}/test`, { method: "POST" }),
   seedDemo: () =>
     req<{ ok: boolean; already_seeded: boolean; counts: { avatars: number; projects: number } }>(
       "/api/system/seed",

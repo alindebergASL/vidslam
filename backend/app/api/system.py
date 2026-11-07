@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..config import get_settings
 from ..db import get_db
+from ..services import provider_keys
 from ..services.model_registry import active_model as _active_model
 from .auth import require_auth
 
@@ -34,11 +35,7 @@ def system_info(db: Session = Depends(get_db)) -> dict:
         "data_dir": s.data_dir,
         "public_base_url": s.public_base_url,
         "redis_configured": bool(s.redis_url),
-        "keys": {
-            "openrouter": bool(s.openrouter_api_key),
-            "elevenlabs": bool(s.elevenlabs_api_key),
-            "gemini": bool(s.gemini_api_key),
-        },
+        "keys": {name: provider_keys.has(name) for name in provider_keys.KEYS},
         "models": {
             "chat": _active_model("chat") or None,
             "image": _active_model("image") or None,

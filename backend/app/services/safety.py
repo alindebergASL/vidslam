@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import re
 
+# Adult content between adults is allowed (no NSFW gate). What stays
+# blocked is sexual content involving minors, and threats against a named
+# person.
 _BLOCKED_PATTERNS = [
-    re.compile(r"\b(child|minor|underage|teen)\b.*\b(sex|nude|naked|porn)\b", re.I),
-    re.compile(r"\b(porn|nude|naked|nsfw|fetish)\b", re.I),
+    re.compile(r"\b(child|children|kid|kids|minor|minors|underage|teen|teens|preteen)\b.*"
+               r"\b(sex|sexual|nude|naked|porn|nsfw|explicit)\b", re.I),
+    re.compile(r"\b(sex|sexual|nude|naked|porn|nsfw|explicit)\b.*"
+               r"\b(child|children|kid|kids|minor|minors|underage|teen|teens|preteen)\b", re.I),
     re.compile(r"\b(kill|murder|assassinate)\b\s+(?:the\s+)?[A-Z][a-z]+", re.I),
-    re.compile(r"\b(cp|loli)\b", re.I),
+    re.compile(r"\b(cp|loli|shota)\b", re.I),
 ]
 
 
@@ -26,6 +31,5 @@ def validate_script(script: str) -> None:
         if pat.search(script):
             raise UnsafeScriptError(
                 "Script appears to contain disallowed content "
-                "(sexual content involving minors, explicit sexual content, "
-                "or threats against a specific person)."
+                "(sexual content involving minors, or threats against a specific person)."
             )

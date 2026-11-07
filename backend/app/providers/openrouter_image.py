@@ -5,6 +5,7 @@ import base64
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import ImageProvider, ImageRef, ModelInfo
 
 
@@ -16,7 +17,7 @@ class OpenRouterImageProvider(ImageProvider):
     """
 
     def __init__(self, *, api_key: str | None = None, model: str | None = None) -> None:
-        self.api_key = api_key or get_settings().openrouter_api_key
+        self.api_key = api_key or provider_keys.resolve("openrouter")
         self.model = model or get_settings().openrouter_image_model
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY missing for real image provider")

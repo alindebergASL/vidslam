@@ -3,12 +3,13 @@ from __future__ import annotations
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import TTSProvider
 
 
 class ElevenLabsTTSProvider(TTSProvider):
     def __init__(self, *, api_key: str | None = None) -> None:
-        self.api_key = api_key or get_settings().elevenlabs_api_key
+        self.api_key = api_key or provider_keys.resolve("elevenlabs")
         if not self.api_key:
             raise RuntimeError("ELEVENLABS_API_KEY missing for real tts provider")
 
