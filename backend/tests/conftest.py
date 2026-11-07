@@ -26,6 +26,11 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     # the dedicated rate-limit tests dial these down explicitly.
     monkeypatch.setenv("RATE_LIMIT_GENERATION_BURST", "10000")
     monkeypatch.setenv("RATE_LIMIT_GENERATION_PER_MINUTE", "10000")
+    # Sogni's model list comes from the bundled snapshot (no network in tests).
+    monkeypatch.setenv("SOGNI_TOOLS_MANIFEST_URL", "")
+    from app.providers import sogni as _sogni
+
+    _sogni._reset_listed()
     # Reset cached singletons (settings + mock video + rate limiter).
     from app import config as _c
     from app.providers import mock_video as _mv
