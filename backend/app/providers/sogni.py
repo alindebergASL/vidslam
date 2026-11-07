@@ -277,6 +277,9 @@ _VIDEO_INFO = {m.selector: m for m in _VIDEOS}
 # list is refreshed with the model catalog (SOGNI_TOOLS_MANIFEST_URL), kept
 # in DATA_DIR, and falls back to the copy bundled here.
 LISTED_TOOLS = ("generate_image", "generate_video", "animate_photo")
+# Also synced, but not required (a listing without it is still valid): the
+# models Sogni's edit_image tool takes, which use reference pictures.
+EDIT_TOOL = "edit_image"
 _BUNDLED = Path(__file__).with_name("sogni_tools.json")
 _SELECTOR_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 _listed: Optional[dict] = None
@@ -365,10 +368,10 @@ def parse_manifest(doc: dict) -> dict[str, list[str]]:
             continue
         fn = t.get("function") if isinstance(t.get("function"), dict) else {}
         name = t.get("name") or fn.get("name")
-        if name not in LISTED_TOOLS:
+        if name not in LISTED_TOOLS and name != EDIT_TOOL:
             continue
         params = t.get("parameters") or t.get("input_schema") or fn.get("parameters") or {}
-        key = "model" if name == "generate_image" else "videoModel"
+        key = "model" if name in ("generate_image", EDIT_TOOL) else "videoModel"
         enum = ((params.get("properties") or {}).get(key) or {}).get("enum") or []
         tools[name] = [s for s in enum if isinstance(s, str) and _SELECTOR_RE.fullmatch(s)]
     return tools
@@ -425,9 +428,12 @@ def _pretty(sel: str) -> str:
                                                                     w.capitalize()) for w in words)
 
 
+_VENDOR_IMAGE_PREFIXES = ("gpt-image", "seedream", "nano-banana", "imagen", "ideogram", "midjourney")
+
+
 def _generic_image(sel: str) -> ImageModel:
     """A selector Sogni lists that we have no notes for yet."""
-    if sel.startswith(("gpt-image", "seedream", "nano-banana", "imagen", "ideogram", "midjourney")):
+    if sel.startswith(_VENDOR_IMAGE_PREFIXES):
         return ImageModel(sel, f"{_pretty(sel)} (via Sogni)", "Newly listed by Sogni. Premium Spark; price "
                           "is an estimate.", 20.0, premium=True, family=VENDOR)
     if sel.endswith("-xl") or "pony" in sel or "sdxl" in sel:
@@ -605,6 +611,202 @@ def spend_note(model: str, kind: str) -> str:
 def takes_source_image(model: str) -> bool:
     m = image_model(model)
     return bool(m and m.img2img)
+
+
+# ---------- reference pictures: Sogni's edit_image tool ----------
+
+# generate_image doesn't apply a reference picture through the workflow API
+# (see ImageModel.img2img), but edit_image does: "the primary image and any
+# additional uploaded images are passed as context images" (Sogni's tool
+# schema). Tested live 2026-11-07: Qwen, Qwen Lightning, FLUX.3 Klein and
+# Krea Identity Edit all kept the exact scene (contextImages 1), 12-57 s,
+# and left the source's shape when no aspect ratio was sent. A blind panel
+# found FLUX.3 Klein and Krea the most faithful to the place.
+
+
+@dataclass(frozen=True)
+class EditModel:
+    selector: str
+    name: str
+    spark: float  # one reference picture at ~1 MP
+    spark_per_ref: float  # each further reference picture
+    max_refs: int
+    premium: bool = False
+    identity: bool = False  # made for keeping a person's likeness
+    naming: str = "picture"  # how a prompt names the pictures: picture | ordinal | context
+
+
+# Documented prices where Sogni lists them (FLUX.3 Klein 2.19 / 3.45 / 4.88
+# Spark for 1-3 refs; Krea Identity Edit 6.49 / 10.4; Qwen Image Edit 8.0);
+# the rest are estimates.
+_EDITS: tuple[EditModel, ...] = (
+    EditModel("flux-3-klein", "FLUX.3 Klein edit", 2.19, 1.35, 10, naming="ordinal"),
+    EditModel("krea-identity-edit", "Krea 2 Identity Edit", 6.49, 3.9, 2, identity=True, naming="context"),
+    EditModel("dark-beast-krea2-identity-edit", "Dark Beast Krea 2 Identity Edit", 7.9, 4.4, 2, identity=True,
+              naming="context"),
+    EditModel("qwen", "Qwen Image Edit", 8.0, 5.9, 3),
+    EditModel("qwen-lightning", "Qwen Image Edit Lightning", 4.0, 3.0, 3),
+    EditModel("gpt-image-2", "GPT Image 2 edit", 30.8, 17.0, 16, premium=True),
+    EditModel("gpt-image-2.5-sunburst", "GPT Image 2.5 Sunburst edit", 30.0, 17.0, 16, premium=True),
+    EditModel("gpt-image-2.5-flare", "GPT Image 2.5 Flare edit", 20.0, 17.0, 16, premium=True),
+    EditModel("gpt-image-2.6-sunburst", "GPT Image 2.6 Sunburst edit", 30.0, 17.0, 16, premium=True),
+    EditModel("gpt-image-2.6-flare", "GPT Image 2.6 Flare edit", 20.0, 17.0, 16, premium=True),
+)
+_EDIT_INFO = {m.selector: m for m in _EDITS}
+# A picked image model's own edit version. Identity twins only keep a
+# likeness; for a place or a guide picture they give way to the scene default.
+_EDIT_TWIN = {
+    "flux-3-klein": "flux-3-klein", "qwen-2512": "qwen", "qwen-2512-lightning": "qwen-lightning",
+    "krea-2-turbo": "krea-identity-edit", "dark-beast-krea2": "dark-beast-krea2-identity-edit",
+    "gpt-image-2": "gpt-image-2", "gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare": "gpt-image-2.5-flare", "gpt-image-2.6-sunburst": "gpt-image-2.6-sunburst",
+    "gpt-image-2.6-flare": "gpt-image-2.6-flare",
+}
+INTENTS = ("same_place", "identity", "guide")
+
+
+@dataclass(frozen=True)
+class EditRoute:
+    model: EditModel
+    refs: tuple[ImageRef, ...]
+    intent: str
+    send_aspect: bool  # same_place keeps the source picture's own shape
+
+
+def edit_models() -> tuple[EditModel, ...]:
+    """The edit models Sogni lists (synced), else our table."""
+    sels = listed()["tools"].get(EDIT_TOOL) or []
+    if not sels:
+        return _EDITS
+    return tuple(_EDIT_INFO.get(s) or _generic_edit(s) for s in dict.fromkeys(sels))
+
+
+def _generic_edit(sel: str) -> EditModel:
+    """An editor Sogni lists that we have no notes for yet."""
+    if sel.startswith(_VENDOR_IMAGE_PREFIXES):
+        return EditModel(sel, f"{_pretty(sel)} edit", 30.0, 17.0, 16, premium=True)
+    return EditModel(sel, f"{_pretty(sel)} edit", 8.0, 5.0, 3, identity="identity" in sel,
+                     naming="context" if "krea" in sel else "picture")
+
+
+def reference_intent(refs: list[ImageRef], intent: str = "") -> str:
+    """What the reference pictures are for: keep a person (identity), keep
+    this exact place in other light (same_place, ambient's Day to night), or
+    guide a new picture (guide: a style, an object, a place)."""
+    if intent in INTENTS:
+        return intent
+    if any(r.role == "character" for r in refs):
+        return "identity"
+    return "guide"
+
+
+def edit_route(model: str, refs: list[ImageRef], intent: str = "") -> Optional[EditRoute]:
+    """Which edit model makes a picture with these references for `model`
+    (a sogni/ image model), or None when references aren't routed to edits."""
+    s = get_settings()
+    if not refs or not s.sogni_edit_references:
+        return None
+    intent = reference_intent(refs, intent)
+    offered = {m.selector: m for m in edit_models()}
+    sel = selector(model)
+    # Its own edit version: from our notes, or the same selector in Sogni's edit list.
+    twin = offered.get(_EDIT_TWIN.get(sel, "")) or offered.get(sel)
+    if twin is not None and twin.identity and intent != "identity":
+        twin = None  # an identity editor is for likeness; a place gets the scene editor
+    default = selector(s.sogni_identity_edit_model if intent == "identity" else s.sogni_scene_edit_model)
+    if twin is None and default and default not in offered:
+        log.warning("sogni: edit model %r isn't in Sogni's edit list; using the next default", default)
+    choice = twin or offered.get(default)
+    if choice is not None and len(refs) > choice.max_refs and not choice.premium:
+        choice = offered.get("flux-3-klein") or choice  # more pictures than it takes: Klein takes 10
+    for fallback in ("flux-3-klein", "qwen"):
+        if choice is None:
+            choice = offered.get(fallback)
+    if choice is None:
+        return None
+    return EditRoute(choice, _order_refs(list(refs), intent, choice.max_refs), intent,
+                     send_aspect=intent != "same_place")
+
+
+def _order_refs(refs: list[ImageRef], intent: str, limit: int) -> tuple[ImageRef, ...]:
+    """The base picture first (a place), then the people, then style and
+    object pictures (details), as Sogni's edit guidance asks. Over the
+    editor's limit, details go before places, and people last."""
+    if intent == "same_place":
+        return tuple(refs[:limit])
+    if intent == "guide":  # a place picture is the base to edit; style and object pictures guide it
+        order = [i for i, r in enumerate(refs) if r.role == "scene"] + \
+                [i for i, r in enumerate(refs) if r.role != "scene"]
+        return tuple(refs[i] for i in order[:limit])
+    people = [i for i, r in enumerate(refs) if r.role == "character"]
+    places = [i for i, r in enumerate(refs) if r.role == "scene"]
+    details = [i for i, r in enumerate(refs) if r.role not in ("character", "scene")]
+    keep = set(people[:limit])
+    for i in places + details:
+        if len(keep) >= limit:
+            break
+        keep.add(i)
+    return tuple(refs[i] for i in places + people + details if i in keep)
+
+
+def can_use_references(model: str) -> bool:
+    """Whether a sogni/ image model's call applies reference pictures."""
+    probe = [ImageRef(url="https://example.invalid/x.png", role="scene")]
+    return takes_source_image(model) or edit_route(model, probe, "same_place") is not None
+
+
+def _edit_model(edit_selector: str) -> Optional[EditModel]:
+    return _EDIT_INFO.get(edit_selector) or next((e for e in edit_models() if e.selector == edit_selector), None)
+
+
+def edit_cost_usd(edit_selector: str, n_refs: int = 1) -> float:
+    m = _edit_model(edit_selector)
+    if m is None:
+        return get_settings().cost_image_per_item
+    return round((m.spark + m.spark_per_ref * max(n_refs - 1, 0)) * SPARK_USD, 6)
+
+
+def edit_spend_usd(edit_selector: str, n_refs: int = 1) -> float:
+    """What one edit counts toward Spend: 0 for Sogni-native editors on Free
+    Spark (PR #19's rule), the list price for GPT Image (Premium Spark)."""
+    m = _edit_model(edit_selector)
+    premium = m.premium if m is not None else edit_selector.startswith(_VENDOR_IMAGE_PREFIXES)
+    if not _counts_toward_spend(edit_selector, premium):
+        return 0.0
+    return edit_cost_usd(edit_selector, n_refs)
+
+
+def _picture_name(i: int, naming: str) -> str:
+    if naming == "ordinal":
+        words = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth")
+        return f"the {words[i]} image" if i < len(words) else f"image {i + 1}"
+    if naming == "context":
+        return f"context_image_{i}"
+    return f"picture {i + 1}"
+
+
+def edit_prompt(route: EditRoute, prompt: str) -> str:
+    """The caller's prompt with what each picture is for. same_place prompts
+    are complete already (ambient writes them for an edit)."""
+    if route.intent == "same_place":
+        return prompt
+    def cap(who: str) -> str:  # context_image_N is a literal token: never capitalised
+        return who if route.model.naming == "context" else who[0].upper() + who[1:]
+
+    lines = []
+    for i, r in enumerate(route.refs):
+        who = cap(_picture_name(i, route.model.naming))
+        if r.role == "character":
+            lines.append(f"{who} shows {r.name or 'the character'}: keep their exact likeness, face, hair and build.")
+        else:
+            what = {"style": "the style to follow", "object": f"{r.name or 'an object'} to include as it is",
+                    "scene": f"the place{(' (' + r.name + ')') if r.name else ''}"}.get(r.role, "a reference")
+            lines.append(f"{who} is {what}.")
+    # Keep the base picture's content only when it is a place; a style or
+    # object picture first means a new picture.
+    tail = ("Preserve all unmentioned details." if route.refs and route.refs[0].role == "scene"
+            else "The picture itself is new; use the pictures only as described.")
+    return " ".join([*lines, prompt.strip(), tail])
 
 
 def capabilities_for(model: str) -> VideoCapabilities:
@@ -883,6 +1085,7 @@ class SogniImageProvider(ImageProvider):
     def __init__(self, *, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         self.client = SogniClient(api_key)
         self.model = model or f"{PREFIX}krea-2-turbo"
+        self.last_route: Optional[EditRoute] = None  # the edit used by the last generate(), if any
 
     def list_models(self) -> list[ModelInfo]:
         return [ModelInfo(id=f"{PREFIX}{m.selector}", name=display_name(m), modality="image",
@@ -910,17 +1113,17 @@ class SogniImageProvider(ImageProvider):
         if settings.get("aspect_ratio"):
             args["aspectRatio"] = str(settings["aspect_ratio"])
         media: list[dict] = []
-        # A frame or a "scene" reference (same place, other time of day — the
-        # ambient drift/anchor variants) is the img2img source; character /
-        # style / object references have no input on generate_image.
         spec = image_model(model)
+        self.last_route = None
+        if references and not (spec and spec.img2img):
+            route = edit_route(model, list(references), str(settings.get("reference_intent") or ""))
+            if route is not None:
+                return self._edit(model, route, prompt, negative_prompt, settings)
+        # A frame or a "scene" reference is the img2img source on a model
+        # marked img2img (none today); otherwise generate_image is text only.
         source = next((r for r in references or [] if r.frame_type), None) or next(
             (r for r in references or [] if r.role == "scene"), None)
-        if source is None and settings.get("img2img") and references:
-            source = references[0]
         if source is not None and not (spec and spec.img2img):
-            # No source image is applied on generate_image (see
-            # ImageModel.img2img): send text only rather than unused fields.
             log.info("sogni %s: no image-to-image through the workflow API; ignoring the source image", model)
             source = None
             references = []
@@ -943,6 +1146,33 @@ class SogniImageProvider(ImageProvider):
 
         spend.record_rate_card("sogni", "image", model, image_spend_usd(model),
                                note=spend_note(model, "image"))
+        return data
+
+    def _edit(self, model: str, route: EditRoute, prompt: str, negative_prompt: str, settings: dict) -> bytes:
+        """A picture made from reference pictures, on edit_image."""
+        args: dict = {"prompt": edit_prompt(route, prompt), "model": route.model.selector,
+                      "sourceImageIndex": -1, "numberOfVariations": 1, "outputFormat": "png"}
+        if route.send_aspect and settings.get("aspect_ratio"):
+            args["aspectRatio"] = str(settings["aspect_ratio"])
+        if negative_prompt:  # edit_image has no negative prompt
+            log.info("sogni %s: edit_image takes no negative prompt; dropped", model)
+        media = [{"kind": "image", "url": r.url} for r in route.refs]
+        self.last_route = route
+        wf = self.client.start(title=prompt[:80], tool=EDIT_TOOL, arguments=args, media_references=media)
+        wf = self._wait(wf)
+        url = self.client.artifact_url(wf, "image")
+        if not url:
+            raise SogniError(f"Sogni edit workflow {wf.get('status')} without an image")
+        data = self.client.download(url)
+        from ..services import spend
+
+        n = len(route.refs)
+        counted = edit_spend_usd(route.model.selector, n)
+        note = (f"edit_image ({route.model.name}, {n} reference picture{'s' if n != 1 else ''}) for {model}; "
+                + ("Sogni Free Spark model: not counted (list price ~"
+                   f"{edit_cost_usd(route.model.selector, n) / SPARK_USD:.1f} Spark)" if not counted
+                   else "Sogni Spark price-table estimate"))
+        spend.record_rate_card("sogni", "image", f"{PREFIX}{route.model.selector} (edit)", counted, note=note)
         return data
 
     def _wait(self, wf: dict) -> dict:

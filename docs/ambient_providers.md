@@ -229,15 +229,40 @@ bundled copy.
   both under text-to-video too. The "uncensored" tag follows the schema's
   list of NSFW-capable image models, and the video models named uncensored /
   spicy.
-- **No image-to-image yet.** The schema documents a source image for Z-Image,
-  Z-Image Turbo and Krea 2 Turbo, but through the workflow API it isn't
-  applied (tested Nov 2026 on three models at two strengths: nothing of the
-  source came through, and Sogni's billing request showed
-  `startingImageStrength: null`). So Sogni picture models get text only, and
-  an ambient scene's "same place, other time of day" stills try the fallback
-  picture model (`AMBIENT_STILL_FALLBACK_MODEL`) first, which takes the
-  reference, and the scene's Sogni model (from the text alone) if that fails.
-  The estimate prices those stills at the fallback model.
+- **Reference pictures go to Sogni's edit tool.** `generate_image` doesn't
+  apply a picture through the workflow API (tested Nov 2026: three models, two
+  strengths, nothing of the source came through, and Sogni's billing request
+  showed `startingImageStrength: null`; the SDK's real image-to-image only
+  redraws a similar scene). `edit_image` does: "the primary image and any
+  additional uploaded images are passed as context images". So a Sogni
+  picture model given references makes an edit (`SOGNI_EDIT_REFERENCES`):
+  - **The editor:** the picked model's own edit version where it has one
+    (FLUX.3 Klein, Qwen 2512 → Qwen Image Edit, GPT Image, and for keeping a
+    person Krea 2 → Krea 2 Identity Edit); otherwise
+    `SOGNI_IDENTITY_EDIT_MODEL` (Krea 2 Identity Edit, up to 2 pictures) for a
+    Cast character and `SOGNI_SCENE_EDIT_MODEL` (FLUX.3 Klein, up to 10) for a
+    place, style or object. Sogni's list of edit models is synced too.
+  - **The prompt** says which picture is which: a place first, then people,
+    then style and object pictures (over an editor's limit, people are kept
+    first). An edit has no negative prompt. A "same place" edit keeps the
+    source's shape; Studio's sends its aspect ratio.
+  - **Spend:** Sogni-native editors count $0 on Free Spark (list price in the
+    note); GPT Image edits are Premium Spark and count.
+  - **Studio** now sends references in the order you picked them, each with
+    its role (character, scene, style, object; a character's logo is an
+    object) and name; a failed edit is an error, never a picture made without
+    your references. Storyboard shots keep their references in asset order.
+  - **Day to night "same place" stills** on a Sogni Picture model try, in
+    order: the fallback picture model (`AMBIENT_STILL_FALLBACK_MODEL`, the most
+    realistic relight in a blind test), a Sogni edit (the most faithful to the
+    place; $0 on Free Spark with Sogni's own editors, while a GPT Image still
+    model edits with Premium Spark), then the Sogni model from the text alone
+    so the scene still finishes. `SOGNI_SAME_PLACE_FIRST=true` tries the Sogni
+    edit first on scenes whose Picture model is a Sogni one. A Sogni edit gets an instruction to change only the light; the
+    fallback model keeps the full still prompt plus "exactly the same place".
+    (A "real long-exposure night" wording made Nano Banana's night read as
+    night in a blind panel, 9/9 votes against 3/9, but turned a still pond into
+    streaks and lost on fidelity, so it isn't used yet.)
 - **Spend** is recorded from Sogni's price table (1 Spark = $0.005) as an
   estimate: Sogni's workflow results carry no cost. Free-Spark jobs didn't
   change the account balance (`/v2/account/balance`) in our tests.

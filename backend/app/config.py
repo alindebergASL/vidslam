@@ -168,6 +168,18 @@ class Settings(BaseSettings):
     sogni_image_timeout_seconds: float = 300.0
     # img2img strength when a picture is passed as the source image.
     sogni_image_strength: float = 0.35
+    # Reference pictures on a Sogni picture model go to Sogni's edit_image
+    # tool (its generate_image ignores them). The editor used when the
+    # picked model has no edit version of its own: for a place or a guide
+    # picture, and for keeping a character's likeness. False: text only.
+    sogni_edit_references: bool = True
+    sogni_scene_edit_model: str = "flux-3-klein"
+    sogni_identity_edit_model: str = "krea-identity-edit"
+    # Day to night's "same place" stills on a Sogni Picture model: by default
+    # the fallback picture model (Nano Banana, the most realistic relight in
+    # a blind test, about $0.055) goes first and a Sogni edit (most faithful,
+    # $0 on Free Spark) second. True tries the Sogni edit first.
+    sogni_same_place_first: bool = False
     # A 429 on a workflow start is retried after Retry-After up to this
     # many seconds; a longer wait fails the call with the wait in the message.
     sogni_max_retry_after_seconds: float = 30.0

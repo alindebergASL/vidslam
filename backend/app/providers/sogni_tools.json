@@ -79,6 +79,18 @@
    "minimax-h3-fasth3-flf2v-turbo-2stage",
    "wan3.0-video",
    "wan3.0-spicy-video"
+  ],
+  "edit_image": [
+   "gpt-image-2",
+   "gpt-image-2.5-sunburst",
+   "gpt-image-2.5-flare",
+   "qwen-lightning",
+   "qwen",
+   "krea-identity-edit",
+   "dark-beast-krea2-identity-edit",
+   "flux-3-klein",
+   "gpt-image-2.6-sunburst",
+   "gpt-image-2.6-flare"
   ]
  }
 }

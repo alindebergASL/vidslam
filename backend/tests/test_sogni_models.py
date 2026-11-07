@@ -338,12 +338,17 @@ def test_fields_go_only_to_models_that_take_them(client, live_sogni):  # noqa: F
     assert "negativePrompt" not in r2v
 
 
-def test_text_only_image_models_get_no_source_image(client, live_sogni):  # noqa: F811
+def test_without_edits_image_models_get_no_source_image(client, live_sogni, monkeypatch):  # noqa: F811
+    """SOGNI_EDIT_REFERENCES=false: generate_image text only (it ignores a
+    source image anyway); the default edit route is in test_sogni_edit.py."""
+    from app import config
     from app.providers.base import ImageRef
     from app.providers.sogni import SogniImageProvider
 
     from .test_sogni import ART_IMG, PNG, _wf
 
+    monkeypatch.setenv("SOGNI_EDIT_REFERENCES", "false")
+    config.get_settings.cache_clear()
     done = _wf("completed", steps=[{"id": "s1", "artifacts": [{"id": "a", "kind": "image", "url": ART_IMG}]}])
     with respx.mock() as router:
         start = router.post(WF).mock(return_value=httpx.Response(201, json=done))
@@ -352,8 +357,10 @@ def test_text_only_image_models_get_no_source_image(client, live_sogni):  # noqa
                                       references=[ImageRef(url="https://x/first.png", role="scene")])
     body = json.loads(start.calls[0].request.content)
     args = body["input"]["steps"][0]["arguments"]
+    assert body["input"]["steps"][0]["toolName"] == "generate_image"
     assert not body.get("media_references") and "sourceImageIndex" not in args
     assert "starting_image_strength" not in args
+    config.get_settings.cache_clear()
 
 
 def test_picker_names_say_frames_once(client):
@@ -441,7 +448,7 @@ def test_a_model_sogni_stops_listing_keeps_its_price(monkeypatch):
     config.get_settings.cache_clear()
 
 
-def test_same_place_stills_prefer_a_model_that_takes_the_reference(client, monkeypatch):
+def test_same_place_stills_try_the_fallback_then_a_sogni_edit_then_text(client, monkeypatch):
     from app.db import SessionLocal
     from app.providers.base import ImageRef
     from app.schemas.ambient import AmbientConfig
@@ -449,13 +456,13 @@ def test_same_place_stills_prefer_a_model_that_takes_the_reference(client, monke
 
     from .test_ambient import SHORT
 
-    calls: list[tuple[str, str]] = []
-    failing: set[str] = set()
+    calls: list[tuple[str, str, int, str]] = []
+    failing: set[tuple[str, bool]] = set()
 
     class Stub:
         def generate(self, *, model, prompt, references, negative_prompt="", settings=None):
-            calls.append((model, prompt))
-            if model in failing:
+            calls.append((model, prompt, len(references), (settings or {}).get("reference_intent", "")))
+            if (model, bool(references)) in failing:
                 raise RuntimeError("down")
             return b"png"
 
@@ -463,22 +470,37 @@ def test_same_place_stills_prefer_a_model_that_takes_the_reference(client, monke
     monkeypatch.setattr(ambient, "routes_per_model", lambda kind, model: True)
     cfg = AmbientConfig(**{**SHORT, "still_model": "sogni/krea-2-turbo"})
     fallback = ambient.still_model_chain(cfg)[1]
+    sogni = "sogni/krea-2-turbo"
     ref = [ImageRef(url="https://x/a.png", role="scene")]
-    same = "night." + ambient._SAME_PLACE
+    assert ambient.reference_still_attempts(cfg) == [(fallback, True), (sogni, True), (sogni, False)]
     db = SessionLocal()
     try:
-        assert ambient.generate_still(db, cfg, prompt="p", aspect_ratio="16:9")[1] == "sogni/krea-2-turbo"
-        # A "same place" still: the model that applies the reference first.
-        assert ambient.generate_still(db, cfg, prompt=same, aspect_ratio="16:9", references=ref)[1] == fallback
-        # It fails: the scene's Sogni model still makes it (from the text alone).
-        failing.add(fallback)
-        assert ambient.generate_still(db, cfg, prompt=same, aspect_ratio="16:9", references=ref)[1] == \
-            "sogni/krea-2-turbo"
+        assert ambient.generate_still(db, cfg, prompt="p", aspect_ratio="16:9")[1] == sogni
+        # A "same place" still: the fallback picture model first, given the edit instruction.
+        assert ambient.generate_still(db, cfg, prompt="full", edit_prompt="relight", aspect_ratio="16:9",
+                                      references=ref)[1] == fallback
+        # It fails: a Sogni edit of the same place.
+        failing.add((fallback, True))
+        assert ambient.generate_still(db, cfg, prompt="full", edit_prompt="relight", aspect_ratio="16:9",
+                                      references=ref)[1] == sogni
+        # That fails too: the Sogni model from the text alone, so the scene still finishes.
+        failing.add((sogni, True))
+        assert ambient.generate_still(db, cfg, prompt="full", edit_prompt="relight", aspect_ratio="16:9",
+                                      references=ref)[1] == sogni
     finally:
         db.close()
-    assert [m for m, _ in calls] == ["sogni/krea-2-turbo", fallback, fallback, "sogni/krea-2-turbo"]
-    assert calls[1][1] == same and calls[3][1] == "night."  # no talk of a reference it never sees
-    assert ambient.reference_still_cost(cfg) != ambient.still_cost(cfg)  # priced at the model that makes it
+    assert calls[1] == (fallback, "full" + ambient._SAME_PLACE, 1, "")  # today's prompt for the fallback
+    assert calls[3] == (sogni, "relight", 1, "same_place")  # the edit instruction for a Sogni edit
+    assert calls[-1] == (sogni, "full", 0, "")  # no reference, no talk of one
+    # Free Spark edits cost $0; the fallback is priced as itself.
+    assert ambient.reference_still_cost(cfg) == ambient._still_model_cost(fallback)
+    monkeypatch.setenv("SOGNI_SAME_PLACE_FIRST", "true")
+    from app import config
+
+    config.get_settings.cache_clear()
+    assert ambient.reference_still_attempts(cfg)[0] == (sogni, True)
+    assert ambient.reference_still_cost(cfg) == 0.0
+    config.get_settings.cache_clear()
 
 
 def test_a_failed_sogni_sync_doesnt_mute_model_gone_alerts(client, monkeypatch):
