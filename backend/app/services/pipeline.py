@@ -1115,26 +1115,49 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
 
 
 def save_studio_result_as_asset(
-    db: Session, job: models.AssetGenerationJob, *, asset_type: str = "lifestyle"
+    db: Session,
+    job: models.AssetGenerationJob,
+    *,
+    asset_type: Optional[str] = None,
+    owner_kind: Optional[str] = None,
+    owner_id: Optional[int] = None,
 ) -> models.Asset:
-    """Promote a completed studio job into the owner's asset library."""
-    if job.status != "completed" or not job.result_path:
+    """File a completed studio image into a cast member's asset library.
+
+    Defaults to the job's own owner. Each call makes a new asset owning its
+    own copy of the image, so one result can go to several characters and
+    deleting the asset never takes the Studio result with it (or the other
+    way round)."""
+    if job.status not in ("completed", "saved") or not job.result_path:
         raise ValueError("studio job is not completed")
-    is_image = job.output_kind == "image"
-    if not is_image:
+    if job.output_kind != "image":
         # We only file image results into the visual asset library; clips stay in /studio.
         raise ValueError("only image studio results can be saved as cast assets")
     import hashlib
+    import uuid
 
-    raw = Path(job.result_path).read_bytes()
-    _ext, mime, width, height = storage.image_info(raw)
+    from .s3 import mirror_to_s3
+
+    kind = owner_kind or job.owner_kind
+    oid = owner_id if owner_id is not None else job.owner_id
+    if asset_type is None:
+        asset_type = "lifestyle" if kind == "avatar" else "reference"
+    src = Path(job.result_path)
+    raw = src.read_bytes()
+    ext, mime, width, height = storage.image_info(raw)
+    # Same place uploads live, so the asset is an ordinary owned file.
+    subdir = get_settings().data_path / "uploads" / kind / str(oid)
+    subdir.mkdir(parents=True, exist_ok=True)
+    dest = subdir / f"{uuid.uuid4().hex}.{ext}"
+    dest.write_bytes(raw)
+    mirror_to_s3(dest, content_type=mime)
     asset = models.Asset(
-        owner_kind=job.owner_kind,
-        avatar_id=job.owner_id if job.owner_kind == "avatar" else None,
-        ingredient_id=job.owner_id if job.owner_kind == "ingredient" else None,
+        owner_kind=kind,
+        avatar_id=oid if kind == "avatar" else None,
+        ingredient_id=oid if kind == "ingredient" else None,
         asset_type=asset_type,
-        original_filename=Path(job.result_path).name,
-        file_path=job.result_path,
+        original_filename=src.name,
+        file_path=str(dest),
         mime_type=mime,
         width=width,
         height=height,
@@ -1148,6 +1171,7 @@ def save_studio_result_as_asset(
     job.status = "saved"
     job.updated_at = datetime.utcnow()
     db.commit()
+    db.refresh(asset)
     return asset
 
 
@@ -1271,6 +1295,10 @@ def run_training_job(db: Session, job_id: int) -> None:
 def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
     job = db.get(models.AssetGenerationJob, vjob.ref_id)
     if job is None:
+        # The Studio job was deleted while the clip was rendering: nothing
+        # will ever show this download, so don't leave it on disk.
+        if vjob.result_path:
+            Path(vjob.result_path).unlink(missing_ok=True)
         return
     data = Path(vjob.result_path).read_bytes()
     path = storage.save_generated_bytes(data, extension="mp4", subdir_name="clips")

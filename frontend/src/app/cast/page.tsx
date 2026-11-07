@@ -5,6 +5,8 @@ import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { Dropzone } from "@/components/Dropzone";
 import { TrainPanel } from "@/components/TrainPanel";
+import { AssignDialog, ASSET_SLOTS, demoteOtherHeroes, slotLabel } from "@/components/AssignDialog";
+import { useToast } from "@/components/Toaster";
 import { api, Asset, Avatar, Ingredient, Project } from "@/lib/api";
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
@@ -160,8 +162,11 @@ function CastInner() {
               kind: "ingredient" as const,
               title: i.name,
               sub: i.visual_identity || i.kind,
-              heroUrl:
-                i.assets[0]?.public_token && api.publicAsset(i.assets[0].public_token),
+              // Same pick as characters: the main picture, else the first image.
+              heroUrl: (() => {
+                const pic = i.assets.find((x) => x.asset_type === "hero") || i.assets[0];
+                return pic?.public_token && api.publicAsset(pic.public_token);
+              })(),
               count: i.assets.length,
               usedInProjects: usage.ingredient[i.id] || 0,
             }))}
@@ -407,6 +412,9 @@ function DetailDrawer({
   const [rights, setRights] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [voices, setVoices] = useState<{ voice_id: string; name: string }[]>([]);
+  const [addingFromStudio, setAddingFromStudio] = useState(false);
+  const [busyAsset, setBusyAsset] = useState<number | null>(null);
+  const toast = useToast();
 
   useEffect(() => {
     if (kind === "avatar") {
@@ -429,6 +437,49 @@ function DetailDrawer({
     setError(null);
     if (kind === "avatar") await api.uploadAvatarAsset(id, file, assetType, true);
     else await api.uploadIngredientAsset(id, file, assetType, true);
+  };
+
+  const changeSlot = async (a: Asset, next: string) => {
+    if (next === a.asset_type || !entity) return;
+    setBusyAsset(a.id);
+    try {
+      await api.updateAsset(a.id, { asset_type: next });
+    } catch (e: any) {
+      toast.error(e.message || "Couldn't change the slot");
+      setBusyAsset(null);
+      return;
+    }
+    // Separate step so a demotion failure isn't reported as a failed slot change.
+    try {
+      // One main picture per cast member: generation reads the first hero.
+      const demoted = next === "hero" ? await demoteOtherHeroes(kind, entity.assets, a.id) : 0;
+      toast.success(
+        `Now the ${slotLabel(kind, next)}` + (demoted ? " (previous main picture moved to the reference slot)" : "")
+      );
+    } catch {
+      toast.error(
+        `Now the ${slotLabel(kind, next)}, but couldn't move the old main picture to the reference slot`
+      );
+    } finally {
+      setBusyAsset(null);
+    }
+    await reload();
+    onChange();
+  };
+
+  const removeAsset = async (a: Asset) => {
+    if (!window.confirm(`Delete this ${slotLabel(kind, a.asset_type).toLowerCase()} image? Projects that use it lose this picture. This can't be undone.`)) return;
+    setBusyAsset(a.id);
+    try {
+      await api.deleteAsset(a.id);
+      toast.success("Image deleted");
+    } catch (e: any) {
+      toast.error(e.message || "Delete failed");
+    } finally {
+      setBusyAsset(null);
+    }
+    await reload();
+    onChange();
   };
 
   if (!entity) return null;
@@ -477,12 +528,9 @@ function DetailDrawer({
               value={assetType}
               onChange={(e) => setAssetType(e.target.value)}
             >
-              {(kind === "avatar"
-                ? ["hero", "reference_sheet", "expression_sheet", "outfit_sheet", "lifestyle", "logo", "other"]
-                : ["hero", "reference", "other"]
-              ).map((t) => (
-                <option key={t} value={t}>
-                  {t}
+              {ASSET_SLOTS[kind].map((t) => (
+                <option key={t.value} value={t.value}>
+                  {t.label}
                 </option>
               ))}
             </select>
@@ -551,23 +599,69 @@ function DetailDrawer({
 
         <TrainPanel kind={kind} id={id} assets={(entity as any).assets} />
 
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <div className="label mb-0">Images ({entity.assets.length})</div>
+          <button className="btn-ghost text-xs" onClick={() => setAddingFromStudio(true)}>
+            + Add from Studio
+          </button>
+        </div>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-          {(entity as any).assets.map((a: Asset) => (
-            <div
-              key={a.id}
-              className="card overflow-hidden aspect-square bg-ink-800 relative"
-            >
-              <img
-                src={api.publicAsset(a.public_token)}
-                className="w-full h-full object-cover"
-                alt={a.asset_type}
-              />
-              <div className="absolute bottom-0 inset-x-0 p-2 bg-black/70 text-[10px] text-ink-100">
-                {a.asset_type} · {a.source}
+          {entity.assets.map((a: Asset) => (
+            <div key={a.id} className={clsx("card overflow-hidden", busyAsset === a.id && "opacity-60")}>
+              <div className="aspect-square bg-ink-800 relative">
+                <img
+                  src={api.publicAsset(a.public_token)}
+                  className="w-full h-full object-cover"
+                  alt={slotLabel(kind, a.asset_type)}
+                />
+                {a.asset_type === "hero" && (
+                  <div className="absolute top-2 left-2 chip text-[10px] py-0.5">Main</div>
+                )}
+                <button
+                  onClick={() => removeAsset(a)}
+                  disabled={busyAsset === a.id}
+                  className="absolute top-2 right-2 chip text-xs py-1 bg-ink-900/85 border-ink-700 hover:text-accent"
+                  aria-label={`Delete ${slotLabel(kind, a.asset_type)} image`}
+                  title="Delete this image"
+                >
+                  Delete
+                </button>
+              </div>
+              <div className="p-2 space-y-1">
+                <select
+                  className="input text-xs py-1.5"
+                  value={a.asset_type}
+                  disabled={busyAsset === a.id}
+                  onChange={(e) => changeSlot(a, e.target.value)}
+                  aria-label="Image slot"
+                >
+                  {ASSET_SLOTS[kind].map((t) => (
+                    <option key={t.value} value={t.value}>
+                      {t.label}
+                    </option>
+                  ))}
+                  {/* Keep legacy/unknown slots visible instead of silently showing another. */}
+                  {!ASSET_SLOTS[kind].some((t) => t.value === a.asset_type) && (
+                    <option value={a.asset_type}>{a.asset_type}</option>
+                  )}
+                </select>
+                <div className="text-[10px] text-ink-400">{a.source === "generated" ? "Generated" : "Uploaded"}</div>
               </div>
             </div>
           ))}
         </div>
+
+        {addingFromStudio && (
+          <AssignDialog
+            owner={{ kind, id, name: (entity as Avatar | Ingredient).name }}
+            onClose={() => setAddingFromStudio(false)}
+            onSaved={async () => {
+              setAddingFromStudio(false);
+              await reload();
+              onChange();
+            }}
+          />
+        )}
       </div>
     </div>
   );

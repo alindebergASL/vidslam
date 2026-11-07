@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db
 from ..schemas import AssetOut
+from ..schemas.api import ASSET_TYPES, AssetUpdate
 from ..services import storage
 from .auth import require_auth
 
@@ -135,15 +136,49 @@ def list_ingredient_assets(
     )
 
 
+@router.patch("/assets/{asset_id}", response_model=AssetOut, dependencies=[auth_dep])
+def update_asset(asset_id: int, body: AssetUpdate, db: Session = Depends(get_db)) -> models.Asset:
+    a = db.get(models.Asset, asset_id)
+    if a is None:
+        raise HTTPException(404, "asset not found")
+    allowed = ASSET_TYPES.get(a.owner_kind, ())
+    if body.asset_type not in allowed:
+        raise HTTPException(422, f"asset_type must be one of {', '.join(allowed)}")
+    a.asset_type = body.asset_type
+    db.commit()
+    db.refresh(a)
+    return a
+
+
 @router.delete("/assets/{asset_id}", status_code=204, dependencies=[auth_dep])
 def delete_asset(asset_id: int, db: Session = Depends(get_db)) -> None:
     a = db.get(models.Asset, asset_id)
     if a is None:
         raise HTTPException(404, "asset not found")
-    try:
-        Path(a.file_path).unlink(missing_ok=True)
-    except OSError:
-        pass
+    path = a.file_path
+    # Assets saved from Studio before saves made copies share the job's
+    # result file, so the file may still be someone else's.
+    shared = (
+        db.query(models.Asset.id)
+        .filter(models.Asset.file_path == path, models.Asset.id != asset_id)
+        .first()
+        is not None
+        or db.query(models.AssetGenerationJob.id)
+        .filter(models.AssetGenerationJob.result_path == path)
+        .first()
+        is not None
+    )
+    # A studio job that was saved as this asset goes back to plain
+    # "completed" (savable again); the FK would otherwise block the delete
+    # on Postgres.
+    for job in (
+        db.query(models.AssetGenerationJob)
+        .filter(models.AssetGenerationJob.result_asset_id == asset_id)
+        .all()
+    ):
+        job.result_asset_id = None
+        if job.status == "saved":
+            job.status = "completed"
     # Strip this id from any shot's reference_asset_ids_json so the editor's
     # reference strip + the renderer's lookup don't carry a dangling id.
     shots_with_ref = (
@@ -155,8 +190,15 @@ def delete_asset(asset_id: int, db: Session = Depends(get_db)) -> None:
         refs = list(shot.reference_asset_ids_json or [])
         if asset_id in refs:
             shot.reference_asset_ids_json = [x for x in refs if x != asset_id]
+    # Flush the FK clears before the row goes so the UPDATE runs first.
+    db.flush()
     db.delete(a)
     db.commit()
+    if path and not shared:
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 @router.get("/assets/{asset_id}/preview", dependencies=[auth_dep])

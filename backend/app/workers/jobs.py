@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import logging
 
+from sqlalchemy import update
+
 from ..db import SessionLocal
 from ..services import pipeline, spend
 
@@ -58,10 +60,35 @@ def regenerate_shots_bulk_job(project_id: int, shot_ids: list[int]) -> None:
 
 
 def generate_asset_job(job_id: int) -> None:
+    from .. import models
+
     db = SessionLocal()
     try:
+        # The job may have been deleted from Studio while it sat in the queue,
+        # and on SQLite a new job can then reuse its id. Only a still-pending
+        # job runs, claimed atomically, so a stale task never runs (and pays
+        # for) a reused id a second time.
+        claimed = db.execute(
+            update(models.AssetGenerationJob)
+            .where(models.AssetGenerationJob.id == job_id,
+                   models.AssetGenerationJob.status == "pending")
+            .values(status="submitted")
+        ).rowcount
+        db.commit()
+        if claimed != 1:
+            log.info("studio job %s is gone or already started; skipping", job_id)
+            return
         with spend.scope(ref=f"studio_job:{job_id}"):
-            pipeline.run_studio_job(db, job_id)
+            try:
+                pipeline.run_studio_job(db, job_id)
+            except Exception:
+                # Deleted mid-run: the final status write hits a missing row.
+                # Nothing is left to report the failure on, so don't raise.
+                db.rollback()
+                if db.get(models.AssetGenerationJob, job_id) is None:
+                    log.info("studio job %s was deleted while running", job_id)
+                    return
+                raise
     finally:
         db.close()
 

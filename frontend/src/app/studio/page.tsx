@@ -4,6 +4,8 @@ import { useRouter } from "next/navigation";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { Dropzone } from "@/components/Dropzone";
+import { AssignDialog, slotLabel } from "@/components/AssignDialog";
+import { useToast } from "@/components/Toaster";
 import { api, Asset, Avatar, Ingredient, StudioJob } from "@/lib/api";
 
 type Filter = "all" | "images" | "videos" | "characters" | "scenes" | "uploads";
@@ -36,6 +38,7 @@ type Tile = {
   selectable?: boolean;
   assetId?: number;
   jobId?: number;
+  ownerKind?: "avatar" | "ingredient";
 };
 
 function Studio() {
@@ -46,6 +49,8 @@ function Studio() {
   const [jobs, setJobs] = useState<StudioJob[]>([]);
   const [selectedRefs, setSelectedRefs] = useState<number[]>([]);
   const [pendingJobIds, setPendingJobIds] = useState<number[]>([]);
+  const [assigning, setAssigning] = useState<StudioJob | null>(null);
+  const toast = useToast();
 
   const reload = async () => {
     const [av, ing, jb] = await Promise.all([
@@ -95,6 +100,7 @@ function Studio() {
         sub: `${j.output_kind} · ${j.owner_kind} #${j.owner_id}`,
         status: j.status,
         jobId: j.id,
+        ownerKind: j.owner_kind,
       });
     }
     // Cast assets.
@@ -109,7 +115,7 @@ function Studio() {
             key: `av-${a.id}`,
             kind: "asset",
             imageUrl: api.publicAsset(a.public_token),
-            label: `${av.name} · ${a.asset_type}`,
+            label: `${av.name} · ${slotLabel("avatar", a.asset_type)}`,
             sub: `Character · ${a.source}`,
             selectable: true,
             assetId: a.id,
@@ -126,7 +132,7 @@ function Studio() {
             key: `ing-${a.id}`,
             kind: "asset",
             imageUrl: api.publicAsset(a.public_token),
-            label: `${ing.name} · ${a.asset_type}`,
+            label: `${ing.name} · ${slotLabel("ingredient", a.asset_type)}`,
             sub: `${ing.kind} · ${a.source}`,
             selectable: true,
             assetId: a.id,
@@ -141,6 +147,40 @@ function Studio() {
     setSelectedRefs((cur) =>
       cur.includes(assetId) ? cur.filter((x) => x !== assetId) : [...cur, assetId]
     );
+  };
+
+  // Studio results and cast images are separate files, so deleting one
+  // never removes the other.
+  const deleteTile = async (t: Tile) => {
+    const what =
+      t.kind === "job"
+        ? "this Studio result"
+        : `"${t.label}" from the cast (projects that use it lose this picture)`;
+    if (!window.confirm(`Delete ${what}? This can't be undone.`)) return;
+    try {
+      if (t.kind === "job" && t.jobId) {
+        await api.deleteStudioJob(t.jobId);
+        setPendingJobIds((cur) => cur.filter((x) => x !== t.jobId));
+      } else if (t.assetId) {
+        await api.deleteAsset(t.assetId);
+        setSelectedRefs((cur) => cur.filter((x) => x !== t.assetId));
+      }
+      toast.success("Deleted");
+    } catch (e: any) {
+      toast.error(e.message || "Delete failed");
+    }
+    await reload();
+  };
+
+  const quickSave = async (jobId: number) => {
+    try {
+      // The backend picks the slot from the job's owner, so report what it chose.
+      const asset = await api.saveStudioJob(jobId);
+      toast.success(`Saved to the cast as ${slotLabel(asset.owner_kind, asset.asset_type)}`);
+    } catch (e: any) {
+      toast.error(e.message || "Save failed");
+    }
+    await reload();
   };
 
   const selectedAssets: Asset[] = useMemo(() => {
@@ -187,7 +227,9 @@ function Studio() {
                 tile={t}
                 selected={t.assetId ? selectedRefs.includes(t.assetId) : false}
                 onSelect={() => t.assetId && toggleRef(t.assetId)}
-                onSaved={reload}
+                onQuickSave={quickSave}
+                onAssign={(jobId) => setAssigning(jobs.find((j) => j.id === jobId) || null)}
+                onDelete={() => deleteTile(t)}
                 onUseInProject={async (jobId) => {
                   const job = jobs.find((j) => j.id === jobId);
                   if (!job) return;
@@ -213,6 +255,17 @@ function Studio() {
         )}
       </div>
 
+      {assigning && (
+        <AssignDialog
+          job={assigning}
+          onClose={() => setAssigning(null)}
+          onSaved={async () => {
+            setAssigning(null);
+            await reload();
+          }}
+        />
+      )}
+
       <PromptBar
         avatars={avatars}
         ingredients={ingredients}
@@ -235,15 +288,21 @@ function TileCard({
   tile,
   selected,
   onSelect,
-  onSaved,
+  onQuickSave,
+  onAssign,
+  onDelete,
   onUseInProject,
 }: {
   tile: Tile;
   selected: boolean;
   onSelect: () => void;
-  onSaved: () => void;
+  onQuickSave: (jobId: number) => void;
+  onAssign: (jobId: number) => void;
+  onDelete: () => void;
   onUseInProject: (jobId: number) => void;
 }) {
+  const finished = tile.status === "completed" || tile.status === "saved";
+  const actionCls = "chip text-xs py-1 bg-ink-900/85 border-ink-700";
   return (
     <div
       className={clsx(
@@ -295,43 +354,77 @@ function TileCard({
         </button>
       )}
 
-      {tile.kind === "job" && tile.status === "completed" && tile.jobId && (
+      {tile.kind === "job" && tile.jobId && (
         // Desktop: shown on hover/focus so they don't cover the image.
         // Touch screens have no hover, so there they stay visible.
-        <div className="absolute top-2 right-2 flex flex-col gap-1 transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
-          <button
-            onClick={async () => {
-              try {
-                await api.saveStudioJob(tile.jobId!);
-              } catch {
-                /* already saved */
-              }
-              onSaved();
-            }}
-            className="chip text-xs py-1 bg-ink-900/85 border-ink-700"
-            title="Save to cast"
-            aria-label="Save this generation to the cast"
-          >
-            Save
-          </button>
-          <button
-            onClick={() => onUseInProject(tile.jobId!)}
-            className="chip text-xs py-1 bg-ink-900/85 border-ink-700"
-            title="Start a new project pre-loaded with this asset's owner"
-            aria-label="Start a new project pre-loaded with this asset's owner"
-          >
-            New Project →
-          </button>
-          {tile.imageUrl && (
+        <div className="absolute top-2 right-2 flex flex-col items-end gap-1 transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
+          {finished && tile.imageUrl && (
+            <button
+              onClick={() => onAssign(tile.jobId!)}
+              className={actionCls}
+              title="Save this image to a character or scene, as its main picture or another slot"
+            >
+              Assign to…
+            </button>
+          )}
+          {tile.status === "completed" && tile.imageUrl && (
+            <button
+              onClick={() => onQuickSave(tile.jobId!)}
+              className={actionCls}
+              title={`Save to this job's ${
+                tile.ownerKind === "ingredient" ? "scene as a reference" : "character as a lifestyle shot"
+              }`}
+              aria-label="Quick save this generation to the cast"
+            >
+              Save
+            </button>
+          )}
+          {finished && (
+            <button
+              onClick={() => onUseInProject(tile.jobId!)}
+              className={actionCls}
+              title="Start a new project pre-loaded with this asset's owner"
+              aria-label="Start a new project pre-loaded with this asset's owner"
+            >
+              New Project →
+            </button>
+          )}
+          {finished && tile.imageUrl && (
             <a
               href={`/ambient/new?studio_job=${tile.jobId}`}
-              className="chip text-xs py-1 bg-ink-900/85 border-ink-700"
+              className={actionCls}
               title="Make an hour-long ambient scene from this image"
             >
               Ambient scene →
             </a>
           )}
+          <button
+            onClick={onDelete}
+            className={clsx(actionCls, "hover:text-accent")}
+            title="Delete this Studio result"
+            aria-label="Delete this Studio result"
+          >
+            Delete
+          </button>
         </div>
+      )}
+
+      {tile.kind === "asset" && tile.assetId && (
+        <button
+          onClick={onDelete}
+          className={clsx(
+            actionCls,
+            "absolute top-2 left-2 hover:text-accent transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100"
+          )}
+          title="Delete this image from the cast"
+          aria-label={`Delete ${tile.label} from the cast`}
+        >
+          Delete
+        </button>
+      )}
+
+      {tile.status === "saved" && (
+        <div className="absolute top-2 left-2 chip text-[10px] py-0.5">saved</div>
       )}
 
       {tile.kind === "job" && tile.status && !["completed", "saved"].includes(tile.status) && (
