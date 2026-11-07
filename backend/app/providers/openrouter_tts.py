@@ -24,6 +24,7 @@ import wave
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import TTSProvider
 
 PCM_RATE = 24000
@@ -42,8 +43,7 @@ def pcm16_to_wav(pcm: bytes, rate: int = PCM_RATE) -> bytes:
 class OpenRouterTTSProvider(TTSProvider):
     def __init__(self, *, model: str, voice: str = "", api_key: str | None = None,
                  chat_audio: bool | None = None, voices: list[str] | None = None) -> None:
-        s = get_settings()
-        self.api_key = api_key or s.openrouter_api_key
+        self.api_key = api_key or provider_keys.resolve("openrouter")
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY missing for OpenRouter TTS")
         self.model = model

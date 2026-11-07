@@ -87,18 +87,29 @@ def test_full_pipeline_produces_playable_mp4(auth_client, tmp_path: Path):
     assert len(r.content) > 1000
 
 
-def test_unsafe_script_blocked(auth_client):
-    aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]
+def _plan_status(auth_client, aid, script: str) -> int:
     pid = auth_client.post(
         "/api/projects",
         json={
-            "title": "bad",
-            "original_script": "nsfw content",
+            "title": "t",
+            "original_script": script,
             "cast": [{"member_kind": "avatar", "avatar_id": aid, "role": "host"}],
         },
     ).json()["id"]
-    r = auth_client.post(f"/api/projects/{pid}/generate-plan")
-    assert r.status_code == 422
+    return auth_client.post(f"/api/projects/{pid}/generate-plan").status_code
+
+
+def test_adult_content_is_not_gated(auth_client):
+    """No NSFW gate: adult themes between adults plan like anything else."""
+    aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]
+    for script in ("nsfw content", "a nude figure study at golden hour", "a sexy fetish photo shoot"):
+        assert _plan_status(auth_client, aid, script) in (200, 202), script
+
+
+def test_sexual_content_involving_minors_is_still_blocked(auth_client):
+    aid = auth_client.post("/api/avatars", json={"name": "X"}).json()["id"]
+    for script in ("a nude teen", "explicit scene with a minor", "loli content"):
+        assert _plan_status(auth_client, aid, script) == 422, script
 
 
 def test_regenerate_shot(auth_client):

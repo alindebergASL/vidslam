@@ -15,13 +15,13 @@ from __future__ import annotations
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import ModelInfo, SubmittedJob
 
 
 class OpenRouterAvatarProvider:
     def __init__(self, *, model: str = "heygen/avatar-iv", api_key: str | None = None) -> None:
-        s = get_settings()
-        self.api_key = api_key or s.openrouter_api_key
+        self.api_key = api_key or provider_keys.resolve("openrouter")
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY missing for avatar provider")
         self.model = model

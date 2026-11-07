@@ -10,6 +10,7 @@ import httpx
 
 from ..config import get_settings
 from ..schemas.storyboard import StoryboardPlan
+from ..services import provider_keys
 from .base import CastContext, ChatProvider
 
 log = logging.getLogger("avs.openrouter.chat")
@@ -48,7 +49,7 @@ def _format_user_payload(project: dict, cast: CastContext) -> str:
 class OpenRouterChatProvider(ChatProvider):
     def __init__(self, *, api_key: str | None = None, model: str | None = None,
                  json_mode: bool | None = None) -> None:
-        self.api_key = api_key or get_settings().openrouter_api_key
+        self.api_key = api_key or provider_keys.resolve("openrouter")
         self.model = model or get_settings().openrouter_chat_model
         # None = decide from the catalog entry's supported_parameters:
         #   structured_outputs → json_schema (schema-guided output)

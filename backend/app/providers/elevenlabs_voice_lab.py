@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import TrainingAsset, TrainingStatus, TrainingSubmit
 
 log = logging.getLogger("avs.training.elevenlabs")
@@ -23,7 +24,8 @@ log = logging.getLogger("avs.training.elevenlabs")
 class ElevenLabsVoiceLabProvider:
     def __init__(self) -> None:
         self._settings = get_settings()
-        if not self._settings.elevenlabs_api_key:
+        self._api_key = provider_keys.resolve("elevenlabs")
+        if not self._api_key:
             raise RuntimeError(
                 "ElevenLabsVoiceLabProvider needs ELEVENLABS_API_KEY — registry should "
                 "fall back to mock when the key isn't set."
@@ -64,7 +66,7 @@ class ElevenLabsVoiceLabProvider:
 
             data["labels"] = json.dumps(config["labels"])
 
-        headers = {"xi-api-key": self._settings.elevenlabs_api_key}
+        headers = {"xi-api-key": self._api_key}
         url = f"{self._settings.elevenlabs_base_url.rstrip('/')}/voices/add"
         with httpx.Client(timeout=120.0) as client:
             r = client.post(url, data=data, files=files, headers=headers)
@@ -84,7 +86,7 @@ class ElevenLabsVoiceLabProvider:
         # Instant clone — already done at submit. Confirm the voice exists
         # (a 404 here means the voice was deleted out-of-band).
         voice_id = self._voice_id_for_job(job.provider_job_id)
-        headers = {"xi-api-key": self._settings.elevenlabs_api_key}
+        headers = {"xi-api-key": self._api_key}
         url = f"{self._settings.elevenlabs_base_url.rstrip('/')}/voices/{voice_id}"
         try:
             with httpx.Client(timeout=15.0) as client:

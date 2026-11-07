@@ -16,6 +16,7 @@ from pathlib import Path
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 
 MAX_SECONDS = 30.0
 
@@ -25,7 +26,7 @@ class ElevenLabsSoundProvider:
 
     def __init__(self, *, api_key: str | None = None, model_id: str | None = None) -> None:
         s = get_settings()
-        self.api_key = api_key or s.elevenlabs_api_key
+        self.api_key = api_key or provider_keys.resolve("elevenlabs")
         self.model_id = model_id or s.elevenlabs_sound_model_id
         if not self.api_key:
             raise RuntimeError("ELEVENLABS_API_KEY missing for real sound provider")

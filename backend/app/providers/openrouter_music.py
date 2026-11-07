@@ -24,6 +24,7 @@ import wave
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import ModelInfo, MusicProvider
 from .lyria_music import _fmt_len
 
@@ -67,8 +68,7 @@ def _collect(obj: dict, out: list[bytes]) -> None:
 
 class OpenRouterMusicProvider(MusicProvider):
     def __init__(self, *, model: str = "google/lyria-3-pro-preview", api_key: str | None = None) -> None:
-        s = get_settings()
-        self.api_key = api_key or s.openrouter_api_key
+        self.api_key = api_key or provider_keys.resolve("openrouter")
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY missing for OpenRouter music")
         self.model = model

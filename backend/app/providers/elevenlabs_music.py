@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import ModelInfo, MusicProvider
 
 
@@ -17,7 +18,7 @@ class ElevenLabsMusicProvider(MusicProvider):
 
     def __init__(self, *, api_key: str | None = None, model_id: str | None = None) -> None:
         s = get_settings()
-        self.api_key = api_key or s.elevenlabs_api_key
+        self.api_key = api_key or provider_keys.resolve("elevenlabs")
         self.model_id = model_id or s.elevenlabs_music_model_id or "music_v2_5"
         if not self.api_key:
             raise RuntimeError("ELEVENLABS_API_KEY missing for real music provider")

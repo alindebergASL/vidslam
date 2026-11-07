@@ -140,6 +140,8 @@ def set_active(kind: str, model: Optional[str], options: Optional[dict] = None) 
 def provider_for(kind: str, model: Optional[str] = None) -> str:
     """Provider that will serve `kind` with the active (or given) model:
     "mock" | "openrouter" | "elevenlabs" | "gemini" | "off"."""
+    from .provider_keys import has
+
     s = get_settings()
     m = active_model(kind) if model is None else model
     if kind == "lipsync" and not m:
@@ -148,21 +150,21 @@ def provider_for(kind: str, model: Optional[str] = None) -> str:
         return "mock"
     if kind == "tts":
         if m == "elevenlabs" or not m:
-            return "elevenlabs" if s.elevenlabs_api_key else "mock"
-        return "openrouter" if s.openrouter_api_key else "mock"
+            return "elevenlabs" if has("elevenlabs") else "mock"
+        return "openrouter" if has("openrouter") else "mock"
     if kind == "music":
         if m.startswith(LYRIA_PREFIX):
             # Lyria 3 Pro / Clip are on OpenRouter; Lyria 3.5 is Google-only.
             on_openrouter = _catalog_provider("music", m) == "openrouter" or m in OPENROUTER_LYRIA
-            if on_openrouter and s.openrouter_api_key:
+            if on_openrouter and has("openrouter"):
                 return "openrouter"
-            if s.gemini_api_key:
+            if has("gemini"):
                 return "gemini"
             return "mock"
-        return "elevenlabs" if s.elevenlabs_api_key else "mock"
+        return "elevenlabs" if has("elevenlabs") else "mock"
     if m.startswith("mock/"):
         return "mock"
-    return "openrouter" if s.openrouter_api_key else "mock"
+    return "openrouter" if has("openrouter") else "mock"
 
 
 def snapshot() -> dict:

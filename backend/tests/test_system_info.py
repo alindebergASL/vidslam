@@ -12,11 +12,14 @@ def test_system_info_reports_mock_and_counts(auth_client):
     assert info["mock_providers"] is True
     assert info["ffmpeg_available"] is True  # installed in the test env
     # In mock mode, keys are absent and that's fine.
-    assert info["keys"] == {"openrouter": False, "elevenlabs": False, "gemini": False}
+    # (replicate + sogni added with Settings → API keys.)
+    assert info["keys"] == {"openrouter": False, "elevenlabs": False, "gemini": False,
+                            "replicate": False, "sogni": False}
     assert info["counts"]["avatars"] >= 1
     assert info["counts"]["brand_kits"] >= 1
     # Never leak secret values — only model ids / booleans.
     assert "openrouter_api_key" not in str(info)
+    assert "sogni_api_key" not in str(info)
     assert isinstance(info["models"]["chat"], (str, type(None)))
 
 

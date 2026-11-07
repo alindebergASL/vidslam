@@ -26,6 +26,7 @@ import zipfile
 import httpx
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import TrainingAsset, TrainingStatus, TrainingSubmit
 
 log = logging.getLogger("avs.training.replicate")
@@ -34,7 +35,8 @@ log = logging.getLogger("avs.training.replicate")
 class ReplicateTrainingProvider:
     def __init__(self) -> None:
         self._settings = get_settings()
-        if not self._settings.replicate_api_token:
+        self._api_token = provider_keys.resolve("replicate")
+        if not self._api_token:
             raise RuntimeError(
                 "ReplicateTrainingProvider needs REPLICATE_API_TOKEN — registry should "
                 "fall back to mock when the token isn't set."
@@ -47,7 +49,7 @@ class ReplicateTrainingProvider:
         return httpx.Client(
             timeout=60.0,
             headers={
-                "Authorization": f"Bearer {self._settings.replicate_api_token}",
+                "Authorization": f"Bearer {self._api_token}",
                 "Content-Type": "application/json",
             },
         )

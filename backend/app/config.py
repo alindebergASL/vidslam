@@ -145,6 +145,20 @@ class Settings(BaseSettings):
     # version as of Nov 2026.
     replicate_lora_trainer: str = "ostris/flux-dev-lora-trainer:26dce37af90b9d997eeb970d92e47de3064d46c300504ae376c75bef6a9022d2"
 
+    # Sogni (sogni.ai) image + video models, ids "sogni/<selector>". Get a
+    # key at https://dashboard.sogni.ai/api-keys. Optional; a key saved in
+    # Settings → API keys overrides this one.
+    sogni_api_key: str = ""
+    sogni_base_url: str = "https://api.sogni.ai"
+    # Image calls start a workflow and poll it (2 s, backing off to 5 s)
+    # until it finishes or this many seconds pass.
+    sogni_image_timeout_seconds: float = 300.0
+    # img2img strength when a picture is passed as the source image.
+    sogni_image_strength: float = 0.35
+    # A 429 on a workflow start is retried after Retry-After up to this
+    # many seconds; a longer wait fails the call with the wait in the message.
+    sogni_max_retry_after_seconds: float = 30.0
+
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01
     cost_image_per_item: float = 0.04
@@ -175,20 +189,28 @@ class Settings(BaseSettings):
         (p / "studio").mkdir(parents=True, exist_ok=True)
         return p
 
+    # Key presence goes through services.provider_keys (a key saved in
+    # Settings → API keys wins over .env). Imported lazily: config must not
+    # pull in the DB layer at import time.
+    def _has_key(self, name: str) -> bool:
+        from .services import provider_keys
+
+        return provider_keys.has(name)
+
     def chat_is_mocked(self) -> bool:
-        return self.mock_providers or not self.openrouter_api_key
+        return self.mock_providers or not self._has_key("openrouter")
 
     def image_is_mocked(self) -> bool:
-        return self.mock_providers or not self.openrouter_api_key
+        return self.mock_providers or not self._has_key("openrouter")
 
     def video_is_mocked(self) -> bool:
-        return self.mock_providers or not self.openrouter_api_key
+        return self.mock_providers or not self._has_key("openrouter")
 
     def tts_is_mocked(self) -> bool:
-        return self.mock_providers or not self.elevenlabs_api_key
+        return self.mock_providers or not self._has_key("elevenlabs")
 
     def music_is_mocked(self) -> bool:
-        return self.mock_providers or not self.elevenlabs_api_key
+        return self.mock_providers or not self._has_key("elevenlabs")
 
 
 @lru_cache

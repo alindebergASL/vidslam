@@ -185,7 +185,10 @@ def reconcile_pending(limit: int = 20) -> int:
     """Swap rate-card placeholders for OpenRouter's reported cost once the
     generation is queryable. Returns how many entries were settled."""
     s = get_settings()
-    if not s.openrouter_api_key:
+    from . import provider_keys
+
+    key = provider_keys.resolve("openrouter")
+    if not key:
         return 0
     db = SessionLocal()
     settled = 0
@@ -199,7 +202,7 @@ def reconcile_pending(limit: int = 20) -> int:
                 try:
                     r = client.get(f"{s.openrouter_base_url.rstrip('/')}/generation",
                                    params={"id": e.generation_id},
-                                   headers={"Authorization": f"Bearer {s.openrouter_api_key}"})
+                                   headers={"Authorization": f"Bearer {key}"})
                 except httpx.HTTPError:
                     break
                 if r.status_code == 404:
@@ -392,13 +395,16 @@ def openrouter_account(*, refresh: bool = False) -> dict:
     import time
 
     s = get_settings()
-    if not s.openrouter_api_key:
+    from . import provider_keys
+
+    key = provider_keys.resolve("openrouter")
+    if not key:
         return {"available": False, "reason": "OPENROUTER_API_KEY not set"}
     if not refresh and _account_cache.get("at", 0) > time.time() - 60:
         return _account_cache["data"]
     try:
         r = httpx.get(f"{s.openrouter_base_url.rstrip('/')}/key", timeout=10.0,
-                      headers={"Authorization": f"Bearer {s.openrouter_api_key}"})
+                      headers={"Authorization": f"Bearer {key}"})
         r.raise_for_status()
         d = r.json().get("data") or {}
         data = {"available": True, **{k: d.get(k) for k in (

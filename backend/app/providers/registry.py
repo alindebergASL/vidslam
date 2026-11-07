@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..config import get_settings
+from ..services import provider_keys
 from .base import (
     ChatProvider,
     ImageProvider,
@@ -166,7 +167,9 @@ def get_training(kind: str | None = None) -> TrainingProvider:
         from .elevenlabs_voice_lab import ElevenLabsVoiceLabProvider
 
         return ElevenLabsVoiceLabProvider()
-    if kind in {"character_lora", "style_lora"} and s.replicate_api_token:
+    # Same gate as provider_status(): MOCK_PROVIDERS=true overrides every
+    # key, so a key saved in Settings never starts paid training in mock mode.
+    if kind in {"character_lora", "style_lora"} and not s.mock_providers and provider_keys.has("replicate"):
         from .replicate_training import ReplicateTrainingProvider
 
         return ReplicateTrainingProvider()
@@ -184,7 +187,7 @@ def provider_status() -> dict:
     snap = reg.snapshot()
     training_lora = (
         "replicate"
-        if (not s.mock_providers and s.replicate_api_token)
+        if (not s.mock_providers and provider_keys.has("replicate"))
         else "mock"
     )
     training_voice = "elevenlabs" if not s.tts_is_mocked() else "mock"

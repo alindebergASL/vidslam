@@ -5,8 +5,8 @@ import { useToast } from "@/components/Toaster";
 import { api, ActiveModel, CatalogEntry, ModelCatalog, ModelKind } from "@/lib/api";
 
 const KINDS: { id: ModelKind; label: string; hint: string }[] = [
-  { id: "video", label: "Video", hint: "Shot clips and ambient loops." },
-  { id: "image", label: "Image", hint: "Studio images. Ambient scene stills use each scene's Picture model (default: AMBIENT_STILL_MODEL, GPT Image 2.6 Sunburst); this model is used for them only when AMBIENT_STILL_MODEL is empty." },
+  { id: "video", label: "Video", hint: "Shot clips and ambient loops. OpenRouter models, or Sogni models (sogni/…, SOGNI_API_KEY — set it in Settings → API keys)." },
+  { id: "image", label: "Image", hint: "Studio images. Ambient scene stills use each scene's Picture model (default: AMBIENT_STILL_MODEL, GPT Image 2.6 Sunburst); this model is used for them only when AMBIENT_STILL_MODEL is empty. Sogni image models (sogni/…) need a Sogni key." },
   { id: "chat", label: "Planner", hint: "Writes storyboards (script, shots, captions)." },
   { id: "tts", label: "Voice", hint: "Voiceovers. ElevenLabs, or an OpenRouter speech / gpt-audio model." },
   { id: "music", label: "Music", hint: "Music beds. ElevenLabs, or Google Lyria — Lyria 3 Pro / Clip through OpenRouter (same key), Lyria 3.5 through Google (GEMINI_API_KEY)." },
@@ -17,6 +17,8 @@ const PROVIDER_LABEL: Record<string, string> = {
   openrouter: "OpenRouter",
   gemini: "Google",
   elevenlabs: "ElevenLabs",
+  sogni: "Sogni",
+  replicate: "Replicate",
   mock: "mock",
   off: "off",
 };
@@ -226,7 +228,7 @@ export function ModelsPanel() {
             </div>
             {active?.provider === "mock" && active.model && !active.model.startsWith("mock/") && (
               <p className="text-[11px] text-amber-200 mt-2">
-                Selected, but mocked: MOCK_PROVIDERS is on or this provider&apos;s key isn&apos;t set.
+                Selected, but mocked: MOCK_PROVIDERS is on or this provider&apos;s key isn&apos;t set (see API keys below).
               </p>
             )}
           </div>
@@ -266,9 +268,12 @@ export function ModelsPanel() {
                     <div className="flex flex-wrap items-center gap-1.5">
                       <span className="text-sm font-medium">{e.name}</span>
                       {e.new && <span className="text-[10px] font-semibold uppercase tracking-wider text-accent">new</span>}
-                      {!e.usable && <span className="text-[10px] text-ink-400">needs {PROVIDER_LABEL[e.provider]} key</span>}
+                      {!e.usable && <span className="text-[10px] text-ink-400">needs {PROVIDER_LABEL[e.provider] ?? e.provider} key</span>}
                     </div>
-                    <div className="text-[11px] text-ink-400 break-all">{e.id} · {PROVIDER_LABEL[e.provider]}</div>
+                    <div className="text-[11px] text-ink-400 break-all">{e.id} · {PROVIDER_LABEL[e.provider] ?? e.provider}</div>
+                    {(e.notes || (e.provider === "sogni" && e.description)) && (
+                      <div className="text-[11px] text-ink-300 mt-0.5">{e.notes || e.description}</div>
+                    )}
                     <div className="flex flex-wrap gap-1 mt-1">
                       {chips(e).map((c) => (
                         <span key={c} className="rounded-sm border border-ink-700 px-1.5 py-px text-[10px] text-ink-300">{c}</span>
