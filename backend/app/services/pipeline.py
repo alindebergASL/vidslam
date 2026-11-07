@@ -1046,6 +1046,15 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
         raise
 
 
+STUDIO_DELETED = "deleted"  # tombstone: the row stays so its id is never reused
+
+
+def _studio_job_deleted(db: Session, job_id: int) -> bool:
+    status = db.query(models.AssetGenerationJob.status).filter(
+        models.AssetGenerationJob.id == job_id).scalar()
+    return status is None or status == STUDIO_DELETED
+
+
 def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
     job = db.get(models.AssetGenerationJob, job_id)
     if job is None:
@@ -1079,10 +1088,25 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             db.commit()
             data = image.generate(model=model, prompt=job.prompt, references=refs,
                                   negative_prompt=job.negative_prompt)
+            # Deleted in Studio while the provider worked: drop the image
+            # (it was still billed). The write below is conditional too, so
+            # a delete in between can't be undone by this result.
+            if _studio_job_deleted(db, job.id):
+                db.rollback()
+                return job
             ext, _mime, _w, _h = storage.image_info(data)
             path = storage.save_generated_bytes(data, extension=ext, subdir_name="images")
-            job.result_path = str(path)
-            job.status = "completed"
+            done = db.query(models.AssetGenerationJob).filter(
+                models.AssetGenerationJob.id == job.id,
+                models.AssetGenerationJob.status != STUDIO_DELETED,
+            ).update({"result_path": str(path), "status": "completed",
+                      "provider": job.provider, "provider_model": job.provider_model},
+                     synchronize_session=False)
+            db.commit()
+            if not done:
+                Path(path).unlink(missing_ok=True)
+            db.refresh(job)
+            return job
         else:  # video_clip — async: completes via webhook / sweeper
             from . import video_jobs
 
@@ -1101,6 +1125,9 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
                     settings={"callback_url": callback} if callback else None,
                 )
 
+            if _studio_job_deleted(db, job.id):
+                db.rollback()
+                return job
             vj = video_jobs.submit(db, purpose="studio", ref_id=job.id, project_id=None, start=start)
             job.provider_job_id = vj.provider_job_id
             db.refresh(job)
@@ -1108,8 +1135,12 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
         db.commit()
         return job
     except Exception as e:  # noqa: BLE001
-        job.status = "failed"
-        job.error = str(e)[:500]
+        db.rollback()
+        # Only a job that still exists gets the failure; a deleted one stays deleted.
+        db.query(models.AssetGenerationJob).filter(
+            models.AssetGenerationJob.id == job_id,
+            models.AssetGenerationJob.status != STUDIO_DELETED,
+        ).update({"status": "failed", "error": str(e)[:500]}, synchronize_session=False)
         db.commit()
         raise
 
@@ -1294,7 +1325,7 @@ def run_training_job(db: Session, job_id: int) -> None:
 
 def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
     job = db.get(models.AssetGenerationJob, vjob.ref_id)
-    if job is None:
+    if job is None or job.status == STUDIO_DELETED:
         # The Studio job was deleted while the clip was rendering: nothing
         # will ever show this download, so don't leave it on disk.
         if vjob.result_path:
@@ -1310,7 +1341,7 @@ def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
 
 def on_studio_clip_failed(db: Session, vjob: models.VideoJob) -> None:
     job = db.get(models.AssetGenerationJob, vjob.ref_id)
-    if job is None:
+    if job is None or job.status == STUDIO_DELETED:
         return
     job.status = "failed"
     job.error = vjob.error[:500]

@@ -52,6 +52,12 @@ def _job_row(job_id: int):
         db.close()
 
 
+def _gone(job_id: int) -> bool:
+    """Deleted Studio jobs are tombstoned (kept, hidden) so their id is never reused."""
+    row = _job_row(job_id)
+    return row is None or (row.status == "deleted" and not row.result_path)
+
+
 def test_save_to_another_character_with_a_chosen_type_makes_a_copy(auth_client):
     job = _image_job(auth_client)
     other = _avatar(auth_client, "Bo")
@@ -265,7 +271,7 @@ def test_queued_job_deleted_before_it_runs_is_a_no_op(auth_client, monkeypatch):
         db.close()
     assert auth_client.delete(f"/api/studio/jobs/{jid}").status_code == 204
     jobs.generate_asset_job(jid)  # must not raise
-    assert _job_row(jid) is None
+    assert _gone(jid)
 
 
 def test_job_deleted_while_generating_is_a_no_op(auth_client, monkeypatch):
@@ -284,14 +290,32 @@ def test_job_deleted_while_generating_is_a_no_op(auth_client, monkeypatch):
     finally:
         db.close()
 
+    newer: list[int] = []
+
     def _generate(self, **kw):
-        # The user deletes the job while the provider is still working.
+        # The user deletes the job while the provider is still working, and
+        # starts another one (on SQLite a hard delete would hand it this id).
         assert auth_client.delete(f"/api/studio/jobs/{jid}").status_code == 204
+        d = _db()
+        try:
+            other = models.AssetGenerationJob(owner_kind="avatar", owner_id=aid, output_kind="image",
+                                              prompt="y", status="pending")
+            d.add(other)
+            d.commit()
+            newer.append(other.id)
+        finally:
+            d.close()
         return make_png_bytes()
 
     monkeypatch.setattr(mock_image.MockImageProvider, "generate", _generate)
     jobs.generate_asset_job(jid)  # must not raise
-    assert _job_row(jid) is None
+    assert _gone(jid)
+    # Review: the deleted job's image must not land in the newer job.
+    assert newer[0] != jid
+    other = _job_row(newer[0])
+    assert (other.status, other.result_path or "") == ("pending", "")
+    assert auth_client.get(f"/api/studio/jobs/{jid}").status_code == 404
+    assert jid not in [j["id"] for j in auth_client.get("/api/studio/jobs").json()]
 
 
 def test_late_clip_completion_for_a_deleted_job_is_a_no_op(auth_client):
@@ -327,7 +351,7 @@ def test_late_clip_completion_for_a_deleted_job_is_a_no_op(auth_client):
         video_jobs.dispatch_failed(db, vjob)
     finally:
         db.close()
-    assert _job_row(jid) is None
+    assert _gone(jid)
 
 
 def _video_jobs_for(job_id: int):
@@ -360,7 +384,7 @@ def test_late_clip_for_a_deleted_job_does_not_fill_a_new_job_reusing_its_id(auth
     r = auth_client.post("/api/studio/generate-clip", json={
         "owner_kind": "avatar", "owner_id": aid, "prompt": "waves", "duration_seconds": 4})
     new_id = r.json()["id"]
-    assert new_id == old_id  # SQLite reuses the freed max id
+    assert new_id != old_id  # deleted jobs are tombstoned, so ids are never reused
     [new_vjob] = _video_jobs_for(new_id)
     assert new_vjob.id != old_vjob.id
 

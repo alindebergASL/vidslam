@@ -36,7 +36,7 @@ from ..workers.jobs import (
     generate_previews_job,
     render_ambient_job,
 )
-from ..workers.queue import QueueUnavailable, enqueue
+from ..workers.queue import enqueue
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -82,8 +82,11 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args) -> str
         raise HTTPException(409, "scene is already generating")
     try:
         return enqueue(generate_ambient_loop_job, project.id, *args)
-    except QueueUnavailable:
-        # Nothing was queued: put the scene back so it can be generated later.
+    except Exception:
+        # QueueUnavailable, or Redis dropping between the health check and
+        # the enqueue: no job was accepted, so nothing would ever clear the
+        # claim. Put the scene back so it can be edited and generated again.
+        # (If a job did get through, its worker sets 'generating' itself.)
         db.query(models.VideoProject).filter(
             models.VideoProject.id == project.id, models.VideoProject.status == "generating",
         ).update({"status": previous}, synchronize_session=False)

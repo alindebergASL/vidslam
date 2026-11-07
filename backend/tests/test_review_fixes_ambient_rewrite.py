@@ -302,3 +302,20 @@ def test_queue_down_puts_the_previous_status_back(auth_client, monkeypatch):
     monkeypatch.setattr(api, "enqueue", down)
     assert auth_client.post(f"/api/ambient/{sid}/generate-loop").status_code == 503
     assert auth_client.get(f"/api/ambient/{sid}").json()["status"] == before
+
+
+def test_a_redis_error_while_enqueueing_puts_the_previous_status_back(auth_client, monkeypatch):
+    """Review: Redis can drop between the health check and the enqueue, with an
+    error that isn't QueueUnavailable. No job was accepted, so the scene must
+    not stay 'generating' (it would refuse every save and Generate)."""
+    import app.api.ambient as api
+
+    sid = auth_client.post("/api/ambient", json={"config": SHORT, "generate": False}).json()["id"]
+    before = auth_client.get(f"/api/ambient/{sid}").json()["status"]
+
+    def dropped(*a, **k):
+        raise ConnectionError("Error 111 connecting to redis:6379. Connection refused.")
+
+    monkeypatch.setattr(api, "enqueue", dropped)
+    assert auth_client.post(f"/api/ambient/{sid}/generate-loop").status_code == 500
+    assert auth_client.get(f"/api/ambient/{sid}").json()["status"] == before

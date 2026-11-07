@@ -11,7 +11,7 @@ from .. import models
 from ..db import get_db
 from ..schemas import AssetOut, StudioJobOut, StudioRequest
 from ..schemas.api import ASSET_TYPES, StudioSaveRequest
-from ..services.pipeline import save_studio_result_as_asset
+from ..services.pipeline import STUDIO_DELETED, save_studio_result_as_asset
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from ..workers.jobs import generate_asset_job
@@ -72,10 +72,17 @@ def generate_clip(body: StudioRequest, db: Session = Depends(get_db)) -> models.
     return job
 
 
+def _live_job(db: Session, job_id: int) -> Optional[models.AssetGenerationJob]:
+    """The job, or None when it doesn't exist or was deleted (tombstoned)."""
+    j = db.get(models.AssetGenerationJob, job_id)
+    return None if j is None or j.status == STUDIO_DELETED else j
+
+
 @router.get("/jobs", response_model=list[StudioJobOut])
 def list_jobs(db: Session = Depends(get_db)) -> list[models.AssetGenerationJob]:
     return (
         db.query(models.AssetGenerationJob)
+        .filter(models.AssetGenerationJob.status != STUDIO_DELETED)
         .order_by(models.AssetGenerationJob.created_at.desc())
         .limit(50)
         .all()
@@ -84,7 +91,7 @@ def list_jobs(db: Session = Depends(get_db)) -> list[models.AssetGenerationJob]:
 
 @router.get("/jobs/{job_id}", response_model=StudioJobOut)
 def get_job(job_id: int, db: Session = Depends(get_db)) -> models.AssetGenerationJob:
-    j = db.get(models.AssetGenerationJob, job_id)
+    j = _live_job(db, job_id)
     if j is None:
         raise HTTPException(404, "job not found")
     return j
@@ -92,7 +99,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)) -> models.AssetGeneratio
 
 @router.get("/jobs/{job_id}/preview")
 def preview_job(job_id: int, db: Session = Depends(get_db)) -> FileResponse:
-    j = db.get(models.AssetGenerationJob, job_id)
+    j = _live_job(db, job_id)
     if j is None or not j.result_path or not Path(j.result_path).exists():
         raise HTTPException(404, "result not ready")
     media = "image/png" if j.output_kind == "image" else "video/mp4"
@@ -106,7 +113,7 @@ def save_job(
     body: Optional[StudioSaveRequest] = Body(None),
     db: Session = Depends(get_db),
 ) -> models.Asset:
-    j = db.get(models.AssetGenerationJob, job_id)
+    j = _live_job(db, job_id)
     if j is None:
         raise HTTPException(404, "job not found")
     body = body or StudioSaveRequest()
@@ -138,7 +145,7 @@ def save_job(
 
 @router.delete("/jobs/{job_id}", status_code=204)
 def delete_job(job_id: int, db: Session = Depends(get_db)) -> None:
-    j = db.get(models.AssetGenerationJob, job_id)
+    j = _live_job(db, job_id)
     if j is None:
         raise HTTPException(404, "job not found")
     path = j.result_path
@@ -156,7 +163,13 @@ def delete_job(job_id: int, db: Session = Depends(get_db)) -> None:
     )
     stale_clips = [v.result_path for v in clip_jobs if v.result_path and v.result_path != path]
     clip_jobs.update({models.VideoJob.ref_id: 0}, synchronize_session="fetch")
-    db.delete(j)
+    # Tombstone rather than delete: on SQLite a deleted max id is handed to
+    # the next job, and an image still being generated for this one would
+    # then fill that new job. The row stays (hidden everywhere) so the id is
+    # never reused; the worker drops a late result for a deleted job.
+    j.status = STUDIO_DELETED
+    j.result_path = ""
+    j.result_asset_id = None
     db.commit()
     for clip in stale_clips:
         try:
