@@ -565,6 +565,43 @@ def video_cost_usd(model: str, seconds: float) -> float:
     return round(video_rate_usd(model) * max(float(seconds or 0.0), 0.0), 6)
 
 
+def _counts_toward_spend(model: str, premium: bool) -> bool:
+    """Only vendor (Premium Spark) models cost money: native models run on
+    Free Spark, which didn't touch the Spark balance in live tests. Set
+    SOGNI_COUNT_FREE_SPARK=true to count them at their list price anyway
+    (e.g. once the free allowance is used up and bought Spark pays)."""
+    return premium or bool(get_settings().sogni_count_free_spark)
+
+
+def image_spend_usd(model: str) -> float:
+    """What one image counts toward Spend: its price if it costs money, else 0."""
+    m = image_model(model) or _IMAGE_INFO.get(selector(model))
+    if m is not None and not _counts_toward_spend(model, m.premium):
+        return 0.0
+    return image_cost_usd(model)
+
+
+def video_spend_rate_usd(model: str) -> float:
+    """Per-second amount a video counts toward Spend (0 for Free Spark models)."""
+    m = video_model(model) or _VIDEO_INFO.get(selector(model))
+    if m is not None and not _counts_toward_spend(model, m.premium):
+        return 0.0
+    return video_rate_usd(model)
+
+
+def video_spend_usd(model: str, seconds: float) -> float:
+    return round(video_spend_rate_usd(model) * max(float(seconds or 0.0), 0.0), 6)
+
+
+def spend_note(model: str, kind: str) -> str:
+    m = (image_model(model) or _IMAGE_INFO.get(selector(model))) if kind == "image" else \
+        (video_model(model) or _VIDEO_INFO.get(selector(model)))
+    if m is not None and not _counts_toward_spend(model, m.premium):
+        return "Sogni Free Spark model: not counted (list price " + (
+            f"~{m.spark:g} Spark)" if kind == "image" else f"~{m.spark_per_second:g} Spark/s)")
+    return "Sogni Spark price-table estimate"
+
+
 def takes_source_image(model: str) -> bool:
     m = image_model(model)
     return bool(m and m.img2img)
@@ -904,8 +941,8 @@ class SogniImageProvider(ImageProvider):
         data = self.client.download(url)
         from ..services import spend
 
-        spend.record_rate_card("sogni", "image", model, image_cost_usd(model),
-                               note="Sogni Spark price-table estimate")
+        spend.record_rate_card("sogni", "image", model, image_spend_usd(model),
+                               note=spend_note(model, "image"))
         return data
 
     def _wait(self, wf: dict) -> dict:
@@ -1041,7 +1078,7 @@ class SogniVideoProvider(VideoProvider):
             secs = _duration_of(wf) or float(job.raw.get("duration") or 5.0)
             # An estimate from the Spark price table; spend records it as one.
             return JobStatus(state="succeeded", progress=1.0, result_url=url,
-                             cost=video_cost_usd(job.model or self.model, secs))
+                             cost=video_spend_usd(job.model or self.model, secs))
         if state == "failed":
             return JobStatus(state="failed", error=err)
         if state == "running":

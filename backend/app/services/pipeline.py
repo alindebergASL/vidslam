@@ -1096,8 +1096,14 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             job.provider = provider_label("image", model)
             job.provider_model = model
             db.commit()
+            # Characters are portraits (Studio's 9:16 tiles); scenes and
+            # objects are landscape. Without it Sogni made square images.
+            from .image_settings import best_image_settings
+
+            aspect = "9:16" if job.owner_kind == "avatar" else "16:9"
             data = image.generate(model=model, prompt=job.prompt, references=refs,
-                                  negative_prompt=job.negative_prompt)
+                                  negative_prompt=job.negative_prompt,
+                                  settings=best_image_settings(model, aspect) or None)
             # Deleted in Studio while the provider worked: drop the image
             # (it was still billed). The write below is conditional too, so
             # a delete in between can't be undone by this result.

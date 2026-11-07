@@ -80,6 +80,19 @@ def _probe_request(name: str, key: str) -> tuple[str, dict, dict]:
     raise HTTPException(404, "unknown provider key")
 
 
+def _account_name(name: str, r: httpx.Response) -> str:
+    """The account a working key belongs to, where the probe returns it
+    (Sogni: data.username). Never the key."""
+    if name != "sogni":
+        return ""
+    try:
+        data = (r.json() or {}).get("data") or {}
+    except (ValueError, AttributeError):
+        return ""
+    who = str(data.get("username") or "").strip() if isinstance(data, dict) else ""
+    return who[:60]
+
+
 def _provider_message(r: httpx.Response) -> str:
     """A short human message from the provider's error body, if any."""
     try:
@@ -135,7 +148,8 @@ def test_key(name: str) -> dict:
         warning = provider_keys.key_warning(name, key)
         if warning:
             return {"ok": False, "detail": warning}
-        return {"ok": True, "detail": f"Key works (HTTP 200, {ms} ms)."}
+        who = _account_name(name, r)
+        return {"ok": True, "detail": f"Key works{f' — account {who}' if who else ''} (HTTP 200, {ms} ms)."}
     msg = _provider_message(r)
     if r.status_code in (401, 403):
         detail = f"Key rejected (HTTP {r.status_code})"
