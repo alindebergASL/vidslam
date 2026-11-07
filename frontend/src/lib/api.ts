@@ -1014,10 +1014,26 @@ export const api = {
       body: JSON.stringify(body),
     }),
   getStudioJob: (id: number) => req<StudioJob>(`/api/studio/jobs/${id}`),
-  saveStudioJob: (id: number, asset_type: string = "lifestyle") =>
-    req<Asset>(`/api/studio/jobs/${id}/save?asset_type=${asset_type}`, {
+  // Files a COPY of a finished Studio image as a new cast asset. With no
+  // options it goes to the job's own owner in the backend's default slot; a
+  // bare string is still accepted as the slot for older callers.
+  saveStudioJob: (
+    id: number,
+    opts?: string | { owner_kind?: "avatar" | "ingredient"; owner_id?: number; asset_type?: string }
+  ) => {
+    const body = typeof opts === "string" ? { asset_type: opts } : opts || {};
+    return req<Asset>(`/api/studio/jobs/${id}/save`, {
       method: "POST",
-    }),
+      body: JSON.stringify(body),
+    });
+  },
+  deleteStudioJob: (id: number) =>
+    req<void>(`/api/studio/jobs/${id}`, { method: "DELETE" }),
+
+  // cast assets (images on a character / scene)
+  updateAsset: (id: number, body: { asset_type: string }) =>
+    req<Asset>(`/api/assets/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteAsset: (id: number) => req<void>(`/api/assets/${id}`, { method: "DELETE" }),
   spendSummary: (month?: string) =>
     req<SpendSummary>(`/api/spend/summary${month ? `?month=${month}` : ""}`),
   spendEntries: (opts: { month?: string; project_id?: number; limit?: number } = {}) => {

@@ -13,6 +13,8 @@ import {
   LookControls,
   ModelControls,
   PhotoRewriteControl,
+  activeRewrite,
+  rewriteApplies,
   type ModelOption,
   OverlayControls,
   MUSIC_LENGTHS,
@@ -27,7 +29,7 @@ import {
   VarietyControls,
   statusTone,
 } from "@/components/ambient/shared";
-import { api, AmbientConfig, AmbientPresets, AmbientScene } from "@/lib/api";
+import { api, AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, PhotoRewrite } from "@/lib/api";
 
 export default function AmbientScenePage() {
   return (
@@ -606,6 +608,30 @@ function TitleEditor({ title, onSave }: { title: string; onSave: (t: string) => 
   );
 }
 
+const rewriteKey = (rw: PhotoRewrite | null) => (rw ? JSON.stringify([rw.scene, rw.light, rw.camera]) : null);
+
+/** The rewrite the saved scene will use after this save, as a comparable key
+ *  (services.ambient.update_scene): a new one is made only when the text, the
+ *  toggle or the look changed and no stored rewrite matches the text. */
+function nextRewriteKey(cfg: AmbientConfig, saved: AmbientConfig): string | null {
+  // The backend keeps a stored rewrite the page didn't send back.
+  const next = { ...cfg, photo: cfg.photo ?? saved.photo };
+  const remade =
+    cfg.scene_prompt.trim() !== saved.scene_prompt.trim() ||
+    cfg.rewrite_prompt !== saved.rewrite_prompt ||
+    cfg.look !== saved.look;
+  if (!remade || !rewriteApplies(next)) return rewriteKey(activeRewrite(next));
+  return rewriteKey(activeRewrite(next)) ?? "new rewrite";
+}
+
+/** Whether the scene's loop makes a still with the Picture model
+ *  (services.ambient.makes_stills, narrowed by the plan): a video model that
+ *  takes no first frame makes the clip from text alone. */
+function usesStillModel(cfg: AmbientConfig, plan: LoopPlan & { first_frame_still?: boolean }): boolean {
+  const makesStills = !cfg.picture_origin || (cfg.variety === "day_night" && cfg.variations > 1);
+  return makesStills && (plan.strategy === "drift" || plan.anchored || !!plan.first_frame_still);
+}
+
 function SettingsPanel({
   scene,
   presets,
@@ -638,14 +664,12 @@ function SettingsPanel({
   const invalidates =
     cfg.scene_prompt !== scene.config.scene_prompt ||
     cfg.scene_preset !== scene.config.scene_preset ||
-    // Turning the rewrite off (or on) changes the prompt only when a rewrite applies.
-    (cfg.rewrite_prompt !== scene.config.rewrite_prompt && !!scene.config.photo?.scene && cfg.look === "photoreal" &&
-      !["upload", "studio", "asset"].includes(cfg.picture_origin)) ||
+    // The rewrite changes the prompt only when one applies before or after.
+    rewriteKey(activeRewrite(scene.config)) !== nextRewriteKey(cfg, scene.config) ||
     cfg.source !== scene.config.source ||
     cfg.loop_seconds !== scene.config.loop_seconds ||
     cfg.model_override !== scene.config.model_override ||
-    ((cfg.still_model ?? "") !== (scene.config.still_model ?? "") &&
-      (!cfg.picture_origin || (cfg.variety === "day_night" && cfg.variations > 1))) ||
+    ((cfg.still_model ?? "") !== (scene.config.still_model ?? "") && usesStillModel(cfg, scene.plan)) ||
     cfg.chain_segments !== scene.config.chain_segments ||
     cfg.variety !== scene.config.variety ||
     (cfg.variety !== "none" && cfg.variations !== scene.config.variations) ||
@@ -853,7 +877,13 @@ function SettingsPanel({
               label="Scene source"
               options={["video", "image_drift"] as const}
               value={cfg.source}
-              onChange={(v) => { set("source", v); set("model_override", ""); }}
+              onChange={(v) => {
+                // A video model isn't a still model (and back): clear it only on a real
+                // switch, so re-clicking the current source keeps the chosen model.
+                if (v === cfg.source) return;
+                set("source", v);
+                set("model_override", v === scene.config.source ? scene.config.model_override : "");
+              }}
               render={(v) => (v === "video" ? "Video clip" : "Still + drift")}
               className="text-xs"
             />

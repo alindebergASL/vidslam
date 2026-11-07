@@ -57,6 +57,18 @@ class AssetOut(BaseModel):
     created_at: datetime
 
 
+# asset_type values each owner kind accepts (the Asset model lists the same).
+ASSET_TYPES: dict[str, tuple[str, ...]] = {
+    "avatar": ("hero", "reference_sheet", "expression_sheet", "outfit_sheet",
+               "lifestyle", "logo", "other"),
+    "ingredient": ("hero", "reference", "other"),
+}
+
+
+class AssetUpdate(BaseModel):
+    asset_type: str
+
+
 class AvatarOut(AvatarBase):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -295,6 +307,15 @@ class StudioRequest(BaseModel):
     reference_asset_ids: list[int] = Field(default_factory=list)
     model: Optional[str] = None
     duration_seconds: float = Field(5.0, ge=1.0, le=60.0)
+
+
+class StudioSaveRequest(BaseModel):
+    """Body for POST /api/studio/jobs/{id}/save. Every field is optional:
+    left out, the asset goes to the job's own owner with that kind's
+    default type. Naming another owner files the image to that character."""
+    owner_kind: Optional[Literal["avatar", "ingredient"]] = None
+    owner_id: Optional[int] = None
+    asset_type: Optional[str] = None
 
 
 class StudioJobOut(BaseModel):

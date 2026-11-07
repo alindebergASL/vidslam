@@ -2,7 +2,16 @@
 import clsx from "clsx";
 import type { ReactNode } from "react";
 import { api } from "@/lib/api";
-import type { AmbientConfig, AmbientPresets, AmbientScene, Corner, LoopPlan, ModelChoice, ScenePreset } from "@/lib/api";
+import type {
+  AmbientConfig,
+  AmbientPresets,
+  AmbientScene,
+  Corner,
+  LoopPlan,
+  ModelChoice,
+  PhotoRewrite,
+  ScenePreset,
+} from "@/lib/api";
 
 /** "3600" → "1h", "5400" → "1h 30m", "600" → "10m", "20" → "20s". */
 export function fmtDuration(seconds: number): string {
@@ -578,6 +587,66 @@ export function SoundControls({
   );
 }
 
+/** SHA-1 of a string's UTF-8 bytes, hex. Synchronous (crypto.subtle is
+ *  async and missing outside secure contexts), for matching the backend's
+ *  rewrite fingerprint while rendering. */
+function sha1Hex(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  const len = bytes.length;
+  const words = new Uint32Array((((len + 8) >> 6) + 1) * 16);
+  for (let i = 0; i < len; i++) words[i >> 2] |= bytes[i] << (24 - (i % 4) * 8);
+  words[len >> 2] |= 0x80 << (24 - (len % 4) * 8);
+  words[words.length - 1] = len * 8; // strings here are far below 512 MB
+  let [h0, h1, h2, h3, h4] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+  const w = new Uint32Array(80);
+  const rotl = (x: number, n: number) => (x << n) | (x >>> (32 - n));
+  for (let off = 0; off < words.length; off += 16) {
+    for (let t = 0; t < 16; t++) w[t] = words[off + t];
+    for (let t = 16; t < 80; t++) w[t] = rotl(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+    let [a, b, c, d, e] = [h0, h1, h2, h3, h4];
+    for (let t = 0; t < 80; t++) {
+      const [f, k] =
+        t < 20 ? [(b & c) | (~b & d), 0x5a827999]
+        : t < 40 ? [b ^ c ^ d, 0x6ed9eba1]
+        : t < 60 ? [(b & c) | (b & d) | (c & d), 0x8f1bbcdc]
+        : [b ^ c ^ d, 0xca62c1d6];
+      const tmp = (rotl(a, 5) + f + e + k + w[t]) >>> 0;
+      e = d;
+      d = c;
+      c = rotl(b, 30) >>> 0;
+      b = a;
+      a = tmp;
+    }
+    h0 = (h0 + a) >>> 0;
+    h1 = (h1 + b) >>> 0;
+    h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0;
+  }
+  return [h0, h1, h2, h3, h4].map((h) => h.toString(16).padStart(8, "0")).join("");
+}
+
+/** services.ambient._text_fingerprint: which text a stored rewrite was made from. */
+export function textFingerprint(text: string): string {
+  return sha1Hex(text.trim()).slice(0, 16);
+}
+
+const OWN_PICTURE = ["upload", "studio", "asset"];
+
+/** Whether a photo rewrite is made for this config (services.ambient.ensure_photo_rewrite). */
+export function rewriteApplies(cfg: AmbientConfig): boolean {
+  return (
+    cfg.look === "photoreal" && cfg.rewrite_prompt && !!cfg.scene_prompt.trim() && !OWN_PICTURE.includes(cfg.picture_origin)
+  );
+}
+
+/** The stored rewrite when it was made from exactly this text (services.ambient.active_rewrite). */
+export function activeRewrite(cfg: AmbientConfig): PhotoRewrite | null {
+  const rw = cfg.photo;
+  if (!rewriteApplies(cfg) || !rw || !rw.scene.trim() || rw.source !== textFingerprint(cfg.scene_prompt)) return null;
+  return rw;
+}
+
 /** "Rewrite it as a real photograph" for a typed description (photoreal only),
  *  and, on a saved scene, what the image model actually receives. */
 export function PhotoRewriteControl({
@@ -593,11 +662,12 @@ export function PhotoRewriteControl({
   saved?: AmbientConfig;
 }) {
   // A picture you brought (not a generated preview) sets the scene; the text only describes motion.
-  const ownPicture = ["upload", "studio", "asset"].includes(cfg.picture_origin);
+  const ownPicture = OWN_PICTURE.includes(cfg.picture_origin);
   if (cfg.look !== "photoreal" || !cfg.scene_prompt.trim() || ownPicture) return null;
-  const rw = saved?.photo;
-  const current =
-    !!saved && saved.rewrite_prompt && cfg.rewrite_prompt && saved.scene_prompt === cfg.scene_prompt && !!rw?.scene;
+  // Only a saved rewrite of exactly this text is what the picture model reads:
+  // one kept from older text (say, saved under another look) waits for a new one.
+  const rw = saved ? activeRewrite({ ...cfg, photo: saved.photo }) : null;
+  const current = !!saved && saved.rewrite_prompt && !!rw;
   const chosenLight = cfg.time_of_day !== "any" || cfg.weather !== "any";
   const showResult = !!saved;
   return (
@@ -660,8 +730,15 @@ export function ModelControls({
   const stills = presets?.still_models ?? [];
   const videos = presets?.video_models ?? [];
   const drift = cfg.source === "image_drift";
-  // Older Still + drift scenes kept their image model in model_override.
-  const stillValue = cfg.still_model || (drift ? cfg.model_override : "");
+  // Older Still + drift scenes kept their image model in model_override; a
+  // video model left there from before the switch is ignored for stills
+  // (services.ambient.still_model_chain), so don't show it as the Picture model.
+  const legacyIsVideo =
+    !!cfg.model_override &&
+    (videos.some((c) => c.id === cfg.model_override) ||
+      videoModels.some((m) => m.id === cfg.model_override) ||
+      cfg.model_override === presets?.default_video_model);
+  const stillValue = cfg.still_model || (drift && !legacyIsVideo ? cfg.model_override : "");
   const defaultStill = stills.find((c) => c.id === presets?.default_still_model);
   const defaultVideo = videos.find((c) => c.id === presets?.default_video_model);
   const stillChoice = stills.find((c) => c.id === stillValue) ?? (stillValue ? undefined : defaultStill);

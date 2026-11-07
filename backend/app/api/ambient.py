@@ -8,8 +8,9 @@ only adds the ambient-specific lifecycle.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -62,6 +63,35 @@ def public_frame(token: str) -> FileResponse:
     if path is None:
         raise HTTPException(404, "not found")
     return FileResponse(path, media_type="image/png")
+
+
+def _enqueue_generation(db: Session, project: models.VideoProject, *args) -> str:
+    """Mark the scene generating before queueing its job: on RQ the job may
+    wait behind a render for a long time, and until a worker picks it up a
+    second Generate would otherwise pass the 409 and queue a second paid run
+    (which resets the clips and drops the first run's chain). The claim is a
+    conditional UPDATE, so two simultaneous requests can't both get through."""
+    previous = project.status
+    claimed = (
+        db.query(models.VideoProject)
+        .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
+        .update({"status": "generating"}, synchronize_session=False)
+    )
+    db.commit()
+    if not claimed:
+        raise HTTPException(409, "scene is already generating")
+    try:
+        return enqueue(generate_ambient_loop_job, project.id, *args)
+    except Exception:
+        # QueueUnavailable, or Redis dropping between the health check and
+        # the enqueue: no job was accepted, so nothing would ever clear the
+        # claim. Put the scene back so it can be edited and generated again.
+        # (If a job did get through, its worker sets 'generating' itself.)
+        db.query(models.VideoProject).filter(
+            models.VideoProject.id == project.id, models.VideoProject.status == "generating",
+        ).update({"status": previous}, synchronize_session=False)
+        db.commit()
+        raise
 
 
 def _get_scene(db: Session, scene_id: int) -> models.VideoProject:
@@ -136,13 +166,13 @@ def list_scenes(db: Session = Depends(get_db)) -> list[AmbientOut]:
              dependencies=[Depends(rate_limit("generation"))])
 def create_scene(body: AmbientCreate, db: Session = Depends(get_db)) -> AmbientOut:
     if body.generate:
-        budget_guard()  # creating without generating is free
+        budget_guard()  # creating without generating is free (a description rewrite skips itself over budget)
     try:
         project = svc.create_scene(db, body)
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     if body.generate:
-        enqueue(generate_ambient_loop_job, project.id)
+        _enqueue_generation(db, project)
         db.expire_all()
         project = _get_scene(db, project.id)
     return svc.to_out(db, project)
@@ -153,13 +183,29 @@ def get_scene(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
     return svc.to_out(db, _get_scene(db, scene_id))
 
 
+def _generation_token(request: Request) -> Callable[[], bool]:
+    """A save's description rewrite is a paid planner call: it takes a token
+    from the generation rate limit, but only when one is actually made, and
+    an empty bucket skips the rewrite instead of refusing the save."""
+    def take() -> bool:
+        try:
+            rate_limit("generation")(request)
+        except HTTPException:
+            return False
+        return True
+    return take
+
+
 @router.patch("/{scene_id}", response_model=AmbientOut)
-def update_scene(scene_id: int, body: AmbientUpdate, db: Session = Depends(get_db)) -> AmbientOut:
+def update_scene(scene_id: int, body: AmbientUpdate, request: Request,
+                 db: Session = Depends(get_db)) -> AmbientOut:
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is generating; wait or cancel first")
     try:
-        project = svc.update_scene(db, project, body)
+        project = svc.update_scene(db, project, body, allow_rewrite=_generation_token(request))
+    except svc.SceneBusy as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     return svc.to_out(db, project)
@@ -175,7 +221,7 @@ def generate_loop(
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is already generating")
-    job_id = enqueue(generate_ambient_loop_job, scene_id, regenerate_music)
+    job_id = _enqueue_generation(db, project, regenerate_music)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
 
 
