@@ -44,7 +44,8 @@ async def upload_avatar_asset(
             owner_id=avatar_id,
         )
     except storage.UploadError as e:
-        raise HTTPException(400, str(e)) from e
+        # 413 too large; 400 not a supported image (message says which).
+        raise HTTPException(e.status_code, str(e)) from e
     a = models.Asset(
         owner_kind="avatar",
         avatar_id=avatar_id,
@@ -101,7 +102,8 @@ async def upload_ingredient_asset(
             owner_id=ingredient_id,
         )
     except storage.UploadError as e:
-        raise HTTPException(400, str(e)) from e
+        # 413 too large; 400 not a supported image (message says which).
+        raise HTTPException(e.status_code, str(e)) from e
     a = models.Asset(
         owner_kind="ingredient",
         ingredient_id=ingredient_id,

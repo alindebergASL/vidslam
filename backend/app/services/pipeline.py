@@ -23,6 +23,7 @@ from ..schemas.storyboard import StoryboardPlan
 from . import alerts, render_files, storage
 from .captions import chunks_to_timed
 from .model_registry import active_model as _active_model
+from .prompting import effective_negative
 from .renderer import RenderInputs, compose
 
 log = logging.getLogger("avs.pipeline")
@@ -354,6 +355,13 @@ def submit_shot_clip(
     shot.provider_model = model
     db.commit()
 
+    # Storyboard shots: the shot's own avoid text plus the Settings video
+    # defaults. Ambient keeps its own list (it is slow on purpose, and the
+    # defaults' "slow motion" would fight it).
+    negative = shot.negative_prompt or ""
+    if purpose != "ambient_segment" and project.mode != "ambient_loop":
+        negative = effective_negative("video", negative)
+
     def start(callback: Optional[str]):
         settings_extra = {
             "aspect_ratio": project.aspect_ratio or None,
@@ -365,7 +373,7 @@ def submit_shot_clip(
             settings_extra["callback_url"] = callback
         return video.submit(
             model=model, prompt=shot.prompt, references=refs,
-            negative_prompt=shot.negative_prompt or "",
+            negative_prompt=negative,
             reference_strategy=shot.reference_strategy or "input_references",
             duration_seconds=shot.duration_seconds or 5.0, settings=settings_extra,
         )
@@ -1104,9 +1112,9 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             # objects are landscape. Without it Sogni made square images.
             from .image_settings import best_image_settings
 
-            aspect = "9:16" if job.owner_kind == "avatar" else "16:9"
+            aspect = job.aspect_ratio or ("9:16" if job.owner_kind == "avatar" else "16:9")
             data = image.generate(model=model, prompt=job.prompt, references=refs,
-                                  negative_prompt=job.negative_prompt,
+                                  negative_prompt=effective_negative("image", job.negative_prompt or ""),
                                   settings=best_image_settings(model, aspect) or None)
             # Deleted in Studio while the provider worked: drop the image
             # (it was still billed). The write below is conditional too, so
@@ -1137,12 +1145,17 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             job.status = "polling"
             db.commit()
 
+            negative = effective_negative("video", job.negative_prompt or "")
+            settings_extra: dict = {}
+            if job.aspect_ratio:  # unset: the model's own default, as before
+                settings_extra["aspect_ratio"] = job.aspect_ratio
+
             def start(callback):
                 return video.submit(
                     model=model, prompt=job.prompt, references=refs,
-                    negative_prompt=job.negative_prompt or "",
+                    negative_prompt=negative,
                     duration_seconds=float(job.duration_seconds or 5.0),
-                    settings={"callback_url": callback} if callback else None,
+                    settings={**settings_extra, **({"callback_url": callback} if callback else {})} or None,
                 )
 
             if _studio_job_deleted(db, job.id):

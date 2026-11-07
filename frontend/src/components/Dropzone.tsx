@@ -1,6 +1,17 @@
 "use client";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
+
+/** Every image picker's `accept`: HEIC/HEIF is the iPhone camera default
+ * (the backend converts it to JPEG). Extensions help pickers that don't know
+ * the HEIC MIME types. */
+export const IMAGE_ACCEPT = "image/png,image/jpeg,image/webp,image/heic,image/heif,.heic,.heif";
+
+/** True for HEIC/HEIF files, which Chrome, Firefox and Android cannot preview from an object URL. */
+export function isHeicFile(f: { type?: string; name?: string }): boolean {
+  const t = (f.type || "").toLowerCase();
+  return t === "image/heic" || t === "image/heif" || /\.hei[cf]$/i.test(f.name || "");
+}
 
 export type DropzoneFileResult =
   | { name: string; ok: true }
@@ -19,18 +30,27 @@ type Props = {
   // Called after the *whole* batch settles, so the parent can refresh once
   // instead of after every file.
   onSettled?: (results: DropzoneFileResult[]) => void;
+  /** Adds a "Take photo" button (rear camera) on touch devices. */
+  capture?: boolean;
 };
 
 export function Dropzone({
-  accept = "image/png,image/jpeg,image/webp",
+  accept = IMAGE_ACCEPT,
   multiple = true,
   disabled = false,
   hint,
   onUpload,
   concurrency = 2,
   onSettled,
+  capture = false,
 }: Props) {
   const input = useRef<HTMLInputElement>(null);
+  const camera = useRef<HTMLInputElement>(null);
+  const [touch, setTouch] = useState(false);
+  useEffect(() => {
+    if (!capture || typeof window === "undefined" || !window.matchMedia) return;
+    setTouch(window.matchMedia("(pointer: coarse)").matches);
+  }, [capture]);
   const [over, setOver] = useState(false);
   const [progress, setProgress] = useState<
     { name: string; state: "pending" | "uploading" | "done" | "error"; error?: string }[]
@@ -128,6 +148,31 @@ export function Dropzone({
           }}
         />
       </div>
+
+      {capture && touch && (
+        <>
+          <button
+            type="button"
+            className="btn-ghost text-xs w-full"
+            disabled={disabled}
+            onClick={() => camera.current?.click()}
+          >
+            📷 Take photo
+          </button>
+          <input
+            ref={camera}
+            type="file"
+            hidden
+            accept="image/*"
+            capture="environment"
+            aria-label="Take a photo with the camera"
+            onChange={(e) => {
+              onFiles(e.target.files);
+              e.target.value = "";
+            }}
+          />
+        </>
+      )}
 
       {progress.length > 0 && (
         <ul className="space-y-1 text-xs">

@@ -537,13 +537,21 @@ function DetailDrawer({
           </div>
           <Dropzone
             disabled={!rights}
+            multiple
+            capture
+            // One at a time: phone uploads are big and the list shows each file's progress.
+            concurrency={1}
             hint={
               rights
-                ? "PNG, JPEG, or WEBP up to 15 MB each. EXIF is stripped on upload."
+                ? "Pick several at once. HEIC (iPhone), PNG, JPEG or WebP up to 50 MB each. EXIF is stripped on upload."
                 : "Confirm rights above to enable uploads."
             }
             onUpload={(file) => upload(file)}
-            onSettled={() => {
+            onSettled={(results) => {
+              const ok = results.filter((r) => r.ok).length;
+              const failed = results.length - ok;
+              if (failed === 0) toast.success(ok === 1 ? "Uploaded 1 image" : `Uploaded ${ok} images`);
+              else toast.error(`${failed} of ${results.length} uploads failed. See the list for why.`);
               reload();
               onChange();
             }}

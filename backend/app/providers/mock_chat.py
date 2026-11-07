@@ -34,6 +34,24 @@ class MockChatProvider(ChatProvider):
         return {"scene": f"{scene[0].upper()}{scene[1:]}.", "light": "Soft, ordinary daylight.",
                 "camera": "Shot on a full-frame camera with a 35 mm lens at f/8 from a tripod."}
 
+    # Clearly-mock additions so a demo shows the round trip without a model.
+    ENHANCE_SUFFIX = {
+        "image": " \u2014 soft natural light, 35mm, shallow depth of field",
+        "scene": " \u2014 soft natural light, 35mm, shallow depth of field",
+        "video": " \u2014 one continuous shot, the camera pushes in gently, real-time pacing",
+    }
+
+    def enhance_prompt(self, text: str, kind: str, model: str = "") -> str:
+        """Deterministic: the text plus a short mock suffix (a script is only
+        tidied, never padded with invented lines)."""
+        if kind not in ("image", "video", "script", "scene"):
+            raise ValueError(f"unknown prompt kind {kind!r}")
+        base = text.strip()
+        if kind == "script":
+            return "\n".join(re.sub(r"[ \t]{2,}", " ", ln).strip() for ln in base.splitlines()).strip()
+        suffix = self.ENHANCE_SUFFIX[kind]
+        return base if base.endswith(suffix) else (base.rstrip(" ,.") + suffix)
+
     def generate_storyboard(self, *, project: dict, cast: CastContext) -> StoryboardPlan:
         script = (project.get("original_script") or "").strip() or "Sample script."
         title = (project.get("title") or "Untitled").strip() or "Untitled"

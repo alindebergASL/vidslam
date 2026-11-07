@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
+import { IMAGE_ACCEPT } from "@/components/Dropzone";
 import { api, AmbientScene } from "@/lib/api";
 
 export type PickedImage = { kind: "studio" | "asset"; id: number; url: string; label: string };
@@ -181,7 +182,7 @@ export function ScenePicture({
           <input
             ref={fileRef}
             type="file"
-            accept="image/png,image/jpeg,image/webp"
+            accept={IMAGE_ACCEPT}
             className="hidden"
             aria-label="Upload a scene picture"
             onChange={(e) => {

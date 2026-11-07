@@ -46,11 +46,19 @@ class Settings(BaseSettings):
     rate_limit_generation_per_minute: float = 10.0
 
     # uploads
-    max_upload_bytes: int = 15 * 1024 * 1024
+    # Phone photos (48 MP HEIC/ProRAW-sized JPEGs) run well past 15 MB.
+    max_upload_bytes: int = 50 * 1024 * 1024
+    # Declared types an image upload may arrive with. The bytes are always
+    # decoded and checked. HEIC/HEIF is the iPhone camera default (converted
+    # to JPEG on upload). Browsers that don't know .heic send octet-stream or
+    # no type at all: storage.accepted_upload_type then takes the file only
+    # when its name is an image name (.heic/.heif/.jpg/...).
     allowed_image_mimes: tuple[str, ...] = (
         "image/png",
         "image/jpeg",
         "image/webp",
+        "image/heic",
+        "image/heif",
     )
 
     # openrouter

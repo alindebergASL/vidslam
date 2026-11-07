@@ -9,6 +9,7 @@ import { AudioPanel } from "@/components/AudioPanel";
 import { RenderHistory } from "@/components/RenderHistory";
 import { GenerationProgress } from "@/components/GenerationProgress";
 import { useToast } from "@/components/Toaster";
+import { EnhanceButton } from "@/components/EnhanceButton";
 import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
 import { api, Asset, Project, Shot, Render } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
@@ -311,6 +312,17 @@ function Inner() {
             })
           }
         />
+        <EnhanceButton
+          className="mt-2"
+          text={project.original_script}
+          kind="script"
+          onUse={(t) => {
+            setProject({ ...project, original_script: t });
+            api
+              .updateProject(projectId, { original_script: t })
+              .catch((e) => toast.error(e.message || "Couldn't save the script"));
+          }}
+        />
         <label className="label mt-4 block" htmlFor="proj-creative-direction">Creative direction</label>
         <textarea
           id="proj-creative-direction"
@@ -607,6 +619,7 @@ function StoryboardScript({
         value={script}
         onChange={(e) => setScript(e.target.value)}
       />
+      <EnhanceButton className="mt-2" text={script} kind="script" onUse={setScript} />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
         <div>
           <label className="label" htmlFor="proj-end-card-text">End-card text</label>
@@ -675,6 +688,7 @@ function ShotRow({
   onDragEnd: () => void;
 }) {
   const [prompt, setPrompt] = useState(shot.prompt);
+  const [avoid, setAvoid] = useState(shot.negative_prompt || "");
   const [dur, setDur] = useState(shot.duration_seconds);
   const [refs, setRefs] = useState<number[]>(shot.reference_asset_ids_json || []);
   const [modelOverride, setModelOverride] = useState(shot.model_override || "");
@@ -769,6 +783,43 @@ function ShotRow({
               className="input min-h-[60px] flex-1 min-w-0"
             />
           </div>
+          {shot.shot_type !== "end_card" && (
+            <div className="mt-2 space-y-2">
+              <EnhanceButton
+                text={prompt}
+                kind="video"
+                model={modelOverride || shot.provider_model || null}
+                onUse={(t) => {
+                  setPrompt(t);
+                  api
+                    .updateShot(projectId, shot.id, { prompt: t })
+                    .then(onChange)
+                    .catch((e) => toast.error(e.message || "Couldn't save the prompt"));
+                }}
+              />
+              <div className="flex items-center gap-2">
+                <label htmlFor={`shot-${shot.id}-avoid`} className="text-xs text-ink-300 shrink-0">
+                  Avoid
+                </label>
+                <input
+                  id={`shot-${shot.id}-avoid`}
+                  value={avoid}
+                  maxLength={1000}
+                  onChange={(e) => setAvoid(e.target.value)}
+                  onBlur={() => {
+                    if (avoid === (shot.negative_prompt || "")) return;
+                    api
+                      .updateShot(projectId, shot.id, { negative_prompt: avoid })
+                      .then(onChange)
+                      .catch((e) => toast.error(e.message || "Couldn't save the avoid list"));
+                  }}
+                  placeholder="e.g. crowds, text on screen"
+                  title="Your defaults from Settings → Prompting are added automatically"
+                  className="input text-xs py-1 flex-1 min-w-0"
+                />
+              </div>
+            </div>
+          )}
           {castAssets.length > 0 && shot.shot_type !== "end_card" && (
             <div className="mt-3">
               <div className="label flex items-center gap-2">

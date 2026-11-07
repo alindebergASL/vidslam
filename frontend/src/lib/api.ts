@@ -290,7 +290,45 @@ export type StudioJob = {
   error: string;
   created_at: string;
   updated_at: string;
+  /** What the user asked to avoid (the Settings defaults are added server-side). */
+  negative_prompt?: string;
+  reference_asset_ids?: number[];
+  /** "" = the default for the owner (character 9:16, scene 16:9). */
+  aspect_ratio?: string;
+  /** Only on the create response: every job id the request made (incl. this one). */
+  batch_ids?: number[];
 };
+
+export type StudioAspect = "" | "9:16" | "16:9" | "1:1";
+
+export type StudioGenerateBody = {
+  owner_kind: "avatar" | "ingredient";
+  owner_id: number;
+  prompt: string;
+  negative_prompt?: string;
+  reference_asset_ids?: number[];
+  model?: string;
+  duration_seconds?: number;
+  /** null = the owner's default aspect. */
+  aspect_ratio?: "9:16" | "16:9" | "1:1" | null;
+  /** 1..4, images only. */
+  variations?: number;
+};
+
+export type PromptDefaults = { image: string; video: string };
+export type EnhanceKind = "image" | "video" | "script" | "scene";
+
+export type PromptPreset = {
+  id: string;
+  name: string;
+  kind: "image" | "video";
+  prompt: string;
+  negative_prompt: string;
+  model: string;
+  aspect_ratio: StudioAspect;
+  created_at: string;
+};
+export type PromptPresetIn = Omit<PromptPreset, "id" | "created_at">;
 
 export type CustomModel = {
   id: number;
@@ -1038,14 +1076,35 @@ export const api = {
   deleteTraining: (id: number) =>
     req<void>(`/api/training-jobs/${id}`, { method: "DELETE" }),
 
+  // prompting: default avoid lists, enhance, presets
+  getPromptDefaults: () => req<PromptDefaults>("/api/prompts/defaults"),
+  setPromptDefaults: (body: PromptDefaults) =>
+    req<PromptDefaults>("/api/prompts/defaults", { method: "PUT", body: JSON.stringify(body) }),
+  resetPromptDefaults: () => req<PromptDefaults>("/api/prompts/defaults", { method: "DELETE" }),
+  enhancePrompt: (body: { text: string; kind: EnhanceKind; model?: string | null }) =>
+    req<{ text: string; model: string }>("/api/prompts/enhance", {
+      method: "POST",
+      body: JSON.stringify({ text: body.text, kind: body.kind, model: body.model || null }),
+    }),
+  listPresets: () => req<PromptPreset[]>("/api/prompts/presets"),
+  createPreset: (p: PromptPresetIn) =>
+    req<PromptPreset>("/api/prompts/presets", { method: "POST", body: JSON.stringify(p) }),
+  updatePreset: (id: string, p: PromptPresetIn) =>
+    req<PromptPreset>(`/api/prompts/presets/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify(p),
+    }),
+  deletePreset: (id: string) =>
+    req<void>(`/api/prompts/presets/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
   // studio
   listStudioJobs: () => req<StudioJob[]>("/api/studio/jobs"),
-  generateImage: (body: any) =>
+  generateImage: (body: StudioGenerateBody) =>
     req<StudioJob>("/api/studio/generate-image", {
       method: "POST",
       body: JSON.stringify(body),
     }),
-  generateClip: (body: any) =>
+  generateClip: (body: StudioGenerateBody) =>
     req<StudioJob>("/api/studio/generate-clip", {
       method: "POST",
       body: JSON.stringify(body),

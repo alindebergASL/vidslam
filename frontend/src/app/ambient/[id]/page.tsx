@@ -7,6 +7,7 @@ import { AuthGate } from "@/components/AuthGate";
 import { RenderHistory } from "@/components/RenderHistory";
 import { PublishPanel } from "@/components/PublishPanel";
 import { useToast } from "@/components/Toaster";
+import { EnhanceButton } from "@/components/EnhanceButton";
 import { ScenePicture } from "@/components/ambient/ScenePicture";
 import {
   ChipRow,
@@ -849,6 +850,13 @@ function SettingsPanel({
               value={cfg.scene_prompt}
               placeholder={preset?.prompt || ""}
               onChange={(e) => set("scene_prompt", e.target.value)}
+            />
+            <EnhanceButton
+              className="mt-2"
+              text={cfg.scene_prompt}
+              kind="scene"
+              model={cfg.still_model || null}
+              onUse={(t) => set("scene_prompt", t)}
             />
             <PhotoRewriteControl cfg={cfg} set={set} idPrefix="set-rewrite" saved={scene.config} />
           </div>

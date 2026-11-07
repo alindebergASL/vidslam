@@ -756,6 +756,10 @@ class PictureError(ValueError):
     """Not a usable picture (bad type, too small, unreadable)."""
 
 
+class PictureTooLarge(PictureError):
+    """The picture is over the size/pixel limit (an upload answers 413)."""
+
+
 def picture_path(project: models.VideoProject) -> Path:
     return storage.render_subdir(project.id) / "picture.png"
 
@@ -771,11 +775,22 @@ def _crop_to_aspect(raw: bytes, aspect: str) -> bytes:
 
     from PIL import Image, ImageOps, UnidentifiedImageError
 
+    # storage registers the HEIC/HEIF opener (iPhone photos) and guards
+    # against decompression bombs from the header, before any decode.
     try:
-        img = Image.open(io.BytesIO(raw))
-        img = ImageOps.exif_transpose(img).convert("RGB")
-    except (UnidentifiedImageError, OSError) as e:
+        img = storage.open_image(raw)
+    except storage.UploadTooLarge as e:
+        raise PictureTooLarge(str(e)) from e
+    except storage.UploadError as e:
         raise PictureError("not a readable image") from e
+    try:
+        if img.format in ("JPEG", "MPO"):
+            img.draft("RGB", (storage.MAX_IMAGE_SIDE, storage.MAX_IMAGE_SIDE))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as e:
+        raise PictureError("not a readable image") from e
+    if max(img.size) > storage.MAX_IMAGE_SIDE:
+        img.thumbnail((storage.MAX_IMAGE_SIDE, storage.MAX_IMAGE_SIDE), Image.LANCZOS)
     if min(img.size) < PICTURE_MIN_SIDE:
         raise PictureError(f"picture is too small ({img.size[0]}×{img.size[1]}); "
                            f"use at least {PICTURE_MIN_SIDE}px on the short side")

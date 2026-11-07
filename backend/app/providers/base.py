@@ -109,6 +109,13 @@ class ChatProvider(Protocol):
         {"scene": str, "light": str, "camera": str}."""
         ...
 
+    def enhance_prompt(self, text: str, kind: str, model: str = "") -> str:
+        """An improved prompt for `kind` ("image" | "video" | "script" |
+        "scene"), keeping the user's subject and intent. `model` is the
+        target generation model, used for a model-family hint. Returns the
+        improved text only."""
+        ...
+
 
 class ImageProvider(Protocol):
     def list_models(self) -> list[ModelInfo]: ...

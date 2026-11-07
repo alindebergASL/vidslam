@@ -29,47 +29,49 @@ def _owner_exists(db: Session, kind: str, owner_id: int) -> bool:
     return False
 
 
-@router.post("/generate-image", response_model=StudioJobOut, status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
-def generate_image(body: StudioRequest, db: Session = Depends(get_db)) -> models.AssetGenerationJob:
+def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int) -> StudioJobOut:
+    """`count` separate jobs for one request (same prompt, refs, model and
+    aspect), each enqueued on its own. Answers with the first job plus the
+    ids of all of them."""
     if not _owner_exists(db, body.owner_kind, body.owner_id):
         raise HTTPException(404, "owner not found")
-    job = models.AssetGenerationJob(
-        owner_kind=body.owner_kind,
-        owner_id=body.owner_id,
-        output_kind="image",
-        prompt=body.prompt,
-        negative_prompt=body.negative_prompt,
-        reference_asset_ids_json=body.reference_asset_ids,
-        provider_model=body.model or "",
-        status="pending",
-    )
-    db.add(job)
+    jobs = [
+        models.AssetGenerationJob(
+            owner_kind=body.owner_kind,
+            owner_id=body.owner_id,
+            output_kind=output_kind,
+            duration_seconds=body.duration_seconds,
+            prompt=body.prompt,
+            negative_prompt=body.negative_prompt,
+            reference_asset_ids_json=list(body.reference_asset_ids),
+            aspect_ratio=body.aspect_ratio or "",
+            provider_model=body.model or "",
+            status="pending",
+        )
+        for _ in range(count)
+    ]
+    db.add_all(jobs)
     db.commit()
-    db.refresh(job)
-    enqueue(generate_asset_job, job.id)
-    return job
+    for job in jobs:
+        db.refresh(job)
+    for job in jobs:
+        enqueue(generate_asset_job, job.id)
+    out = StudioJobOut.model_validate(jobs[0])
+    out.batch_ids = [j.id for j in jobs]
+    return out
+
+
+@router.post("/generate-image", response_model=StudioJobOut, status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
+def generate_image(body: StudioRequest, db: Session = Depends(get_db)) -> StudioJobOut:
+    return _create_jobs(db, body, "image", body.variations)
 
 
 @router.post("/generate-clip", response_model=StudioJobOut, status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
-def generate_clip(body: StudioRequest, db: Session = Depends(get_db)) -> models.AssetGenerationJob:
-    if not _owner_exists(db, body.owner_kind, body.owner_id):
-        raise HTTPException(404, "owner not found")
-    job = models.AssetGenerationJob(
-        owner_kind=body.owner_kind,
-        owner_id=body.owner_id,
-        output_kind="video_clip",
-        duration_seconds=body.duration_seconds,
-        prompt=body.prompt,
-        negative_prompt=body.negative_prompt,
-        reference_asset_ids_json=body.reference_asset_ids,
-        provider_model=body.model or "",
-        status="pending",
-    )
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-    enqueue(generate_asset_job, job.id)
-    return job
+def generate_clip(body: StudioRequest, db: Session = Depends(get_db)) -> StudioJobOut:
+    if body.variations > 1:
+        # Clips are the expensive output; one per request, never N by accident.
+        raise HTTPException(422, "variations apply to images only; make one clip at a time")
+    return _create_jobs(db, body, "video_clip", 1)
 
 
 def _live_job(db: Session, job_id: int) -> Optional[models.AssetGenerationJob]:

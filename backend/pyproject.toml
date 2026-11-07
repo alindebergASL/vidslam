@@ -13,6 +13,8 @@ dependencies = [
   "httpx>=0.27",
   "cryptography>=42",
   "Pillow>=10.4",
+  # HEIC/HEIF decoding (iPhone camera photos); registered in services/storage.py.
+  "pillow-heif>=0.18",
   "rq>=1.16",
   "redis>=5.0",
   "itsdangerous>=2.2",
