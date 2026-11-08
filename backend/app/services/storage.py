@@ -2,24 +2,67 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 import uuid
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Optional
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 from ..config import get_settings
 
 settings = get_settings()
 
 
+# iPhone photos are HEIC by default. Registering the opener once here lets
+# every Image.open on uploaded bytes (Cast, brand logos, ambient pictures)
+# read them; they're converted to JPEG before anything else sees them.
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+    HEIF_SUPPORTED = True
+except ImportError:  # pragma: no cover — the dependency is required, but never crash on boot
+    HEIF_SUPPORTED = False
+
+# Long side cap for uploads; bigger photos are scaled down (Lanczos) first.
+MAX_IMAGE_SIDE = 4096
+# Decompression-bomb guard, checked from the header before any pixel is
+# decoded: a tiny file can claim gigapixels. 100 MP covers every phone camera.
+MAX_IMAGE_PIXELS = 100_000_000
+
+HEIF_MIMES = ("image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence")
+_HEIF_EXTS = (".heic", ".heif", ".hif")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", *_HEIF_EXTS)
+# What a browser sends when it doesn't know the type (Chrome/Firefox on
+# Windows or Android for a .heic file); the name then decides.
+_UNKNOWN_MIMES = ("", "application/octet-stream", "binary/octet-stream")
+
+
 class UploadError(ValueError):
-    pass
+    """A rejected upload. `status_code` is what the API answers with."""
+
+    status_code = 400
+
+
+class UploadTooLarge(UploadError):
+    status_code = 413
+
+
+class UnsupportedUpload(UploadError):
+    # 400 (not 415) keeps the Cast/brand contract existing clients rely on.
+    status_code = 400
 
 
 # Pillow format → (extension, mime type): what a file really is.
 _FORMAT_TYPES = {"PNG": ("png", "image/png"), "JPEG": ("jpg", "image/jpeg"),
                  "WEBP": ("webp", "image/webp"), "GIF": ("gif", "image/gif")}
+
+# Formats an upload may be in, and what each is saved as.
+# MPO is a JPEG with an MPF block (iPhone HDR/Portrait, many Samsung camera
+# photos): its first frame is kept, as JPEG.
+_UPLOAD_OUTPUT = {"PNG": "PNG", "JPEG": "JPEG", "WEBP": "WEBP", "HEIF": "JPEG", "AVIF": "JPEG",
+                  "MPO": "JPEG"}
 
 
 def _ext_for_mime(mime: str) -> str:
@@ -30,6 +73,141 @@ def _ext_for_mime(mime: str) -> str:
     }.get(mime, "bin")
 
 
+def _mb(n: int) -> str:
+    return f"{n / (1024 * 1024):.0f} MB"
+
+
+def too_large_message(size: int, limit: Optional[int] = None) -> str:
+    """'That file is 62 MB; the limit is 50 MB.'"""
+    limit = settings.max_upload_bytes if limit is None else limit
+    shown = _mb(size)
+    if shown == _mb(limit):  # just over: whole MB would read "50 MB; the limit is 50 MB"
+        shown = f"{size / (1024 * 1024):.1f} MB"
+    return f"That file is {shown}; the limit is {_mb(limit)}."
+
+
+def _describe(content_type: str, fmt: Optional[str] = None) -> str:
+    """A short, safe name for what a rejected file is (never its contents)."""
+    if fmt:
+        return f"a {fmt} image"
+    ct = re.sub(r"[^a-zA-Z0-9.+/_-]", "", (content_type or "").split(";")[0].strip())[:60]
+    return ct or "an unknown file type"
+
+
+def unsupported_message(content_type: str, fmt: Optional[str] = None) -> str:
+    return f"HEIC/PNG/JPEG/WebP only — this looks like {_describe(content_type, fmt)}."
+
+
+def is_heif_name(filename: str) -> bool:
+    return (filename or "").lower().endswith(_HEIF_EXTS)
+
+
+def accepted_upload_type(content_type: str, filename: str) -> bool:
+    """Whether the browser-declared type (or, for an unknown type, the file
+    name) is one we take. The bytes are still checked when decoding."""
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct in settings.allowed_image_mimes and ct not in _UNKNOWN_MIMES:
+        return True
+    if ct in HEIF_MIMES:
+        return True
+    return ct in _UNKNOWN_MIMES and (filename or "").lower().endswith(_IMAGE_EXTS)
+
+
+def check_upload_type(content_type: str, filename: str) -> None:
+    if not accepted_upload_type(content_type, filename):
+        raise UnsupportedUpload(unsupported_message(content_type))
+
+
+def check_upload_size(size: int) -> None:
+    if size > settings.max_upload_bytes:
+        raise UploadTooLarge(too_large_message(size))
+
+
+def _upload_size(file: BinaryIO) -> Optional[int]:
+    try:
+        pos = file.tell()
+        file.seek(0, io.SEEK_END)
+        size = file.tell()
+        file.seek(pos)
+        return size - pos
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def read_upload(file: BinaryIO) -> bytes:
+    """Read an uploaded file, refusing (413) before reading one over the
+    limit when its size is known (Starlette spools uploads to a seekable
+    temp file)."""
+    size = _upload_size(file)
+    if size is not None:
+        check_upload_size(size)
+    raw = file.read(settings.max_upload_bytes + 1)
+    if len(raw) > settings.max_upload_bytes:
+        check_upload_size(size if size and size > len(raw) else len(raw))
+    return raw
+
+
+def open_image(raw: bytes) -> "Image.Image":
+    """Open uploaded bytes with the decompression-bomb guard applied from the
+    header (no pixels decoded yet). Raises UploadTooLarge / UnsupportedUpload."""
+    try:
+        img = Image.open(io.BytesIO(raw))
+    except Image.DecompressionBombError as e:
+        raise UploadTooLarge("That image has too many pixels to process safely.") from e
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError) as e:
+        raise UnsupportedUpload("File is not a recognizable image. " + unsupported_message("")) from e
+    w, h = img.size
+    if w * h > MAX_IMAGE_PIXELS:
+        img.close()
+        raise UploadTooLarge(f"That image is {w}×{h} px; the limit is "
+                             f"{MAX_IMAGE_PIXELS // 1_000_000} megapixels.")
+    return img
+
+
+def _downscaled(img: "Image.Image") -> "Image.Image":
+    if max(img.size) > MAX_IMAGE_SIDE:
+        img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE), Image.LANCZOS)
+    return img
+
+
+def normalize_uploaded_image(raw: bytes) -> tuple[bytes, str, str, int, int]:
+    """Decode uploaded bytes and re-encode them clean: EXIF stripped (after
+    applying its rotation), HEIC/HEIF converted to JPEG (quality 90), long
+    side capped at MAX_IMAGE_SIDE. Returns (bytes, ext, mime, width, height)."""
+    img = open_image(raw)
+    try:
+        fmt = img.format or ""
+        out_fmt = _UPLOAD_OUTPUT.get(fmt)
+        if out_fmt is None:
+            raise UnsupportedUpload(unsupported_message("", fmt))
+        if fmt in ("JPEG", "MPO"):
+            # Decode a huge JPEG at reduced scale instead of in full.
+            img.draft("RGB", (MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+        try:
+            img.load()
+            img = ImageOps.exif_transpose(img)
+        except Image.DecompressionBombError as e:
+            raise UploadTooLarge("That image has too many pixels to process safely.") from e
+        except (OSError, ValueError, SyntaxError) as e:
+            raise UnsupportedUpload("File is not a recognizable image. "
+                                    + unsupported_message("", fmt)) from e
+        img = _downscaled(img)
+        save_kwargs: dict = {}
+        if out_fmt == "JPEG":
+            save_kwargs = {"quality": 90, "optimize": True}
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+        elif out_fmt == "WEBP":
+            save_kwargs["quality"] = 92
+        buf = io.BytesIO()
+        # A fresh save carries no EXIF/XMP: Pillow only writes what it's given.
+        img.save(buf, format=out_fmt, **save_kwargs)
+        ext, mime = _FORMAT_TYPES[out_fmt]
+        return buf.getvalue(), ext, mime, img.size[0], img.size[1]
+    finally:
+        img.close()
+
+
 def save_uploaded_image(
     file: BinaryIO,
     *,
@@ -38,39 +216,13 @@ def save_uploaded_image(
     owner_kind: str,
     owner_id: int,
 ) -> dict:
-    """Validate + strip EXIF + persist; return metadata dict."""
-    if mime_type not in settings.allowed_image_mimes:
-        raise UploadError(f"Unsupported mime type: {mime_type}")
+    """Validate + strip EXIF + persist; return metadata dict.
 
-    raw = file.read()
-    if len(raw) > settings.max_upload_bytes:
-        raise UploadError(
-            f"File too large: {len(raw)} > {settings.max_upload_bytes} bytes"
-        )
-
-    try:
-        with Image.open(io.BytesIO(raw)) as img:
-            img.load()
-            fmt = img.format
-            width, height = img.size
-            # Strip EXIF: re-encode without the exif chunk.
-            buf = io.BytesIO()
-            save_kwargs: dict = {}
-            if fmt == "JPEG":
-                save_kwargs["quality"] = 90
-                save_kwargs["optimize"] = True
-                img_to_save = img.convert("RGB")
-            elif fmt == "PNG":
-                img_to_save = img
-            elif fmt == "WEBP":
-                save_kwargs["quality"] = 92
-                img_to_save = img
-            else:
-                raise UploadError(f"Unsupported image format: {fmt}")
-            img_to_save.save(buf, format=fmt, **save_kwargs)
-            cleaned = buf.getvalue()
-    except UnidentifiedImageError as e:
-        raise UploadError("File is not a recognizable image") from e
+    Takes PNG, JPEG, WebP and HEIC/HEIF (also when the browser sent no type
+    or application/octet-stream for a .heic name). HEIC is saved as JPEG."""
+    check_upload_type(mime_type, original_filename)
+    raw = read_upload(file)
+    cleaned, ext, mime_type, width, height = normalize_uploaded_image(raw)
 
     checksum = hashlib.sha256(cleaned).hexdigest()
     subdir = settings.data_path / "uploads" / owner_kind / str(owner_id)
@@ -78,7 +230,6 @@ def save_uploaded_image(
     # Name and type the file by what it is, not what the browser claimed
     # (a JPEG sent as image/png would be served as PNG, and providers such
     # as HeyGen reject the mismatch).
-    ext, mime_type = _FORMAT_TYPES[fmt]
     filename = f"{uuid.uuid4().hex}.{ext}"
     out_path = subdir / filename
     out_path.write_bytes(cleaned)

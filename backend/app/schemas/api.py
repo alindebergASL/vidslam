@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from .storyboard import StoryboardPlan
 
@@ -307,6 +307,11 @@ class StudioRequest(BaseModel):
     reference_asset_ids: list[int] = Field(default_factory=list)
     model: Optional[str] = None
     duration_seconds: float = Field(5.0, ge=1.0, le=60.0)
+    # None = the owner's default (avatar 9:16 portrait, ingredient 16:9).
+    aspect_ratio: Optional[Literal["9:16", "16:9", "1:1"]] = None
+    # Images only: this many separate jobs from one request. A clip
+    # request with more than 1 is refused (422) rather than billed N times.
+    variations: int = Field(1, ge=1, le=4)
 
 
 class StudioSaveRequest(BaseModel):
@@ -325,6 +330,11 @@ class StudioJobOut(BaseModel):
     owner_id: int
     output_kind: str
     prompt: str
+    # The user's own "avoid" text (defaults are added when the job runs).
+    negative_prompt: str = ""
+    reference_asset_ids: list[int] = Field(
+        default_factory=list, validation_alias=AliasChoices("reference_asset_ids", "reference_asset_ids_json"))
+    aspect_ratio: str = ""  # "" = the owner's default
     duration_seconds: float
     provider: str
     provider_model: str
@@ -334,6 +344,18 @@ class StudioJobOut(BaseModel):
     error: str
     created_at: datetime
     updated_at: datetime
+    # Every job a create request made (the first included); only on that response.
+    batch_ids: list[int] = Field(default_factory=list)
+
+    @field_validator("reference_asset_ids", mode="before")
+    @classmethod
+    def _ref_ids(cls, v):
+        return list(v or [])
+
+    @field_validator("negative_prompt", "aspect_ratio", mode="before")
+    @classmethod
+    def _none_is_empty(cls, v):
+        return v or ""
 
 
 # --- Custom model training ---

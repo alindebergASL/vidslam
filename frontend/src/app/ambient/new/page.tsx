@@ -5,6 +5,8 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { useToast } from "@/components/Toaster";
+import { IMAGE_ACCEPT, isHeicFile } from "@/components/Dropzone";
+import { EnhanceButton } from "@/components/EnhanceButton";
 import { PickedImage, PicturePicker, pictureUse } from "@/components/ambient/ScenePicture";
 import {
   ChipRow,
@@ -78,7 +80,7 @@ function Inner() {
     }
   }, []);
   useEffect(() => () => {
-    if (picture?.file) URL.revokeObjectURL(picture.url);
+    if (picture?.file && picture.url) URL.revokeObjectURL(picture.url);
   }, [picture]);
 
   useEffect(() => {
@@ -308,6 +310,16 @@ function Inner() {
                 : "Leave blank to use the preset text."}{" "}
               We add &ldquo;static camera, no cuts, no people, seamless loop&rdquo; directives automatically.
             </p>
+            <EnhanceButton
+              className="mt-2"
+              text={cfg.scene_prompt}
+              kind="scene"
+              model={cfg.still_model || null}
+              onUse={(t) => {
+                setPromptTouched(true);
+                set("scene_prompt", t);
+              }}
+            />
             <PhotoRewriteControl
               cfg={{ ...cfg, picture_origin: picture ? (picture.file ? "upload" : picture.picked!.kind) : "" }}
               set={set}
@@ -316,9 +328,18 @@ function Inner() {
 
             <div className="label mt-5">Start from a picture (optional)</div>
             <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
-              {picture && (
-                <img src={picture.url} alt="Chosen picture" className="w-full sm:w-40 aspect-video object-cover rounded-md border border-ink-700" />
-              )}
+              {picture &&
+                (picture.file && isHeicFile(picture.file) ? (
+                  <div
+                    className="w-full sm:w-40 aspect-video rounded-md border border-ink-700 bg-ink-800 flex flex-col items-center justify-center p-2 text-center"
+                    title={picture.file.name}
+                  >
+                    <span className="text-xs text-ink-100 truncate max-w-full">{picture.file.name}</span>
+                    <span className="text-[11px] text-ink-400 mt-1">Preview after upload (HEIC)</span>
+                  </div>
+                ) : (
+                  <img src={picture.url} alt="Chosen picture" className="w-full sm:w-40 aspect-video object-cover rounded-md border border-ink-700" />
+                ))}
               <div className="min-w-0">
                 <div className="flex flex-wrap gap-2">
                   <button type="button" className="btn-ghost text-xs" onClick={() => fileRef.current?.click()}>
@@ -343,13 +364,14 @@ function Inner() {
             <input
               ref={fileRef}
               type="file"
-              accept="image/png,image/jpeg,image/webp"
+              accept={IMAGE_ACCEPT}
               className="hidden"
               aria-label="Upload a scene picture"
               onChange={(e) => {
                 const f = e.target.files?.[0];
                 e.target.value = "";
-                if (f) setPicture({ file: f, url: URL.createObjectURL(f) });
+                // Most browsers cannot decode HEIC/HEIF, so skip the object URL and show a placeholder tile.
+                if (f) setPicture({ file: f, url: isHeicFile(f) ? "" : URL.createObjectURL(f) });
               }}
             />
             {picking && (

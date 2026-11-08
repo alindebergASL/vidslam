@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
+import { EnhanceButton } from "@/components/EnhanceButton";
 import { api, Avatar, BrandKit, CastMember, Ingredient } from "@/lib/api";
 
 const MODES = [
@@ -226,13 +227,15 @@ function Inner() {
         </div>
 
         <div className="card p-4">
-          <label className="label">Script</label>
+          <label className="label" htmlFor="new-project-script">Script</label>
           <textarea
+            id="new-project-script"
             className="input min-h-[140px]"
             value={script}
             onChange={(e) => setScript(e.target.value)}
             placeholder="If your dating bio says food, travel, and music…"
           />
+          <EnhanceButton className="mt-2" text={script} kind="script" onUse={setScript} />
           <div className="text-xs text-ink-400 mt-2">
             The planner will tighten this into a short-form voiceover.
           </div>

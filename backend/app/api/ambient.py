@@ -15,7 +15,6 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from .. import models
-from ..config import get_settings
 from ..db import get_db
 from ..schemas.ambient import (
     AmbientBatchRequest,
@@ -275,14 +274,15 @@ async def upload_picture(scene_id: int, file: UploadFile = File(...), db: Sessio
     the still of a Still + drift scene. Cropped to the scene's aspect."""
     project = _get_scene(db, scene_id)
     _picture_busy(project)
-    s = get_settings()
-    if (file.content_type or "") not in s.allowed_image_mimes:
-        raise HTTPException(415, f"unsupported image type {file.content_type!r}")
-    raw = await file.read(s.max_upload_bytes + 1)
-    if len(raw) > s.max_upload_bytes:
-        raise HTTPException(413, f"image is larger than {s.max_upload_bytes // (1024 * 1024)} MB")
+    try:
+        storage.check_upload_type(file.content_type or "", file.filename or "")
+        raw = storage.read_upload(file.file)
+    except storage.UploadError as e:
+        raise HTTPException(413 if e.status_code == 413 else 415, str(e)) from e
     try:
         svc.set_picture(db, project, raw, "upload")
+    except svc.PictureTooLarge as e:
+        raise HTTPException(413, str(e)) from e
     except svc.PictureError as e:
         raise HTTPException(422, str(e)) from e
     return svc.to_out(db, project)

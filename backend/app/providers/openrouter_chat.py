@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -174,6 +175,42 @@ class OpenRouterChatProvider(ChatProvider):
         return {k: str(out.get(k) or "").strip() for k in ("scene", "light", "camera")}
 
 
+    def enhance_prompt(self, text: str, kind: str, model: str = "") -> str:
+        """One short call: the user's prompt improved for `kind` (see
+        ENHANCE_GUIDES), with a hint for the target `model`'s family."""
+        body: dict = {
+            "model": self.model,
+            "temperature": 0.4,
+            "messages": [
+                {"role": "system", "content": enhance_system_prompt(kind, model)},
+                {"role": "user", "content": text},
+            ],
+        }
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(url, headers=self._headers(), json=body)
+            r.raise_for_status()
+            data = r.json()
+        if "choices" not in data:
+            err = data.get("error") or {}
+            raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
+        from ..services import spend
+
+        spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
+                                generation_id=str(data.get("id") or ""), estimate=0.001,
+                                note="prompt enhance")
+        # A malformed 200 ("choices": [], a choice without a message, a null
+        # content) must surface as the router's 502, not an opaque 500.
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (IndexError, KeyError, TypeError):
+            raise RuntimeError("OpenRouter returned no message") from None
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if not isinstance(content, str):
+            raise RuntimeError("OpenRouter returned no message")
+        return clean_enhanced(content)
+
 # Tested blind (Nov 2026): typed descriptions full of hype words ("magical",
 # "8k ultra realistic", "crystal clear turquoise") scored 4.7-5.7; the same
 # descriptions rewritten like this scored 6.3-7.0. Plain ones didn't change.
@@ -274,3 +311,62 @@ def extract_json(text: str) -> dict:
                         break  # not JSON after all; try the next "{"
         start = text.find("{", start + 1)
     raise ValueError(f"no JSON object in model reply: {text[:200]!r}")
+
+
+# "Enhance my prompt" guides, one per kind. Hype words are banned on purpose:
+# they made pictures look more AI in blind tests (see SCENE_REWRITE_SYSTEM).
+_ENHANCE_COMMON = """Keep the user's subject and intent exactly; add detail, don't replace anything they asked for, and don't add people, objects or claims they didn't ask for beyond ordinary detail. No hype words (8k, 4k, ultra, HD, masterpiece, stunning, breathtaking, epic, award-winning, hyperrealistic). Reply with the improved prompt only: no preamble, no quotes, no notes, no markdown."""
+
+ENHANCE_GUIDES: dict[str, str] = {
+    "image": """You improve a prompt for an image model. Describe, in this order: the subject, the setting, the composition and framing, the light (physically: where it comes from, how hard or soft, where shadows fall), the lens and camera, and the style. Photoreal unless the text asks for a style (illustration, watercolor, 3D, anime...). At most about 120 words.""",
+    "video": """You improve a prompt for a video model. Describe one continuous shot (no cuts): the subject and what it does, the camera movement (or a locked-off camera), pacing in real time (never slow motion unless the user asks for it), and the light. At most about 80 words.""",
+    "script": """You tighten a voiceover script for a short vertical video. Put a hook in the first line; use plain spoken sentences that are easy to say aloud; keep the same facts and claims (never invent facts, numbers, prices, names or promises); keep the same length within 15%. Reply with the script text only, no stage directions or labels.""",
+    "scene": """You improve a description of a calm ambient place for an image model, like a real photograph: what is there (concrete materials, real plant and rock species, a few untidy natural details), the composition, the light described physically, the lens and camera. No people unless the user asks for them, no text. At most about 120 words.""",
+}
+
+_VIDEO_MOTION = ("seedance", "kling", "wan", "veo", "hailuo", "minimax", "ltx", "sora", "runway", "pixverse")
+_NATURAL = ("gpt-image", "gpt-5-image", "dall-e", "nano-banana", "gemini", "imagen", "seedream")
+_TAGGY = ("sogni/", "chroma", "flux", "z-image", "krea", "stable-diffusion", "sdxl", "sd3", "sd-")
+
+
+def model_family_hint(kind: str, model: str) -> str:
+    """One line nudging the wording toward what the target model reads best."""
+    m = (model or "").lower()
+    if not m or kind == "script":
+        return ""
+    if kind == "video" and any(f in m for f in _VIDEO_MOTION):
+        return ("The target is a video model that responds to explicit camera and motion words: "
+                "name the camera move and the subject's motion plainly (e.g. 'the camera pushes in', "
+                "'she turns toward the window').")
+    if any(f in m for f in _NATURAL):
+        return "The target model reads natural sentences best: write full, plain sentences, not tag lists."
+    if any(f in m for f in _TAGGY):
+        return ("The target is a diffusion model (SD/Flux family): short comma-separated phrases are fine, "
+                "most important first; no weight syntax like (word:1.2).")
+    return ""
+
+
+def enhance_system_prompt(kind: str, model: str = "") -> str:
+    guide = ENHANCE_GUIDES.get(kind)
+    if guide is None:
+        raise ValueError(f"unknown prompt kind {kind!r}")
+    hint = model_family_hint(kind, model)
+    return "\n".join(x for x in (guide, _ENHANCE_COMMON, hint) if x)
+
+
+_LABEL = re.compile(r"^\s*(?:improved |enhanced |final )?(?:prompt|script)\s*:\s*", re.I)
+
+
+def clean_enhanced(text: str) -> str:
+    """The reply as a bare prompt: no code fences, wrapping quotes or a
+    leading "Prompt:" label; capped at 4000 chars."""
+    t = (text or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    t = _LABEL.sub("", t.strip())
+    if len(t) >= 2 and t[0] == t[-1] and t[0] in "\"'\u201c":
+        t = t[1:-1]
+    elif len(t) >= 2 and t[0] == "\u201c" and t[-1] == "\u201d":
+        t = t[1:-1]
+    return t.strip()[:4000]

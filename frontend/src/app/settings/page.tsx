@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
 import { ApiKeysPanel } from "@/components/ApiKeysPanel";
 import { ModelsPanel } from "@/components/ModelsPanel";
+import { PromptingPanel } from "@/components/PromptingPanel";
 import { SpendPanel } from "@/components/SpendPanel";
 import { YouTubeCard } from "@/components/YouTubeCard";
 import { api, SystemInfo } from "@/lib/api";
@@ -45,7 +46,7 @@ function Inner() {
     <div className="p-4 sm:p-8 max-w-4xl">
       <header className="mb-4">
         <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">Settings & Status</h1>
-        <p className="text-ink-300 mt-1">Models, spend, publishing, API keys and deployment.</p>
+        <p className="text-ink-300 mt-1">Models, prompting, spend, publishing, API keys and deployment.</p>
       </header>
 
       {/* Section menu: the page is long, so jump straight to what you need. */}
@@ -55,6 +56,7 @@ function Inner() {
       >
         {[
           ["models", "Models"],
+          ["prompting", "Prompting"],
           ["spend", "Spend"],
           ["youtube", "YouTube"],
           ["keys", "API keys"],
@@ -71,6 +73,10 @@ function Inner() {
 
       <div id="models" className="scroll-mt-16">
         <ModelsPanel />
+      </div>
+
+      <div id="prompting" className="scroll-mt-16">
+        <PromptingPanel />
       </div>
 
       <div id="spend" className="scroll-mt-16">

@@ -86,7 +86,8 @@ async def upload_logo(
             owner_id=brand_kit_id,
         )
     except storage.UploadError as e:
-        raise HTTPException(400, str(e)) from e
+        # 413 too large; 400 not a supported image (message says which).
+        raise HTTPException(e.status_code, str(e)) from e
     import secrets
 
     bk.logo_path = meta["file_path"]

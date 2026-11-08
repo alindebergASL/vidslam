@@ -1,12 +1,52 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { Dropzone } from "@/components/Dropzone";
 import { AssignDialog, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
-import { api, Asset, Avatar, Ingredient, StudioJob } from "@/lib/api";
+import { EnhanceButton } from "@/components/EnhanceButton";
+import { PresetsMenu } from "@/components/PresetsMenu";
+import { api, Asset, Avatar, Ingredient, PromptPreset, StudioAspect, StudioJob } from "@/lib/api";
+
+const ASPECTS: { id: StudioAspect; label: string }[] = [
+  { id: "", label: "Auto" },
+  { id: "9:16", label: "9:16" },
+  { id: "16:9", label: "16:9" },
+  { id: "1:1", label: "1:1" },
+];
+
+/** What Remix or a preset loads into the prompt bar. `nonce` makes a repeat apply. */
+type PromptLoad = {
+  nonce: number;
+  outputKind: "image" | "video_clip";
+  prompt: string;
+  negative_prompt: string;
+  model: string;
+  aspect_ratio: StudioAspect;
+  duration_seconds?: number;
+};
+
+function asAspect(v: string | undefined | null): StudioAspect {
+  return v === "9:16" || v === "16:9" || v === "1:1" ? v : "";
+}
+
+/** Clip lengths the Studio bar offers. */
+const CLIP_SECONDS = [5, 8, 10, 15, 20, 30] as const;
+
+/** Snap any duration (the API allows 1-60s) to the nearest offered clip length, so the select shows what gets billed. */
+function snapClipSeconds(d: number): number {
+  return CLIP_SECONDS.reduce<number>((a, b) => (Math.abs(b - d) < Math.abs(a - d) ? b : a), CLIP_SECONDS[0]);
+}
+
+/** Placeholder rows for every job a create request made, so all show as pending tiles. */
+function batchPlaceholders(first: StudioJob): StudioJob[] {
+  const ids = first.batch_ids && first.batch_ids.length > 0 ? first.batch_ids : [first.id];
+  const all = ids.includes(first.id) ? ids : [first.id, ...ids];
+  // Siblings share the first job's status (the backend creates the whole batch as "pending").
+  return all.map((id) => (id === first.id ? first : { ...first, id, batch_ids: [] }));
+}
 
 type Filter = "all" | "images" | "videos" | "characters" | "scenes" | "uploads";
 
@@ -50,7 +90,22 @@ function Studio() {
   const [selectedRefs, setSelectedRefs] = useState<number[]>([]);
   const [pendingJobIds, setPendingJobIds] = useState<number[]>([]);
   const [assigning, setAssigning] = useState<StudioJob | null>(null);
+  const [load, setLoad] = useState<PromptLoad | null>(null);
   const toast = useToast();
+
+  // Remix: put a finished result's settings back into the prompt bar.
+  const remix = (job: StudioJob) => {
+    setSelectedRefs(job.reference_asset_ids || []);
+    setLoad({
+      nonce: Date.now(),
+      outputKind: job.output_kind,
+      prompt: job.prompt,
+      negative_prompt: job.negative_prompt || "",
+      model: job.provider_model || "",
+      aspect_ratio: asAspect(job.aspect_ratio),
+      duration_seconds: job.output_kind === "video_clip" ? job.duration_seconds : undefined,
+    });
+  };
 
   const reload = async () => {
     const [av, ing, jb] = await Promise.all([
@@ -230,6 +285,10 @@ function Studio() {
                 onQuickSave={quickSave}
                 onAssign={(jobId) => setAssigning(jobs.find((j) => j.id === jobId) || null)}
                 onDelete={() => deleteTile(t)}
+                onRemix={(jobId) => {
+                  const job = jobs.find((j) => j.id === jobId);
+                  if (job) remix(job);
+                }}
                 onUseInProject={async (jobId) => {
                   const job = jobs.find((j) => j.id === jobId);
                   if (!job) return;
@@ -271,9 +330,12 @@ function Studio() {
         ingredients={ingredients}
         selectedRefs={selectedRefs}
         selectedAssets={selectedAssets}
+        load={load}
         onCreated={(j) => {
-          setJobs((prev) => [j, ...prev]);
-          setPendingJobIds((prev) => [...prev, j.id]);
+          const rows = batchPlaceholders(j);
+          const ids = rows.map((r) => r.id);
+          setJobs((prev) => [...rows, ...prev.filter((p) => !ids.includes(p.id))]);
+          setPendingJobIds((prev) => Array.from(new Set([...prev, ...ids])));
         }}
         onAddRefs={(ids) =>
           setSelectedRefs((cur) => Array.from(new Set([...cur, ...ids])))
@@ -292,6 +354,7 @@ function TileCard({
   onAssign,
   onDelete,
   onUseInProject,
+  onRemix,
 }: {
   tile: Tile;
   selected: boolean;
@@ -300,6 +363,7 @@ function TileCard({
   onAssign: (jobId: number) => void;
   onDelete: () => void;
   onUseInProject: (jobId: number) => void;
+  onRemix: (jobId: number) => void;
 }) {
   const finished = tile.status === "completed" || tile.status === "saved";
   const actionCls = "chip text-xs py-1 bg-ink-900/85 border-ink-700";
@@ -389,6 +453,16 @@ function TileCard({
               New Project →
             </button>
           )}
+          {finished && (
+            <button
+              onClick={() => onRemix(tile.jobId!)}
+              className={actionCls}
+              title="Load this result's prompt, avoid list, references, model and aspect into the prompt bar"
+              aria-label="Remix: load this result's settings into the prompt bar"
+            >
+              Remix
+            </button>
+          )}
           {finished && tile.imageUrl && (
             <a
               href={`/ambient/new?studio_job=${tile.jobId}`}
@@ -441,6 +515,7 @@ function PromptBar({
   ingredients,
   selectedRefs,
   selectedAssets,
+  load,
   onCreated,
   onAddRefs,
   onReload,
@@ -449,6 +524,7 @@ function PromptBar({
   ingredients: Ingredient[];
   selectedRefs: number[];
   selectedAssets: Asset[];
+  load: PromptLoad | null;
   onCreated: (j: StudioJob) => void;
   onAddRefs: (assetIds: number[]) => void;
   onReload: () => Promise<void> | void;
@@ -463,6 +539,15 @@ function PromptBar({
   const [clipSeconds, setClipSeconds] = useState<number>(5);
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadOwner, setUploadOwner] = useState<string>("");
+  const [avoid, setAvoid] = useState("");
+  const [moreOpen, setMoreOpen] = useState(false);
+  const [aspect, setAspect] = useState<StudioAspect>("");
+  const [variations, setVariations] = useState(1);
+  const promptRef = useRef<HTMLInputElement>(null);
+  const barRef = useRef<HTMLDivElement>(null);
+  // A model to select once the list for the (possibly new) output kind is
+  // in place; otherwise switching kinds resets to that kind's first model.
+  const wantModel = useRef<string | null>(null);
 
   // Default upload target = first selected character → first selected
   // ingredient → first avatar → first ingredient. Re-derived as the cast
@@ -496,8 +581,43 @@ function PromptBar({
   useEffect(() => {
     // Reset to default when switching output kind so we don't carry a video
     // model into an image generation request.
-    setModel(currentModels[0]?.id || "");
+    const want = wantModel.current;
+    if (want !== null && currentModels.length > 0) wantModel.current = null;
+    if (want && currentModels.some((m) => m.id === want)) setModel(want);
+    else setModel(currentModels[0]?.id || "");
   }, [outputKind, imageModels, videoModels]);
+
+  // Fill the bar from Remix or a preset.
+  const apply = (p: Omit<PromptLoad, "nonce">) => {
+    setPrompt(p.prompt);
+    setAvoid(p.negative_prompt);
+    if (p.negative_prompt) setMoreOpen(true);
+    setAspect(p.aspect_ratio);
+    if (p.duration_seconds) setClipSeconds(snapClipSeconds(p.duration_seconds));
+    if (p.outputKind !== outputKind) {
+      wantModel.current = p.model;
+      setOutputKind(p.outputKind);
+    } else if (p.model && currentModels.some((m) => m.id === p.model)) {
+      setModel(p.model);
+    }
+    barRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    promptRef.current?.focus();
+  };
+
+  useEffect(() => {
+    if (load) apply(load);
+  }, [load?.nonce]);
+
+  const applyPreset = (p: PromptPreset) =>
+    apply({
+      outputKind: p.kind === "video" ? "video_clip" : "image",
+      prompt: p.prompt,
+      negative_prompt: p.negative_prompt,
+      model: p.model,
+      aspect_ratio: p.aspect_ratio,
+    });
+
+  const isImage = outputKind === "image";
 
   const submit = async () => {
     if (!prompt.trim()) return;
@@ -542,8 +662,10 @@ function PromptBar({
         owner_id,
         prompt,
         reference_asset_ids: selectedRefs,
+        aspect_ratio: aspect || null,
+        ...(avoid.trim() ? { negative_prompt: avoid.trim() } : {}),
         ...(model ? { model } : {}),
-        ...(outputKind === "video_clip" ? { duration_seconds: clipSeconds } : {}),
+        ...(outputKind === "video_clip" ? { duration_seconds: clipSeconds } : { variations }),
       };
       const job =
         outputKind === "image"
@@ -574,7 +696,10 @@ function PromptBar({
   };
 
   return (
-    <div className="fixed bottom-0 left-0 md:left-56 right-0 z-10 bg-ink-900/95 border-t border-ink-800 backdrop-blur-sm">
+    <div
+      ref={barRef}
+      className="fixed bottom-0 left-0 md:left-56 right-0 z-10 bg-ink-900/95 border-t border-ink-800 backdrop-blur-sm"
+    >
       <div className="max-w-5xl mx-auto px-3 sm:px-6 py-3">
         {selectedRefs.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1.5 text-xs text-ink-300">
@@ -625,7 +750,7 @@ function PromptBar({
               disabled={!uploadOwner}
               hint={
                 uploadOwner
-                  ? "PNG/JPEG/WEBP up to 15MB. Uploaded assets auto-attach as references for your next generation."
+                  ? "HEIC/PNG/JPEG/WebP up to 50 MB. Uploaded assets auto-attach as references for your next generation."
                   : avatars.length + ingredients.length === 0
                   ? "Create a cast member first (Cast → New)."
                   : "Pick a target above."
@@ -653,7 +778,7 @@ function PromptBar({
               title="Clip length (the model snaps it to the nearest length it supports)"
               aria-label="Clip length"
             >
-              {[5, 8, 10, 15, 20, 30].map((n) => (
+              {CLIP_SECONDS.map((n) => (
                 <option key={n} value={n}>
                   {n}s
                 </option>
@@ -675,6 +800,54 @@ function PromptBar({
               ))}
             </select>
           )}
+          <select
+            value={aspect}
+            onChange={(e) => setAspect(asAspect(e.target.value))}
+            className="chip text-xs bg-ink-800"
+            title="Aspect ratio. Auto: characters 9:16, scenes 16:9"
+            aria-label="Aspect ratio"
+          >
+            {ASPECTS.map((a) => (
+              <option key={a.id || "auto"} value={a.id}>
+                {a.label}
+              </option>
+            ))}
+          </select>
+          {isImage && (
+            <select
+              value={variations}
+              onChange={(e) => setVariations(Number(e.target.value))}
+              className="chip text-xs bg-ink-800"
+              title="How many images to make from this prompt. Each one costs the same as a single image."
+              aria-label="Variations"
+            >
+              {[1, 2, 3, 4].map((n) => (
+                <option key={n} value={n}>
+                  {n === 1 ? "1 image" : `${n} images`}
+                </option>
+              ))}
+            </select>
+          )}
+          <PresetsMenu
+            current={() => ({
+              kind: isImage ? "image" : "video",
+              prompt,
+              negative_prompt: avoid.trim(),
+              model,
+              aspect_ratio: aspect,
+            })}
+            onApply={applyPreset}
+          />
+          <button
+            type="button"
+            onClick={() => setMoreOpen((v) => !v)}
+            className="chip text-xs"
+            aria-expanded={moreOpen}
+            aria-controls="studio-more-row"
+            title="Things to avoid in this generation"
+          >
+            {avoid.trim() ? "Avoid •" : "Avoid"}
+          </button>
           <button
             type="button"
             onClick={() => setUploadOpen((v) => !v)}
@@ -686,10 +859,12 @@ function PromptBar({
             📎
           </button>
           <input
+            ref={promptRef}
+            aria-label="Prompt"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="What do you want to create?"
-            className="flex-1 min-w-0 basis-full sm:basis-0 order-first sm:order-none bg-transparent outline-hidden text-sm px-2 py-2 sm:py-0"
+            className="flex-1 min-w-0 basis-full order-first bg-transparent outline-hidden text-sm px-2 py-2"
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
@@ -697,13 +872,51 @@ function PromptBar({
               }
             }}
           />
+          <EnhanceButton
+            className="contents"
+            text={prompt}
+            kind={isImage ? "image" : "video"}
+            model={model || null}
+            disabled={submitting}
+            onUse={(t) => {
+              setPrompt(t);
+              promptRef.current?.focus();
+            }}
+          />
           <button
             onClick={submit}
             disabled={submitting || !prompt.trim()}
             className="btn-primary text-sm disabled:opacity-50 ml-auto sm:ml-0"
+            title={
+              isImage && variations > 1
+                ? `Makes ${variations} images: about ${variations}× the cost of one`
+                : undefined
+            }
           >
-            {submitting ? "…" : "Generate →"}
+            {submitting ? "…" : isImage && variations > 1 ? `Generate ×${variations} →` : "Generate →"}
           </button>
+          {moreOpen && (
+            <div id="studio-more-row" className="basis-full flex flex-wrap items-center gap-2 px-2 pt-1">
+              <label htmlFor="studio-avoid" className="text-xs text-ink-300">
+                Avoid
+              </label>
+              <input
+                id="studio-avoid"
+                value={avoid}
+                onChange={(e) => setAvoid(e.target.value)}
+                maxLength={1000}
+                placeholder="e.g. text overlays, crowds, cartoon look"
+                className="input text-xs py-1 flex-1 min-w-[12rem]"
+              />
+              <span className="text-[11px] text-ink-400 basis-full">
+                Your defaults from{" "}
+                <a href="/settings#prompting" className="underline">
+                  Settings → Prompting
+                </a>{" "}
+                are added automatically.
+              </span>
+            </div>
+          )}
         </div>
         {error && <div className="text-xs text-accent mt-2">{error}</div>}
       </div>

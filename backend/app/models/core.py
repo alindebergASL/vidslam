@@ -278,6 +278,9 @@ class AssetGenerationJob(Base):
     # Requested clip length (video_clip only); the provider snaps it to what
     # the model supports.
     duration_seconds: Mapped[float] = mapped_column(Float, default=5.0)
+    # "9:16" | "16:9" | "1:1"; "" = the owner's default (avatar 9:16,
+    # ingredient 16:9). Migration 0003.
+    aspect_ratio: Mapped[str] = mapped_column(String(10), default="", server_default="")
     prompt: Mapped[str] = mapped_column(Text, default="")
     negative_prompt: Mapped[str] = mapped_column(Text, default="")
     reference_asset_ids_json: Mapped[list | None] = mapped_column(JSON, default=list)

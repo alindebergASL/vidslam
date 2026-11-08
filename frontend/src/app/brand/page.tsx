@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
+import { IMAGE_ACCEPT } from "@/components/Dropzone";
 import { api, BrandKit } from "@/lib/api";
 
 export default function BrandPage() {
@@ -189,7 +190,7 @@ function BrandCard({ kit, onChange }: { kit: BrandKit; onChange: () => void }) {
           ref={logoInput}
           type="file"
           hidden
-          accept="image/png,image/jpeg,image/webp"
+          accept={IMAGE_ACCEPT}
           onChange={async (e) => {
             if (!e.target.files) return;
             const updated = await api.uploadBrandLogo(k.id, e.target.files[0]);
