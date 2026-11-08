@@ -512,7 +512,8 @@ STILL_MODEL_CHOICES: list[ModelChoiceOut] = [
 ]
 VIDEO_MODEL_CHOICES: list[ModelChoiceOut] = [
     ModelChoiceOut(id="alibaba/wan-3.0", label="Wan 3.0",
-                   note="Keeps the still's look, with the steadiest background. About $0.15–0.20 per second.",
+                   note="The most lifelike motion, and keeps the still's look; its exposure and colour can drift "
+                        "and show at the loop point. About $0.17 per second.",
                    recommended=True),
     ModelChoiceOut(id="google/gemini-omni-1.2-flash", label="Gemini Omni 1.2 Flash",
                    note="New and untested here: it was failing on OpenRouter in Nov 2026. Clips up to 15 s.",
@@ -521,7 +522,32 @@ VIDEO_MODEL_CHOICES: list[ModelChoiceOut] = [
                    note="Livelier water, but it redrew rock with an embossed texture in a test.",
                    experimental=True),
 ]
+# Offered as well when a Sogni key is set. Blind loop test, Nov 2026 (4
+# presets, closed 10 s loops from the same picture): MiniMax H3 FastH3 made
+# the most seamless, steadiest loops (7.8 overall against Wan 3.0's 7.4), with
+# softer, calmer motion; its two-stage version keeps the seams and is much
+# sharper, but takes about 8 minutes a clip. LTX-2.5 (4.5) isn't offered.
+SOGNI_VIDEO_CHOICES: list[ModelChoiceOut] = [
+    ModelChoiceOut(id="sogni/minimax-h3-fasth3-flf2v-turbo-2stage", label="MiniMax H3 sharp (Sogni)",
+                   note="The same seamless loops as MiniMax H3 fast (the most seamless in a blind test), rendered "
+                        "at 2K so it's about as sharp as the picture. Free on Sogni's Free Spark. Slow: about 8 "
+                        "minutes per 10 s clip, longer for 15 s, one clip at a time. 6–15 s.",
+                   est_cost=0.0),
+    ModelChoiceOut(id="sogni/minimax-h3-fasth3-flf2v-turbo", label="MiniMax H3 fast (Sogni)",
+                   note="Same seamless loops in under a minute or two, but softer than the picture. Free on "
+                        "Sogni's Free Spark. 6–15 s.", est_cost=0.0),
+]
 _STILL_COST = {c.id: c.est_cost for c in STILL_MODEL_CHOICES if c.est_cost is not None}
+
+
+def video_model_choices() -> list[ModelChoiceOut]:
+    """The video models offered up front: Sogni's too when its key is set."""
+    from . import provider_keys
+
+    if not provider_keys.has("sogni"):
+        return list(VIDEO_MODEL_CHOICES)
+    # Only those Sogni still lists (its synced model list).
+    return VIDEO_MODEL_CHOICES + [c for c in SOGNI_VIDEO_CHOICES if _sogni.video_model(c.id) is not None]
 
 
 def still_model_chain(cfg: AmbientConfig) -> list[str]:
@@ -564,6 +590,8 @@ def uses_still_model(cfg: AmbientConfig) -> bool:
 def _is_video_model(model: str) -> bool:
     if model in {c.id for c in VIDEO_MODEL_CHOICES} or model == _active_model("video"):
         return True
+    if _sogni.is_sogni(model) and _sogni.video_model(model) is not None:
+        return True  # no catalog needed for Sogni's own list
     try:
         from . import model_catalog
 
@@ -740,7 +768,7 @@ def presets() -> AmbientPresetsOut:
         total_options=list(TOTAL_OPTIONS),
         aspect_options=["16:9", "9:16", "1:1"],
         still_models=STILL_MODEL_CHOICES,
-        video_models=VIDEO_MODEL_CHOICES,
+        video_models=video_model_choices(),
         default_still_model=still_model_chain(AmbientConfig())[0] if still_model_chain(AmbientConfig()) else "",
         default_video_model=_active_model("video"),
     )
@@ -1732,7 +1760,8 @@ def _finish_chain(db: Session, project: models.VideoProject) -> None:
     segs = [db.get(models.VideoShot, i) for i in chain["segment_ids"]]
     clip = storage.render_subdir(project.id) / f"shot_00_{shot.id}.mp4"
     _, length = join_segments([Path(s.clip_path) for s in segs], clip,
-                              aspect_ratio=project.aspect_ratio, crossfade=plan.join_crossfade)
+                              aspect_ratio=project.aspect_ratio, crossfade=plan.join_crossfade,
+                              resolution=cfg.output_resolution)
     shot.clip_path = str(clip)
     shot.provider = segs[0].provider
     shot.provider_model = segs[0].provider_model

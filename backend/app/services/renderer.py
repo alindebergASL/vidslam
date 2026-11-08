@@ -65,13 +65,53 @@ def _dims_for_aspect(aspect: str, resolution: str = "1080p") -> tuple[int, int]:
     return w, h
 
 
+# A clip whose shape is within this much of the frame's is cropped to fill
+# it instead of padded: video models return near-16:9 sizes (Sogni's LTX-2.5
+# 1280x704, MiniMax H3 1344x768), and padding drew thin black bars along the
+# edges of every loop. A clearly different shape (9:16 in a 16:9 frame) is
+# still padded, so nothing important is cut off.
+FILL_TOLERANCE = 0.06
+
+
+def _probe_size(path: Path) -> Optional[tuple[int, int]]:
+    """(width, height) of a file's first video stream as ffmpeg shows it,
+    i.e. after rotation metadata (a phone's portrait clip), or None."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate", str(path)])
+    if rc != 0:
+        return None
+    try:
+        st = json.loads(log)["streams"][0]
+        w, h = int(st["width"]), int(st["height"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    rotation = 0.0
+    try:
+        for sd in st.get("side_data_list") or []:
+            if "rotation" in sd:
+                rotation = float(sd["rotation"])
+        if not rotation and (st.get("tags") or {}).get("rotate"):
+            rotation = float(st["tags"]["rotate"])
+    except (TypeError, ValueError):
+        rotation = 0.0
+    if round(abs(rotation)) % 180 == 90:
+        w, h = h, w
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def fit_vf(width: int, height: int, size: Optional[tuple[int, int]] = None, *, flags: str = "") -> str:
+    """Scale into width x height: crop to fill when `size`'s shape is within
+    FILL_TOLERANCE of the frame's, else scale to fit and pad (unknown size: pad)."""
+    fl = f":flags={flags}" if flags else ""
+    if size and abs((size[0] / size[1]) / (width / height) - 1.0) <= FILL_TOLERANCE:
+        return f"scale={width}:{height}:force_original_aspect_ratio=increase{fl},crop={width}:{height}"
+    return (f"scale={width}:{height}:force_original_aspect_ratio=decrease{fl},"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
+
+
 def _normalize_clip(src: Path, dst: Path, width: int, height: int) -> str:
     """Re-encode a clip to a uniform size/fps/codec so they can be concatenated."""
-    vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-        f"setsar=1,fps={FPS}"
-    )
+    vf = f"{fit_vf(width, height, _probe_size(src))},setsar=1,fps={FPS}"
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
         "-vf", vf,
@@ -462,10 +502,7 @@ def timer_filter(out: Path, mode: str, *, total: float, height: int, position: s
 def _encode_normalized(
     src: Path, dst: Path, *, width: int, height: int, slow_factor: float, extra_vf: str = ""
 ) -> str:
-    vf = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease:flags=lanczos,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-    )
+    vf = f"{fit_vf(width, height, _probe_size(src), flags='lanczos')},setsar=1"
     if slow_factor and abs(slow_factor - 1.0) > 1e-3:
         # Slow the clip down; fps= re-samples so the output stays constant-rate.
         vf += f",setpts={slow_factor:.4f}*PTS"
@@ -1015,15 +1052,14 @@ def extract_frame(src: Path, dst: Path, *, last: bool) -> Path:
     return dst
 
 
-def join_graph(lengths: list[float], *, crossfade: float, width: int, height: int) -> str:
+def join_graph(lengths: list[float], *, crossfade: float, width: int, height: int,
+               sizes: Optional[list[Optional[tuple[int, int]]]] = None) -> str:
     """filter_complex text joining len(lengths) inputs with rounded linear
-    dissolves of `crossfade` seconds; output label [out]."""
+    dissolves of `crossfade` seconds; output label [out]. `sizes` (each
+    input's width x height, if known) lets near-frame shapes fill (fit_vf)."""
     cf = crossfade
-    norm = (
-        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={FPS},format=yuv420p"
-    )
     n = len(lengths)
+    sizes = list(sizes or []) + [None] * (n - len(sizes or []))
     parts: list[str] = []
     order: list[str] = []
     for i in range(n):
@@ -1032,6 +1068,7 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
         tail_out = cf if (i < n - 1 and cf > 0) else 0.0  # dissolved into the next
         outs = ["b"] + (["h"] if head_in else []) + (["t"] if tail_out else [])
         labels = "".join(f"[{o}{i}]" for o in outs)
+        norm = f"{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},format=yuv420p"
         parts.append(f"[{i}:v]{norm},split={len(outs)}{labels}" if len(outs) > 1 else f"[{i}:v]{norm}[b{i}]")
         parts[-1] = parts[-1].replace(f"[b{i}]", f"[bb{i}]")
         parts.append(f"[bb{i}]trim=start={head_in:.4f}:end={L - tail_out:.4f},setpts=PTS-STARTPTS[body{i}]")
@@ -1058,6 +1095,7 @@ def join_segments(
     *,
     aspect_ratio: str,
     crossfade: float = 0.5,
+    resolution: str = "1080p",
 ) -> tuple[Path, float]:
     """Join chained clips into one loop clip with short crossfades.
 
@@ -1068,13 +1106,15 @@ def join_segments(
     xfade requires identical streams. Returns (path, duration)."""
     if not segments:
         raise ValueError("no segments to join")
-    width, height = _dims_for_aspect(aspect_ratio)
+    # At the scene's output size: a 4K scene keeps a 2K source's detail.
+    width, height = _dims_for_aspect(aspect_ratio, resolution)
     if len(segments) == 1:
         _encode_normalized(segments[0], dst, width=width, height=height, slow_factor=1.0)
         return dst, _probe_duration(dst)
     lengths = [_probe_duration(p) for p in segments]
     cf = max(0.0, min(crossfade, min(lengths) / 3.0))
-    graph = join_graph(lengths, crossfade=cf, width=width, height=height)
+    graph = join_graph(lengths, crossfade=cf, width=width, height=height,
+                       sizes=[_probe_size(p) for p in segments])
     prev = "out"
     cmd = ["ffmpeg", "-y"]
     for p in segments:
