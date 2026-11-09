@@ -54,8 +54,8 @@ def is_sogni_model(model: str | None) -> bool:
 
 
 def is_routed_model(model: str | None) -> bool:
-    """An id whose provider comes from its prefix (sogni/…, and the
-    reserved runware/… and replicate/…)."""
+    """An id whose provider comes from its prefix (sogni/…, runware/…, and
+    the reserved replicate/…)."""
     from ..services import model_registry as reg
 
     m = str(model or "")
@@ -95,6 +95,10 @@ def get_image(model: str | None = None) -> ImageProvider:
         from .sogni import SogniImageProvider
 
         return SogniImageProvider(model=model)
+    if provider == "runware":
+        from .runware import RunwareImageProvider
+
+        return RunwareImageProvider(model=model)
     from .openrouter_image import OpenRouterImageProvider
 
     return OpenRouterImageProvider(model=model)
@@ -111,9 +115,21 @@ def get_video(model: str | None = None) -> VideoProvider:
         from .sogni import SogniVideoProvider
 
         return SogniVideoProvider(model=model)
+    if provider == "runware":
+        from .runware import RunwareVideoProvider
+
+        return RunwareVideoProvider(model=model)
     from .openrouter_video import OpenRouterVideoProvider
 
     return OpenRouterVideoProvider(model=model)
+
+
+def uses_webhooks(model: str | None) -> bool:
+    """Whether a video job for `model` can be told to call back (OpenRouter
+    only; Sogni has no callbacks and Runware's aren't signed: both are polled)."""
+    from ..services import model_registry as reg
+
+    return not any(str(model or "").startswith(p) for p in reg.ROUTED_PREFIXES)
 
 
 # Explicit names for call sites that always hold a concrete model.
@@ -132,7 +148,7 @@ def provider_label(kind: str, model: str | None) -> str:
         from ..services import model_registry as reg
 
         p = reg.provider_for(kind, model)
-        return p if p in ("mock", "sogni") else "openrouter"
+        return p if p in ("mock", "sogni", "runware") else "openrouter"
     s = get_settings()
     mocked = s.image_is_mocked() if kind == "image" else s.video_is_mocked()
     return "mock" if mocked else "openrouter"

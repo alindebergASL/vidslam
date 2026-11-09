@@ -141,10 +141,10 @@ def set_active(kind: str, model: Optional[str], options: Optional[dict] = None) 
 
 
 # Providers whose models are picked per call by an id prefix.
-ROUTED_PREFIXES = {SOGNI_PREFIX: "sogni"}
+ROUTED_PREFIXES = {SOGNI_PREFIX: "sogni", "runware/": "runware"}
 # Providers coming in later releases: their ids are refused cleanly (never
 # sent to OpenRouter as unknown ids), e.g. after a rollback.
-RESERVED_PREFIXES = {"runware/": "runware", "replicate/": "replicate"}
+RESERVED_PREFIXES = {"replicate/": "replicate"}
 
 
 def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[str]]:
@@ -188,7 +188,13 @@ def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[st
     if kind in ("image", "video"):
         for prefix, name in ROUTED_PREFIXES.items():
             if m.startswith(prefix):
-                # Served by its own provider whatever else is active.
+                # Served by its own provider whatever else is active. A
+                # provider you add later (Runware) without its key isn't set
+                # up: refused, never faked with placeholder output.
+                from .provider_keys import KEYS
+
+                if not has(name) and name in KEYS and KEYS[name].default_enabled is None:
+                    return "unavailable", name
                 return pick(name)
     if m.startswith("mock/"):
         return "mock", None

@@ -194,6 +194,29 @@ class Settings(BaseSettings):
 
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01
+    # Runware (runware.ai) image + video models, ids "runware/<AIR>" (e.g.
+    # runware/runware:107@1). Get a key at https://my.runware.ai/keys.
+    # Optional; a key saved in Settings → API keys wins over this one.
+    runware_api_key: str = ""
+    runware_base_url: str = "https://api.runware.ai/v1"
+    # Public model docs (no key): the index of models and each one's schema.
+    runware_models_index_url: str = "https://runware.ai/docs/models/index.json"
+    runware_docs_models_base: str = "https://runware.ai/docs/models"
+    # Runware's own content check. Off = uncensored output on the open
+    # models Runware hosts (vendor models stay moderated by their vendor).
+    # Always on for requests carrying a Cast member's picture; a request
+    # whose prompt involves minors is refused before it's sent (safety.py).
+    runware_check_content: bool = False
+    runware_image_timeout_seconds: float = 300.0
+    # Long side of a generated still (16:9 → 1920×1080, or 1920×1088 on
+    # models that need multiples of 64; the app crops to the aspect ratio).
+    runware_image_long_side: int = 1920
+    # How much an image-to-image source may change (0 = keep, 1 = replace).
+    runware_image_strength: float = 0.4
+    # Video output: "1080p" or "720p" (about half the price per second).
+    runware_video_resolution: str = "1080p"
+    runware_max_retry_after_seconds: float = 30.0
+
     cost_image_per_item: float = 0.04
     # Ambient stills at their best settings cost more than a default image:
     # GPT Image 2.6 Sunburst at quality "max" bills ~$0.13 (Nov 2026).

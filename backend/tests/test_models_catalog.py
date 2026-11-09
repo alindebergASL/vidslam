@@ -88,11 +88,11 @@ def test_catalog_groups_models_by_capability(auth_client, monkeypatch):
     snap = auth_client.post("/api/models/refresh").json()
     assert _ids(snap, "chat") == {"anthropic/claude-sonnet-x", "openai/gpt-4o-mini"}
     assert _ids(snap, "tts") == {"openai/gpt-audio-mini", "openai/gpt-4o-mini-tts", "elevenlabs"}
-    # The refresh also adds the static Sogni catalog (spec: Sogni provider);
-    # the OpenRouter-sourced sets are unchanged.
-    assert {i for i in _ids(snap, "image") if not i.startswith("sogni/")} == \
+    # The refresh also adds the static Sogni and Runware catalogs; the
+    # OpenRouter-sourced sets are unchanged.
+    assert {i for i in _ids(snap, "image") if not i.startswith(("sogni/", "runware/"))} == \
         {"google/gemini-2.5-flash-image", "openai/gpt-image-2"}
-    assert {i for i in _ids(snap, "video") if not i.startswith("sogni/")} == \
+    assert {i for i in _ids(snap, "video") if not i.startswith(("sogni/", "runware/"))} == \
         {"alibaba/wan-3.0", "heygen/heygen-video-1"}
     sogni = {e["id"]: e for e in snap["entries"] if e["id"].startswith("sogni/")}
     assert {"sogni/krea-2-turbo", "sogni/ltx25"} <= set(sogni)
@@ -113,7 +113,8 @@ def test_catalog_groups_models_by_capability(auth_client, monkeypatch):
     assert wan["max_seconds"] == 30 and "last_frame" in wan["frame_images"]
     tts = next(e for e in snap["entries"] if e["id"] == "openai/gpt-4o-mini-tts")
     assert tts["supported_voices"] == ["alloy", "nova", "shimmer"]
-    assert all(e["usable"] for e in snap["entries"])
+    assert all(e["usable"] for e in snap["entries"] if e["provider"] != "runware")
+    assert not any(e["usable"] for e in snap["entries"] if e["provider"] == "runware")  # no Runware key
     assert snap["new_count"] == 0  # first poll flags nothing
     assert snap["errors"] == {}
 

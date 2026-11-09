@@ -38,7 +38,7 @@ log = logging.getLogger("avs.video_jobs")
 
 ACTIVE = ("submitted", "running")
 # Providers with no completion callbacks: their jobs are always polled.
-NO_WEBHOOK_PROVIDERS = frozenset({"sogni"})
+NO_WEBHOOK_PROVIDERS = frozenset({"sogni", "runware"})
 TERMINAL = ("completed", "failed")
 
 
@@ -114,9 +114,9 @@ def submit(
         job.uses_webhook = False  # nothing will call back: poll at the normal cadence
     job.model = submitted.model or ""
     sent = (submitted.raw or {}).get("duration") if isinstance(submitted.raw, dict) else None
-    if job.provider == "sogni" and sent:
-        # The length actually requested (Sogni snaps it): poll() and the spend
-        # estimate use it when the result does not report its own duration.
+    if job.provider in NO_WEBHOOK_PROVIDERS and sent:
+        # The length actually requested (Sogni and Runware snap it): poll()
+        # and the spend estimate use it when the result doesn't report one.
         job.context_json = {**(job.context_json or {}), "duration": sent}
     job.provider_job_id = submitted.job_id
     job.polling_url = submitted.polling_url or ""
@@ -140,6 +140,10 @@ def provider_for(job: models.VideoJob):
         from ..providers.sogni import SogniVideoProvider
 
         return SogniVideoProvider(model=job.model or None)
+    if job.provider == "runware":
+        from ..providers.runware import RunwareVideoProvider
+
+        return RunwareVideoProvider(model=job.model or None)
     from ..providers.openrouter_video import OpenRouterVideoProvider
 
     return OpenRouterVideoProvider(model=job.model or None)

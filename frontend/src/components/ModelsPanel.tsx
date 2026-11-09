@@ -18,6 +18,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   gemini: "Google",
   elevenlabs: "ElevenLabs",
   sogni: "Sogni",
+  runware: "Runware",
   unavailable: "nobody: its provider is switched off",
   replicate: "Replicate",
   mock: "mock",
@@ -291,7 +292,7 @@ export function ModelsPanel() {
                       {!e.usable && <span className="text-[10px] text-ink-400">needs {PROVIDER_LABEL[e.provider] ?? e.provider} key</span>}
                     </div>
                     <div className="text-[11px] text-ink-400 break-all">{e.id} · {PROVIDER_LABEL[e.provider] ?? e.provider}</div>
-                    {(e.notes || (e.provider === "sogni" && e.description)) && (
+                    {(e.notes || ((e.provider === "sogni" || e.provider === "runware") && e.description)) && (
                       <div className="text-[11px] text-ink-300 mt-0.5">{e.notes || e.description}</div>
                     )}
                     <div className="flex flex-wrap gap-1 mt-1">

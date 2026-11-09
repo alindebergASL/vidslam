@@ -334,6 +334,11 @@ def model_family_hint(kind: str, model: str) -> str:
     m = (model or "").lower()
     if not m or kind == "script":
         return ""
+    if m.startswith("runware/"):
+        # Runware ids (AIRs like runware:107@1) don't say the family: the name does.
+        from .runware import display_name
+
+        m = f"{m} {display_name(model)}".lower()
     if kind == "video" and any(f in m for f in _VIDEO_MOTION):
         return ("The target is a video model that responds to explicit camera and motion words: "
                 "name the camera move and the subject's motion plainly (e.g. 'the camera pushes in', "

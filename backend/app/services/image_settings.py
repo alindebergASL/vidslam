@@ -68,9 +68,9 @@ def _builtin(model: str, aspect_ratio: str) -> dict:
 
 def best_image_settings(model: str, aspect_ratio: str = "16:9") -> dict:
     """Settings for the most realistic output `model` offers, for POST /images."""
-    if model.startswith("sogni/"):
-        # Sogni's generate_image takes the aspect ratio and sizes the image
-        # itself; there is no OpenRouter parameters listing to read.
+    if model.startswith(("sogni/", "runware/")):
+        # Sogni sizes the image itself from the aspect ratio; Runware's
+        # request builder picks the size its model accepts (runware.py).
         return {"aspect_ratio": aspect_ratio}
     params = _fetch_parameters(model)
     if params is None:

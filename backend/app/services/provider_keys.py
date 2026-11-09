@@ -28,6 +28,7 @@ log = logging.getLogger("avs.provider_keys")
 
 SETTING_PREFIX = "secret."
 ENABLED_PREFIX = "provider."  # provider.<name> = {"enabled": bool, "updated_at": ...}
+OPTIONS_PREFIX = "provider_options."  # provider_options.<name> = {option: bool, ...}
 CACHE_TTL_SECONDS = 15.0
 MIN_LEN = 8
 MAX_LEN = 500
@@ -44,6 +45,9 @@ class KeySpec:
     # On/off in Settings → API keys until switched: True (on), or None (on
     # once a key is set: a provider the user adds later).
     default_enabled: Optional[bool] = True
+    # Per-provider switches shown on its row: option name -> config.Settings
+    # field holding the default (e.g. Runware's content check).
+    options: tuple[tuple[str, str], ...] = ()
 
 
 KEYS: dict[str, KeySpec] = {
@@ -64,6 +68,10 @@ KEYS: dict[str, KeySpec] = {
         KeySpec("sogni", "Sogni", "SOGNI_API_KEY", "sogni_api_key",
                 "Sogni image and video models (sogni/…)",
                 "https://dashboard.sogni.ai/api-keys"),
+        KeySpec("runware", "Runware", "RUNWARE_API_KEY", "runware_api_key",
+                "Runware image and video models (runware/…), incl. uncensored open models",
+                "https://my.runware.ai/keys", default_enabled=None,
+                options=(("check_content", "runware_check_content"),)),
     )
 }
 
@@ -266,7 +274,41 @@ def _row(name: str) -> dict:
     row["enabled"] = enabled(name)
     row["enabled_default"] = spec.default_enabled  # True, or None: on once a key is set
     row["enabled_explicit"] = exp is not None
+    if spec.options:
+        row["options"] = {opt: option(name, opt) for opt, _ in spec.options}
     return row
+
+
+def option(name: str, opt: str) -> bool:
+    """A provider option: as set in Settings, else its config default.
+    Read every time, like the on/off switch."""
+    spec = _spec(name)
+    fields = dict(spec.options)
+    if opt not in fields:
+        raise KeyError(f"unknown option {opt!r} for {name}")
+    from .model_registry import get_setting
+
+    rec = get_setting(OPTIONS_PREFIX + name)
+    if isinstance(rec, dict) and isinstance(rec.get(opt), bool):
+        return rec[opt]
+    return bool(getattr(get_settings(), fields[opt]))
+
+
+def set_option(name: str, opt: str, value: Optional[bool]) -> dict:
+    """Set (or, with None, reset to its default) one provider option."""
+    spec = _spec(name)
+    if opt not in dict(spec.options):
+        raise KeyError(f"unknown option {opt!r} for {name}")
+    from .model_registry import get_setting, put_setting
+
+    rec = dict(get_setting(OPTIONS_PREFIX + name) or {})
+    if value is None:
+        rec.pop(opt, None)
+    else:
+        rec[opt] = bool(value)
+    put_setting(OPTIONS_PREFIX + name, rec or None)
+    log.info("provider %s option %s set to %s", name, opt, "default" if value is None else value)
+    return _row(name)
 
 
 SOGNI_WORKER_PREFIX = "sogni_wkr_"

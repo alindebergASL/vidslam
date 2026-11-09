@@ -11,6 +11,7 @@ from .registry import (
     provider_label,
     provider_status,
     routes_per_model,
+    uses_webhooks,
     video_capabilities,
     video_provider_for,
 )
@@ -28,6 +29,7 @@ __all__ = [
     "provider_label",
     "provider_status",
     "routes_per_model",
+    "uses_webhooks",
     "video_capabilities",
     "video_provider_for",
 ]

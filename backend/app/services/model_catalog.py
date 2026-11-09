@@ -271,6 +271,19 @@ def _sogni_entries() -> list[dict]:
     return out
 
 
+def _runware_entries() -> list[dict]:
+    """Runware's curated models (from their bundled schemas) and every
+    other live image/video model in its index (providers/runware.py)."""
+    from ..providers import runware
+
+    return runware.catalog_entries(provider_keys.has("runware"))
+
+
+# Providers whose entries are built locally (not by a polled listing).
+_LOCAL = {"sogni": _sogni_entries, "runware": _runware_entries}
+# Local sync errors that don't mean a provider's models went missing.
+_SYNC_SOURCES = ("sogni_tools", "runware_index")
+
 _refresh_lock = threading.Lock()
 
 
@@ -313,8 +326,18 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
             except Exception as e:  # noqa: BLE001 — keeps the last good list
                 log.warning("catalog source sogni_tools failed: %s", e)
                 errors["sogni_tools"] = str(e)[:300]
+        # Runware's public index (no key needed, but only synced with a key).
+        if provider_keys.has("runware") and not get_settings().mock_providers:
+            try:
+                from ..providers import runware
+
+                runware.refresh_index(None if own else client)
+            except Exception as e:  # noqa: BLE001 — keeps the last good list
+                log.warning("catalog source runware_index failed: %s", e)
+                errors["runware_index"] = str(e)[:300]
         entries += _static_entries()
         entries += _sogni_entries()
+        entries += _runware_entries()
         # A Lyria model served by both OpenRouter and Google appears once,
         # as the OpenRouter entry (one key for everything); the Google route
         # stays available as a fallback for it.
@@ -354,7 +377,7 @@ def _alert_missing_active(snap: dict, prev_entries: list[dict]) -> None:
     before = {(e["kind"], e["id"]): e.get("provider") for e in prev_entries}
     # Only a failed source that feeds the model's provider can hide it (a
     # failed Sogni list sync keeps the last good list, so it hides nothing).
-    failed = {_SOURCE_PROVIDER.get(k, "*") for k in (snap.get("errors") or {}) if k != "sogni_tools"}
+    failed = {_SOURCE_PROVIDER.get(k, "*") for k in (snap.get("errors") or {}) if k not in _SYNC_SOURCES}
     for kind in reg.KINDS:
         sel = reg.selected(kind)
         if not sel or sel.startswith("mock/"):
@@ -397,20 +420,21 @@ def _live_usable(snap: Optional[dict]) -> Optional[dict]:
 
 
 def _with_sogni(snap: Optional[dict]) -> Optional[dict]:
-    """Serve the current Sogni entries (built locally from the synced list)
-    rather than the copy stored with the snapshot, so a newer list or newer
-    notes show up without waiting for the next poll."""
+    """Serve the current Sogni and Runware entries (built locally from their
+    synced lists) rather than the copy stored with the snapshot, so a newer
+    list or newer notes show up without waiting for the next poll."""
     if not snap:
         return snap
     entries = snap.get("entries") or []
-    stored = {(e.get("kind"), e.get("id")): e for e in entries if e.get("provider") == "sogni"}
-    fresh = []
-    for e in _sogni_entries():
-        key = (e["kind"], e["id"])
-        # Keep the poll's own "new" flag; one it hasn't seen yet is new.
-        new = bool(stored[key].get("new")) if key in stored else bool(stored)
-        fresh.append({**e, "new": new})
-    merged = [*(e for e in entries if e.get("provider") != "sogni"), *fresh]
+    merged = [e for e in entries if e.get("provider") not in _LOCAL]
+    for provider, build in _LOCAL.items():
+        stored = {(e.get("kind"), e.get("id")): e for e in entries if e.get("provider") == provider}
+        for e in build():
+            key = (e["kind"], e["id"])
+            # Keep the poll's own "new" flag; one it hasn't seen yet is new
+            # (none when the provider had no entries in that poll).
+            new = bool(stored[key].get("new")) if key in stored else bool(stored)
+            merged.append({**e, "new": new})
     return {**snap, "entries": merged,
             "counts": {k: sum(1 for e in merged if e.get("kind") == k) for k in reg.KINDS},
             "new_count": sum(1 for e in merged if e.get("new"))}

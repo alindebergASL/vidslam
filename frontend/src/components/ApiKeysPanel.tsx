@@ -98,7 +98,7 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
   const helpId = `${uid}-help`;
   const statusId = `${uid}-status`;
   const inputRef = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState<null | "save" | "clear" | "test" | "switch">(null);
+  const [busy, setBusy] = useState<null | "save" | "clear" | "test" | "switch" | "option">(null);
   const [hasInput, setHasInput] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [test, setTest] = useState<ApiKeyTestResult | null>(null);
@@ -196,6 +196,25 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
     }
   };
 
+  const setCheck = async (value: boolean) => {
+    setBusy("option");
+    setMessage(null);
+    try {
+      const updated = await api.setProviderOptions(row.name, { check_content: value });
+      onChange(updated);
+      setMessage({
+        ok: true,
+        text: value
+          ? `${row.label} content check is on: its open models are moderated too.`
+          : `${row.label} content check is off: its open models are uncensored (minors are always refused).`,
+      });
+    } catch (err: any) {
+      setMessage({ ok: false, text: err.message || "Couldn't change the setting." });
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const on = row.enabled ?? true;
   // Providers added later (enabled_default null) turn on by themselves once a key is saved.
   const autoOn = row.enabled_default === null && !row.enabled_explicit && !row.set;
@@ -239,6 +258,22 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
           )}
         </div>
       </div>
+      {row.options && "check_content" in row.options && (
+        <label className="mt-2 flex items-start gap-2 text-[11px] text-ink-300">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={!!row.options.check_content}
+            disabled={busy !== null}
+            onChange={(e) => setCheck(e.target.checked)}
+          />
+          <span>
+            {row.label} content check{busy === "option" ? " …" : ""}. Off = uncensored output on the open models
+            {" "}{row.label} hosts; vendor models (Google, Kling, Wan…) stay moderated by their vendor. Prompts involving
+            minors are always refused, and pictures of your Cast are always checked.
+          </span>
+        </label>
+      )}
       {row.warning && (
         <p role="note" className="text-[11px] text-amber-300 mt-1">
           {row.warning}

@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..config import get_settings
 from ..providers import get_image, provider_label, routes_per_model, video_capabilities
+from ..providers import runware as _runware
 from ..providers import sogni as _sogni
 from ..providers.base import ImageRef, VideoCapabilities
 from ..schemas.ambient import (
@@ -625,6 +626,8 @@ def _is_video_model(model: str) -> bool:
         return True
     if _sogni.is_sogni(model) and _sogni.video_model(model) is not None:
         return True  # no catalog needed for Sogni's own list
+    if _runware.is_runware(model):
+        return _runware.is_video_model(model)
     try:
         from . import model_catalog
 
@@ -635,7 +638,10 @@ def _is_video_model(model: str) -> bool:
 
 def _takes_reference(model: str) -> bool:
     """Whether a still model applies a reference picture. Sogni models do
-    through Sogni's edit_image tool (sogni.edit_route), unless that's off."""
+    through Sogni's edit_image tool (sogni.edit_route), unless that's off;
+    Runware's edit models (inputs.referenceImages) do."""
+    if _runware.is_runware(model):
+        return _runware.takes_reference(model)
     return not _sogni.is_sogni(model) or _sogni.can_use_references(model)
 
 
@@ -702,6 +708,8 @@ def _still_model_cost(model: str) -> float:
         return s.cost_ambient_still
     if _sogni.is_sogni(model):
         return _sogni.image_spend_usd(model)
+    if _runware.is_runware(model):
+        return _runware.image_cost_usd(model)
     return _STILL_COST.get(model, s.cost_image_per_item)
 
 
@@ -709,6 +717,8 @@ def _video_rate(model: str) -> float:
     """Rate-card USD per second of loop video on `model`."""
     if _sogni.is_sogni(model):
         return _sogni.video_spend_rate_usd(model)
+    if _runware.is_runware(model):
+        return _runware.video_rate_usd(model)
     return get_settings().cost_video_per_second
 
 

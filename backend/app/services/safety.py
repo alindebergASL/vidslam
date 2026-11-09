@@ -33,3 +33,23 @@ def validate_script(script: str) -> None:
                 "Script appears to contain disallowed content "
                 "(sexual content involving minors, or threats against a specific person)."
             )
+
+
+# The minors patterns only: image and video prompts are short descriptions
+# where the threat pattern would misfire ("kill time", "murder mystery").
+_MINOR_PATTERNS = (*_BLOCKED_PATTERNS[:2], _BLOCKED_PATTERNS[3])
+
+
+class UnsafePromptError(UnsafeScriptError):
+    """An image or video prompt refused before it reaches a provider."""
+
+
+def check_prompt(text: str) -> None:
+    """Raise UnsafePromptError for a generation prompt involving sexual
+    content and minors. Called on every prompt sent to a provider whose own
+    content check is off (Runware), whatever screen it came from."""
+    flat = " ".join(str(text or "").split())  # the patterns don't cross newlines
+    for pat in _MINOR_PATTERNS:
+        if pat.search(flat):
+            raise UnsafePromptError(
+                "This prompt was refused: it appears to involve sexual content and minors.")
