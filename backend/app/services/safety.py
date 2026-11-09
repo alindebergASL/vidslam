@@ -35,21 +35,43 @@ def validate_script(script: str) -> None:
             )
 
 
-# The minors patterns only: image and video prompts are short descriptions
-# where the threat pattern would misfire ("kill time", "murder mystery").
-_MINOR_PATTERNS = (*_BLOCKED_PATTERNS[:2], _BLOCKED_PATTERNS[3])
+# Generation prompts (image/video): sexual content and minors, with wider
+# wording than validate_script's (and without its threat pattern, which
+# misfires on short descriptions: "kill time", "murder mystery").
+_AGE = r"(?:1[0-7]|[1-9])"
+_MINOR_TERMS = (
+    r"\b(?:child|children|kid|kids|kiddie|minor|minors|underage|under-age|teen|teens|teenage|teenaged|"
+    r"teenager|teenagers|preteen|pre-teen|preteens|tween|tweens|schoolgirl|schoolgirls|schoolboy|"
+    r"schoolboys|toddler|toddlers|infant|infants|little (?:girl|boy)s?|young (?:girl|boy)s?|"
+    r"loli|lolita|shota|jailbait|cp)\b"
+    rf"|\b{_AGE}\s?-?\s?(?:years?|yrs?)(?:\s?-?\s?old)?\b|\b{_AGE}\s?y/?o\b|\baged?\s{_AGE}\b"
+)
+_SEXUAL_TERMS = (
+    r"\b(?:sex|sexual|sexuali[sz]ed|sexy|nude|nudes|naked|nudity|porn|porno|pornographic|nsfw|"
+    r"explicit|erotic|erotica|topless|bottomless|lingerie|undress|undressed|undressing|seductive|"
+    r"seductively|nipples?|genitals?|genitalia|orgasm|aroused|arousal|fetish|horny|lewd|stripping|"
+    r"stripper)\b"
+)
+_MINOR_RE = re.compile(_MINOR_TERMS, re.I)
+_SEXUAL_RE = re.compile(_SEXUAL_TERMS, re.I)
+_ALWAYS_RE = re.compile(r"\b(?:loli|lolita|shota|jailbait|cp)\b", re.I)
 
 
 class UnsafePromptError(UnsafeScriptError):
     """An image or video prompt refused before it reaches a provider."""
 
 
+def mentions_minor(text: str) -> bool:
+    """The prompt names a child or a minor's age (even innocently): callers
+    turn the provider's own content check on as a backstop."""
+    return bool(_MINOR_RE.search(" ".join(str(text or "").split())))
+
+
 def check_prompt(text: str) -> None:
     """Raise UnsafePromptError for a generation prompt involving sexual
     content and minors. Called on every prompt sent to a provider whose own
     content check is off (Runware), whatever screen it came from."""
-    flat = " ".join(str(text or "").split())  # the patterns don't cross newlines
-    for pat in _MINOR_PATTERNS:
-        if pat.search(flat):
-            raise UnsafePromptError(
-                "This prompt was refused: it appears to involve sexual content and minors.")
+    flat = " ".join(str(text or "").split())
+    if _ALWAYS_RE.search(flat) or (_MINOR_RE.search(flat) and _SEXUAL_RE.search(flat)):
+        raise UnsafePromptError(
+            "This prompt was refused: it appears to involve sexual content and minors.")

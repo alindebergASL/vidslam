@@ -261,17 +261,51 @@ def display_name(model: str) -> str:
 # ---------- capabilities and prices ----------
 
 
-def _durations(spec: Optional[dict]) -> list[int]:
-    if not spec:
-        return []
-    enum = spec.get("enum") or [a.get("const") for a in spec.get("oneOf") or spec.get("anyOf") or []
-                                if isinstance(a, dict) and isinstance(a.get("const"), (int, float))]
-    if enum:
-        return sorted({int(round(float(x))) for x in enum if isinstance(x, (int, float))})
-    lo, hi = spec.get("minimum"), spec.get("maximum")
-    if lo is None or hi is None:
-        return []
-    return list(range(max(1, math.ceil(float(lo))), int(math.floor(float(hi))) + 1))
+def _num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _durations(request: Optional[dict]) -> list[int]:
+    """Every clip length (whole seconds) the request schema allows: the
+    duration property's enum/const/range, including those nested in
+    oneOf/anyOf and in allOf rules (e.g. "with frames, 5 s only")."""
+    found: set[int] = set()
+    defaults: set[int] = set()
+
+    def spec_values(spec: Any) -> None:
+        if not isinstance(spec, dict):
+            return
+        for x in spec.get("enum") or []:
+            if _num(x):
+                found.add(int(round(float(x))))
+        if _num(spec.get("const")):
+            found.add(int(round(float(spec["const"]))))
+        lo, hi = spec.get("minimum"), spec.get("maximum")
+        if _num(lo) and _num(hi) and hi >= lo:
+            found.update(range(max(1, math.ceil(float(lo))), int(math.floor(float(hi))) + 1))
+        if _num(spec.get("default")):
+            defaults.add(int(round(float(spec["default"]))))
+        for k in ("oneOf", "anyOf", "allOf"):
+            for sub in spec.get(k) or []:
+                spec_values(sub)
+
+    def walk(o: Any) -> None:
+        if isinstance(o, dict):
+            props = o.get("properties")
+            if isinstance(props, dict) and "duration" in props:
+                spec_values(props["duration"])
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(request or {})
+    return sorted(found or defaults)
+
+
+# When a schema states no lengths: common ones, checked against it per request.
+_FALLBACK_DURATIONS = [4, 5, 6, 8, 10]
 
 
 def capabilities_for(model: str) -> VideoCapabilities:
@@ -286,7 +320,7 @@ def capabilities_for(model: str) -> VideoCapabilities:
     first = "first" in frames
     refs_only = any("referenceImages" in (m.get("inputs") or []) for m in modes)
     return VideoCapabilities(
-        durations=_durations(_props(sch).get("duration")) or [5],
+        durations=_durations(sch.get("request")) or list(_FALLBACK_DURATIONS),
         first_frame=first, last_frame="last" in frames,
         needs_first_frame=not has_text and first,
         needs_reference=not has_text and not first and refs_only,
@@ -511,9 +545,15 @@ def _size_variants(sch: dict, aspect: str, long_side: int, resolutions: list[str
             yield v
 
 
-def _ordered_refs(refs: list[ImageRef]) -> list[ImageRef]:
-    rank = {"scene": 0, "character": 1, "object": 2, "style": 3}
-    return sorted(refs, key=lambda r: (0 if r.frame_type else 1, rank.get(r.role, 4)))
+def _pick_refs(refs: list[ImageRef], limit: int) -> list[ImageRef]:
+    """Up to `limit` pictures in the user's order; when some must go,
+    frames and Cast people are kept first, then scenes, objects, styles."""
+    if len(refs) <= limit:
+        return list(refs)
+    rank = {"character": 1, "scene": 2, "object": 3, "style": 4}
+    keep = sorted(range(len(refs)), key=lambda i: (0 if refs[i].frame_type else rank.get(refs[i].role, 5), i))
+    chosen = sorted(keep[:max(0, limit)])
+    return [refs[i] for i in chosen]
 
 
 def _name_refs(prompt: str, used: list[ImageRef]) -> str:
@@ -523,32 +563,65 @@ def _name_refs(prompt: str, used: list[ImageRef]) -> str:
     return f"{prompt}\n({'; '.join(names)}.)"
 
 
-def _choose(sch: dict, base: dict, variants: list[dict], label: str) -> dict:
+def _choose(sch: dict, bases: list[dict], variants: list[dict], label: str) -> dict:
+    """The first base × variant the schema accepts. `bases` go from all our
+    defaults set to fewer (a model's rules can forbid one in some modes)."""
     first_err = None
-    for v in variants:
-        task = {**copy.deepcopy(base), **v}
-        err = schema_error(sch, task)
-        if err is None:
-            return task
-        first_err = first_err or err
+    for base in bases:
+        for v in variants:
+            task = {**copy.deepcopy(base), **v}
+            err = schema_error(sch, task)
+            if err is None:
+                return task
+            first_err = first_err or err
     raise RunwareError(f"{label}: couldn't build a request Runware accepts ({first_err})")
 
 
-def _base(sch: dict, task_type: str, model_air: str, prompt: str, negative: str,
-          check_content: bool) -> dict:
+def _fit_text(text: str, spec: Optional[dict], *, terms: bool = False) -> str:
+    """`text` within the field's maxLength: cut at the last comma (for
+    lists of terms) or space before the limit."""
+    limit = (spec or {}).get("maxLength")
+    text = (text or "").strip()
+    if not isinstance(limit, int) or len(text) <= limit:
+        return text
+    cut = text[:limit]
+    sep = cut.rfind(",") if terms else -1
+    if sep < limit // 2:
+        sep = cut.rfind(" ")
+    return (cut[:sep] if sep > limit // 2 else cut).rstrip(" ,")
+
+
+def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str,
+           check_content: bool, cast: bool) -> list[dict]:
+    """The request without its size/frames, with our defaults (quiet: no
+    audio or prompt rewriting; permissive: vendor safety knobs at their
+    loosest), then without the permissive knobs, then without either."""
     props = _props(sch)
+    full = _fit_text(prompt, props.get("positivePrompt"))
+    if len(full) < len(prompt.strip()):
+        log.warning("runware %s: prompt cut to the model's %s characters", model_air, len(full))
     task: dict = {"taskType": task_type, "taskUUID": str(uuid.uuid4()), "model": model_air,
-                  "positivePrompt": prompt}
+                  "positivePrompt": full}
     for key, value in (("includeCost", True), ("numberResults", 1), ("outputType", "URL")):
         if key in props:
             _put(task, props, (key,), value)
-    neg = (negative or "").strip()
+    neg = _fit_text(negative, props.get("negativePrompt"), terms=True)
     if neg and "negativePrompt" in props and _allowed(props["negativePrompt"], neg) and len(neg) >= 2:
         task["negativePrompt"] = neg
-    _put(task, props, ("safety", "checkContent"), bool(check_content))
-    for path, value in _QUIET + _PERMISSIVE:
-        _put(task, props, path, value)
-    return task
+    if not _put(task, props, ("safety", "checkContent"), bool(check_content)) and cast:
+        # Rule: a Cast member's picture never goes out without the check.
+        raise RunwareError(f"{model_air} has no content check, so it can't be sent pictures of your Cast")
+    quiet = copy.deepcopy(task)
+    for path, value in _QUIET:
+        _put(quiet, props, path, value)
+    loud = copy.deepcopy(quiet)
+    for path, value in _PERMISSIVE:
+        _put(loud, props, path, value)
+    out: list[dict] = []
+    for t in (loud, quiet, task):
+        if t not in out:
+            out.append(t)
+    return out
 
 
 def build_image_task(model: str, prompt: str, references: list[ImageRef], *, negative_prompt: str = "",
@@ -562,12 +635,11 @@ def build_image_task(model: str, prompt: str, references: list[ImageRef], *, neg
         raise RunwareError(f"{a} isn't in Runware's model list")
     props = _props(sch)
     inputs = (_sub(props, "inputs") or {}).get("properties") or {}
-    refs = _ordered_refs(list(references or []))
+    refs = list(references or [])
     used: list[ImageRef] = []
     extra: dict = {}
     if refs and "referenceImages" in inputs:
-        n = int(inputs["referenceImages"].get("maxItems") or 4)
-        used = refs[:n]
+        used = _pick_refs(refs, int(inputs["referenceImages"].get("maxItems") or 4))
         extra = {"inputs": {"referenceImages": [r.url for r in used]}}
     elif refs and "seedImage" in inputs:
         src = next((r for r in refs if r.frame_type or r.role == "scene"), None)
@@ -578,19 +650,22 @@ def build_image_task(model: str, prompt: str, references: list[ImageRef], *, neg
             if "strength" in props:
                 extra["strength"] = round(min(max(strength, 0.0), 1.0), 2)
     if len(used) < len(refs):
-        log.info("runware %s: %d reference picture(s) not used (the model takes %s)", a,
-                 len(refs) - len(used), "fewer" if used else "none of this kind")
-    # A Cast member's likeness always goes through Runware's content check.
+        log.warning("runware %s: %d reference picture(s) not used (the model takes %s)", a,
+                    len(refs) - len(used), "fewer" if used else "none of this kind")
+    # A Cast member's likeness, or a prompt about children, always goes
+    # through Runware's content check.
     cast = any(r.role == "character" for r in used)
-    checked = (check_content_default() if check_content is None else check_content) or cast
-    base = _base(sch, "imageInference", a, _name_refs(prompt, used), negative_prompt, checked)
-    for key, value in (("deliveryMethod", "sync"), ("outputFormat", "JPG"), ("outputQuality", 95)):
-        if key in props:
-            _put(base, props, (key,), value)
-    base.update(extra)
+    checked = (check_content_default() if check_content is None else check_content) or cast \
+        or mentions_minor(prompt)
+    bases = _bases(sch, "imageInference", a, _name_refs(prompt, used), negative_prompt, checked, cast)
+    for base in bases:
+        for key, value in (("deliveryMethod", "sync"), ("outputFormat", "JPG"), ("outputQuality", 95)):
+            if key in props:
+                _put(base, props, (key,), value)
+        base.update(copy.deepcopy(extra))
     variants = list(_size_variants(sch, str(settings.get("aspect_ratio") or "16:9"),
                                    s.runware_image_long_side, ["2K", "2k", "1K", "1k"], frames=bool(used)))
-    return _choose(sch, base, variants, display_name(model))
+    return _choose(sch, bases, variants, display_name(model))
 
 
 def _frames(refs: list[ImageRef], strategy: str) -> tuple[Optional[ImageRef], Optional[ImageRef]]:
@@ -632,22 +707,27 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
         frame_variants = [{"inputs": {"frameImages": [{"image": r.url, "frame": f} for r, f in pinned]}},
                           {"inputs": {"frameImages": [r.url for r, _ in pinned]}}]
     elif refs and "referenceImages" in inputs:
-        loose = _ordered_refs(refs)[: int(inputs["referenceImages"].get("maxItems") or 4)]
+        loose = _pick_refs(refs, int(inputs["referenceImages"].get("maxItems") or 4))
         used = loose
         frame_variants = [{"inputs": {"referenceImages": [r.url for r in loose]}}]
     if len(used) < len(refs):
-        log.info("runware %s: %d reference picture(s) not used", a, len(refs) - len(used))
+        # Like Sogni: a model that takes no loose pictures makes the clip from
+        # the prompt (storyboard shots attach the Cast to every shot).
+        log.warning("runware %s: %d reference picture(s) not used (the model takes %s)", a,
+                    len(refs) - len(used), "fewer" if used else "only pinned frames")
     cast = any(r.role == "character" for r in used)
-    checked = (check_content_default() if check_content is None else check_content) or cast
-    base = _base(sch, "videoInference", a, _name_refs(prompt, used if not first else []),
-                 negative_prompt, checked)
-    _put(base, props, ("deliveryMethod",), "async")
+    checked = (check_content_default() if check_content is None else check_content) or cast \
+        or mentions_minor(prompt)
+    bases = _bases(sch, "videoInference", a, _name_refs(prompt, used if not first else []),
+                   negative_prompt, checked, cast)
     loop = first is not None and last is not None and first.url == last.url
-    if loop:
-        _put(base, props, ("providerSettings", "bytedance", "cameraFixed"), True)
-    if settings.get("generate_audio"):
-        for path, _ in _QUIET[:4]:
-            _put(base, props, path, True)
+    for base in bases:
+        _put(base, props, ("deliveryMethod",), "async")
+        if loop:
+            _put(base, props, ("providerSettings", "bytedance", "cameraFixed"), True)
+        if settings.get("generate_audio"):
+            for path, _ in _QUIET[:4]:
+                _put(base, props, path, True)
     want = caps.snap(duration_seconds)
     durations = sorted(caps.durations or [want], key=lambda d: (d < want, abs(d - want)))
     res = video_resolution()
@@ -662,8 +742,11 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
                 if "duration" in props:
                     v["duration"] = d
                 variants.append(v)
-    task = _choose(sch, base, variants, display_name(model))
-    return task, int(task.get("duration") or want)
+    task = _choose(sch, bases, variants, display_name(model))
+    got = int(task.get("duration") or want)
+    if got != want:
+        log.warning("runware %s: asked for %s s, the model takes %s s here", a, want, got)
+    return task, got
 
 
 # ---------- HTTP client ----------
@@ -671,12 +754,20 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
 
 class RunwareError(RuntimeError):
     def __init__(self, message: str, *, status: int = 0, code: Any = None, refused: bool = False,
-                 final: bool = False) -> None:
+                 final: bool = False, task_failed: bool = False) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.refused = refused  # declined for its content
         self.final = final  # retrying won't help (no credit, bad key)
+        self.task_failed = task_failed  # the task itself failed (not the request about it)
+
+    @property
+    def transient(self) -> bool:
+        """A failure to *ask* about a task (network, overload, server error,
+        a key just cleared), not a failure of the task: ask again later."""
+        return not self.task_failed and (self.status == 0 or self.status in (401, 403, 408, 429)
+                                         or self.status >= 500)
 
 
 def _error_items(body: Any) -> list[dict]:
@@ -781,13 +872,23 @@ class RunwareClient:
 
     def get_response(self, task_uuid: str) -> Optional[dict]:
         """The task's latest row, None while Runware has nothing to report.
-        Raises RunwareError when the task failed or isn't known."""
+        Raises RunwareError: with task_failed=True when the task failed or
+        isn't known; otherwise (5xx, overload, auth) the question failed and
+        can be asked again (err.transient)."""
         status, body = self.post([{"taskType": "getResponse", "taskUUID": task_uuid}], timeout=30.0)
         row = self._row(body, task_uuid)
         if row is not None and str(row.get("status") or "").lower() not in ("error", "failed"):
             return row
-        if row is not None or _error_items(body) or status >= 400:
-            raise self.error_for(status, row if row is not None and _error_items(row) else body)
+        if row is not None:
+            err = self.error_for(status, row if _error_items(row) else body)
+            err.task_failed = True
+            raise err
+        if status == 0 or status >= 500 or status in (401, 403, 408, 429):
+            raise self.error_for(status, body)  # transient: ask again later
+        if status >= 400 or _error_items(body):
+            err = self.error_for(status, body)  # e.g. taskNotFound
+            err.task_failed = True
+            raise err
         return None
 
     def run(self, task: dict, *, timeout: float) -> dict:
@@ -801,6 +902,8 @@ class RunwareClient:
             log.warning("runware %s: no answer to the request (%s); asking for its result", uid, type(e).__name__)
             return self.wait(uid, deadline)
         row = self._row(body, uid)
+        if status in (429, 503) and row is None:
+            raise self.error_for(status, body)  # overloaded even after retries: it didn't run
         if status >= 500 and row is None:
             log.warning("runware %s: HTTP %s; asking for its result instead of resending", uid, status)
             return self.wait(uid, deadline)
@@ -813,9 +916,22 @@ class RunwareClient:
         return row
 
     def wait(self, task_uuid: str, deadline: float) -> dict:
+        """Ask about a task until it's done. A failed question (network,
+        overload, server error) is asked again; only the task failing, or
+        the deadline, ends the wait early."""
         delay = 2.0
         while True:
-            row = self.get_response(task_uuid)
+            try:
+                row = self.get_response(task_uuid)
+            except RunwareError as e:
+                if not e.transient:
+                    raise
+                log.warning("runware %s: couldn't get its result yet (%s); asking again", task_uuid, e)
+                row = None
+            except httpx.TransportError as e:
+                log.warning("runware %s: couldn't get its result yet (%s); asking again",
+                            task_uuid, type(e).__name__)
+                row = None
             if row is not None and str(row.get("status") or "success").lower() not in ("processing", "pending"):
                 return row
             if time.monotonic() + delay > deadline:
@@ -841,6 +957,12 @@ def check_content_default() -> bool:
         return provider_keys.option("runware", "check_content")
     except Exception:  # noqa: BLE001 — no database (scripts): the config value
         return bool(get_settings().runware_check_content)
+
+
+def mentions_minor(text: str) -> bool:
+    from ..services.safety import mentions_minor as _m
+
+    return _m(text)
 
 
 def _guard(prompt: str) -> None:
@@ -872,7 +994,8 @@ def catalog_entries(usable: bool) -> list[dict]:
     out: list[dict] = []
     rows = {r["air"]: r for r in index_rows()}
     curated = [a for a in b["curated"] if a in b["schemas"]]
-    for a in curated + [a for a in rows if a not in b["schemas"]]:
+    unusable = set(b.get("unusable") or [])
+    for a in curated + [a for a in rows if a not in b["schemas"] and a not in unusable]:
         sch = b["schemas"].get(a)
         row = rows.get(a) or {}
         kind = kind_of((sch or {}).get("capabilities") or row.get("caps"))
@@ -936,12 +1059,7 @@ class RunwareImageProvider(ImageProvider):
         task = build_image_task(model, prompt, list(references or []), negative_prompt=negative_prompt,
                                 settings=settings)
         row = self.client.run(task, timeout=get_settings().runware_image_timeout_seconds)
-        url = row.get("imageURL")
-        if not url:
-            raise RunwareError(f"Runware returned no image for {air(model)}")
-        if row.get("NSFWContent") is not None:
-            log.info("runware %s: NSFWContent=%s", air(model), row.get("NSFWContent"))
-        data = RunwareClient.download(url)
+        # Billed now, whether or not the download works: record it first.
         from ..services import spend
 
         cost = row.get("cost")
@@ -952,7 +1070,12 @@ class RunwareImageProvider(ImageProvider):
             spend.record(provider="runware", kind="image", model=model, cost=image_cost_usd(model),
                          is_estimate=True, source="rate_card", generation_id=task["taskUUID"],
                          note="Runware reported no cost")
-        return data
+        url = row.get("imageURL")
+        if not url:
+            raise RunwareError(f"Runware returned no image for {air(model)}")
+        if row.get("NSFWContent") is not None:
+            log.info("runware %s: NSFWContent=%s", air(model), row.get("NSFWContent"))
+        return RunwareClient.download(url)
 
 
 class RunwareVideoProvider(VideoProvider):
@@ -998,7 +1121,9 @@ class RunwareVideoProvider(VideoProvider):
         try:
             row = self.client.get_response(job.job_id)
         except RunwareError as e:
-            return JobStatus(state="failed", error=str(e))
+            if e.task_failed:
+                return JobStatus(state="failed", error=str(e))
+            raise  # couldn't ask (5xx, overload, key): the sweeper asks again until the deadline
         if row is None:
             return JobStatus(state="queued")
         st = str(row.get("status") or "").lower()
@@ -1037,3 +1162,38 @@ def is_video_model(model: str) -> bool:
         return kind_of(sch.get("capabilities")) == "video"
     row = next((r for r in index_rows() if r.get("air") == a), None)
     return bool(row) and kind_of(row.get("caps")) == "video"
+
+
+def smoke_build(model: str) -> Optional[str]:
+    """None when the app can build a valid request for this model the way
+    it uses it (text, or a first frame / a reference where the model needs
+    one); else why not. The snapshot script hides models that fail."""
+    from .base import ImageRef
+
+    sch = schema(model)
+    if sch is None:
+        return "no schema"
+    caps = set(sch.get("capabilities") or [])
+    pic = ImageRef(url="https://example.com/picture.jpg", role="scene", frame_type="first_frame")
+    tries: list = []
+    kind = kind_of(caps)
+    if kind == "image":
+        if "text-to-image" in caps:
+            tries.append(lambda: build_image_task(model, "a quiet street at dusk", [], check_content=False))
+        tries.append(lambda: build_image_task(model, "the same street at night", [pic], check_content=False))
+    elif kind == "video":
+        tries.append(lambda: build_video_task(model, "rain falls on a quiet street", [],
+                                              duration_seconds=5, check_content=False))
+        tries.append(lambda: build_video_task(model, "rain falls on a quiet street", [pic],
+                                              reference_strategy="frame_images", duration_seconds=5,
+                                              check_content=False))
+    else:
+        return "not an image or video model"
+    err = None
+    for t in tries:
+        try:
+            t()
+            return None
+        except RunwareError as e:
+            err = err or str(e)
+    return err or "nothing to try"

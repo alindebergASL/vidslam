@@ -7,7 +7,12 @@ It keeps:
 - the live image and video models from the index (for the catalog);
 - the request schema of each curated model (CURATED below), without its
   descriptions, plus its modes, capabilities and prices. These schemas
-  drive the payload builder in providers/runware.py and the contract tests.
+  drive the payload builder in providers/runware.py and the contract tests;
+- "unusable": the other models the app can't build a request for (they need
+  inputs it never sends, e.g. a video to edit or an audio track), checked
+  with the app's own builder, so the catalog doesn't offer them. Run it
+  where the backend imports (e.g. inside the backend container) for this;
+  elsewhere the list is left empty.
 
 Any other model's schema is fetched the first time it is used (and cached).
 """
@@ -93,6 +98,35 @@ def schema_entry(doc: dict) -> dict:
     }
 
 
+def smoke_test(rows: list[dict], curated: dict) -> list[str]:
+    """AIRs of index models the app's request builder can't serve."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from app.providers import runware
+    except Exception as e:  # noqa: BLE001 — not inside the backend: skip
+        print(f"not checking which models the app can use ({e})", file=sys.stderr)
+        return []
+    bad = []
+    for r in rows:
+        a = r["air"]
+        if a in curated:
+            continue
+        try:
+            runware._schemas[a] = {"id": r["id"], "name": r["name"],
+                                   **schema_entry(_get(SCHEMA_URL.format(id=r["id"])))}
+            why = runware.smoke_build(runware.PREFIX + a)
+        except Exception as e:  # noqa: BLE001 — a schema we can't read is unusable too
+            why = str(e)
+        if why:
+            bad.append(a)
+            print(f"unusable: {a} ({why[:120]})", file=sys.stderr)
+    for a in curated:
+        why = runware.smoke_build(runware.PREFIX + a)
+        if why:
+            raise SystemExit(f"curated model {a} fails the builder: {why}")
+    return sorted(bad)
+
+
 def main() -> int:
     index = _get(INDEX_URL)
     by_air = {e.get("air"): e for e in index if e.get("air")}
@@ -105,11 +139,13 @@ def main() -> int:
             continue
         schemas[air] = {"id": e["id"], "name": e.get("name") or e["id"],
                         **schema_entry(_get(SCHEMA_URL.format(id=e["id"])))}
+    unusable = smoke_test(rows, schemas)
     out = {
         "generated_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "curated": [a for a in CURATED if a in schemas],
         "index": rows,
         "schemas": schemas,
+        "unusable": unusable,
     }
     OUT.write_text(json.dumps(out, separators=(",", ":"), sort_keys=True) + "\n")
     print(f"wrote {OUT} ({OUT.stat().st_size // 1024} KB, {len(rows)} models, {len(schemas)} schemas)")

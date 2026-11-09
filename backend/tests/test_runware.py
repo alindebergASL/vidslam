@@ -115,8 +115,8 @@ def test_content_check_setting_and_cast_pictures(client, live):
     t = runware.build_image_task("runware/alibaba:qwen-image-edit@2511", "her sitting in the bar",
                                  [_ref(FACE, "character", name="Naina"), _ref()])
     assert t["safety"]["checkContent"] is True
-    assert t["inputs"]["referenceImages"] == [PIC, FACE]  # the scene first, then the person
-    assert "image 2 is Naina" in t["positivePrompt"]
+    assert t["inputs"]["referenceImages"] == [FACE, PIC]  # the user's order
+    assert "image 1 is Naina" in t["positivePrompt"] and "image 2 is the scene" in t["positivePrompt"]
 
 
 def test_references_follow_each_models_inputs(client, live):
@@ -269,7 +269,7 @@ def test_capabilities_from_the_schemas(client, live):
 
 def test_poll_states(client, live):
     from app.providers.base import SubmittedJob
-    from app.providers.runware import RunwareVideoProvider
+    from app.providers.runware import RunwareError, RunwareVideoProvider
 
     job = SubmittedJob(provider="runware", model="runware/lightricks:ltx@2.3-fast", job_id="t-1")
     rows = {
@@ -287,6 +287,14 @@ def test_poll_states(client, live):
         assert (st.state, st.result_url, st.cost) == ("succeeded", VID_URL, 0.48)
         route.mock(return_value=httpx.Response(400, json={"errors": [{"code": "taskNotFound", "message": "no"}]}))
         assert p.poll(job).state == "failed"
+        # Failing to *ask* isn't the task failing: the sweeper asks again
+        # (a clip Runware is still making, and billing, isn't thrown away).
+        for bad in (httpx.Response(500, text="<html>oops</html>"), httpx.Response(502, text="bad gateway"),
+                    httpx.Response(429, json={"errors": [{"code": "serviceOverloaded"}]})):
+            route.mock(return_value=bad)
+            with pytest.raises(RunwareError) as e:
+                p.poll(job)
+            assert e.value.transient
         route.mock(return_value=_answer({"taskUUID": "t-1", "status": "error",
                                          "error": {"code": "providerError", "message": "boom"}}))
         st = p.poll(job)
@@ -522,3 +530,157 @@ def test_budget_cap_stops_requests_before_they_are_sent(client, live):
             RunwareImageProvider().generate(model="runware/runware:107@1", prompt="a quiet street",
                                             references=[])
         assert not router.calls
+
+
+
+# ---------- review follow-ups ----------
+
+
+def test_waiting_survives_a_failed_question_and_overload_is_not_waited_on(client, live):
+    from app.providers.runware import RunwareError, RunwareImageProvider
+
+    answers = {"get": iter([httpx.Response(500, json={"errors": [{"code": "internalError", "message": "x"}]})])}
+
+    def answer(t):
+        if t["taskType"] == "imageInference":
+            raise httpx.ReadTimeout("slow")
+        nxt = next(answers["get"], None)
+        return nxt or _answer({"taskType": "imageInference", "taskUUID": t["taskUUID"], "imageURL": IMG_URL,
+                               "cost": 0.01})
+
+    with respx.mock() as router:
+        post = router.post(API).mock(side_effect=_respond(answer))
+        router.get(IMG_URL).mock(return_value=httpx.Response(200, content=JPEG))
+        assert RunwareImageProvider().generate(model="runware/runware:z-image@turbo", prompt="a quiet street",
+                                               references=[]) == JPEG
+        assert len(_inference_posts(post, "imageInference")) == 1
+    # Still overloaded after the retries: it didn't run, so no waiting for it.
+    with respx.mock() as router:
+        post = router.post(API).mock(return_value=httpx.Response(503, json={"errors": [{"code": "serviceOverloaded"}]}))
+        with pytest.raises(RunwareError):
+            RunwareImageProvider().generate(model="runware/runware:z-image@turbo", prompt="a quiet street",
+                                            references=[])
+        assert not _inference_posts(post, "getResponse")
+
+
+def test_a_billed_image_is_recorded_even_if_its_download_fails(client, live):
+    from app import models
+    from app.db import SessionLocal
+    from app.providers.runware import RunwareImageProvider
+
+    with respx.mock() as router:
+        router.post(API).mock(side_effect=_respond(lambda t: _answer(
+            {"taskType": "imageInference", "taskUUID": t["taskUUID"], "imageURL": IMG_URL, "cost": 0.02})))
+        router.get(IMG_URL).mock(return_value=httpx.Response(503))
+        with pytest.raises(httpx.HTTPStatusError):
+            RunwareImageProvider().generate(model="runware/runware:z-image@turbo", prompt="a quiet street",
+                                            references=[])
+    db = SessionLocal()
+    try:
+        row = db.query(models.SpendEntry).one()
+        assert (row.cost_usd, row.is_estimate) == (0.02, False)
+    finally:
+        db.close()
+
+
+def test_durations_nested_in_alternatives_and_rules():
+    from app.providers.runware import _durations
+
+    assert _durations({"properties": {"duration": {"oneOf": [{"type": "integer", "enum": [6, 10]},
+                                                             {"const": "auto"}]}}}) == [6, 10]
+    assert _durations({"properties": {"duration": {"type": "integer"}},
+                       "allOf": [{"if": {}, "then": {"properties": {"duration": {"enum": [5]}}}}]}) == [5]
+    assert _durations({"properties": {"duration": {"type": "number", "default": 7}}}) == [7]
+
+
+def _fake_model(monkeypatch, air_id: str, request: dict, modes=None, caps=None):
+    from app.providers import runware
+
+    monkeypatch.setitem(runware._schemas, air_id, {
+        "id": air_id, "name": air_id, "capabilities": caps or ["text-to-video", "image-to-video"],
+        "modes": modes or [{"id": "text"}, {"id": "first-frame", "inputs": ["frameImages"], "frames": ["first"]}],
+        "pricing": {}, "request": request})
+    return f"runware/{air_id}"
+
+
+_IMG = {"type": "string"}
+_CORE = {"taskType": {"type": "string"}, "taskUUID": {"type": "string"}, "model": {"type": "string"},
+         "positivePrompt": {"type": "string", "minLength": 2}}
+
+
+def test_a_permissive_knob_a_rule_forbids_is_dropped_not_fatal(client, live, monkeypatch):
+    from app.providers import runware
+
+    model = _fake_model(monkeypatch, "test:knob@1", {
+        "type": "object", "additionalProperties": False, "required": ["taskType", "taskUUID", "model"],
+        "properties": {**_CORE, "duration": {"type": "integer", "enum": [5]},
+                       "settings": {"type": "object", "additionalProperties": False,
+                                    "properties": {"safetyTolerance": {"type": "integer", "maximum": 4},
+                                                   "audio": {"type": "boolean"}}},
+                       "inputs": {"type": "object", "properties": {"frameImages": {"type": "array", "items": _IMG}}}},
+        "allOf": [{"if": {"properties": {"inputs": {"required": ["frameImages"]}}, "required": ["inputs"]},
+                   "then": {"properties": {"settings": {"properties": {"safetyTolerance": {"maximum": 2}}}}}}]})
+    t, _ = runware.build_video_task(model, "rain on a street", [_ref(frame_type="first_frame")],
+                                    reference_strategy="frame_images")
+    assert t["inputs"]["frameImages"] and "safetyTolerance" not in t.get("settings", {})
+    assert t["settings"]["audio"] is False  # the quiet defaults stay
+    t, _ = runware.build_video_task(model, "rain on a street", [])
+    assert t["settings"]["safetyTolerance"] == 4
+
+
+def test_cast_pictures_are_kept_and_never_sent_unchecked(client, live, monkeypatch):
+    from app.providers import runware
+
+    naina, raj = _ref(FACE, "character", name="Naina"), _ref("https://x.test/raj.jpg", "character", name="Raj")
+    bar, street = _ref("https://x.test/bar.jpg"), _ref("https://x.test/street.jpg")
+    t = runware.build_image_task("runware/alibaba:qwen-image-edit@2511", "the two of them at the bar",
+                                 [naina, raj, bar, street])
+    assert t["inputs"]["referenceImages"] == [FACE, "https://x.test/raj.jpg", "https://x.test/bar.jpg"]
+    t, _ = runware.build_video_task("runware/alibaba:wan@2.7", "she walks into the bar", [naina, bar])
+    assert t["inputs"]["referenceImages"] == [FACE] and t["safety"]["checkContent"] is True
+    model = _fake_model(monkeypatch, "test:nocheck@1", {
+        "type": "object", "additionalProperties": False, "required": ["taskType", "taskUUID", "model"],
+        "properties": {**_CORE, "inputs": {"type": "object", "properties": {
+            "referenceImages": {"type": "array", "items": _IMG, "maxItems": 2}}}}},
+        modes=[{"id": "reference-images", "inputs": ["referenceImages"]}], caps=["edit"])
+    with pytest.raises(runware.RunwareError, match="no content check"):
+        runware.build_image_task(model, "her portrait", [naina])
+    runware.build_image_task(model, "the street at night", [street])  # no Cast picture: fine
+
+
+def test_long_prompts_fit_the_model(client, live):
+    from app.providers import runware
+
+    negative = ", ".join(f"thing number {i}" for i in range(60))  # ~900 characters
+    t, _ = runware.build_video_task("runware/alibaba:wan@2.7", "rain on a street", [], negative_prompt=negative)
+    assert 0 < len(t["negativePrompt"]) <= 500 and t["negativePrompt"].endswith(tuple("0123456789"))
+    t, _ = runware.build_video_task("runware/vidu:4@2", "slow rain " * 400, [])
+    assert len(t["positivePrompt"]) <= 2000
+
+
+def test_minors_wording_is_refused_and_any_child_turns_the_check_on(client, live):
+    from app.providers import runware
+    from app.services.safety import UnsafePromptError, check_prompt
+
+    for bad in ("naked teenage girl", "sexy teenager in lingerie", "nude 14-year-old girl", "topless schoolgirl",
+                "erotic photo of a young boy", "nsfw pic of a 12 year old", "a nude toddler",
+                "explicit photo of a little girl", "a 15yo in lingerie", "loli art"):
+        with pytest.raises(UnsafePromptError):
+            check_prompt(bad)
+    for fine in ("a young boy fishing at dawn", "nude woman on a beach at sunset", "sexy woman in lingerie",
+                 "a kid at a strip mall", "an 18 year old student, nude portrait", "comic strip of a cat"):
+        check_prompt(fine)
+    t = runware.build_image_task("runware/runware:z-image@turbo", "children playing in a park", [])
+    assert t["safety"]["checkContent"] is True  # innocent, but checked anyway
+    t = runware.build_image_task("runware/runware:z-image@turbo", "a quiet park at dusk", [])
+    assert t["safety"]["checkContent"] is False
+
+
+def test_models_the_app_cannot_drive_are_not_offered(client, live):
+    from app.providers import runware
+
+    b = runware.bundle()
+    assert b["unusable"]  # e.g. video editors that need a video, try-on, avatars
+    ids = {e["id"] for e in runware.catalog_entries(True)}
+    assert not ids & {f"runware/{a}" for a in b["unusable"]}
+    assert all(f"runware/{a}" in ids for a in b["curated"])
