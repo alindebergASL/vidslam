@@ -15,9 +15,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Iterator, Optional
 
 from ..config import get_settings
 from . import secret_box
@@ -25,6 +27,7 @@ from . import secret_box
 log = logging.getLogger("avs.provider_keys")
 
 SETTING_PREFIX = "secret."
+ENABLED_PREFIX = "provider."  # provider.<name> = {"enabled": bool, "updated_at": ...}
 CACHE_TTL_SECONDS = 15.0
 MIN_LEN = 8
 MAX_LEN = 500
@@ -38,6 +41,9 @@ class KeySpec:
     field: str  # attribute on config.Settings
     powers: str
     docs_url: str
+    # On/off in Settings → API keys until switched: True (on), or None (on
+    # once a key is set: a provider the user adds later).
+    default_enabled: Optional[bool] = True
 
 
 KEYS: dict[str, KeySpec] = {
@@ -54,7 +60,7 @@ KEYS: dict[str, KeySpec] = {
                 "https://aistudio.google.com/apikey"),
         KeySpec("replicate", "Replicate", "REPLICATE_API_TOKEN", "replicate_api_token",
                 "Character and style LoRA training",
-                "https://replicate.com/account/api-tokens"),
+                "https://replicate.com/account/api-tokens", default_enabled=None),
         KeySpec("sogni", "Sogni", "SOGNI_API_KEY", "sogni_api_key",
                 "Sogni image and video models (sogni/…)",
                 "https://dashboard.sogni.ai/api-keys"),
@@ -93,9 +99,12 @@ def invalidate(name: Optional[str] = None) -> None:
     with _lock:
         if name is None:
             _cache.clear()
+            _enabled_cache.clear()
         else:
             for k in [k for k in _cache if k[-1] == name]:
                 _cache.pop(k, None)
+            for k in [k for k in _enabled_cache if k[-1] == name]:
+                _enabled_cache.pop(k, None)
 
 
 def _stored(name: str) -> tuple[str, str, Optional[dict]]:
@@ -142,7 +151,88 @@ def resolve(name: str) -> str:
 
 
 def has(name: str) -> bool:
+    """A key is set (app or env). Says nothing about the on/off switch."""
     return bool(resolve(name))
+
+
+# ---------- on/off ----------
+
+_enabled_cache: dict[tuple, tuple[float, Optional[bool]]] = {}  # unused (kept for invalidate)
+# Set while finishing work already under way (the next loop segment, a
+# scene's music bed after its video): a provider switched off meanwhile
+# still serves it. New work is refused.
+_continuing: ContextVar[bool] = ContextVar("provider_continuing", default=False)
+
+
+class ProviderUnavailable(Exception):
+    """A call needs a provider that is switched off (or has no key and must
+    not be faked). Raised before any provider request; the API answers 409."""
+
+    def __init__(self, provider: str, *, kind: str = "", model: str = "", reason: str = "off") -> None:
+        self.provider, self.kind, self.model, self.reason = provider, kind, model, reason
+        label = KEYS[provider].label if provider in KEYS else provider.title()
+        if reason == "off":
+            msg = f"{label} is turned off in Settings → API keys"
+        elif reason == "unsupported":
+            msg = f"{label} models aren't supported by this version of the app"
+        else:
+            msg = f"{label} isn't set up yet (no API key in Settings → API keys)"
+        super().__init__(msg + (f" ({model})" if model else "") + ".")
+
+
+def explicit_enabled(name: str) -> Optional[bool]:
+    """The switch as the user set it, or None when following the default.
+    Read every time (one small row): a flip applies at once in every web
+    worker and the job worker, not after a cache TTL."""
+    _spec(name)
+    from .model_registry import get_setting
+
+    rec = get_setting(ENABLED_PREFIX + name)
+    return bool(rec["enabled"]) if isinstance(rec, dict) and "enabled" in rec else None
+
+
+def enabled(name: str) -> bool:
+    """Whether the user has this provider on (the switch, else its default)."""
+    spec = _spec(name)
+    exp = explicit_enabled(name)
+    if exp is not None:
+        return exp
+    return has(name) if spec.default_enabled is None else bool(spec.default_enabled)
+
+
+def usable(name: str) -> bool:
+    """On, and a key is set: its models are offered."""
+    return has(name) and enabled(name)
+
+
+def serves(name: str) -> bool:
+    """On, or finishing work already under way (see continuing)."""
+    return enabled(name) or _continuing.get()
+
+
+def in_continuation() -> bool:
+    return _continuing.get()
+
+
+@contextmanager
+def continuing() -> Iterator[None]:
+    token = _continuing.set(True)
+    try:
+        yield
+    finally:
+        _continuing.reset(token)
+
+
+def set_enabled(name: str, value: Optional[bool]) -> dict:
+    """Switch a provider on/off; None goes back to its default."""
+    _spec(name)
+    from .model_registry import put_setting
+
+    put_setting(ENABLED_PREFIX + name, None if value is None else {
+        "enabled": bool(value), "updated_at": datetime.now(timezone.utc).isoformat()})
+    invalidate(name)
+    log.info("provider %s switched %s", name, "to its default" if value is None else ("on" if value else "off"))
+    return _row(name)
 
 
 def _row(name: str) -> dict:
@@ -172,6 +262,10 @@ def _row(name: str) -> dict:
         row.update(set=True, source="env", last4=env[-4:])
     active = value if source == "app" and value else env
     row["warning"] = key_warning(name, active) if row["set"] and active else None
+    exp = explicit_enabled(name)
+    row["enabled"] = enabled(name)
+    row["enabled_default"] = spec.default_enabled  # True, or None: on once a key is set
+    row["enabled_explicit"] = exp is not None
     return row
 
 

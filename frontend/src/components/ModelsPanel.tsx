@@ -18,6 +18,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   gemini: "Google",
   elevenlabs: "ElevenLabs",
   sogni: "Sogni",
+  unavailable: "nobody: its provider is switched off",
   replicate: "Replicate",
   mock: "mock",
   off: "off",
@@ -79,7 +80,11 @@ export function ModelsPanel() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.modelCatalog().then(setCat).catch((e) => setError(e.message));
+    const load = () => api.modelCatalog().then(setCat).catch((e) => setError(e.message));
+    load();
+    // A provider switched on/off in Settings → API keys changes what's listed.
+    window.addEventListener("providers-changed", load);
+    return () => window.removeEventListener("providers-changed", load);
   }, []);
 
   const active: ActiveModel | undefined = cat?.active?.[kind];
@@ -87,6 +92,7 @@ export function ModelsPanel() {
     const needle = q.trim().toLowerCase();
     return (cat?.entries ?? [])
       .filter((e) => e.kind === kind)
+      .filter((e) => e.enabled !== false) // its provider is switched off
       .filter((e) => !onlyUsable || e.usable)
       .filter((e) => !needle || e.id.toLowerCase().includes(needle) || e.name.toLowerCase().includes(needle))
       .sort((a, b) =>
@@ -98,14 +104,22 @@ export function ModelsPanel() {
       );
   }, [cat, kind, q, onlyUsable, active?.model]);
 
-  const newByKind = (k: ModelKind) => (cat?.entries ?? []).filter((e) => e.kind === k && e.new).length;
+  const newByKind = (k: ModelKind) => (cat?.entries ?? []).filter((e) => e.kind === k && e.new && e.enabled !== false).length;
+  // New models you can see (not those of providers switched off).
+  const newVisible = (cat?.entries ?? []).filter((e) => e.new && e.enabled !== false).length;
+  const hiddenOff = useMemo(() => {
+    const off = (cat?.entries ?? []).filter((e) => e.kind === kind && e.enabled === false);
+    return { count: off.length, providers: Array.from(new Set(off.map((e) => PROVIDER_LABEL[e.provider] ?? e.provider))) };
+  }, [cat, kind]);
 
   const refresh = async () => {
     setBusy("refresh");
     try {
       const c = await api.refreshModels();
       setCat(c);
-      toast.success(c.new_count ? `Catalog refreshed — ${c.new_count} new model${c.new_count === 1 ? "" : "s"}` : "Catalog refreshed");
+      // Only the new models you can see (not those of providers switched off).
+      const fresh = (c.entries ?? []).filter((e) => e.new && e.enabled !== false).length;
+      toast.success(fresh ? `Catalog refreshed — ${fresh} new model${fresh === 1 ? "" : "s"}` : "Catalog refreshed");
     } catch (e: any) {
       toast.error(e.message || "Refresh failed");
     } finally {
@@ -142,9 +156,9 @@ export function ModelsPanel() {
         <div>
           <h2 id="models-h" className="text-lg font-medium flex items-center gap-2">
             Models
-            {!!cat?.new_count && (
+            {newVisible > 0 && (
               <span className="chip text-[11px] py-0.5 grad border-transparent text-ink-950">
-                {cat.new_count} new
+                {newVisible} new
               </span>
             )}
           </h2>
@@ -247,6 +261,12 @@ export function ModelsPanel() {
               Only usable with my keys
             </label>
           </div>
+          {hiddenOff.count > 0 && (
+            <p className="text-[11px] text-ink-400 mb-2">
+              {hiddenOff.count} model{hiddenOff.count === 1 ? "" : "s"} hidden: {hiddenOff.providers.join(", ")}{" "}
+              {hiddenOff.providers.length === 1 ? "is" : "are"} switched off in Settings → API keys.
+            </p>
+          )}
 
           <ul className="space-y-1.5 max-h-112 overflow-y-auto pr-1" aria-label="Available models">
             {entries.length === 0 && (

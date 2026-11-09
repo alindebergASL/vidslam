@@ -103,6 +103,13 @@ export type ApiKeyStatus = {
   updated_at: string | null;
   /** A problem visible from the key's shape alone (e.g. a Sogni worker key). */
   warning?: string | null;
+  /** On/off switch: off hides the provider's models everywhere and refuses new work that needs it. */
+  enabled?: boolean;
+  /** True: on unless switched off. null: on once a key is set. */
+  enabled_default?: boolean | null;
+  enabled_explicit?: boolean;
+  /** Set on the reply to switching off: active model kinds this provider was serving. */
+  in_use?: string[];
 };
 
 export type ApiKeysResponse = {
@@ -443,6 +450,9 @@ export type AmbientPresets = {
   /** What "" means on this deployment. */
   default_still_model?: string;
   default_video_model?: string;
+  /** The default's provider is switched off in Settings → API keys. */
+  default_still_off?: boolean;
+  default_video_off?: boolean;
 };
 
 export type AmbientScene = {
@@ -554,6 +564,8 @@ export type CatalogEntry = {
   provider: "openrouter" | "gemini" | "elevenlabs" | "sogni" | (string & {});
   description: string;
   usable: boolean;
+  /** False when its provider is switched off in Settings → API keys (pickers hide it). */
+  enabled?: boolean;
   new: boolean;
   active?: boolean;
   created?: number | null;
@@ -806,6 +818,11 @@ export const api = {
     req<ApiKeyStatus>(`/api/settings/keys/${encodeURIComponent(name)}`, { method: "DELETE" }),
   testApiKey: (name: string) =>
     req<ApiKeyTestResult>(`/api/settings/keys/${encodeURIComponent(name)}/test`, { method: "POST" }),
+  setProviderEnabled: (name: string, enabled: boolean | null) =>
+    req<ApiKeyStatus>(`/api/settings/keys/${encodeURIComponent(name)}/enabled`, {
+      method: "PUT",
+      body: JSON.stringify({ enabled }),
+    }),
   seedDemo: () =>
     req<{ ok: boolean; already_seeded: boolean; counts: { avatars: number; projects: number } }>(
       "/api/system/seed",

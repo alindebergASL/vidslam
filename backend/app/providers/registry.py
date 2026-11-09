@@ -18,13 +18,24 @@ if TYPE_CHECKING:
 
 
 
+def _checked(kind: str, model: str) -> str:
+    """The provider to build for `kind` with `model`; raises
+    ProviderUnavailable (before any provider call) when it's switched off."""
+    from ..services import model_registry as reg
+
+    provider, blocked = reg.route_info(kind, model)
+    if provider == "unavailable":
+        raise reg.unavailable(kind, model, blocked)
+    return provider
+
+
 def _active(kind: str) -> tuple[str, str]:
     """(model, provider) for `kind`, read at call time so a switch in the
     Settings page applies to the next job without a restart."""
     from ..services import model_registry as reg
 
     model = reg.active_model(kind)
-    return model, reg.provider_for(kind, model)
+    return model, _checked(kind, model)
 
 
 def get_chat() -> ChatProvider:
@@ -42,26 +53,33 @@ def is_sogni_model(model: str | None) -> bool:
     return bool(model) and str(model).startswith("sogni/")
 
 
+def is_routed_model(model: str | None) -> bool:
+    """An id whose provider comes from its prefix (sogni/…, and the
+    reserved runware/… and replicate/…)."""
+    from ..services import model_registry as reg
+
+    m = str(model or "")
+    return bool(m) and any(m.startswith(p) for p in (*reg.ROUTED_PREFIXES, *reg.RESERVED_PREFIXES))
+
+
 def routes_per_model(kind: str, model: str | None) -> bool:
     """True when a call for a concrete `model` must pick its provider from
-    that model rather than from the active one: a `sogni/` id, or any id
-    while a Sogni model is active. Everything else keeps the old routing
-    (the active model's provider, with the per-call model passed to it)."""
+    that model rather than from the active one: a prefixed id (sogni/…), or
+    any id while a prefixed model is active. Everything else keeps the old
+    routing (the active model's provider, with the per-call model passed)."""
     if not model:
         return False
-    if is_sogni_model(model):
+    if is_routed_model(model):
         return True
     from ..services import model_registry as reg
 
-    return is_sogni_model(reg.active_model(kind))
+    return is_routed_model(reg.active_model(kind))
 
 
 def _route(kind: str, model: str | None) -> tuple[str, str]:
     """(model, provider) to build for `kind`, given the call's model if any."""
     if routes_per_model(kind, model):
-        from ..services import model_registry as reg
-
-        return str(model), reg.provider_for(kind, model)
+        return str(model), _checked(kind, str(model))
     return _active(kind)
 
 
@@ -187,20 +205,30 @@ def get_music() -> MusicProvider:
 
 def get_sound():
     """Nature-sound beds for ambient scenes: ElevenLabs sound effects when a
-    key is set and providers are live, else a generated noise placeholder."""
+    key is set and providers are live, else a generated noise placeholder
+    (never when ElevenLabs is merely switched off: then it's refused)."""
     if get_settings().music_is_mocked():
         from .sound import MockSoundProvider
 
         return MockSoundProvider()
+    if not provider_keys.serves("elevenlabs"):
+        raise provider_keys.ProviderUnavailable("elevenlabs", kind="sound")
     from .sound import ElevenLabsSoundProvider
 
     return ElevenLabsSoundProvider()
 
 
 def get_avatar():
-    """Portrait → talking-head clip provider, or None when lip-sync is off."""
-    model, provider = _active("lipsync")
-    if provider == "off":
+    """Portrait → talking-head clip provider, or None when lip-sync is off
+    (or its provider is switched off: talking heads then use the video
+    model, as with no portrait)."""
+    from ..services import model_registry as reg
+
+    model = reg.active_model("lipsync")
+    provider = reg.provider_for("lipsync", model)
+    # Switched off, even for a render already running: the video model (which
+    # was checked when the render was queued) makes the talking head instead.
+    if provider in ("off", "unavailable") or reg.switched_off("lipsync", model):
         return None
     if provider == "mock":
         from .mock_avatar import MockAvatarProvider
@@ -228,12 +256,16 @@ def get_training(kind: str | None = None) -> TrainingProvider:
     global _training_singleton
     s = get_settings()
     if kind == "voice_clone" and not s.tts_is_mocked():
+        if not provider_keys.serves("elevenlabs"):
+            raise provider_keys.ProviderUnavailable("elevenlabs", kind="voice_clone")
         from .elevenlabs_voice_lab import ElevenLabsVoiceLabProvider
 
         return ElevenLabsVoiceLabProvider()
     # Same gate as provider_status(): MOCK_PROVIDERS=true overrides every
     # key, so a key saved in Settings never starts paid training in mock mode.
     if kind in {"character_lora", "style_lora"} and not s.mock_providers and provider_keys.has("replicate"):
+        if not provider_keys.serves("replicate"):
+            raise provider_keys.ProviderUnavailable("replicate", kind=kind)
         from .replicate_training import ReplicateTrainingProvider
 
         return ReplicateTrainingProvider()
@@ -249,12 +281,13 @@ def provider_status() -> dict:
 
     s = get_settings()
     snap = reg.snapshot()
-    training_lora = (
-        "replicate"
-        if (not s.mock_providers and provider_keys.has("replicate"))
-        else "mock"
-    )
-    training_voice = "elevenlabs" if not s.tts_is_mocked() else "mock"
+    def _train(name: str, live: bool) -> str:
+        if not live:
+            return "mock"
+        return name if provider_keys.enabled(name) else "unavailable"
+
+    training_lora = _train("replicate", not s.mock_providers and provider_keys.has("replicate"))
+    training_voice = _train("elevenlabs", not s.tts_is_mocked())
     return {
         "mock_providers_env": s.mock_providers,
         "chat": snap["chat"]["provider"],

@@ -83,6 +83,9 @@ def start_training(
     if body.kind == "voice_clone" and kind != "avatar":
         raise HTTPException(422, "voice_clone training must target an avatar")
 
+    from ..providers import get_training
+
+    get_training(body.kind)  # its provider switched off: 409 before anything is created
     cm = models.CustomModel(
         name=body.name or f"{kind}-{owner_id}-{body.kind}",
         kind=body.kind,
@@ -144,8 +147,13 @@ def cancel_training(job_id: int, db: Session = Depends(get_db)) -> models.Custom
     try:
         from ..providers import get_training
         from ..providers.base import TrainingSubmit
+        from ..services import provider_keys
 
-        provider = get_training(cm.kind)
+        # Stopping work already running is never refused by the on/off
+        # switch: switching a provider off and then cancelling must still
+        # stop (and stop billing) the run at the provider.
+        with provider_keys.continuing():
+            provider = get_training(cm.kind)
         if cm.provider_job_id:
             provider.cancel(
                 TrainingSubmit(

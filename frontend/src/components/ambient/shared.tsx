@@ -776,7 +776,10 @@ export function ModelControls({
             if (drift && cfg.model_override) set("model_override", "");
           }}
         >
-          <option value="">Recommended{defaultStill ? ` · ${defaultStill.label}` : ""}</option>
+          <option value="">
+            Recommended{defaultStill ? ` · ${defaultStill.label}` : ""}
+            {presets?.default_still_off ? " (provider off)" : ""}
+          </option>
           {stills.length > 0 && (
             <optgroup label="Suggested">
               {stills.map((c) => (
@@ -795,7 +798,7 @@ export function ModelControls({
               ))}
             </optgroup>
           )}
-          {!known(stillValue, stills, imageModels) && <option value={stillValue}>{stillValue}</option>}
+          {!known(stillValue, stills, imageModels) && <option value={stillValue}>{stillValue} (not available)</option>}
         </select>
         {stillHelp && <p className="text-xs text-ink-400 mt-1">{stillHelp}</p>}
       </div>
@@ -812,6 +815,7 @@ export function ModelControls({
           >
             <option value="">
               Default{defaultVideo ? ` · ${defaultVideo.label}` : presets?.default_video_model ? ` · ${presets.default_video_model}` : ""}
+              {presets?.default_video_off ? " (provider off)" : ""}
             </option>
             {videos.length > 0 && (
               <optgroup label="Suggested">
@@ -832,7 +836,7 @@ export function ModelControls({
               </optgroup>
             )}
             {!known(cfg.model_override, videos, videoModels) && (
-              <option value={cfg.model_override}>{cfg.model_override}</option>
+              <option value={cfg.model_override}>{cfg.model_override} (not available)</option>
             )}
           </select>
           {videoChoice?.note && <p className="text-xs text-ink-400 mt-1">{videoChoice.note}</p>}

@@ -10,7 +10,7 @@ import logging
 from sqlalchemy import update
 
 from ..db import SessionLocal
-from ..services import pipeline, spend
+from ..services import pipeline, provider_keys, spend
 
 log = logging.getLogger("avs.jobs")
 
@@ -27,7 +27,7 @@ def generate_plan_job(project_id: int, preserve_edits: bool = False) -> None:
 def generate_video_job(project_id: int) -> None:
     db = SessionLocal()
     try:
-        with spend.scope(project_id=project_id):
+        with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
             pipeline.render_project(db, project_id)
     finally:
         db.close()
@@ -36,7 +36,7 @@ def generate_video_job(project_id: int) -> None:
 def regenerate_shot_job(project_id: int, shot_id: int, recompose: bool = True) -> None:
     db = SessionLocal()
     try:
-        with spend.scope(project_id=project_id):
+        with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
             pipeline.regenerate_shot(db, project_id, shot_id, recompose=recompose)
     finally:
         db.close()
@@ -53,7 +53,7 @@ def recompose_project_job(project_id: int) -> None:
 def regenerate_shots_bulk_job(project_id: int, shot_ids: list[int]) -> None:
     db = SessionLocal()
     try:
-        with spend.scope(project_id=project_id):
+        with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
             pipeline.regenerate_shots_bulk(db, project_id, shot_ids)
     finally:
         db.close()
@@ -78,7 +78,7 @@ def generate_asset_job(job_id: int) -> None:
         if claimed != 1:
             log.info("studio job %s is gone or already started; skipping", job_id)
             return
-        with spend.scope(ref=f"studio_job:{job_id}"):
+        with spend.scope(ref=f"studio_job:{job_id}"), provider_keys.continuing():  # checked when queued
             try:
                 pipeline.run_studio_job(db, job_id)
             except Exception:
@@ -106,7 +106,7 @@ def generate_ambient_loop_job(project_id: int, regenerate_music: bool = True) ->
 
     db = SessionLocal()
     try:
-        with spend.scope(project_id=project_id):
+        with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
             ambient.generate_loop(db, project_id, regenerate_music=regenerate_music)
     finally:
         db.close()
@@ -151,7 +151,9 @@ def ambient_batch_job(project_ids: list[int], render: bool = True) -> None:
         try:
             # Video loops finish asynchronously; render_after renders each
             # scene when its loop is ready.
-            with spend.scope(project_id=pid):
+            # Checked when the batch was queued: finish it even if a provider
+            # is switched off meanwhile.
+            with spend.scope(project_id=pid), provider_keys.continuing():
                 ambient.generate_loop(db, pid, render_after=render)
         except Exception:  # noqa: BLE001 — failures are recorded on the scene
             log.exception("batch item %s failed", pid)

@@ -11,6 +11,7 @@ from .. import models
 from ..db import get_db
 from ..schemas import AssetOut, StudioJobOut, StudioRequest
 from ..schemas.api import ASSET_TYPES, StudioSaveRequest
+from ..services import provider_gate
 from ..services.pipeline import STUDIO_DELETED, save_studio_result_as_asset
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
@@ -35,6 +36,8 @@ def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int)
     ids of all of them."""
     if not _owner_exists(db, body.owner_kind, body.owner_id):
         raise HTTPException(404, "owner not found")
+    # The model's provider switched off in Settings: 409 before anything is queued.
+    provider_gate.require_model("image" if output_kind == "image" else "video", body.model or None, db)
     jobs = [
         models.AssetGenerationJob(
             owner_kind=body.owner_kind,
