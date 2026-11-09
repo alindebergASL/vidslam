@@ -14,7 +14,7 @@ def test_system_info_reports_mock_and_counts(auth_client):
     # In mock mode, keys are absent and that's fine.
     # (replicate + sogni added with Settings → API keys.)
     assert info["keys"] == {"openrouter": False, "elevenlabs": False, "gemini": False,
-                            "replicate": False, "sogni": False}
+                            "replicate": False, "sogni": False, "runware": False}
     assert info["counts"]["avatars"] >= 1
     assert info["counts"]["brand_kits"] >= 1
     # Never leak secret values — only model ids / booleans.
