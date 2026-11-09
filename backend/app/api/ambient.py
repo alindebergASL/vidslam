@@ -18,6 +18,7 @@ from .. import models
 from ..db import get_db
 from ..schemas.ambient import (
     AmbientBatchRequest,
+    AmbientConfig,
     AmbientCreate,
     AmbientEstimateRequest,
     AmbientOut,
@@ -26,7 +27,7 @@ from ..schemas.ambient import (
     PictureFrom,
 )
 from ..services import ambient as svc
-from ..services import storage
+from ..services import provider_gate, storage
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from ..workers.jobs import (
@@ -70,6 +71,9 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args) -> str
     second Generate would otherwise pass the 409 and queue a second paid run
     (which resets the clips and drops the first run's chain). The claim is a
     conditional UPDATE, so two simultaneous requests can't both get through."""
+    # A provider switched off: 409, nothing queued (args[0]: regenerate_music).
+    provider_gate.require_ambient(svc._config_of(project), regenerate_music=bool(args[0]) if args else True,
+                                  project=project)
     previous = project.status
     claimed = (
         db.query(models.VideoProject)
@@ -121,6 +125,8 @@ def generate_previews(missing_only: bool = True) -> dict:
     # "Missing" includes a preview made from an older version of the prompt.
     ids = [p.id for p in svc.SCENE_PRESETS if p.prompt
            and not (missing_only and svc.preview_is_current(p.id))]
+    if ids:
+        provider_gate.require_still(AmbientConfig())
     job_id = enqueue(generate_previews_job, ids) if ids else None
     return {"presets": ids, "job_id": job_id, "status": "enqueued" if ids else "nothing_to_do"}
 
@@ -134,10 +140,16 @@ def batch_create(body: AmbientBatchRequest, db: Session = Depends(get_db)) -> di
         raise HTTPException(422, f"unknown or custom presets: {', '.join(unknown)}")
     created = []
     total = 0.0
-    for pid in body.presets:
+
+    def cfg_for(pid: str):
         preset = svc._PRESET_BY_ID[pid]
-        cfg = body.config.model_copy(update={"scene_preset": pid, "scene_prompt": "",
-                                             "music_mood": body.config.music_mood if body.config.music_mood == "none" else preset.music_mood})
+        return body.config.model_copy(update={"scene_preset": pid, "scene_prompt": "",
+                                              "music_mood": body.config.music_mood if body.config.music_mood == "none" else preset.music_mood})
+
+    for pid in body.presets:  # every scene's providers first: no half-created batch
+        provider_gate.require_ambient(cfg_for(pid))
+    for pid in body.presets:
+        cfg = cfg_for(pid)
         project = svc.create_scene(db, AmbientCreate(aspect_ratio=body.aspect_ratio, config=cfg, generate=False))
         created.append(project.id)
         total += svc.estimate_ambient_cost(cfg)["total"]
@@ -166,6 +178,7 @@ def list_scenes(db: Session = Depends(get_db)) -> list[AmbientOut]:
 def create_scene(body: AmbientCreate, db: Session = Depends(get_db)) -> AmbientOut:
     if body.generate:
         budget_guard()  # creating without generating is free (a description rewrite skips itself over budget)
+        provider_gate.require_ambient(body.config)  # before the scene (and its rewrite) is made
     try:
         project = svc.create_scene(db, body)
     except ValueError as e:
@@ -295,6 +308,7 @@ def generate_picture(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut
     making the video; regenerate until it looks right."""
     project = _get_scene(db, scene_id)
     _picture_busy(project)
+    provider_gate.require_still(svc._config_of(project))  # the scene's chosen model, not a silent swap
     try:
         svc.generate_picture(db, project)
     except svc.PictureError as e:

@@ -21,8 +21,19 @@ const KIND_NAMES: Record<string, string> = {
 /** One sentence for the provider status instead of raw flags. */
 function providerSummary(st: Record<string, any>): { live: boolean; text: string } {
   const kinds = Object.keys(KIND_NAMES).filter((k) => typeof st[k] === "string");
-  const real = kinds.filter((k) => st[k] !== "mock" && st[k] !== "off");
+  const real = kinds.filter((k) => st[k] !== "mock" && st[k] !== "off" && st[k] !== "unavailable");
+  // Kinds whose provider is switched off in Settings → API keys.
+  const switchedOff = kinds.filter((k) => st[k] === "unavailable").map((k) => KIND_NAMES[k]);
   if (st.mock_providers_env === true || real.length === 0) {
+    if (switchedOff.length && st.mock_providers_env !== true) {
+      const placeholder = ["chat", "image", "video", "tts", "music"].filter((k) => st[k] === "mock").map((k) => KIND_NAMES[k]);
+      return {
+        live: false,
+        text:
+          `Switched off: ${switchedOff.join(", ")}.` +
+          (placeholder.length ? ` Placeholder (no API key): ${placeholder.join(", ")}.` : ""),
+      };
+    }
     return { live: false, text: "Demo mode: videos use placeholder clips and nothing is billed." };
   }
   const names = [...new Set(real.map((k) => PROVIDER_NAMES[st[k]] || st[k]))].join(" + ");
@@ -33,7 +44,10 @@ function providerSummary(st: Record<string, any>): { live: boolean; text: string
     .map((k) => KIND_NAMES[k]);
   return {
     live: true,
-    text: `Live with ${names}.` + (mocked.length ? ` Still placeholder: ${mocked.join(", ")}.` : ""),
+    text:
+      `Live with ${names}.` +
+      (mocked.length ? ` Still placeholder: ${mocked.join(", ")}.` : "") +
+      (switchedOff.length ? ` Switched off: ${switchedOff.join(", ")}.` : ""),
   };
 }
 

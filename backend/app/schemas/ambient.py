@@ -226,6 +226,9 @@ class AmbientPresetsOut(BaseModel):
     # What "" (default) means on this deployment.
     default_still_model: str = ""
     default_video_model: str = ""
+    # The default's provider is switched off in Settings → API keys.
+    default_still_off: bool = False
+    default_video_off: bool = False
 
 
 class LoopPlanOut(BaseModel):

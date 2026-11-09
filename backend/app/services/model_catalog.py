@@ -376,19 +376,23 @@ def _live_usable(snap: Optional[dict]) -> Optional[dict]:
     if not snap:
         return snap
     known = set(provider_keys.KEYS)
-    have: dict[str, bool] = {}
+    memo: dict[tuple[str, str], bool] = {}
 
-    def _has(p: str) -> bool:
-        if p not in have:
-            have[p] = provider_keys.has(p)
-        return have[p]
+    def _q(fn: str, p: str) -> bool:
+        if (fn, p) not in memo:
+            memo[(fn, p)] = getattr(provider_keys, fn)(p)
+        return memo[(fn, p)]
 
     for e in snap.get("entries") or []:
         p = e.get("provider")
         if p not in known:
             continue
         alt = e.get("also_via")
-        e["usable"] = _has(p) or bool(alt in known and _has(alt))
+        alt = alt if alt in known else None
+        # usable: on and keyed; enabled: the user hasn't switched it off
+        # (pickers hide the entries of providers that are off).
+        e["usable"] = _q("usable", p) or bool(alt and _q("usable", alt))
+        e["enabled"] = _q("enabled", p) or bool(alt and _q("usable", alt))
     return snap
 
 

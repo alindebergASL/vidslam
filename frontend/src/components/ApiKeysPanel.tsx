@@ -7,6 +7,11 @@ import { api, ApiKeyStatus, ApiKeyTestResult } from "@/lib/api";
 // typed value lives only in the (uncontrolled) password input and is cleared
 // right after a save attempt.
 
+// Model kinds (as the API names them) in the words the Models panel uses.
+const KIND_LABEL: Record<string, string> = {
+  chat: "planner", image: "image", video: "video", tts: "voice", music: "music", lipsync: "lip-sync",
+};
+
 const SOURCE_CHIP: Record<ApiKeyStatus["source"], { text: string; cls: string }> = {
   app: { text: "Saved in app", cls: "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" },
   env: { text: "From server env", cls: "border-sky-500/40 bg-sky-500/10 text-sky-300" },
@@ -46,7 +51,7 @@ export function ApiKeysPanel() {
   return (
     <section className="card p-4 mb-6" aria-labelledby="api-keys-heading">
       <h2 id="api-keys-heading" className="text-lg font-medium mb-2">
-        API keys
+        API keys &amp; providers
       </h2>
       <p className="text-xs text-ink-400 mb-1">
         Keys saved here override the server&apos;s <code>.env</code> and are stored encrypted on the
@@ -54,7 +59,9 @@ export function ApiKeysPanel() {
         app-saved key to fall back to the server environment.
       </p>
       <p className="text-xs text-ink-400 mb-3">
-        Saved keys reach the background worker within about 15 seconds.
+        Saved keys reach the background worker within about 15 seconds. Switch a provider off to hide
+        its models from every picker; new work that needs it is refused, and anything already running
+        finishes.
       </p>
       {mock && (
         <p className="text-xs text-amber-200 border border-amber-500/30 bg-amber-500/5 rounded-md px-3 py-2 mb-3">
@@ -91,7 +98,7 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
   const helpId = `${uid}-help`;
   const statusId = `${uid}-status`;
   const inputRef = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState<null | "save" | "clear" | "test">(null);
+  const [busy, setBusy] = useState<null | "save" | "clear" | "test" | "switch">(null);
   const [hasInput, setHasInput] = useState(false);
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
   const [test, setTest] = useState<ApiKeyTestResult | null>(null);
@@ -164,6 +171,34 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
     }
   };
 
+  const toggle = async () => {
+    const next = !(row.enabled ?? true);
+    if (!next && !window.confirm(`Turn ${row.label} off? Its models disappear from every picker, and new work that needs it is refused until you turn it back on.`)) return;
+    setBusy("switch");
+    setMessage(null);
+    setTest(null);
+    try {
+      const updated = await api.setProviderEnabled(row.name, next);
+      onChange(updated);
+      const uses = (updated.in_use ?? []).map((k) => KIND_LABEL[k] ?? k).join(", ");
+      setMessage({
+        ok: true,
+        text: next
+          ? `${row.label} is on.`
+          : `${row.label} is off.${uses ? ` Your active ${uses} model${(updated.in_use ?? []).length > 1 ? "s use" : " uses"} it: pick another in Settings → Models.` : ""}`,
+      });
+      // Pickers elsewhere on the page re-read the catalog.
+      window.dispatchEvent(new Event("providers-changed"));
+    } catch (err: any) {
+      setMessage({ ok: false, text: err.message || "Couldn't switch the provider." });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const on = row.enabled ?? true;
+  // Providers added later (enabled_default null) turn on by themselves once a key is saved.
+  const autoOn = row.enabled_default === null && !row.enabled_explicit && !row.set;
   const updated = row.source === "app" ? when(row.updated_at) : "";
 
   return (
@@ -178,6 +213,24 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
           <code className="text-[11px] text-ink-400">{row.env_var}</code>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            role="switch"
+            aria-checked={on}
+            aria-label={`${row.label} provider`}
+            className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+              on ? "border-emerald-500/60 bg-emerald-500/40" : "border-ink-700 bg-ink-800"
+            } disabled:opacity-50`}
+            disabled={busy !== null}
+            onClick={toggle}
+            title={on ? `Turn ${row.label} off` : `Turn ${row.label} on`}
+          >
+            <span
+              aria-hidden="true"
+              className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${on ? "translate-x-4" : "translate-x-1"}`}
+            />
+          </button>
+          <span className="text-[11px] text-ink-300 w-14">{busy === "switch" ? "…" : on ? "On" : "Off"}</span>
           <span className={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${chip.cls}`}>{chip.text}</span>
           {row.last4 && (
             <span className="text-[11px] text-ink-300" aria-label={`ends in ${row.last4}`}>
@@ -193,6 +246,8 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
       )}
       <p id={helpId} className="text-[11px] text-ink-400 mt-1">
         Powers {row.powers}.
+        {autoOn && <> Turns on when you save a key.</>}
+        {!on && !autoOn && <> Off: its models are hidden and new work that needs it is refused.</>}
         {updated && <> Saved {updated}.</>}
         {row.docs_url && (
           <>

@@ -140,37 +140,98 @@ def set_active(kind: str, model: Optional[str], options: Optional[dict] = None) 
     put_setting(_key(kind), value)
 
 
-def provider_for(kind: str, model: Optional[str] = None) -> str:
-    """Provider that will serve `kind` with the active (or given) model:
-    "mock" | "openrouter" | "elevenlabs" | "gemini" | "sogni" | "off"."""
-    from .provider_keys import has
+# Providers whose models are picked per call by an id prefix.
+ROUTED_PREFIXES = {SOGNI_PREFIX: "sogni"}
+# Providers coming in later releases: their ids are refused cleanly (never
+# sent to OpenRouter as unknown ids), e.g. after a rollback.
+RESERVED_PREFIXES = {"runware/": "runware", "replicate/": "replicate"}
+
+
+def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[str]]:
+    """(provider, blocked) for `kind` with the active (or given) model.
+    provider: "mock" | "openrouter" | "elevenlabs" | "gemini" | "sogni" |
+    "off" (no lip-sync) | "unavailable"; blocked names the provider that
+    would serve it but is switched off (or isn't supported/set up)."""
+    from .provider_keys import enabled, has, in_continuation
 
     s = get_settings()
     m = active_model(kind) if model is None else model
     if kind == "lipsync" and not m:
-        return "off"
+        return "off", None
     if s.mock_providers:
-        return "mock"
+        return "mock", None
+    for prefix, name in RESERVED_PREFIXES.items():
+        if m.startswith(prefix):
+            return "unavailable", name
+
+    def pick(name: str) -> tuple[str, Optional[str]]:
+        # No key: the placeholder provider, as always. A key but switched
+        # off: refused, never faked (work already running still finishes).
+        if not has(name):
+            return "mock", None
+        return (name, None) if (enabled(name) or in_continuation()) else ("unavailable", name)
+
     if kind == "tts":
-        if m == "elevenlabs" or not m:
-            return "elevenlabs" if has("elevenlabs") else "mock"
-        return "openrouter" if has("openrouter") else "mock"
+        return pick("elevenlabs" if (m == "elevenlabs" or not m) else "openrouter")
     if kind == "music":
         if m.startswith(LYRIA_PREFIX):
             # Lyria 3 Pro / Clip are on OpenRouter; Lyria 3.5 is Google-only.
             on_openrouter = _catalog_provider("music", m) == "openrouter" or m in OPENROUTER_LYRIA
-            if on_openrouter and has("openrouter"):
-                return "openrouter"
-            if has("gemini"):
-                return "gemini"
-            return "mock"
-        return "elevenlabs" if has("elevenlabs") else "mock"
-    if m.startswith(SOGNI_PREFIX) and kind in ("image", "video"):
-        # Sogni image/video models: served by Sogni whatever else is active.
-        return "sogni" if has("sogni") else "mock"
+            cands = [c for c in (["openrouter"] if on_openrouter else []) + ["gemini"] if has(c)]
+            for c in cands:  # a provider that's on first, even mid-run
+                if enabled(c):
+                    return c, None
+            if cands and in_continuation():
+                return cands[0], None
+            return ("unavailable", cands[0]) if cands else ("mock", None)
+        return pick("elevenlabs")
+    if kind in ("image", "video"):
+        for prefix, name in ROUTED_PREFIXES.items():
+            if m.startswith(prefix):
+                # Served by its own provider whatever else is active.
+                return pick(name)
     if m.startswith("mock/"):
-        return "mock"
-    return "openrouter" if has("openrouter") else "mock"
+        return "mock", None
+    return pick("openrouter")
+
+
+def provider_for(kind: str, model: Optional[str] = None) -> str:
+    """Provider that will serve `kind` with the active (or given) model:
+    "mock" | "openrouter" | "elevenlabs" | "gemini" | "sogni" | "off" |
+    "unavailable" (switched off: see route_info)."""
+    return route_info(kind, model)[0]
+
+
+def switched_off(kind: str, model: Optional[str] = None) -> bool:
+    """Its provider is switched off (ignoring work already running): used to
+    try other models first, e.g. in a still model chain."""
+    from .provider_keys import _continuing
+
+    token = _continuing.set(False)
+    try:
+        return route_info(kind, model)[0] == "unavailable"
+    finally:
+        _continuing.reset(token)
+
+
+def unavailable(kind: str, model: Optional[str] = None, blocked: Optional[str] = None):
+    """The ProviderUnavailable to raise for `kind` with `model`."""
+    from .provider_keys import KEYS, ProviderUnavailable, has
+
+    m = active_model(kind) if model is None else model
+    if blocked in RESERVED_PREFIXES.values() and any(m.startswith(p) for p in RESERVED_PREFIXES):
+        reason = "unsupported"
+    else:
+        reason = "off" if blocked in KEYS and has(blocked) else "no_key"
+    return ProviderUnavailable(blocked or "provider", kind=kind, model=m, reason=reason)
+
+
+def require(kind: str, model: Optional[str] = None) -> None:
+    """Raise ProviderUnavailable when `kind` with `model` can't be served
+    (before queueing paid work)."""
+    provider, blocked = route_info(kind, model)
+    if provider == "unavailable":
+        raise unavailable(kind, model, blocked)
 
 
 def snapshot() -> dict:

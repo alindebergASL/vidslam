@@ -924,6 +924,11 @@ function ShotRow({
                     {m.id.startsWith("custom:") ? `★ ${m.name}` : m.name}
                   </option>
                 ))}
+                {modelOverride && !videoModels.some((m) => m.id === modelOverride) && (
+                  // Kept on the shot but no longer offered (e.g. its provider is
+                  // switched off in Settings): show it, so Default can clear it.
+                  <option value={modelOverride}>{modelOverride} (not available)</option>
+                )}
               </select>
               {modelOverride.startsWith("custom:") && (
                 <div className="text-[10px] text-ink-400 mt-1">

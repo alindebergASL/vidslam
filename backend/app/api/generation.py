@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db
 from ..schemas import ProjectStatusOut, RenderOut, ShotOut
-from ..services import render_files
+from ..services import provider_gate, render_files
 from ..services.preflight import run_preflight
 from ..services.ratelimit import rate_limit
 from ..services.safety import UnsafeScriptError, validate_script
@@ -87,6 +87,7 @@ def generate_plan(
         validate_script(project.original_script or "")
     except UnsafeScriptError as e:
         raise HTTPException(422, str(e)) from e
+    provider_gate.require_model("chat")
     job_id = enqueue(generate_plan_job, project_id, preserve_edits=preserve_edits)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
@@ -126,6 +127,7 @@ def generate_video(
         raise HTTPException(404, "project not found")
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
+    provider_gate.require_project(db, project)  # even with force: a switched-off provider is refused
     if not force:
         result = run_preflight(db, project)
         if not result["ok"]:
@@ -220,6 +222,7 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
         job_id = enqueue(recompose_project_job, project_id)
         action = "recompose"
     else:
+        provider_gate.require_project(db, project)  # only the shots it resubmits
         job_id = enqueue(generate_video_job, project_id)
         action = "resume"
     return {
@@ -245,6 +248,7 @@ def regenerate_shots_bulk(
     targets = [sid for sid in body.shot_ids if sid in valid]
     if not targets:
         raise HTTPException(422, "no regenerable shots in the selection")
+    provider_gate.require_project(db, project, shot_ids=set(targets))
     job_id = enqueue(regenerate_shots_bulk_job, project_id, targets)
     return {
         "project_id": project_id,
@@ -283,6 +287,7 @@ def regenerate_shot(
     shot = db.get(models.VideoShot, shot_id)
     if shot is None or shot.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
+    provider_gate.require_model("video", shot.model_override or None, db)
     job_id = enqueue(regenerate_shot_job, project_id, shot_id, recompose)
     return {
         "shot_id": shot_id,

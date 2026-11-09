@@ -217,6 +217,15 @@ def create_app() -> FastAPI:
     async def _queue_down(request, exc):  # noqa: ANN001
         return JSONResponse({"detail": str(exc)}, status_code=503)
 
+    from .services.provider_keys import ProviderUnavailable
+
+    @app.exception_handler(ProviderUnavailable)
+    async def _provider_off(request, exc):  # noqa: ANN001
+        # A provider switched off in Settings (or not set up): refused before
+        # any provider call, so nothing was spent.
+        return JSONResponse({"detail": str(exc), "code": "provider_unavailable",
+                             "provider": exc.provider}, status_code=409)
+
     app.include_router(api_router)
     return app
 

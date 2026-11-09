@@ -45,13 +45,17 @@ def get_catalog(kind: Optional[str] = None, refresh: bool = False) -> dict:
         raise HTTPException(422, f"kind must be one of {', '.join(model_registry.KINDS)}")
     snap = model_catalog.get_snapshot()
     if refresh or snap is None:
-        snap = model_catalog.refresh()
+        model_catalog.refresh()
+        snap = model_catalog.get_snapshot()  # the live view: on/off switches and keys applied
     return _catalog_view(snap, kind)
 
 
 @router.post("/refresh", dependencies=[Depends(rate_limit("generation"))])
 def refresh_catalog() -> dict:
-    return _catalog_view(model_catalog.refresh(), None)
+    snap = model_catalog.refresh()
+    # The live view (on/off switches and keys applied), keeping the poll's report.
+    live = model_catalog.get_snapshot() or snap
+    return _catalog_view({**live, "errors": snap.get("errors", live.get("errors"))}, None)
 
 
 @router.get("/active")
@@ -73,5 +77,7 @@ def set_active(body: SetActive) -> dict:
                 f"{model!r} isn't in the {body.kind} catalog — refresh the catalog, "
                 "or pass allow_unlisted=true to use it anyway",
             )
+    if model:
+        model_registry.require(body.kind, model)  # its provider switched off: 409
     model_registry.set_active(body.kind, model, body.options)
     return model_registry.snapshot()

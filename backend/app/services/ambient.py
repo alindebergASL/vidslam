@@ -44,6 +44,8 @@ from ..schemas.api import RenderOut, ShotOut
 from . import alerts, render_files, storage
 from .image_settings import best_image_settings
 from .model_registry import active_model as _active_model
+from .model_registry import switched_off as _switched_off
+from .provider_keys import ProviderUnavailable as _ProviderUnavailable
 from .renderer import (
     AmbientRenderInputs,
     _dims_for_aspect,
@@ -401,6 +403,11 @@ def ensure_photo_rewrite(cfg: AmbientConfig, *, allow: Optional[Callable[[], boo
     if not _rewrite_affordable() or (allow is not None and not allow()):
         log.info("scene description rewrite skipped (budget or rate limit); using it as typed")
         return cfg.model_copy(update={"photo": None})
+    from .model_registry import switched_off
+
+    if switched_off("chat"):
+        log.info("scene description rewrite skipped (the planner's provider is switched off)")
+        return cfg.model_copy(update={"photo": None})
     text = cfg.scene_prompt.strip()
     try:
         from ..providers import get_chat
@@ -540,14 +547,26 @@ SOGNI_VIDEO_CHOICES: list[ModelChoiceOut] = [
 _STILL_COST = {c.id: c.est_cost for c in STILL_MODEL_CHOICES if c.est_cost is not None}
 
 
+def _offered(choices: list[ModelChoiceOut], kind: str) -> list[ModelChoiceOut]:
+    """Choices whose provider isn't switched off in Settings → API keys."""
+    from .model_registry import provider_for
+
+    return [c for c in choices if provider_for(kind, c.id) != "unavailable"]
+
+
 def video_model_choices() -> list[ModelChoiceOut]:
-    """The video models offered up front: Sogni's too when its key is set."""
+    """The video models offered up front: Sogni's too when it's on and keyed."""
     from . import provider_keys
 
-    if not provider_keys.has("sogni"):
-        return list(VIDEO_MODEL_CHOICES)
-    # Only those Sogni still lists (its synced model list).
-    return VIDEO_MODEL_CHOICES + [c for c in SOGNI_VIDEO_CHOICES if _sogni.video_model(c.id) is not None]
+    choices = list(VIDEO_MODEL_CHOICES)
+    if provider_keys.usable("sogni"):
+        # Only those Sogni still lists (its synced model list).
+        choices += [c for c in SOGNI_VIDEO_CHOICES if _sogni.video_model(c.id) is not None]
+    return _offered(choices, "video")
+
+
+def still_model_choices() -> list[ModelChoiceOut]:
+    return _offered(list(STILL_MODEL_CHOICES), "image")
 
 
 def still_model_chain(cfg: AmbientConfig) -> list[str]:
@@ -565,6 +584,20 @@ def still_model_chain(cfg: AmbientConfig) -> list[str]:
         return [primary]  # the scene's own trained model: a different model isn't a substitute
     chain = [primary, s.ambient_still_fallback_model or active]
     return [m for i, m in enumerate(chain) if m and m not in chain[:i]]
+
+
+def _live_chain(cfg: AmbientConfig) -> list[str]:
+    """still_model_chain without models whose provider is switched off in
+    Settings (unless every one is: then generate_still refuses, or a run
+    already under way finishes on them)."""
+    from .model_registry import provider_for, switched_off
+
+    chain = still_model_chain(cfg)
+    live = [m for m in chain if not switched_off("image", m)]
+    if len(live) < len(chain) and not get_settings().mock_providers:
+        # A switched-off model isn't replaced by a placeholder (no-key) one.
+        live = [m for m in live if provider_for("image", m) != "mock"]
+    return live or chain
 
 
 def makes_stills(cfg: AmbientConfig) -> bool:
@@ -616,7 +649,7 @@ def reference_still_attempts(cfg: AmbientConfig) -> list[tuple[str, bool]]:
     on the scene's models, so a scene still finishes."""
     from .model_registry import provider_for
 
-    chain = still_model_chain(cfg)
+    chain = _live_chain(cfg)
     mock = get_settings().mock_providers
     usable = [m for m in chain if _takes_reference(m) and (mock or provider_for("image", m) != "mock")]
     # Sogni first only for a scene whose own Picture model is a Sogni one.
@@ -645,7 +678,7 @@ def reference_still_chain(cfg: AmbientConfig) -> list[str]:
 
 def still_cost(cfg: AmbientConfig) -> float:
     """Rate-card cost of one still on this scene's primary still model."""
-    chain = still_model_chain(cfg)
+    chain = _live_chain(cfg)
     return _still_model_cost(chain[0] if chain else "")
 
 
@@ -696,7 +729,7 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
     from .pipeline import _log_provider_call, _resolve_model
 
     last: Optional[Exception] = None
-    attempts = reference_still_attempts(cfg) if references else [(m, False) for m in still_model_chain(cfg)]
+    attempts = reference_still_attempts(cfg) if references else [(m, False) for m in _live_chain(cfg)]
     for model, with_refs in attempts:
         model = _resolve_model(db, model)
         image = None
@@ -717,6 +750,8 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
         except Exception as e:  # noqa: BLE001 — try the fallback model
             last = e
             log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
+            if isinstance(e, _ProviderUnavailable):
+                continue  # switched off in Settings: a refusal, not a provider error
             # Recorded (status=error) so the provider-error alerts see it.
             route = getattr(image, "last_route", None)
             _log_provider_call(db, project_id=project_id,
@@ -767,10 +802,13 @@ def presets() -> AmbientPresetsOut:
         loop_options=list(LOOP_OPTIONS),
         total_options=list(TOTAL_OPTIONS),
         aspect_options=["16:9", "9:16", "1:1"],
-        still_models=STILL_MODEL_CHOICES,
+        still_models=still_model_choices(),
         video_models=video_model_choices(),
         default_still_model=still_model_chain(AmbientConfig())[0] if still_model_chain(AmbientConfig()) else "",
         default_video_model=_active_model("video"),
+        default_still_off=bool(still_model_chain(AmbientConfig())) and all(
+            _switched_off("image", m) for m in still_model_chain(AmbientConfig())),
+        default_video_off=_switched_off("video", _active_model("video")),
     )
 
 

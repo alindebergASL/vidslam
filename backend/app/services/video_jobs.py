@@ -249,11 +249,12 @@ def _record_spend(db: Session, job: models.VideoJob) -> None:
 
 
 def dispatch_completed(db: Session, job: models.VideoJob) -> None:
-    from . import spend
+    from . import provider_keys, spend
 
     # Follow-on paid work (next ambient segment, music, fallback clips) is
-    # attributed to the same project / render.
-    with spend.scope(project_id=job.project_id, render_id=job.render_id):
+    # attributed to the same project / render, and finishes even if its
+    # provider was switched off meanwhile (the run was already paid for).
+    with spend.scope(project_id=job.project_id, render_id=job.render_id), provider_keys.continuing():
         _dispatch_completed(db, job)
 
 
@@ -273,9 +274,9 @@ def _dispatch_completed(db: Session, job: models.VideoJob) -> None:
 
 
 def dispatch_failed(db: Session, job: models.VideoJob) -> None:
-    from . import spend
+    from . import provider_keys, spend
 
-    with spend.scope(project_id=job.project_id, render_id=job.render_id):
+    with spend.scope(project_id=job.project_id, render_id=job.render_id), provider_keys.continuing():
         _dispatch_failed(db, job)
 
 

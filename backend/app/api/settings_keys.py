@@ -63,6 +63,36 @@ def delete_key(name: str) -> dict:
     return provider_keys.clear_key(name)
 
 
+@router.put("/{name}/enabled")
+async def put_enabled(name: str, request: Request) -> dict:
+    """Switch a provider on/off: {"enabled": true | false | null} (null =
+    back to its default). Off hides its models from every picker and refuses
+    new work that needs it (409); work already running finishes."""
+    _known(name)
+    try:
+        body = json.loads((await request.body()) or b"null")
+    except (ValueError, UnicodeDecodeError):
+        body = None
+    if not isinstance(body, dict) or "enabled" not in body or body["enabled"] not in (True, False, None):
+        raise HTTPException(422, 'body must be JSON: {"enabled": true | false | null}')
+    row = provider_keys.set_enabled(name, body["enabled"])
+    row["in_use"] = _in_use(name) if row["enabled"] is False else []
+    return row
+
+
+def _in_use(name: str) -> list[str]:
+    """The active model kinds (Settings → Models) this provider serves now
+    that it's off, so the UI can say what stops working."""
+    from ..services import model_registry as reg
+
+    out = []
+    for kind in reg.KINDS:
+        provider, blocked = reg.route_info(kind)
+        if provider == "unavailable" and blocked == name:
+            out.append(kind)
+    return out
+
+
 def _probe_request(name: str, key: str) -> tuple[str, dict, dict]:
     s = get_settings()
     if name == "openrouter":

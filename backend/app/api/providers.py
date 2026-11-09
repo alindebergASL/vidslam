@@ -27,7 +27,7 @@ def status() -> dict:
     return provider_status()
 
 
-def _trained_lora_entries(db: Session) -> list[dict]:
+def _trained_lora_entries(db: Session, kind: str) -> list[dict]:
     """The user's completed character/style LoRA adapters as picker entries.
     Shared by the image- and video-model listings so a trained identity
     adapter is selectable in the Studio AND per-shot in the editor."""
@@ -40,6 +40,18 @@ def _trained_lora_entries(db: Session) -> list[dict]:
         .order_by(models_pkg.CustomModel.completed_at.desc())
         .all()
     )
+    # Not offered while the provider that trained them, or the one that runs
+    # them, is switched off (exactly the check a generate request gets).
+    from ..services import provider_gate
+
+    def _servable(cm) -> bool:  # noqa: ANN001
+        try:
+            provider_gate.require_model(kind, f"custom:{cm.id}", db)
+        except provider_keys.ProviderUnavailable:
+            return False
+        return True
+
+    trained = [cm for cm in trained if _servable(cm)]
     return [
         {
             "id": f"custom:{cm.id}",
@@ -61,8 +73,8 @@ def _catalog_entries(kind: str) -> list[dict]:
     snap = model_catalog.get_snapshot() or {}
     out = []
     for e in snap.get("entries") or []:
-        if e.get("kind") != kind:
-            continue
+        if e.get("kind") != kind or e.get("enabled") is False:
+            continue  # a provider switched off in Settings isn't offered
         bits = []
         if e.get("max_seconds"):
             bits.append(f"up to {e['max_seconds']}s")
@@ -85,20 +97,23 @@ def _catalog_entries(kind: str) -> list[dict]:
 def _merged(kind: str, provider_list) -> list[dict]:
     """Provider's own list (always includes whatever it can actually serve,
     e.g. the mock model) plus the polled catalog, de-duplicated."""
+    switched_off = False
     try:
         base = _to_dict(provider_list())
+    except provider_keys.ProviderUnavailable:
+        base, switched_off = [], True  # the active model's provider is off
     except Exception:  # noqa: BLE001 — the catalog may still have entries
         base = []
     seen = {m["id"] for m in base}
     extra = [m for m in _catalog_entries(kind) if m["id"] not in seen]
-    if not base and not extra:
+    if not base and not extra and not switched_off:
         raise HTTPException(502, f"failed to list {kind} models")
     return base + extra
 
 
 @router.get("/openrouter/video-models")
 def video_models(db: Session = Depends(get_db)) -> list[dict]:
-    return _trained_lora_entries(db) + _merged("video", lambda: get_video().list_models())
+    return _trained_lora_entries(db, "video") + _merged("video", lambda: get_video().list_models())
 
 
 @router.get("/openrouter/image-models")
@@ -111,7 +126,7 @@ def image_models(db: Session = Depends(get_db)) -> list[dict]:
     """
     # Custom adapters surface first since users almost always want their
     # own model over the base when they've trained one.
-    return _trained_lora_entries(db) + _merged("image", lambda: get_image().list_models())
+    return _trained_lora_entries(db, "image") + _merged("image", lambda: get_image().list_models())
 
 
 @router.get("/caption-styles")
