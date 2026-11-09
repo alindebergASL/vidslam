@@ -211,9 +211,20 @@ bundled copy.
   the Sogni app.
 - **Closed loops on Free Spark.** LTX 2.5 (`sogni/ltx25`) and the MiniMax H3
   first + last frame models (`sogni/minimax-h3-*flf2v*`) pin both ends of a
-  clip (`animate_photo`, `frameRole: "both"`), so ambient loops close on the
-  anchor still. Tested Nov 2026: the last frame came back within 3.0x (LTX)
-  and 1.9x (H3 FastH3 flf2v) of a normal frame step, as close as Wan 3.0.
+  clip (`animate_photo`, `frameRole: "both"`). A blind test (Nov 2026: 4
+  presets, closed 10 s loops from the same picture, three judges) scored
+  MiniMax H3 FastH3 flf2v 7.8 overall, with the most seamless (8.8) and
+  steadiest (8.3) loops but softer, calmer motion; Wan 3.0 on OpenRouter 7.4,
+  with the most lifelike motion but exposure and colour that drift and don't
+  come back at the seam ($1.70 per 10 s); LTX 2.5 4.5 (a jump after the first
+  frame, smeared water, and it doesn't return to the picture). The two-stage
+  H3 (`minimax-h3-fasth3-flf2v-turbo-2stage`, 2688x1536) keeps the seams and
+  is as sharp as the picture, but took about 8 minutes a clip, one clip at a
+  time. With a Sogni key, the ambient Video model list offers both H3s.
+- **Clip size:** Sogni returns near-16:9 sizes (LTX 1280x704, H3 1344x768 or
+  2688x1536). Clips within 6% of the frame's shape are cropped to fill it
+  (`renderer.fit_vf`), so there are no thin black bars; clearly different
+  shapes (9:16 in a 16:9 scene) are still padded.
 - **Which tool lists a model decides how it's used:** `animate_photo` models
   take an exact first frame; models listed only there need a starting picture
   (the app says so instead of sending an invalid request). MiniMax H3 `r2v`

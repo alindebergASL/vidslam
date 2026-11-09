@@ -194,8 +194,9 @@ _I2V = dict(animate=True, text=False, **_H3)
 _FLF = dict(animate=True, text=False, last_frame=True, flf_only=True, **_H3)
 _R2V = dict(references=True, needs_reference=True, **_H3)
 _VIDEOS: tuple[VideoModel, ...] = (
-    VideoModel("ltx25", "LTX-2.5", "Sogni's default video model. Text, first frame, or first + last frame "
-               "(closed loops). 2–20 s.", 2, 20, 7.4, animate=True, last_frame=True, negative=True),
+    VideoModel("ltx25", "LTX-2.5", "Sogni's default video model. Text, first frame, or first + last frame. "
+               "2–20 s. Not for ambient loops: in a blind test (Nov 2026) it jumped after the first frame and "
+               "didn't come back to the picture.", 2, 20, 7.4, animate=True, last_frame=True, negative=True),
     VideoModel("ltx23", "LTX-2.3", "Previous LTX. Text or first frame. 2–20 s. ~17.5 Spark per 5 s.", 2, 20, 3.5,
                animate=True, negative=True),
     VideoModel("wan22", "Wan 2.2", "Text or first frame, no audio. 2–10 s (assumed).", 2, 10, 4.0, animate=True,
@@ -221,10 +222,13 @@ _VIDEOS: tuple[VideoModel, ...] = (
                "ends). ~16 Spark/s (documented).", spark_per_second=16.0, **_FLF),
     VideoModel("minimax-h3-flf2v-turbo", "MiniMax H3 Turbo", "First and last frame, 4-step. ~6 Spark/s "
                "(documented).", spark_per_second=6.0, **_FLF),
-    VideoModel("minimax-h3-fasth3-flf2v-turbo", "MiniMax H3 FastH3", "First and last frame: closed loops on "
-               "Free Spark. 4 Spark/s (documented).", spark_per_second=4.0, **_FLF),
+    VideoModel("minimax-h3-fasth3-flf2v-turbo", "MiniMax H3 FastH3", "First and last frame: the most seamless "
+               "ambient loops in a blind test (Nov 2026), calmer and softer than Wan 3.0. 4 Spark/s (documented).",
+               spark_per_second=4.0, **_FLF),
     VideoModel("minimax-h3-fasth3-flf2v-turbo-2stage", "MiniMax H3 FastH3 Two-Stage", "First and last frame, "
-               "upscaled 2x. 16 Spark/s at 2K (documented).", spark_per_second=16.0, **_FLF),
+               "rendered at 768p then upscaled and refined 2x (2688x1536): as seamless as FastH3 and about as sharp as "
+               "the picture in a Nov 2026 test, but about 8 minutes a clip. 16 Spark/s at 2K (documented).",
+               spark_per_second=16.0, **_FLF),
     VideoModel("minimax-h3-r2v", "MiniMax H3 Reference", "Needs at least one reference picture (a loose "
                "guide, not an exact frame). ~16 Spark/s plus reference input.", spark_per_second=16.0, **_R2V),
     VideoModel("minimax-h3-r2v-turbo", "MiniMax H3 Turbo Reference", "Needs a reference picture. ~6 Spark/s.",
