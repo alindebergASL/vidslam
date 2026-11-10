@@ -446,3 +446,72 @@ def test_migration_0005_adds_fingerprint_columns_empty_for_existing_rows(tmp_pat
     command.downgrade(dbmod._alembic_config(), "0004")
     assert "clip_fingerprint" not in {c["name"] for c in inspect(dbmod.engine).get_columns("video_shots")}
     assert "voice_fingerprint" not in {c["name"] for c in inspect(dbmod.engine).get_columns("renders")}
+
+
+def test_a_clip_in_flight_from_before_an_edit_is_remade_not_composed(auth_client):
+    """Cancel, edit the shot while its clip is still being made, resume: the
+    old clip lands out of date, so the render makes the shot again instead
+    of being put together with it."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import fingerprints, video_jobs
+
+    pid = _rendered(auth_client)
+    shot_id, job_id = _put_shot_in_flight(pid)
+    db = SessionLocal()
+    try:
+        shot = db.get(models.VideoShot, shot_id)
+        job = db.get(models.VideoJob, job_id)
+        # The job carries the fingerprint of the shot as it was when submitted.
+        job.context_json = {**job.context_json,
+                            "fingerprint": fingerprints.video_fingerprint(shot.project, shot)}
+        db.commit()
+    finally:
+        db.close()
+    assert auth_client.patch(f"/api/projects/{pid}/shots/{shot_id}",
+                             json={"prompt": "a completely different picture"}).status_code == 200
+    assert auth_client.post(f"/api/projects/{pid}/retry").status_code == 202
+    before = _video_jobs(pid)
+
+    db = SessionLocal()
+    try:
+        assert video_jobs.check(db, job_id) == "completed"  # the old clip lands
+    finally:
+        db.close()
+    assert _video_jobs(pid) == before + 1, "the edited shot is made again"
+    # With the test provider the new clip lands at once, so the video is
+    # finished now, and from the new clip rather than the outdated one.
+    st = auth_client.get(f"/api/projects/{pid}/status").json()
+    assert st["latest_render"]["status"] == "completed"
+    shot = next(s for s in auth_client.get(f"/api/projects/{pid}").json()["shots"] if s["id"] == shot_id)
+    assert shot["clip_stale"] is False and shot["status"] == "completed"
+    db = SessionLocal()
+    try:
+        row = db.get(models.VideoShot, shot_id)
+        assert row.clip_fingerprint == fingerprints.video_fingerprint(row.project, row)
+    finally:
+        db.close()
+
+
+def test_the_provider_check_covers_edited_shots(auth_client):
+    """An edited shot with a clip is submitted again, so the check made
+    before queueing (provider switched off → 409) must include it."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import provider_gate
+
+    pid = _rendered(auth_client)
+    shot_id = _body(auth_client, pid)[0]["id"]
+    db = SessionLocal()
+    try:
+        project = db.get(models.VideoProject, pid)
+        assert provider_gate._shots_to_submit(project) == []
+    finally:
+        db.close()
+    auth_client.patch(f"/api/projects/{pid}/shots/{shot_id}", json={"prompt": "something else entirely"})
+    db = SessionLocal()
+    try:
+        project = db.get(models.VideoProject, pid)
+        assert [s.id for s in provider_gate._shots_to_submit(project)] == [shot_id]
+    finally:
+        db.close()

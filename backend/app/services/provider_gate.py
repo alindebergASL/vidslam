@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..config import get_settings
-from . import provider_keys
+from . import fingerprints, provider_keys
 from .model_registry import active_model, provider_for, require
 
 
@@ -88,8 +88,9 @@ def _shots_to_submit(project: models.VideoProject, only: Optional[set[int]] = No
             if sh.id in only:
                 out.append(sh)
             continue
-        if sh.status == "completed" and sh.clip_path and Path(sh.clip_path).exists():
-            continue
+        if sh.status == "completed" and sh.clip_path and Path(sh.clip_path).exists() \
+                and not fingerprints.shot_is_stale(sh):
+            continue  # reused; an edited shot is made again, so it is checked
         out.append(sh)
     return out
 

@@ -439,7 +439,47 @@ def on_shot_clip_ready(db: Session, job: models.VideoJob) -> None:
     shot.status = "completed"
     shot.error = (job.context_json or {}).get("note", "")
     db.commit()
+    if _remake_outdated(db, job, shot):
+        return
     _after_shot(db, job)
+
+
+def _remake_outdated(db: Session, job: models.VideoJob, shot: models.VideoShot) -> bool:
+    """A clip that was still being made when its shot (or, for lip-sync, the
+    voiceover) was edited lands out of date. A render waiting on it must not
+    be put together with it: make the shot again for that render instead.
+    True when a new clip was submitted."""
+    if (job.context_json or {}).get("after", "compose") != "compose" or not job.render_id:
+        return False
+    render = db.get(models.Render, job.render_id)
+    if render is None or render.status != "generating_shots" or not fingerprints.shot_is_stale(shot):
+        return False
+    project = db.get(models.VideoProject, render.project_id)
+    if project is None:
+        return False
+    log.info("shot %s: the clip that just landed was made from older settings; making it again", shot.id)
+    try:
+        note = ""
+        if shot.shot_type == "talking_head":
+            ok = submit_talking_head(
+                db, project, shot, plan=StoryboardPlan.model_validate(project.generated_plan_json),
+                audio_path=render.audio_path,
+                start=_shot_start(project, shot), render_id=render.id,
+                voice_fingerprint=render.voice_fingerprint,
+            )
+            if ok is True:
+                return True
+            note = ok or ""
+            shot = db.get(models.VideoShot, shot.id)
+        submit_shot_clip(db, project, shot, render_id=render.id, after="compose", note=note)
+        return True
+    except Exception as e:  # noqa: BLE001 — the render fails with the reason
+        log.exception("remaking outdated shot %s failed", shot.id)
+        shot = db.get(models.VideoShot, shot.id)
+        shot.status = "failed"
+        shot.error = f"could not remake the edited shot: {str(e)[:300]}"
+        db.commit()
+        return False
 
 
 def on_shot_clip_failed(db: Session, job: models.VideoJob) -> None:
