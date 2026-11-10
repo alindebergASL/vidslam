@@ -669,8 +669,9 @@ def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str
     for path, value in _QUIET:
         _put(quiet, props, path, value)
     loud = copy.deepcopy(quiet)
-    for path, value in _PERMISSIVE:
-        _put(loud, props, path, value)
+    if _adult_mode():  # vendor safety knobs stay at the vendor's defaults otherwise
+        for path, value in _PERMISSIVE:
+            _put(loud, props, path, value)
     out: list[dict] = []
     for t in (loud, quiet, task):
         if t not in out:
@@ -1003,8 +1004,17 @@ class RunwareClient:
         return r.content
 
 
+def _adult_mode() -> bool:
+    from ..services.content_mode import adult_mode
+
+    return adult_mode()
+
+
 def check_content_default() -> bool:
-    """Runware's content check as set in Settings (else RUNWARE_CHECK_CONTENT)."""
+    """Runware's content check: always on unless adult mode is; then as set
+    in Settings (else RUNWARE_CHECK_CONTENT)."""
+    if not _adult_mode():
+        return True
     try:
         from ..services import provider_keys
 

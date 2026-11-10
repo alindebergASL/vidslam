@@ -13,10 +13,10 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..db import get_db
 from ..schemas import ProjectStatusOut, RenderOut, ShotOut
-from ..services import provider_gate, render_files
+from ..services import content_mode, provider_gate, render_files
 from ..services.preflight import run_preflight
 from ..services.ratelimit import rate_limit
-from ..services.safety import UnsafeScriptError, validate_script
+from ..services.safety import UnsafeScriptError, check_script, validate_script
 from ..services.spend import budget_guard
 from ..workers.jobs import (
     generate_plan_job,
@@ -85,9 +85,12 @@ def generate_plan(
         raise HTTPException(404, "project not found")
     try:
         validate_script(project.original_script or "")
+        # Everything the planner reads: in adult mode a permissive model plans.
+        check_script("\n".join(x for x in (project.original_script, project.creative_direction,
+                                            project.title, project.cta_text) if x))
     except UnsafeScriptError as e:
         raise HTTPException(422, str(e)) from e
-    provider_gate.require_model("chat")
+    provider_gate.require_model("chat", content_mode.chat_model())
     job_id = enqueue(generate_plan_job, project_id, preserve_edits=preserve_edits)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 

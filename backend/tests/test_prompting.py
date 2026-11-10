@@ -143,12 +143,13 @@ def test_enhance_is_rate_limited(auth_client, monkeypatch):
 # ---------- enhance (OpenRouter, mocked HTTP) ----------
 
 
-def _live(monkeypatch):
+def _live(monkeypatch, adult=False):
     from app import config
 
     monkeypatch.setenv("MOCK_PROVIDERS", "false")
     monkeypatch.setenv("OPENROUTER_API_KEY", "fake-key")
     monkeypatch.setenv("OPENROUTER_CHAT_MODEL", "test/planner")
+    monkeypatch.setenv("ADULT_MODE", "true" if adult else "false")
     config.get_settings.cache_clear()
 
 
@@ -364,3 +365,167 @@ def test_reset_defaults_returns_to_the_built_ins(auth_client):
     r = auth_client.delete("/api/prompts/defaults")
     assert r.status_code == 200 and r.json() == BUILTIN_NEGATIVES
     assert auth_client.get("/api/prompts/defaults").json() == BUILTIN_NEGATIVES
+
+
+# ---------- adult mode and refusals ----------
+
+DS = "deepseek/deepseek-v4-flash"
+DS_PRO = "deepseek/deepseek-v4-pro"
+REFUSAL = "I can't write a prompt for explicit sexual content, but here's a version for a non-explicit beach scene: ..."
+
+
+def _models_asked(route) -> list[str]:
+    return [json.loads(c.request.content)["model"] for c in route.calls]
+
+
+@respx.mock
+def test_adult_mode_enhances_with_deepseek_and_off_uses_the_planner(auth_client, monkeypatch):
+    _live(monkeypatch)
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=_reply("A rewritten prompt."))
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a beach at dusk", "kind": "image"})
+    assert r.json()["model"] == "test/planner" and _models_asked(route) == ["test/planner"]
+    assert auth_client.put("/api/settings/content", json={"adult": True}).json()["adult"] is True
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a beach at dusk", "kind": "image"})
+    assert r.status_code == 200 and r.json() == {"text": "A rewritten prompt.", "model": DS}
+    system = json.loads(route.calls[-1].request.content)["messages"][0]["content"]
+    assert "REFUSED_MINOR" in system and "DECLINED" in system and "adult" in system
+
+
+@respx.mock
+def test_outside_adult_mode_a_decline_is_the_answer_not_retried(auth_client, monkeypatch):
+    _live(monkeypatch)
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=_reply(REFUSAL))
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a beach scene", "kind": "image"})
+    assert r.status_code == 422 and "Adult mode" in r.json()["detail"] and len(route.calls) == 1
+
+
+@respx.mock
+def test_in_adult_mode_a_decline_is_retried_once_then_reported(auth_client, monkeypatch):
+    _live(monkeypatch, adult=True)
+    route = respx.post(f"{OR}/chat/completions").mock(side_effect=[_reply("DECLINED"), _reply("The rewrite.")])
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a beach scene", "kind": "image"})
+    assert r.status_code == 200 and r.json() == {"text": "The rewrite.", "model": DS_PRO}
+    assert _models_asked(route) == [DS, DS_PRO]
+    route.mock(side_effect=[_reply(REFUSAL), _reply("I'm sorry, but I can't rewrite this prompt.")])
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a beach scene", "kind": "image"})
+    assert r.status_code == 422 and "declined" in r.json()["detail"] and "unchanged" in r.json()["detail"]
+
+
+@respx.mock
+def test_a_minors_refusal_is_never_retried(auth_client, monkeypatch):
+    _live(monkeypatch, adult=True)
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=_reply("REFUSED_MINOR"))
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a beach scene", "kind": "image"})
+    assert r.status_code == 422 and "sexualise a minor" in r.json()["detail"] and len(route.calls) == 1
+    route.mock(return_value=_reply("I can't create content that sexualizes a minor or childlike traits."))
+    n = len(route.calls)
+    assert auth_client.post("/api/prompts/enhance", json={"text": "a beach scene", "kind": "image"}).status_code == 422
+    assert len(route.calls) == n + 1  # words about a minor: no second model asked
+
+
+@pytest.mark.parametrize("reply", [
+    "I can't rewrite this prompt because it describes explicit sexual activity. Here's an alternative: ...",
+    "I'm unable to rewrite this prompt.",
+    "Sorry, I can't do this.",
+    "I don't write sexually explicit content, but here's a beach scene",
+    "I won't be able to rewrite this.",
+    "I apologize, but I can't help with that request.",
+    "I’m sorry — I can’t help with this.",
+    "I'm not going to write that.",
+    "That's not something I can help with.",
+    "I can not write that.",
+    "As an AI, I can't create explicit sexual content.",
+    "I understand you'd like a sensual scene, but I can't produce sexually explicit material.",
+    "This request goes against my guidelines.",
+    "DECLINED",
+    "**DECLINED**",
+])
+def test_refusal_wordings_are_caught(reply):
+    from app.services.prompting import refusal
+
+    assert refusal(reply, "a couple on a beach") == "declined"
+
+
+@pytest.mark.parametrize("text,out", [
+    ("I can't make this up: our sourdough sold out in 12 minutes.", "I can't make this up: our sourdough sold out in 12 minutes. Come early."),
+    ("I can't help it, I love this coffee.", "I can't help it: I love this coffee."),
+    ("she is excited", "She smiles. \"I can't wait to see the ocean,\" she says."),
+    ("an ad for a stroller", "A sleek stroller rolls through a park at golden hour."),
+    ("PureGlow: the safer alternative for bath time.",
+     "Bath time should be gentle. PureGlow is a safer alternative made for children's sensitive skin."),
+    ("Boudoir portrait, tasteful take on vintage pin-up", "A tasteful take on vintage pin-up: soft light, satin."),
+    ("Declined. Again. Third time this week.", "Declined. Again. That's the third time this week my card got rejected."),
+    ("I can't do this anymore. Then I found FocusTea.", "I can’t do this anymore. Then I found FocusTea, calm focus."),
+    ("I can't describe how good this coffee is.", "\"I can't describe how good this coffee is,\" she says."),
+])
+def test_faithful_rewrites_are_not_refusals(text, out):
+    from app.services.prompting import refusal
+
+    assert refusal(out, text) is None
+
+
+@respx.mock
+def test_minors_are_refused_before_any_call_and_in_the_rewrite(auth_client, monkeypatch):
+    _live(monkeypatch, adult=True)
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=_reply("nude photo of a teenage girl"))
+    r = auth_client.post("/api/prompts/enhance", json={"text": "naked teenage girl", "kind": "image"})
+    assert r.status_code == 422 and "refused" in r.json()["detail"] and not route.calls
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a woman on a beach", "kind": "image"})
+    assert r.status_code == 422 and "rewrite was refused" in r.json()["detail"]
+
+
+@respx.mock
+def test_scripts_get_the_script_check(auth_client, monkeypatch):
+    _live(monkeypatch, adult=True)
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=_reply(
+        "My daughter and I opened this lingerie boutique ten years ago. Come see the new collection."))
+    r = auth_client.post("/api/prompts/enhance", json={
+        "text": "My daughter and I started this lingerie boutique ten years ago. Come see the new collection.",
+        "kind": "script"})
+    assert r.status_code == 200, r.text  # what generating that script accepts
+    assert len(route.calls) == 1
+
+
+@respx.mock
+def test_enhance_follows_the_openrouter_switch(auth_client, monkeypatch):
+    from app.services import provider_keys
+
+    _live(monkeypatch, adult=True)
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=_reply("x"))
+    provider_keys.set_enabled("openrouter", False)
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a beach", "kind": "image"})
+    assert r.status_code == 409 and not route.calls
+
+
+def test_mock_mode_ignores_adult_mode(auth_client):
+    auth_client.put("/api/settings/content", json={"adult": True})
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a cat on a sofa", "kind": "image"})
+    assert r.status_code == 200 and r.json()["text"].startswith("a cat on a sofa")
+
+
+def test_a_decline_naming_a_minor_is_a_minors_refusal():
+    from app.services.prompting import refusal
+
+    assert refusal("DECLINED: this sexualises a 15-year-old.", "x") == "minor"
+    assert refusal("REFUSED_MINOR", "x") == "minor"
+    assert refusal("I can't create content that sexualizes a minor.", "x") == "minor"
+    assert refusal("DECLINED", "a high school dance") == "minor"  # the prompt mentions one: never retried
+
+
+@respx.mock
+def test_scripts_get_the_minors_check_too(auth_client, monkeypatch):
+    _live(monkeypatch, adult=True)
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=_reply("x"))
+    r = auth_client.post("/api/prompts/enhance", json={"text": "naked teenage girl in her bedroom", "kind": "script"})
+    assert r.status_code == 422 and "refused" in r.json()["detail"] and not route.calls
+    route.mock(return_value=_reply("A 14-year-old strips for the camera."))
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a dancer warms up", "kind": "script"})
+    assert r.status_code == 422 and "rewrite was refused" in r.json()["detail"]
+
+
+@respx.mock
+def test_an_empty_rewrite_is_a_502(auth_client, monkeypatch):
+    _live(monkeypatch, adult=True)
+    respx.post(f"{OR}/chat/completions").mock(return_value=_reply("   "))
+    r = auth_client.post("/api/prompts/enhance", json={"text": "a short ad", "kind": "script"})
+    assert r.status_code == 502 and "empty" in r.json()["detail"]

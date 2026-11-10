@@ -212,6 +212,20 @@ def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
 # ---------- public entry points ----------
 
 
+def _check_plan(plan: StoryboardPlan) -> None:
+    """The planner's own output gets the minors checks too (in adult mode a
+    permissive model plans): every shot prompt, with its avoid list, and
+    the spoken script."""
+    from .safety import UnsafePromptError, check_prompt, check_script, steers_young
+
+    check_script(plan.cleaned_voice_script or "")
+    for shot in plan.shots:
+        check_prompt(shot.visual_prompt or "")
+        if steers_young(shot.visual_prompt or "", shot.negative_prompt or ""):
+            raise UnsafePromptError(
+                "This plan was refused: a shot's avoid list removes signs of adulthood from a sexual prompt.")
+
+
 def generate_plan(
     db: Session, project_id: int, *, preserve_edits: bool = False
 ) -> StoryboardPlan:
@@ -221,17 +235,19 @@ def generate_plan(
     project.status = "planning"
     db.commit()
 
-    chat = get_chat()
-    cast = _build_cast_context(db, project)
+    chat = None
     try:
+        chat = get_chat()
+        cast = _build_cast_context(db, project)
         plan = chat.generate_storyboard(project=_project_dict(project), cast=cast)
+        _check_plan(plan)
     except Exception as e:  # noqa: BLE001
         project.status = "failed"
         db.commit()
         _log_provider_call(
             db,
             project_id=project.id,
-            provider=type(chat).__name__,
+            provider=type(chat).__name__ if chat is not None else "chat",
             endpoint="generate_storyboard",
             request_summary={"title": project.title, "mode": project.mode},
             response_summary={"error": str(e)[:500]},

@@ -62,6 +62,12 @@ WORKFLOWS = "/v1/creative-agent/workflows"
 _sleep = time.sleep
 
 
+def _adult_mode() -> bool:
+    from ..services.content_mode import adult_mode
+
+    return adult_mode()
+
+
 def is_sogni(model: Optional[str]) -> bool:
     return bool(model) and str(model).startswith(PREFIX)
 
@@ -915,17 +921,32 @@ class SogniClient:
                           retry_after=_retry_after(r, body))
 
     def start(self, *, title: str, tool: str, arguments: dict,
-              media_references: Optional[list[dict]] = None) -> dict:
+              media_references: Optional[list[dict]] = None, cast: bool = False,
+              negative: str = "") -> dict:
         """Start a one-step workflow; returns the workflow snapshot. One fresh
         Idempotency-Key per call, reused only when retrying this same start
-        (network errors, 429 within the wait cap, 5xx)."""
+        (network errors, 429 within the wait cap, 5xx).
+
+        A prompt sexualising minors is refused before it's sent; Sogni's safe
+        filter is on outside adult mode, and always for a Cast member's
+        picture (`cast`), a prompt mentioning a child or a minor's age, or a
+        sexual prompt whose avoid list (`negative`) removes signs of
+        adulthood."""
+        from ..services.safety import check_prompt, mentions_minor, steers_young
+
+        prompt = str(arguments.get("prompt") or "")
+        negative = negative or str(arguments.get("negativePrompt") or "")
+        check_prompt(prompt)
+        guarded = cast or mentions_minor(prompt) or steers_young(prompt, negative)
         body: dict = {
             "input": {"title": title[:120] or "vidslam", "steps": [
                 {"id": STEP_ID, "toolName": tool, "arguments": arguments},
             ]},
             "token_type": "auto",
             "app_source": APP_SOURCE,
-            "safe_content_filter": bool(get_settings().sogni_safe_content_filter),
+            # On unless adult mode is (then SOGNI_SAFE_CONTENT_FILTER decides),
+            # and always when guarded (above).
+            "safe_content_filter": bool(get_settings().sogni_safe_content_filter) or guarded or not _adult_mode(),
         }
         if media_references:
             body["media_references"] = media_references
@@ -1139,7 +1160,7 @@ class SogniImageProvider(ImageProvider):
         elif references:
             # generate_image has no identity-reference input.
             log.info("sogni %s: ignoring %d reference image(s) (no reference input)", model, len(references))
-        wf = self.client.start(title=prompt[:80], tool="generate_image", arguments=args,
+        wf = self.client.start(title=prompt[:80], tool="generate_image", arguments=args, negative=negative_prompt,
                                media_references=media or None)
         wf = self._wait(wf)
         url = self.client.artifact_url(wf, "image")
@@ -1162,7 +1183,8 @@ class SogniImageProvider(ImageProvider):
             log.info("sogni %s: edit_image takes no negative prompt; dropped", model)
         media = [{"kind": "image", "url": r.url} for r in route.refs]
         self.last_route = route
-        wf = self.client.start(title=prompt[:80], tool=EDIT_TOOL, arguments=args, media_references=media)
+        wf = self.client.start(title=prompt[:80], tool=EDIT_TOOL, arguments=args, media_references=media,
+                               cast=any(r.role == "character" for r in route.refs), negative=negative_prompt)
         wf = self._wait(wf)
         url = self.client.artifact_url(wf, "image")
         if not url:
@@ -1296,7 +1318,10 @@ class SogniVideoProvider(VideoProvider):
                     args["prompt"] = f"Use {tag} as the first frame. {prompt}"
             elif loose:
                 log.info("sogni %s: ignoring %d reference image(s) (model takes none)", model, len(loose))
-        wf = self.client.start(title=prompt[:80], tool=tool, arguments=args, media_references=media or None)
+        sent = {m["url"] for m in media}
+        wf = self.client.start(title=prompt[:80], tool=tool, arguments=args, media_references=media or None,
+                               cast=any(r.role == "character" and r.url in sent for r in refs),
+                               negative=negative_prompt)
         wid = str(wf["workflowId"])
         return SubmittedJob(provider="sogni", model=model, job_id=wid,
                             polling_url=f"{self.client.base}{WORKFLOWS}/{wid}",

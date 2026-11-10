@@ -33,6 +33,7 @@ def live(monkeypatch):
     """Providers live with a fake Runware key; nothing sleeps."""
     monkeypatch.setenv("MOCK_PROVIDERS", "false")
     monkeypatch.setenv("RUNWARE_API_KEY", KEY)
+    monkeypatch.setenv("ADULT_MODE", "true")  # the uncensored defaults these tests cover
     from app.providers import runware
 
     monkeypatch.setattr(runware, "_sleep", lambda s: None)

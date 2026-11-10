@@ -99,8 +99,8 @@ def test_image_start_poll_download(client, live_sogni, where):
     assert len(req.headers["idempotency-key"]) >= 32
     body = json.loads(req.content)
     assert set(body) == {"input", "token_type", "app_source", "safe_content_filter"}  # snake_case only
-    # No NSFW gate: Sogni's content filter is off unless SOGNI_SAFE_CONTENT_FILTER=true.
-    assert body["token_type"] == "auto" and body["safe_content_filter"] is False
+    # Sogni's content filter is on unless Adult mode is (see test_content_mode.py).
+    assert body["token_type"] == "auto" and body["safe_content_filter"] is True
     step = body["input"]["steps"][0]
     assert step["id"] == "s1" and step["toolName"] == "generate_image"
     assert step["arguments"] == {"prompt": "a misty lake", "model": "krea-2-turbo", "numberOfVariations": 1,

@@ -53,20 +53,26 @@ _AGE = rf"(?:1[0-7]|0?[1-9]|{_NUM_WORDS})"
 _ORD = rf"(?:1[0-7]th|1st|2nd|3rd|[4-9]th|{_ORD_WORDS})"
 # "13 year old", "13-yr-old", "12yrold", "13 y.o.", "13yo", "14-yo", "13 y/o",
 # "aged 13", "age: 13", "13 years of age", "turning 12", "her 9th birthday".
+# A count of years alone isn't an age ("ten years of marriage").
 _AGE_FORMS = (
-    rf"\b{_AGE}\s*-?\s*(?:years?|yrs?)(?:\s*-?\s*olds?)?\b"
+    rf"\b{_AGE}\s*-?\s*(?:years?|yrs?)\s*-?\s*(?:olds?|of\s+age)\b"
     rf"|\b{_AGE}\s*-?\s*(?:y\s*[./]?\s*o\b\.?|yo\b)"
     rf"|\bage[ds]?\s*[:=]?\s*{_AGE}\b"
     rf"|\b(?:turning|turned|just turned)\s+{_AGE}\b"
     rf"|\b{_ORD}\s+birthday\b"
 )
 # A person word near a bare age: "girl, 13", "boy (12)", "girl who is 12",
-# "girl of 8", "13 girl".
+# "girl of 8"; or a teen age then one person: "13 girl" (not "one person",
+# "two models" or "12 girls on a runway").
 _PERSON = (r"(?:girl|girls|boy|boys|kid|kids|child|daughter|son|sister|brother|niece|nephew|student|"
            r"pupil|model|person|teen|baby|babe)")
 _PERSON_AGE = (rf"\b{_PERSON}(?:\W+(?:who|is|was|of|aged?|just|only|about|around|maybe))*\W+{_AGE}\b"
                rf"(?!\s*(?:am|pm|cm|mm|kg|lbs?|%|ft|in\b|\+|:\d))"
-               rf"|\b{_AGE}\W{{0,3}}{_PERSON}\b")
+               r"|\b1[0-7]\W{0,3}(?:girl|boy|kid|child|daughter|son|teen|student|pupil|schoolgirl|schoolboy)\b"
+               # "she is 14", "he's 12", "they just turned 13" (not "he is 6 feet", "10 minutes late").
+               rf"|\b(?:she|he|they)(?:[’']s|\s+(?:is|was|are|were|turns|turned|just turned))\s+{_AGE}\b"
+               r"(?!\s*(?:am|pm|cm|mm|kg|lbs?|%|ft|feet|foot|in\b|inch(?:es)?|min(?:ute)?s?|h(?:ou)?rs?|"
+               r"sec(?:ond)?s?|days?|weeks?|months?|times|x\b|\+|:\d|th\b|st\b|nd\b|rd\b|of\b|out\b|percent|points?))")
 _MINOR_TERMS = (
     r"\b(?:child|childs|children|childlike|child-like|kid|kids|kiddie|kiddy|minor|minors|underage|"
     r"underaged|under-age|under-aged|teen|teens|teenage|teenaged|teenager|teenagers|teenie|teeny|"
@@ -93,7 +99,8 @@ _SEXUAL_TERMS = (
     r"nsfw|erotic|erotica|topless|bottomless|lingerie|panties|thong|g-string|"
     r"undress|undressed|undressing|unclothed|seductive|seductively|nipples?|genitals?|genitalia|"
     r"boobs?|tits?|vagina|vaginal|penis|pussy|cock|crotch|orgasm|aroused|arousal|"
-    r"fetish|horny|lewd|stripping|stripper|striptease|masturbat\w*|intercourse|hentai|ecchi|onlyfans|"
+    r"fetish|horny|lewd|stripping|stripper|striptease|strips? (?:naked|nude|down|off|for)|"
+    r"stripped (?:naked|nude|down|off)|masturbat\w*|intercourse|hentai|ecchi|onlyfans|"
     r"spread legs|bdsm|bondage|explicit(?!\s+(?:lyrics|language|instructions|permission|consent)))\b"
 )
 # Ordinary words that are sexual only in context ("kids in swimwear at the
@@ -188,6 +195,22 @@ def check_prompt(text: str) -> None:
     if _any(_ALWAYS_RE, forms) or (_any(_MINOR_RE, forms) and _any(_SEXUAL_RE, forms)):
         raise UnsafePromptError(
             "This prompt was refused: it appears to involve sexual content and minors.")
+
+
+# Scripts: the same minors check without family words ("my daughter and I
+# started this boutique"), which ad copy uses about adults all the time.
+_SCRIPT_MINOR_RE = re.compile(
+    _MINOR_TERMS.replace("daughter|daughters|stepdaughter|stepdaughters|step-daughter|", ""), re.I)
+
+
+def check_script(text: str) -> None:
+    """check_prompt for scripts and other planner input (creative direction,
+    titles): what validate_script misses ("teenage", "14-year-old", look-alike
+    letters), without its family-word false positives."""
+    forms = _forms(text)
+    if _any(_ALWAYS_RE, forms) or (_any(_SCRIPT_MINOR_RE, forms) and _any(_SEXUAL_RE, forms)):
+        raise UnsafePromptError(
+            "This script was refused: it appears to involve sexual content and minors.")
 
 
 _ADULT_RE = re.compile(r"\b(?:adults?|adult-looking|mature|grown|grown-up|grownup|older|old|aged|elderly|"

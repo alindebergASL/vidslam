@@ -39,7 +39,12 @@ def _active(kind: str) -> tuple[str, str]:
 
 
 def get_chat() -> ChatProvider:
-    model, provider = _active("chat")
+    """The planner (Settings → Models), or in adult mode the adult text model
+    (services/content_mode.py): storyboards, ✨ Enhance, scene rewrites."""
+    from ..services import content_mode
+
+    adult = content_mode.text_model()
+    model, provider = (adult, _checked("chat", adult)) if adult else _active("chat")
     if provider == "mock":
         from .mock_chat import MockChatProvider
 
