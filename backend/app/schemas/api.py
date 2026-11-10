@@ -190,6 +190,8 @@ class ProjectUpdate(BaseModel):
     primary_avatar_id: Optional[int] = None
     brand_kit_id: Optional[int] = None
     generated_plan_json: Optional[dict] = None
+    # The project's own TTS voice; null or "" = back to the character's voice.
+    voice_id: Optional[str] = Field(None, max_length=120)
 
 
 class ShotOut(BaseModel):
@@ -212,6 +214,21 @@ class ShotOut(BaseModel):
     error: str
     # Edited since its clip was made: the next render makes a new clip.
     clip_stale: bool = False
+    # Aspect ratio the clip was made at ("" = unknown / no clip).
+    clip_aspect_ratio: str = ""
+    # Clips kept for this shot (the current one included).
+    takes_count: int = 0
+
+
+AddShotType = Literal["hero", "b_roll", "talking_head", "transition"]
+
+
+class ShotCreate(BaseModel):
+    """Body for POST /api/projects/{id}/shots: a new shot with no clip."""
+    after_shot_id: Optional[int] = None  # None = at the end (before the end card)
+    shot_type: AddShotType = "b_roll"
+    prompt: str = ""
+    duration_seconds: float = Field(5.0, ge=1.0, le=60.0)
 
 
 class ShotUpdate(BaseModel):
@@ -241,6 +258,8 @@ class PlanEditIn(BaseModel):
 class ProjectOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    # The project's own TTS voice; None = the primary character's voice.
+    voice_id: Optional[str] = None
     title: str
     original_script: str
     mode: str
@@ -266,6 +285,52 @@ class ProjectOut(BaseModel):
     updated_at: datetime
     cast_members: list[CastMemberOut] = Field(default_factory=list)
     shots: list[ShotOut] = Field(default_factory=list)
+
+
+class ShotEditOut(BaseModel):
+    """Result of adding, duplicating or deleting a shot."""
+    project: ProjectOut
+    shot: Optional[ShotOut] = None  # the new shot (None after a delete)
+    # Captions were spread over the new total shot time.
+    captions_resynced: bool = False
+    # Delete only: clip files thrown away (the shot's takes).
+    clips_discarded: int = 0
+
+
+class TakeOut(BaseModel):
+    id: int
+    shot_id: int
+    current: bool
+    provider: str
+    provider_model: str
+    cost_usd: Optional[float] = None
+    note: str = ""
+    aspect_ratio: str = ""
+    file_exists: bool
+    url: str
+    created_at: Optional[str] = None
+
+
+class TakesOut(BaseModel):
+    takes: list[TakeOut]
+    keep: int  # takes kept per shot; older ones are deleted (never the current one)
+
+
+class VoiceoverPreviewOut(BaseModel):
+    url: str
+    source: Literal["preview", "render"]
+    fingerprint: str
+    # Still matches the spoken script, voice and voice model.
+    current: bool
+    duration_seconds: float
+    video_seconds: float
+    difference_seconds: float
+    fit: Literal["fits", "too_long", "too_short"]
+    fit_text: str
+    cost_estimate: float
+    # POST only: true when an identical voiceover existed, so nothing was paid.
+    reused: bool = False
+    created_at: Optional[str] = None
 
 
 class RenderOut(BaseModel):

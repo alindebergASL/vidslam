@@ -26,7 +26,9 @@ class ElevenLabsTTSProvider(TTSProvider):
             r.raise_for_status()
             data = r.json()
         return [
-            {"voice_id": v.get("voice_id"), "name": v.get("name")}
+            # preview_url: ElevenLabs' own short sample (free to play).
+            {"voice_id": v.get("voice_id"), "name": v.get("name"),
+             "preview_url": v.get("preview_url") or ""}
             for v in data.get("voices", [])
         ]
 

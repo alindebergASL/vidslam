@@ -20,7 +20,7 @@ from ..providers import (
 )
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
-from . import alerts, fingerprints, render_files, storage
+from . import alerts, fingerprints, render_files, storage, takes
 from .captions import chunks_to_timed
 from .model_registry import active_model as _active_model
 from .prompting import effective_negative
@@ -361,6 +361,8 @@ def submit_shot_clip(
     # A sogni/ or runware/ model is served by its provider whatever video model is active.
     per_model = routes_per_model("video", model)
     video = get_video(model) if per_model else get_video()
+    if purpose == "shot":
+        takes.ensure_current_take(db, shot)  # the clip being replaced stays selectable
     shot.status = "submitted"
     shot.error = note
     shot.clip_path = ""
@@ -402,6 +404,7 @@ def submit_shot_clip(
         job = video_jobs.submit(
             db, purpose=purpose, ref_id=shot.id, project_id=project.id, render_id=render_id,
             context={"after": after, **({"note": note} if note else {}),
+                     "aspect": project.aspect_ratio or "",
                      **({"fingerprint": fingerprint} if fingerprint else {}), **(context or {})}, start=start,
             webhooks=uses_webhooks(model),
         )
@@ -430,15 +433,28 @@ def on_shot_clip_ready(db: Session, job: models.VideoJob) -> None:
         # Avatar models size the clip to their audio/script; trim to the shot.
         from .renderer import trim_clip
 
-        trimmed = path.with_name(f"shot_{shot.shot_order:02d}_{shot.id}.mp4")
+        # One file per job: an earlier take of this shot keeps its own file.
+        trimmed = path.with_name(f"shot_{shot.shot_order:02d}_{shot.id}_{job.id}.mp4")
         trim_clip(path, trimmed, duration=float((job.context_json or {}).get("duration") or shot.duration_seconds or 5.0))
         path.unlink(missing_ok=True)
         path = trimmed
+    ctx = job.context_json or {}
     shot.clip_path = str(path)
-    shot.clip_fingerprint = (job.context_json or {}).get("fingerprint", "")
+    shot.clip_fingerprint = ctx.get("fingerprint", "")
+    if "aspect" in ctx:
+        shot.clip_aspect_ratio = ctx.get("aspect") or ""
+    else:  # a job submitted before the aspect was kept with it
+        project = db.get(models.VideoProject, job.project_id) if job.project_id else None
+        shot.clip_aspect_ratio = (project.aspect_ratio if project else "") or ""
     shot.status = "completed"
-    shot.error = (job.context_json or {}).get("note", "")
+    shot.error = ctx.get("note", "")
     db.commit()
+    try:
+        takes.record(db, shot, job)
+    except Exception:  # noqa: BLE001 — losing a take row must not stop the render
+        db.rollback()
+        log.exception("shot %s: could not record the take", shot.id)
+        shot = db.get(models.VideoShot, job.ref_id)
     if _remake_outdated(db, job, shot):
         return
     _after_shot(db, job)
@@ -664,6 +680,7 @@ def submit_talking_head(
         speech = min(dur, _probe_duration(seg) or dur)
     script = (plan.cleaned_voice_script if len(body) == 1 else "") or shot.caption_text \
         or plan.cleaned_voice_script or shot.prompt
+    takes.ensure_current_take(db, shot)  # the clip being replaced stays selectable
     shot.status = "submitted"
     shot.provider = "lipsync"
     shot.provider_model = getattr(avatar, "model", "")
@@ -687,6 +704,7 @@ def submit_talking_head(
     try:
         video_jobs.submit(db, purpose="avatar", ref_id=shot.id, project_id=project.id, render_id=render_id,
                           context={"after": after, "duration": dur, "speech_seconds": round(speech, 2),
+                                   "aspect": project.aspect_ratio or "",
                                    **({"fingerprint": fingerprint} if fingerprint else {})},
                           start=start_fn)
     except Exception as e:  # noqa: BLE001 — submit failed: use the video model
@@ -723,12 +741,7 @@ def generate_audio(
         return None
 
     tts = get_tts()
-    voice_id = ""
-    primary = (
-        db.get(models.Avatar, project.primary_avatar_id) if project.primary_avatar_id else None
-    )
-    if primary and primary.elevenlabs_voice_id:
-        voice_id = primary.elevenlabs_voice_id
+    voice_id = fingerprints.tts_voice_id(db, project)
     try:
         audio_bytes = tts.synthesize(text=plan.cleaned_voice_script, voice_id=voice_id)
         out_dir = storage.render_subdir(project.id)
@@ -764,6 +777,133 @@ class VoiceoverFailed(RuntimeError):
     """The voiceover could not be synthesized."""
 
 
+def voiceover_preview_path(project: models.VideoProject) -> Optional[Path]:
+    """The preview voiceover's file, when one was made and is on disk."""
+    path = str((project.voiceover_preview_json or {}).get("path") or "")
+    return Path(path) if path and Path(path).is_file() else None
+
+
+def _tts_cost(script: str) -> float:
+    return len(script or "") / 1000.0 * get_settings().cost_tts_per_1k_chars
+
+
+def _body_seconds(project: models.VideoProject) -> float:
+    return float(sum(float(s.duration_seconds or 0) for s in _body_shots(project)))
+
+
+END_CARD_SECONDS = 2.5  # renderer._make_end_card's default length
+
+
+def voiceover_fit(project: models.VideoProject, audio_seconds: float) -> dict:
+    """The voiceover's real length against the shots' total time, in plain words."""
+    shots = round(_body_seconds(project), 2)
+    end_card = END_CARD_SECONDS if (project.cta_text or "").strip() else 0.0
+    diff = round(audio_seconds - shots, 1)
+    if audio_seconds > shots + 0.5:
+        verdict = "too_long"
+        if audio_seconds <= shots + end_card:
+            text = f"about {abs(diff):g} s longer than the shots: it runs over the end card"
+        else:
+            text = f"about {abs(diff):g} s longer than the video: the end will be cut"
+    elif audio_seconds < shots - 1.5:
+        verdict = "too_short"
+        text = f"about {abs(diff):g} s shorter than the video: the last {abs(diff):g} s have no voice"
+    else:
+        verdict, text = "fits", "fits"
+    return {"audio_seconds": round(audio_seconds, 2), "video_seconds": shots,
+            "difference_seconds": diff, "fit": verdict, "fit_text": text}
+
+
+def make_voiceover_preview(db: Session, project: models.VideoProject) -> dict:
+    """Synthesize the current spoken script with the project's voice and keep
+    it as the project's current voiceover: the next render uses it at no
+    charge. When a voiceover made from exactly the same script, voice and
+    voice model already exists, nothing is paid for and that one is returned."""
+    from .renderer import _probe_duration
+
+    if not project.generated_plan_json:
+        raise ValueError("generate a storyboard plan first")
+    if fingerprints.voice_source(project) != "tts":
+        raise VoiceoverNotSynthesized(project)
+    fingerprint = fingerprints.voice_fingerprint(db, project)
+    existing = _reusable_voiceover(db, project, fingerprint)
+    if existing:
+        return {"path": existing, "fingerprint": fingerprint, "cost_estimate": 0.0, "reused": True}
+    script = str(project.generated_plan_json.get("cleaned_voice_script") or "")
+    tts = get_tts()
+    voice_id = fingerprints.tts_voice_id(db, project)
+    out_dir = storage.render_subdir(project.id)
+    try:
+        data = tts.synthesize(text=script, voice_id=voice_id)
+    except Exception as e:  # noqa: BLE001
+        _log_provider_call(db, project_id=project.id, provider=type(tts).__name__, endpoint="tts.synthesize",
+                           request_summary={"chars": len(script), "preview": True},
+                           response_summary={"error": str(e)[:500]}, status="error")
+        raise VoiceoverFailed(f"The voice provider said: {str(e)[:400] or type(e).__name__}") from e
+    # One file per fingerprint: a render that used an earlier preview keeps
+    # pointing at the audio it was made with.
+    path = out_dir / f"voice_preview_{fingerprint[:16]}.m4a"
+    path.write_bytes(data)
+    old = voiceover_preview_path(project)
+    if old is not None and old != path and not db.query(models.Render.id).filter(
+            models.Render.project_id == project.id, models.Render.audio_path == str(old)).first():
+        old.unlink(missing_ok=True)
+    cost = round(_tts_cost(script), 4)
+    project.voiceover_preview_json = {
+        "path": str(path), "fingerprint": fingerprint,
+        "duration_seconds": round(_probe_duration(path), 2), "cost_estimate": cost,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    db.commit()
+    _log_provider_call(db, project_id=project.id, provider=type(tts).__name__, endpoint="tts.synthesize",
+                       request_summary={"chars": len(script), "voice_id": bool(voice_id), "preview": True},
+                       response_summary={"bytes": len(data)})
+    return {"path": str(path), "fingerprint": fingerprint, "cost_estimate": cost, "reused": False}
+
+
+def current_voiceover(db: Session, project: models.VideoProject) -> Optional[dict]:
+    """The voiceover to play in the editor: whichever of the preview and the
+    newest render's voiceover still matches the script and voice (the
+    preview first), else the newer of the two. `current` says whether it
+    still matches."""
+    from .renderer import _probe_duration
+
+    fp_now = fingerprints.voice_fingerprint(db, project) if fingerprints.voice_source(project) == "tts" else ""
+    candidates: list[dict] = []
+    preview = voiceover_preview_path(project)
+    if preview is not None:
+        meta = project.voiceover_preview_json or {}
+        candidates.append({
+            "source": "preview", "path": str(preview), "fingerprint": str(meta.get("fingerprint") or ""),
+            "duration_seconds": float(meta.get("duration_seconds") or 0) or round(_probe_duration(preview), 2),
+            "cost_estimate": float(meta.get("cost_estimate") or 0.0), "created_at": meta.get("created_at")})
+    latest = _latest_audio_render(db, project.id)
+    if latest is not None and str(preview or "") != latest.audio_path:
+        candidates.append({
+            "source": "render", "path": latest.audio_path, "fingerprint": latest.voice_fingerprint or "",
+            "duration_seconds": round(_probe_duration(Path(latest.audio_path)), 2), "cost_estimate": 0.0,
+            "created_at": latest.created_at.isoformat() if latest.created_at else None})
+    if not candidates:
+        return None
+    for c in candidates:
+        c["current"] = bool(fp_now) and c["fingerprint"] == fp_now
+    for c in candidates:
+        if c["current"]:
+            return c
+    return max(candidates, key=lambda c: c["created_at"] or "")
+
+
+class VoiceoverNotSynthesized(ValueError):
+    """The project's voiceover is an uploaded file or silent: nothing to synthesize."""
+
+    def __init__(self, project: models.VideoProject) -> None:
+        source = fingerprints.voice_source(project)
+        msg = ("The voiceover is your uploaded file, so there is nothing to make."
+               if source == "upload" else
+               "This project is silent (or has no spoken script), so there is no voiceover to make.")
+        super().__init__(msg)
+
+
 def _latest_audio_render(db: Session, project_id: int) -> Optional[models.Render]:
     """The newest render that has a voiceover, if its file is still on disk."""
     for r in (db.query(models.Render)
@@ -777,7 +917,11 @@ def _latest_audio_render(db: Session, project_id: int) -> Optional[models.Render
 def _reusable_voiceover(db: Session, project: models.VideoProject, fingerprint: str) -> Optional[str]:
     """The voiceover already on disk, when it was made from exactly the
     current spoken script, voice and voice model. Only the newest one is
-    looked at: each synthesis replaces the project's voice file."""
+    looked at: each synthesis replaces the project's voice file. A
+    voiceover made with "Make voiceover" (the preview) counts too."""
+    preview = voiceover_preview_path(project)
+    if preview is not None and fingerprint and (project.voiceover_preview_json or {}).get("fingerprint") == fingerprint:
+        return str(preview)
     latest = _latest_audio_render(db, project.id)
     if latest is not None and fingerprint and latest.voice_fingerprint == fingerprint:
         return latest.audio_path
@@ -820,16 +964,57 @@ def _lipsync_available(db: Session, project: models.VideoProject) -> bool:
             and _hero_portrait(db, project) is not None)
 
 
+def _clip_follows_voice(db: Session, project: models.VideoProject, shot: models.VideoShot,
+                        voice_fp: str) -> bool:
+    """The shot's lip-synced clip was cut from the voiceover with this
+    fingerprint (at the shot's current place and length)."""
+    if not voice_fp or not shot.clip_fingerprint:
+        return False
+    portrait = _hero_portrait(db, project)
+    return shot.clip_fingerprint == fingerprints.lipsync_fingerprint(
+        project, shot, voice=voice_fp, start=_shot_start(project, shot),
+        portrait_id=portrait.id if portrait else None)
+
+
+def _lipsynced_clips(project: models.VideoProject) -> list[models.VideoShot]:
+    return [s for s in _body_shots(project)
+            if s.provider == "lipsync" and s.clip_path and s.clip_fingerprint]
+
+
+def current_voiceover_made(db: Session, project: models.VideoProject) -> bool:
+    """The voiceover for the current spoken script and voice is already on
+    disk (from "Make voiceover" or a render)."""
+    fp = fingerprints.voice_fingerprint(db, project)
+    return bool(fp and _reusable_voiceover(db, project, fp))
+
+
 def regen_needs_new_voiceover(db: Session, project: models.VideoProject,
-                              shots: list[models.VideoShot]) -> list[models.VideoShot]:
-    """The shots a single re-roll cannot fix: lip-synced shots while the
-    voiceover is out of date. A re-roll lip-syncs to the voiceover on disk
-    (the old one), so the paid clip would still be out of date and the next
-    render would buy it again. Only Generate video makes the new voiceover."""
+                              shots: list[models.VideoShot], *,
+                              recompose: bool = True) -> list[models.VideoShot]:
+    """The shots a re-roll cannot fix: lip-synced shots while the voiceover
+    is out of date.
+
+    Without the new voiceover on disk, a re-roll lip-syncs to the old one, so
+    the paid clip would still be out of date and the next render would buy it
+    again. Only Generate video makes the new voiceover.
+
+    With the new voiceover already made ("Make voiceover"), the re-roll cuts
+    its clip from it, and a recompose puts that voiceover under the video.
+    Any other lip-synced clip still cut from the old voiceover would then be
+    out of step, so a recomposing re-roll is refused unless it takes those
+    shots along too (they are returned with the re-rolled ones)."""
     talking = [s for s in shots if s.shot_type == "talking_head"]
     if not talking or not _voiceover_changed(db, project) or not _lipsync_available(db, project):
         return []
-    return talking
+    voice_fp = fingerprints.voice_fingerprint(db, project)
+    if not _reusable_voiceover(db, project, voice_fp):
+        return talking
+    if not recompose:
+        return []  # the clip is cut from the new voiceover; nothing is composed yet
+    picked = {s.id for s in shots}
+    left_behind = [s for s in _lipsynced_clips(project)
+                   if s.id not in picked and not _clip_follows_voice(db, project, s, voice_fp)]
+    return talking + left_behind if left_behind else []
 
 
 def _active_job_for(db: Session, shot_id: int) -> Optional[models.VideoJob]:
@@ -872,7 +1057,7 @@ def render_plan(db: Session, project: models.VideoProject) -> dict:
     elif _reusable_voiceover(db, project, voice_fp):
         voiceover, voice_cost = "reuse", 0.0
     else:
-        voiceover, voice_cost = "new", len(script) / 1000.0 * rates.cost_tts_per_1k_chars
+        voiceover, voice_cost = "new", _tts_cost(script)
     # The finished video's voice no longer matches the spoken script / voice.
     voiceover_changed = _voiceover_changed(db, project)
     lipsync_on = _lipsync_available(db, project)
@@ -885,6 +1070,8 @@ def render_plan(db: Session, project: models.VideoProject) -> dict:
             action, reason = "in_flight", "already being made; it is kept and not paid for again"
         elif has_clip and not fingerprints.shot_is_stale(shot):
             action, reason = "reuse", ""
+        elif has_clip and fingerprints.aspect_changed(shot, project):
+            action, reason = "generate", "the video's shape (aspect ratio) changed"
         elif has_clip and shot.provider == "lipsync" and voiceover_changed:
             action, reason = "generate", "lip-sync follows the voiceover, which changed"
         elif has_clip:
@@ -1188,12 +1375,16 @@ def _submit_regen(db: Session, project: models.VideoProject, shot: models.VideoS
     everything else goes to the video model."""
     note = ""
     if shot.shot_type == "talking_head" and project.generated_plan_json:
-        latest = _latest_audio_render(db, project.id)
-        if latest is not None:
+        voice_fp = fingerprints.voice_fingerprint(db, project)
+        audio = _reusable_voiceover(db, project, voice_fp)
+        if audio is None:
+            latest = _latest_audio_render(db, project.id)
+            audio, voice_fp = (latest.audio_path, latest.voice_fingerprint) if latest is not None else (None, "")
+        if audio is not None:
             ok = submit_talking_head(
                 db, project, shot, plan=StoryboardPlan.model_validate(project.generated_plan_json),
-                audio_path=latest.audio_path, start=_shot_start(project, shot), render_id=None, after=after,
-                voice_fingerprint=latest.voice_fingerprint,
+                audio_path=audio, start=_shot_start(project, shot), render_id=None, after=after,
+                voice_fingerprint=voice_fp,
             )
             if ok is True:
                 return
@@ -1262,6 +1453,32 @@ def _latest_completed_audio(db: Session, project_id: int) -> Optional[Path]:
     return None
 
 
+def _recompose_voiceover(db: Session, project: models.VideoProject) -> tuple[Optional[Path], str]:
+    """The voiceover a recompose puts under the clips, and its fingerprint.
+
+    The current one (made with "Make voiceover", or by the last render) when
+    it is on disk, so a shot re-rolled against it stays in step and the
+    captions match what is said. The last render's voiceover instead when the
+    lip-synced clips were all cut from that one (nothing was re-rolled
+    against the new voiceover yet): swapping it would put every one of them
+    out of step."""
+    old_audio = _latest_completed_audio(db, project.id)
+    source_render = _latest_audio_render(db, project.id)
+    # Same voiceover file as before: keep knowing what it was made from.
+    old_fp = (source_render.voice_fingerprint
+              if source_render is not None and old_audio and source_render.audio_path == str(old_audio)
+              else "")
+    voice_fp = fingerprints.voice_fingerprint(db, project)
+    current = _reusable_voiceover(db, project, voice_fp) if voice_fp else None
+    if current is None or (old_audio is not None and Path(current) == old_audio):
+        return old_audio, old_fp
+    clips = _lipsynced_clips(project)
+    if (old_fp and any(_clip_follows_voice(db, project, s, old_fp) for s in clips)
+            and not any(_clip_follows_voice(db, project, s, voice_fp) for s in clips)):
+        return old_audio, old_fp
+    return Path(current), voice_fp
+
+
 def recompose_project(db: Session, project_id: int) -> models.Render:
     """Re-run only the FFmpeg composition step, reusing existing shot clips + audio.
 
@@ -1291,17 +1508,13 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
     if not clip_paths:
         raise ValueError("no shot clips available to recompose")
 
-    audio = _latest_completed_audio(db, project_id)
-    source_render = _latest_audio_render(db, project_id)
+    audio, audio_fp = _recompose_voiceover(db, project)
 
     render = models.Render(
         project_id=project.id,
         status="rendering",
         audio_path=str(audio) if audio else "",
-        # Same voiceover file as before: keep knowing what it was made from.
-        voice_fingerprint=(source_render.voice_fingerprint
-                           if source_render is not None and audio and source_render.audio_path == str(audio)
-                           else ""),
+        voice_fingerprint=audio_fp,
     )
     db.add(render)
     db.commit()

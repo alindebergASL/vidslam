@@ -68,7 +68,7 @@ class OpenRouterTTSProvider(TTSProvider):
 
     def list_voices(self) -> list[dict]:
         names = self.voices or ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-        return [{"voice_id": v, "name": v} for v in names]
+        return [{"voice_id": v, "name": v, "preview_url": ""} for v in names]
 
     def _voice_for(self, voice_id: str) -> str:
         # Per-avatar ElevenLabs ids mean nothing to other providers; only use

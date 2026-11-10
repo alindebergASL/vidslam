@@ -43,6 +43,15 @@ def voice_source(project: models.VideoProject) -> str:
     return "tts"
 
 
+def tts_voice_id(db: Session, project: models.VideoProject) -> str:
+    """The voice the TTS speaks with: the project's own choice, else the
+    primary character's voice ("" = the provider default)."""
+    if (project.voice_id or "").strip():
+        return project.voice_id.strip()
+    avatar = db.get(models.Avatar, project.primary_avatar_id) if project.primary_avatar_id else None
+    return (avatar.elevenlabs_voice_id if avatar else "") or ""
+
+
 def voice_fingerprint(db: Session, project: models.VideoProject) -> str:
     """What the project's voiceover would be made from right now.
     "" for a silent project (there is no voiceover to compare)."""
@@ -56,8 +65,7 @@ def voice_fingerprint(db: Session, project: models.VideoProject) -> str:
                         "mtime": stat.st_mtime_ns})
     from . import model_registry as reg
 
-    avatar = db.get(models.Avatar, project.primary_avatar_id) if project.primary_avatar_id else None
-    voice_id = (avatar.elevenlabs_voice_id if avatar else "") or ""
+    voice_id = tts_voice_id(db, project)
     return _digest({
         "source": "tts",
         "script": _spoken_script(project),
@@ -127,15 +135,27 @@ def current_fingerprint(db: Session, project: models.VideoProject, shot: models.
     return video_fingerprint(project, shot)
 
 
+def aspect_changed(shot: models.VideoShot, project: Optional[models.VideoProject] = None) -> bool:
+    """The clip was made at another aspect ratio than the project's now.
+    "" (not known) never counts as changed."""
+    project = project or shot.project
+    made = (shot.clip_aspect_ratio or "").strip()
+    return bool(made and project is not None and made != (project.aspect_ratio or "").strip())
+
+
 def shot_is_stale(shot: models.VideoShot) -> bool:
     """True when the shot has a clip that no longer matches its settings."""
-    if not shot.clip_fingerprint or shot.status != "completed" or not shot.clip_path:
+    if shot.status != "completed" or not shot.clip_path:
         return False
     if shot.shot_type in ("end_card", "ambient_segment"):
         return False
     db = object_session(shot)
     project = shot.project
     if db is None or project is None:
+        return False
+    if project.mode != "ambient_loop" and aspect_changed(shot, project):
+        return True  # the video's shape changed: every clip is made again
+    if not shot.clip_fingerprint:
         return False
     if shot.provider == "lipsync" and voice_source(project) == "silent":
         return False  # no voiceover to be out of step with
