@@ -79,7 +79,7 @@ def test_time_of_day_replaces_the_presets_own_light():
 def test_changing_look_or_weather_invalidates_the_loop(auth_client):
     sid = auth_client.post("/api/ambient", json={"config": SHORT, "generate": True}).json()["id"]
     assert auth_client.get(f"/api/ambient/{sid}").json()["loop_status"] == "completed"
-    r = auth_client.patch(f"/api/ambient/{sid}", json={"config": {**SHORT, "look": "claymation"}})
+    r = auth_client.patch(f"/api/ambient/{sid}?discard_loop=true", json={"config": {**SHORT, "look": "claymation"}})
     assert r.status_code == 200, r.text
     assert r.json()["loop_status"] == "pending"  # needs a new clip in the new style
 

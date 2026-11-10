@@ -4,15 +4,20 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { StatusBadge } from "@/components/StatusBadge";
 import { AuthGate } from "@/components/AuthGate";
-import { PreflightModal } from "@/components/PreflightModal";
+import { PreflightModal, renderPlanLines } from "@/components/PreflightModal";
+import { Dialog } from "@/components/Dialog";
 import { AudioPanel } from "@/components/AudioPanel";
 import { RenderHistory } from "@/components/RenderHistory";
 import { GenerationProgress } from "@/components/GenerationProgress";
 import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
-import { api, Asset, Project, Shot, Render } from "@/lib/api";
+import { api, Asset, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, Render } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
+
+// Project states in which a render (or a re-plan) can be started.
+const CAN_GENERATE = ["planned", "failed", "completed", "cancelled"];
+const usd = (n: number) => `$${n.toFixed(2)}`;
 
 export default function ProjectEditorPage() {
   return (
@@ -37,6 +42,9 @@ function Inner() {
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showPreflight, setShowPreflight] = useState(false);
+  // What "Generate video" would make, reuse and cost right now.
+  const [renderPlan, setRenderPlan] = useState<RenderPlan | null>(null);
+  const [showReplan, setShowReplan] = useState(false);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
   const [videoModels, setVideoModels] = useState<
@@ -76,6 +84,13 @@ function Inner() {
           });
         } catch {
           setPreflight(null);
+        }
+        if (p.generated_plan_json) {
+          try {
+            setRenderPlan(await api.renderPlan(projectId));
+          } catch {
+            setRenderPlan(null);
+          }
         }
       }
       const renderActive =
@@ -134,7 +149,7 @@ function Inner() {
         meta: true,
         label: "Generate video (with preflight)",
         run: () => {
-          if (project && ["planned", "failed", "completed"].includes(project.status)) {
+          if (project && CAN_GENERATE.includes(project.status)) {
             setShowPreflight(true);
           }
         },
@@ -144,19 +159,17 @@ function Inner() {
         ctrl: true,
         label: "Generate video (with preflight)",
         run: () => {
-          if (project && ["planned", "failed", "completed"].includes(project.status)) {
+          if (project && CAN_GENERATE.includes(project.status)) {
             setShowPreflight(true);
           }
         },
       },
       {
         key: "g",
-        label: "Re-plan storyboard (keeps per-shot edits)",
+        label: "Re-plan storyboard (asks first)",
+        // Only opens the question: re-planning replaces work and is a paid call.
         run: () => {
-          api
-            .generatePlan(projectId, { preserveEdits: true })
-            .then(() => setPolling(true))
-            .catch((e) => setError(e.message));
+          if (project?.generated_plan_json && CAN_GENERATE.includes(project.status)) setShowReplan(true);
         },
       },
       {
@@ -177,14 +190,47 @@ function Inner() {
         key: "Escape",
         label: "Close preflight / shortcuts overlay",
         run: () => {
+          if (showReplan) return false; // the dialog closes itself on Escape
           if (showShortcuts) setShowShortcuts(false);
           else if (showPreflight) setShowPreflight(false);
           else return false;  // let the browser handle it
         },
       },
     ],
-    [project, projectId, showPreflight, showShortcuts]
+    [project, projectId, showPreflight, showShortcuts, showReplan]
   );
+
+  const replan = async (preserve: boolean) => {
+    setShowReplan(false);
+    try {
+      await api.generatePlan(projectId, { preserveEdits: preserve });
+      toast.info(
+        preserve
+          ? "Re-planning. Your spoken script, end card, captions and shot edits are kept"
+          : "Re-planning from scratch. The script, captions and every shot are replaced"
+      );
+      setPolling(true);
+    } catch (err: any) {
+      toast.error(err.message || "Re-plan failed");
+    }
+  };
+
+  // The latest video no longer matches the editor: the voice or some clips
+  // would be made new by the next render.
+  const hasClips = !!project?.shots.some((s) => s.clip_path && s.shot_type !== "end_card");
+  const outOfDate =
+    !!renderPlan &&
+    !!project &&
+    CAN_GENERATE.includes(project.status) &&
+    hasClips &&
+    (renderPlan.voiceover_changed || project.shots.some((s) => s.clip_stale));
+  const planRows = new Map<number, RenderPlanShot>((renderPlan?.shots || []).map((s) => [s.id, s]));
+  // Ticked shots a re-roll can't fix (lip-synced, voiceover out of date).
+  const blockedSelected = selected
+    .map((sid) => planRows.get(sid))
+    .filter((r): r is RenderPlanShot => !!r?.needs_new_voiceover)
+    .map((r) => r.shot_order)
+    .sort((a, b) => a - b);
 
   if (error)
     return <div className="p-8 text-accent">{error}</div>;
@@ -243,20 +289,20 @@ function Inner() {
               {preflight.summary === "ok" ? "Preflight ✓" : preflight.summary === "warn" ? "Preflight ⚠" : "Preflight ✕"}
             </button>
           )}
-          {project.status === "planned" || project.status === "failed" ? (
+          {project.generated_plan_json && CAN_GENERATE.includes(project.status) ? (
             <button
-              className="btn-primary"
+              className={project.status === "completed" && !outOfDate ? "btn-ghost" : "btn-primary"}
               onClick={() => setShowPreflight(true)}
-              title="Keyboard: ⌘/Ctrl + Enter"
+              title="Shows what is made new, what is reused and what it costs before anything starts. Keyboard: ⌘/Ctrl + Enter"
             >
-              Generate Video
+              Generate video
             </button>
           ) : null}
           {project.status === "completed" && render && (
             <>
               <button
                 className="btn-ghost"
-                title="Re-run only the FFmpeg compose step using existing clips + audio"
+                title="Puts the video together again from the clips and voiceover that already exist. Free. It does not make a new voiceover or new clips."
                 onClick={async () => {
                   try {
                     await api.recompose(projectId);
@@ -295,7 +341,8 @@ function Inner() {
         </label>
         {project.generated_plan_json && (
           <p className="text-[11px] text-ink-400 -mt-1 mb-2">
-            What you wrote. The planner turns it into the spoken script below; changes here apply when you re-plan.
+            What you wrote. The planner turns it into the spoken script below. Changes here reach the spoken
+            script only when you re-plan and choose to start fresh.
           </p>
         )}
         <textarea
@@ -375,7 +422,47 @@ function Inner() {
       <AudioPanel project={project} onChange={(p) => setProject(p)} />
 
       {project.generated_plan_json && (
-        <StoryboardScript project={project} onChange={(p) => setProject(p)} />
+        <StoryboardScript
+          project={project}
+          onChange={(p) => {
+            setProject(p);
+            refresh(); // the voiceover and lip-sync clips may now be out of date
+          }}
+        />
+      )}
+
+      {outOfDate && renderPlan && (
+        <div className="card p-4 mb-6 border-amber-500/40 bg-amber-500/10">
+          <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm font-medium text-amber-300">
+                {project.status === "completed"
+                  ? "The finished video is out of date"
+                  : "Some clips no longer match their shots"}
+              </div>
+              <p className="text-xs text-amber-200/90 mt-1">
+                You edited the script, the voice or some shots after their voiceover or clips were made.
+                Generate video would do this:
+              </p>
+              <ul className="text-xs text-amber-200/90 mt-1 list-disc pl-5 space-y-0.5">
+                {renderPlanLines(renderPlan).map((l, i) => (
+                  <li key={i}>{l}</li>
+                ))}
+              </ul>
+              {project.status === "completed" && (
+                <p className="text-[11px] text-amber-200/70 mt-2">
+                  Re-compose is free but keeps the old voiceover and the old clips.
+                </p>
+              )}
+            </div>
+            <button
+              className="btn-primary text-xs whitespace-nowrap"
+              onClick={() => setShowPreflight(true)}
+            >
+              Generate video · about {usd(renderPlan.total)}
+            </button>
+          </div>
+        </div>
       )}
 
       <section className="mb-6">
@@ -385,8 +472,21 @@ function Inner() {
             {selected.length > 0 ? (
               <>
                 <span className="text-xs text-ink-300">{selected.length} selected</span>
+                {blockedSelected.length > 0 && (
+                  <span className="text-xs text-amber-300">
+                    {blockedSelected.length === 1 ? "Shot" : "Shots"} {blockedSelected.join(", ")}{" "}
+                    {blockedSelected.length === 1 ? "is" : "are"} lip-synced and the voiceover changed: use
+                    Generate video, or untick {blockedSelected.length === 1 ? "it" : "them"}.
+                  </span>
+                )}
                 <button
-                  className="btn-primary text-xs"
+                  className="btn-primary text-xs disabled:opacity-50"
+                  disabled={blockedSelected.length > 0}
+                  title={
+                    blockedSelected.length > 0
+                      ? "A re-roll would lip-sync these shots to the old voiceover, so you would pay for them twice. Generate video makes the new voiceover and the clips together."
+                      : undefined
+                  }
                   onClick={async () => {
                     const count = selected.length;
                     try {
@@ -421,24 +521,10 @@ function Inner() {
                 </button>
                 <button
                   className="btn-ghost text-xs"
-                  title="Re-plan keeping your per-shot edits (prompt, duration, references). Hold Shift to discard them."
-                  onClick={async (e) => {
-                    // Default: preserve edits. Shift-click = fresh slate.
-                    const preserve = !e.shiftKey;
-                    try {
-                      await api.generatePlan(projectId, { preserveEdits: preserve });
-                      toast.info(
-                        preserve
-                          ? "Re-planning — your per-shot edits will be kept"
-                          : "Re-planning from scratch — per-shot edits cleared"
-                      );
-                      setPolling(true);
-                    } catch (err: any) {
-                      toast.error(err.message || "Re-plan failed");
-                    }
-                  }}
+                  title="Asks what to keep before anything is replaced. One paid planner call."
+                  onClick={() => setShowReplan(true)}
                 >
-                  Re-plan
+                  Re-plan…
                 </button>
               </>
             )}
@@ -459,6 +545,7 @@ function Inner() {
                 index={idx}
                 projectId={projectId}
                 shot={s}
+                planRow={planRows.get(s.id)}
                 castAssets={castAssets}
                 videoModels={videoModels}
                 onChange={refresh}
@@ -517,6 +604,10 @@ function Inner() {
         />
       )}
 
+      {showReplan && (
+        <ReplanDialog project={project} onClose={() => setShowReplan(false)} onChoose={replan} />
+      )}
+
       <RenderHistory projectId={projectId} />
 
       {showShortcuts && (
@@ -538,7 +629,7 @@ function Inner() {
               {[
                 { keys: ["⌘", "Enter"], label: "Generate video (with preflight)" },
                 { keys: ["Ctrl", "Enter"], label: "Generate video (with preflight)" },
-                { keys: ["G"], label: "Re-plan storyboard" },
+                { keys: ["G"], label: "Re-plan storyboard (asks what to keep first)" },
                 { keys: ["R"], label: "Re-compose latest render" },
                 { keys: ["?"], label: "Toggle this overlay" },
                 { keys: ["Esc"], label: "Close overlays" },
@@ -565,6 +656,87 @@ function Inner() {
         </div>
       )}
     </div>
+  );
+}
+
+function ReplanDialog({
+  project,
+  onClose,
+  onChoose,
+}: {
+  project: Project;
+  onClose: () => void;
+  onChoose: (keepEdits: boolean) => void;
+}) {
+  const [cost, setCost] = useState<CostEstimate | null>(null);
+  useEffect(() => {
+    api.costEstimate(project.id).then(setCost).catch(() => setCost(null));
+  }, [project.id]);
+
+  const body = project.shots.filter((s) => s.shot_type !== "end_card");
+  const withClips = body.filter((s) => s.clip_path).length;
+  const planCall = cost?.lines.find((l) => l.item.startsWith("Storyboard plan"));
+  const clipLines = cost?.lines.filter((l) => / clips \(/.test(l.item)) || [];
+  const clipCost = clipLines.reduce((sum, l) => sum + l.cost, 0);
+  const shots = (n: number) => `${n} shot${n === 1 ? "" : "s"}`;
+
+  return (
+    <Dialog title="Re-plan the storyboard?" onClose={onClose}>
+      <p className="text-sm text-ink-200">
+        The planner reads your original script and creative direction again and writes a new storyboard.
+        Either choice is one paid planner call{planCall ? ` (about ${usd(planCall.cost)})` : ""}.
+      </p>
+
+      <div className="rounded-md border border-ink-700 p-3 space-y-2">
+        <div className="text-sm font-medium text-ink-100">Keep my edits</div>
+        <ul className="text-xs text-ink-300 list-disc pl-4 space-y-1">
+          <li>
+            Kept: the spoken script, end-card text and captions, and each shot&apos;s prompt, avoid text,
+            duration, references, caption, model and clip.
+          </li>
+          <li>
+            Replaced: each shot&apos;s type, and the camera direction of shots that have no clip yet. A shot
+            with a clip keeps its camera direction, so its clip stays current and is not paid for again.
+            Shots are matched by position (shot 1 stays shot 1), so new ones are added or the last ones
+            removed if the new plan has a different number.
+          </li>
+          <li>
+            Changes to the original script do not reach the spoken script this way. Edit the spoken script
+            yourself, or start fresh.
+          </li>
+        </ul>
+        <button className="btn-primary text-xs" onClick={() => onChoose(true)}>
+          Re-plan and keep my edits
+        </button>
+      </div>
+
+      <div className="rounded-md border border-red-500/40 p-3 space-y-2">
+        <div className="text-sm font-medium text-ink-100">Start fresh</div>
+        <ul className="text-xs text-ink-300 list-disc pl-4 space-y-1">
+          <li>
+            Replaced: everything. The spoken script, end-card text, captions and all {shots(project.shots.length)}{" "}
+            with their edits are written again from the original script.
+          </li>
+          {withClips > 0 && (
+            <li>
+              The {withClips === 1 ? "1 clip" : `${withClips} clips`} already made {withClips === 1 ? "is" : "are"}{" "}
+              discarded. Making clips for the new storyboard is paid again when you generate the video
+              {clipCost > 0 ? ` (about ${usd(clipCost)} for a storyboard this size)` : ""}.
+            </li>
+          )}
+          <li>Finished videos in the render history stay.</li>
+        </ul>
+        <button className="btn-ghost text-xs" onClick={() => onChoose(false)}>
+          Replace everything
+        </button>
+      </div>
+
+      <div className="flex justify-end">
+        <button className="btn-ghost text-xs" onClick={onClose}>
+          Cancel
+        </button>
+      </div>
+    </Dialog>
   );
 }
 
@@ -608,7 +780,8 @@ function StoryboardScript({
       <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-1 mb-2">
         <h2 className="text-lg font-medium">Voiceover & captions</h2>
         <span className="text-[11px] text-ink-400">
-          What&apos;s actually spoken (TTS) and shown on screen — edits apply on the next render.
+          What is spoken and shown on screen. After saving, use Generate video to hear a changed script: it
+          makes a new voiceover and keeps the clips that still match. Re-compose keeps the old voice.
         </span>
       </div>
       <label className="label" htmlFor="proj-spoken-script">Spoken script</label>
@@ -662,6 +835,7 @@ function ShotRow({
   index,
   projectId,
   shot,
+  planRow,
   castAssets,
   videoModels,
   onChange,
@@ -676,6 +850,7 @@ function ShotRow({
   index: number;
   projectId: number;
   shot: Shot;
+  planRow?: RenderPlanShot;
   castAssets: Asset[];
   videoModels: { id: string; name: string; description: string }[];
   onChange: () => void;
@@ -694,6 +869,11 @@ function ShotRow({
   const [modelOverride, setModelOverride] = useState(shot.model_override || "");
   const [regenBusy, setRegenBusy] = useState(false);
   const toast = useToast();
+  // Lip-synced and the voiceover is out of date: a re-roll would lip-sync to
+  // the old voiceover, so only Generate video can make a clip that matches.
+  const needsNewVoice = !!planRow?.needs_new_voiceover;
+  const voiceFirst =
+    "Off for this shot: the spoken script or voice changed, and a re-roll would lip-sync to the old voiceover, so you would pay for the clip twice. Generate video makes the new voiceover and this clip together.";
 
   const regenerate = async (recompose: boolean) => {
     setRegenBusy(true);
@@ -718,6 +898,7 @@ function ShotRow({
       : [...refs, assetId];
     setRefs(next);
     await api.updateShot(projectId, shot.id, { reference_asset_ids_json: next });
+    onChange(); // the clip may now be out of date
   };
 
   return (
@@ -753,6 +934,26 @@ function ShotRow({
             <span className="text-xs font-medium text-ink-200">Shot {shot.shot_order}</span>
             <span className="chip text-[10px] py-0.5">{shotTypeLabel(shot.shot_type)}</span>
             <StatusBadge status={shot.status} />
+            {shot.clip_stale && (
+              <span
+                className="chip text-[10px] py-0.5 bg-amber-500/10 border-amber-500/40 text-amber-300"
+                title={
+                  (planRow?.reason ? `Why: ${planRow.reason}. ` : "") +
+                  "The clip shown is the old one. " +
+                  (needsNewVoice
+                    ? "Generate video makes the new voiceover and a new clip to match it"
+                    : "Generate video, or Regenerate shot, makes a new clip") +
+                  (planRow && planRow.cost > 0 ? ` (about ${usd(planRow.cost)}).` : ".") +
+                  (needsNewVoice
+                    ? " Regenerate shot is off for this shot: it would use the old voiceover and you would pay for the clip twice."
+                    : "") +
+                  " Re-compose keeps the old clip."
+                }
+              >
+                {shot.provider === "lipsync" ? "Voiceover changed since this clip" : "Edited since this clip"}
+                {planRow && planRow.cost > 0 ? ` · new clip about ${usd(planRow.cost)}` : ""}
+              </span>
+            )}
           </div>
           <div className="flex gap-3">
             {shot.status === "completed" && shot.clip_path && shot.shot_type !== "end_card" && (
@@ -880,16 +1081,24 @@ function ShotRow({
           <button
             className="btn-ghost w-full text-xs disabled:opacity-50"
             onClick={() => regenerate(true)}
-            disabled={regenBusy}
-            title="Regenerate just this shot's clip, then re-stitch the final video using existing audio + other shots."
+            disabled={regenBusy || needsNewVoice}
+            title={
+              needsNewVoice
+                ? voiceFirst
+                : "Regenerate just this shot's clip, then re-stitch the final video using existing audio + other shots."
+            }
           >
             {regenBusy ? "Regenerating…" : "Regenerate shot"}
           </button>
           <button
             className="w-full text-[11px] text-ink-400 hover:text-ink-100 disabled:opacity-50 py-0.5"
             onClick={() => regenerate(false)}
-            disabled={regenBusy}
-            title="Just remake the clip; click Re-compose at the top when you want to update the final video."
+            disabled={regenBusy || needsNewVoice}
+            title={
+              needsNewVoice
+                ? voiceFirst
+                : "Just remake the clip; click Re-compose at the top when you want to update the final video."
+            }
           >
             Regenerate clip only
           </button>
@@ -910,9 +1119,10 @@ function ShotRow({
                     await api.updateShot(projectId, shot.id, { model_override: next });
                     toast.info(
                       next
-                        ? "Model set — applies on the next re-roll of this shot"
-                        : "Model override cleared — back to the default"
+                        ? "Model set. The next render or re-roll makes a new clip for this shot"
+                        : "Model cleared. The next render or re-roll makes a new clip on the default model"
                     );
+                    onChange();
                   } catch (err: any) {
                     toast.error(err.message || "Failed to set model");
                   }
@@ -932,7 +1142,7 @@ function ShotRow({
               </select>
               {modelOverride.startsWith("custom:") && (
                 <div className="text-[10px] text-ink-400 mt-1">
-                  Trained adapter — applied on the next regenerate.
+                  Trained adapter. Used for this shot&apos;s next clip.
                 </div>
               )}
             </div>

@@ -1,6 +1,42 @@
 "use client";
 import { useEffect, useState } from "react";
-import { api, CostEstimate, PreflightCheck, PreflightResult } from "@/lib/api";
+import { api, CostEstimate, PreflightCheck, PreflightResult, RenderPlan } from "@/lib/api";
+
+const usd = (n: number) => `$${n.toFixed(2)}`;
+const count = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+/** Plain sentences for what "Generate video" does and costs right now. */
+export function renderPlanLines(plan: RenderPlan): string[] {
+  const lines: string[] = [];
+  if (plan.voiceover === "new")
+    lines.push(
+      plan.voiceover_changed
+        ? `Voiceover: the spoken script or voice changed, so a new voiceover is made (about ${usd(plan.voiceover_cost)}).`
+        : `Voiceover: a new one is made (about ${usd(plan.voiceover_cost)}).`
+    );
+  else if (plan.voiceover === "reuse") lines.push("Voiceover: unchanged, so it is reused at no charge.");
+  else if (plan.voiceover === "upload") lines.push("Voiceover: your uploaded file, no charge.");
+  else lines.push("Voiceover: none (silent).");
+  if (plan.reuse > 0)
+    lines.push(
+      plan.reuse === 1
+        ? "1 clip still matches its shot and is reused at no charge."
+        : `${plan.reuse} clips still match their shots and are reused at no charge.`
+    );
+  if (plan.in_flight > 0)
+    lines.push(`${count(plan.in_flight, "clip")} already being made: waited for, not paid for again.`);
+  const made = plan.shots.filter((s) => s.action === "generate");
+  for (const reason of Array.from(new Set(made.map((s) => s.reason)))) {
+    const group = made.filter((s) => s.reason === reason);
+    const cost = group.reduce((sum, s) => sum + s.cost, 0);
+    lines.push(
+      `Shot${group.length === 1 ? "" : "s"} ${group.map((s) => s.shot_order).join(", ")}: new ${
+        group.every((s) => s.lipsync) ? "lip-sync " : ""
+      }clip${group.length === 1 ? "" : "s"} (${reason}), about ${usd(cost)}.`
+    );
+  }
+  return lines;
+}
 
 export function PreflightModal({
   projectId,
@@ -13,11 +49,13 @@ export function PreflightModal({
 }) {
   const [result, setResult] = useState<PreflightResult | null>(null);
   const [cost, setCost] = useState<CostEstimate | null>(null);
+  const [plan, setPlan] = useState<RenderPlan | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api.preflight(projectId).then(setResult).catch((e) => setError(e.message));
     api.costEstimate(projectId).then(setCost).catch(() => setCost(null));
+    api.renderPlan(projectId).then(setPlan).catch(() => setPlan(null));
   }, [projectId]);
 
   return (
@@ -49,10 +87,31 @@ export function PreflightModal({
               ))}
             </div>
 
+            {plan && (
+              <div className="mb-4 rounded-md border border-ink-700 bg-ink-800/50 p-3">
+                <div className="text-sm flex items-center justify-between gap-3">
+                  <span className="text-ink-200">What this run makes</span>
+                  <span className="font-semibold text-ink-100">
+                    about {usd(plan.total)} {plan.currency}
+                  </span>
+                </div>
+                <ul className="mt-2 space-y-1 text-xs text-ink-300 list-disc pl-4">
+                  {renderPlanLines(plan).map((l, i) => (
+                    <li key={i}>{l}</li>
+                  ))}
+                </ul>
+                <div className="text-[10px] text-ink-500 pt-2">
+                  Estimate from the rate card. Putting the video together is free.
+                </div>
+              </div>
+            )}
+
             {cost && (
               <details className="mb-4 rounded-md border border-ink-700 bg-ink-800/50 p-3">
                 <summary className="cursor-pointer text-sm flex items-center justify-between">
-                  <span className="text-ink-200">Estimated cost (real providers)</span>
+                  <span className="text-ink-200">
+                    {plan ? "Full price if everything were made new" : "Estimated cost (real providers)"}
+                  </span>
                   <span className="font-semibold text-ink-100">
                     ~${cost.total.toFixed(2)} {cost.currency}
                   </span>

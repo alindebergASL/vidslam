@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
 import { IMAGE_ACCEPT } from "@/components/Dropzone";
+import { askBeforeDiscard } from "@/components/ambient/shared";
 import { api, AmbientScene } from "@/lib/api";
 
 export type PickedImage = { kind: "studio" | "asset"; id: number; url: string; label: string };
@@ -110,10 +111,14 @@ export function ScenePicture({
   const origin = scene.config.picture_origin;
   const has = !!scene.picture_ready;
 
-  const run = async (key: string, fn: () => Promise<AmbientScene>, ok: string) => {
+  // Every picture change needs a new loop: when one is already made, ask
+  // first and say about what it cost (the server refuses without the flag).
+  const run = async (key: string, action: string, fn: (discardLoop: boolean) => Promise<AmbientScene>, ok: string) => {
     setBusy(key);
     try {
-      onChange(await fn());
+      const next = await askBeforeDiscard(scene, true, action, fn);
+      if (!next) return;
+      onChange(next);
       toast.success(ok);
     } catch (e: any) {
       toast.error(e.message || "Picture update failed");
@@ -150,7 +155,9 @@ export function ScenePicture({
               : "Made from the scene prompt when you generate the loop. Or start from a picture of your own."}
           </p>
           {has && scene.loop_status === "pending" && (
-            <p className="text-[11px] text-amber-300 mt-1">Generate the loop to build it from this picture.</p>
+            <p className="text-[11px] text-amber-300 mt-1">
+              No video has been made from this picture yet. If it looks right, make the loop below.
+            </p>
           )}
           <div className="flex flex-wrap gap-2 mt-3">
             <button type="button" className="btn-ghost text-xs" disabled={lock} onClick={() => fileRef.current?.click()}>
@@ -164,7 +171,9 @@ export function ScenePicture({
               className="btn-ghost text-xs"
               disabled={lock}
               title="One image call: preview the scene before paying for any video"
-              onClick={() => run("gen", () => api.generateAmbientPicture(scene.id), "Picture generated")}
+              onClick={() =>
+                run("gen", "Generating a new picture", (d) => api.generateAmbientPicture(scene.id, d), "Picture generated")
+              }
             >
               {busy === "gen" ? "Generating…" : origin === "generated" ? "Regenerate preview" : "Generate preview"}
             </button>
@@ -173,7 +182,9 @@ export function ScenePicture({
                 type="button"
                 className="text-xs text-ink-400 hover:text-ink-100 px-2"
                 disabled={lock}
-                onClick={() => run("clear", () => api.clearAmbientPicture(scene.id), "Picture removed")}
+                onClick={() =>
+                  run("clear", "Removing the picture", (d) => api.clearAmbientPicture(scene.id, d), "Picture removed")
+                }
               >
                 Remove
               </button>
@@ -188,7 +199,8 @@ export function ScenePicture({
             onChange={(e) => {
               const f = e.target.files?.[0];
               e.target.value = "";
-              if (f) run("upload", () => api.uploadAmbientPicture(scene.id, f), "Picture uploaded");
+              if (f)
+                run("upload", "Uploading a new picture", (d) => api.uploadAmbientPicture(scene.id, f, d), "Picture uploaded");
             }}
           />
         </div>
@@ -200,8 +212,9 @@ export function ScenePicture({
             setPicking(false);
             run(
               "pick",
-              () =>
-                api.ambientPictureFrom(scene.id, p.kind === "studio" ? { studio_job_id: p.id } : { asset_id: p.id }),
+              "Choosing another picture",
+              (d) =>
+                api.ambientPictureFrom(scene.id, p.kind === "studio" ? { studio_job_id: p.id } : { asset_id: p.id }, d),
               "Picture set"
             );
           }}

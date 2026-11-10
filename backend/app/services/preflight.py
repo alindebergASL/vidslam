@@ -236,11 +236,21 @@ def _check_models(db: Session, project: models.VideoProject) -> CheckResult:
 
 def _check_voice(db: Session, project: models.VideoProject) -> CheckResult:
     """ElevenLabs needs a voice: the avatar's, or ELEVENLABS_DEFAULT_VOICE_ID.
-    Without one the TTS call fails and the video renders without a voiceover."""
+    Without one the TTS call fails, and the render stops there (before any
+    clip is paid for) — so this blocks rather than warns."""
+    from . import fingerprints
     from . import model_registry as reg
 
     s = get_settings()
     source = (project.voiceover_source or "tts").lower()
+    if (project.generated_plan_json and source != "silent"
+            and fingerprints.voice_source(project) == "silent"):
+        # Nothing to say: the render goes ahead without a voice, so no voice
+        # is needed. Said here so it is not a surprise in the finished video.
+        return CheckResult(id="voice_selected", label="Voice", status="warn",
+                           message="The spoken script is empty, so the video is made without a voice. "
+                                   "No voiceover is paid for.",
+                           detail="Write the spoken script in Voiceover & captions if you want a voice.")
     if source != "tts" or s.mock_providers or reg.provider_for("tts") != "elevenlabs":
         return CheckResult(id="voice_selected", label="Voice", status="ok",
                            message="Voiceover source doesn't need an ElevenLabs voice.")
@@ -249,10 +259,12 @@ def _check_voice(db: Session, project: models.VideoProject) -> CheckResult:
         return CheckResult(id="voice_selected", label="Voice", status="ok",
                            message="An ElevenLabs voice is set.")
     return CheckResult(
-        id="voice_selected", label="Voice", status="warn",
-        message="No ElevenLabs voice is set: the video will have no voiceover.",
-        detail="Give the avatar a voice, set ELEVENLABS_DEFAULT_VOICE_ID, or pick an "
-               "OpenRouter voice model in Settings → Models.",
+        id="voice_selected", label="Voice", status="fail",
+        message="No ElevenLabs voice is set, so the voiceover can't be made. "
+                "The render would stop before any clip is generated.",
+        detail="Give the avatar a voice, set ELEVENLABS_DEFAULT_VOICE_ID, pick an "
+               "OpenRouter voice model in Settings → Models, or set the voiceover "
+               "to an uploaded file or to silent in Audio.",
     )
 
 

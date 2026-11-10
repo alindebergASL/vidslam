@@ -10,7 +10,10 @@ import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { ScenePicture } from "@/components/ambient/ScenePicture";
 import {
+  aboutUsd,
+  askBeforeDiscard,
   ChipRow,
+  loopAtStakeText,
   LookControls,
   ModelControls,
   PhotoRewriteControl,
@@ -92,7 +95,11 @@ function Inner() {
   const run = async (key: string, fn: () => Promise<unknown>, okMsg?: string) => {
     setBusy(key);
     try {
-      await fn();
+      // null: the user said no to a confirmation, so nothing happened.
+      const done = await fn();
+      // Nothing changed, so nothing to reload: a reload would hand the
+      // settings form a new scene object and wipe its unsaved edits.
+      if (done === null) return;
       if (okMsg) toast.success(okMsg);
       // A regenerated bed keeps the same URL and "ready" flag, so reload()
       // sees no change: bump the version or the player keeps the old audio.
@@ -133,6 +140,28 @@ function Inner() {
   const render = scene.latest_render;
   const rendered = render?.status === "completed";
   const plan = scene.plan;
+  const resume = !inFlight ? scene.resume ?? null : null;
+  const loopCost = aboutUsd(scene.generate_cost);
+  // The picture is there and no video has been made from it: the step where
+  // the creator checks it before paying for the loop.
+  const checkPicture =
+    !loopReady && !inFlight && !resume && !!scene.picture_ready && scene.config.source === "video" &&
+    plan.picture_usable !== false;
+  // Generate loop starts from nothing: say what that replaces and what it buys.
+  const startLoop = () => {
+    if (
+      scene.loop_at_stake &&
+      !window.confirm(
+        `${loopReady ? "Regenerating" : "Starting over"} discards ${loopAtStakeText(scene)} and buys a new loop for ${loopCost}. Continue?`
+      )
+    ) {
+      return Promise.resolve(null);
+    }
+    // Regenerating the clip keeps an existing music bed; a first
+    // generation (or a missing bed) produces one too.
+    return api.generateAmbientLoop(id, !scene.music_ready);
+  };
+  const startMsg = loopReady ? "Regenerating the loop clip" : "Generating loop and music";
   const moodLabel =
     scene.config.music_mood === "none"
       ? "No music"
@@ -315,17 +344,11 @@ function Inner() {
                   type="button"
                   className="btn-ghost text-sm"
                   disabled={inFlight || busy !== null}
-                  onClick={() =>
-                    run(
-                      "loop",
-                      // Regenerating the clip keeps an existing music bed; a
-                      // first generation (or a missing bed) produces one too.
-                      () => api.generateAmbientLoop(id, !scene.music_ready),
-                      loopReady ? "Regenerating the loop clip" : "Generating loop and music"
-                    )
-                  }
+                  title={`Buys the whole loop: ${loopCost}`}
+                  onClick={() => run("loop", startLoop, startMsg)}
                 >
-                  {loopReady ? "Regenerate loop" : "Generate loop"}
+                  {loopReady ? "Regenerate loop" : resume ? "Start over" : "Generate loop"}
+                  <span className="text-ink-400"> · {scene.generate_cost ? loopCost : "free"}</span>
                 </button>
               </div>
             </div>
@@ -362,8 +385,63 @@ function Inner() {
               <div className="relative">
                 <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={previewSrc(preset)} className="aspect-video" />
                 <div className="absolute inset-x-0 bottom-0 p-4 bg-linear-to-t from-ink-950/90 to-transparent text-sm">
-                  {scene.loop_status === "failed" ? (
+                  {resume ? (
+                    <div className="space-y-2">
+                      <div className="text-red-300">
+                        {resume.clip > resume.clips
+                          ? "Every clip was made, but finishing the loop failed"
+                          : `Clip ${resume.clip} of ${resume.clips}${
+                              resume.takes > 1 ? ` in take ${resume.take} of ${resume.takes}` : ""
+                            } failed`}
+                        : {resume.error || scene.loop_error || "unknown error"}
+                      </div>
+                      <div className="text-ink-200">
+                        {keptText(resume)} Resuming makes only what is missing, for {aboutUsd(resume.cost)}. Starting
+                        over buys the whole loop again, for {loopCost}.
+                        {resume.model
+                          ? ` Resuming keeps the video model the finished clips were made with (${resume.model})${
+                              resume.model_changed
+                                ? "; the model set now is different and is only used if you start over."
+                                : "."
+                            }`
+                          : ""}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          className="btn-primary text-sm disabled:opacity-50"
+                          disabled={busy !== null}
+                          onClick={() => run("resume", () => api.resumeAmbientLoop(id), "Resuming the loop")}
+                        >
+                          {resume.clip > resume.clips ? "Finish the loop" : `Resume from clip ${resume.clip}`}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost text-sm"
+                          disabled={busy !== null}
+                          onClick={() => run("loop", startLoop, startMsg)}
+                        >
+                          Start over
+                        </button>
+                      </div>
+                    </div>
+                  ) : scene.loop_status === "failed" ? (
                     <span className="text-red-300">Loop failed: {scene.loop_error || "unknown error"}</span>
+                  ) : checkPicture ? (
+                    <div className="space-y-2">
+                      <div className="text-ink-200">
+                        Check the picture above: the video is built from it. Making the loop costs {loopCost}. Not
+                        right? Regenerate or replace the picture first.
+                      </div>
+                      <button
+                        type="button"
+                        className="btn-primary text-sm disabled:opacity-50"
+                        disabled={busy !== null}
+                        onClick={() => run("loop", startLoop, startMsg)}
+                      >
+                        Looks right, make the loop
+                      </button>
+                    </div>
                   ) : (
                     <span className="text-ink-200">No loop yet — generate one to preview it here.</span>
                   )}
@@ -507,8 +585,15 @@ function Inner() {
             scene={scene}
             presets={presets}
             disabled={inFlight}
-            onSave={(cfg, aspect) =>
-              run("settings", () => api.updateAmbient(id, { config: cfg, aspect_ratio: aspect }), "Settings saved")
+            onSave={(cfg, aspect, needsNewLoop) =>
+              run(
+                "settings",
+                () =>
+                  askBeforeDiscard(scene, needsNewLoop, "Saving these settings", (discard) =>
+                    api.updateAmbient(id, { config: cfg, aspect_ratio: aspect }, discard)
+                  ),
+                "Settings saved"
+              )
             }
           />
         </aside>
@@ -530,6 +615,19 @@ function renderSummary(log: string | undefined, fallback: string): string {
   if (kv.seam) parts.push(kv.seam === "closed" ? "seamless loop" : "crossfaded loop");
   if (kv.clips && Number(kv.clips) > 1) parts.push(`${kv.clips} clips`);
   return parts.join(" · ");
+}
+
+/** "Clips 1 to 2 and take 1 are kept." */
+function keptText(r: NonNullable<AmbientScene["resume"]>): string {
+  const parts: string[] = [];
+  if (r.take > 1) parts.push(r.take === 2 ? "take 1" : `takes 1 to ${r.take - 1}`);
+  if (r.kept_clips > 0) {
+    const clips = r.kept_clips === 1 ? "clip 1" : `clips 1 to ${r.kept_clips}`;
+    parts.push(r.takes > 1 ? `${clips} of take ${r.take}` : clips);
+  }
+  if (!parts.length) return "No clip was finished yet.";
+  const joined = parts.join(" and ");
+  return `${joined[0].toUpperCase()}${joined.slice(1)} ${parts.length > 1 || r.kept_clips > 1 || r.take > 2 ? "are" : "is"} kept.`;
 }
 
 function Step({
@@ -642,16 +740,19 @@ function SettingsPanel({
   scene: AmbientScene;
   presets: AmbientPresets | null;
   disabled: boolean;
-  onSave: (cfg: AmbientConfig, aspect: string) => void;
+  onSave: (cfg: AmbientConfig, aspect: string, needsNewLoop: boolean) => void;
 }) {
   const [cfg, setCfg] = useState<AmbientConfig>(scene.config);
   const [aspect, setAspect] = useState(scene.aspect_ratio);
   const [imageModels, setImageModels] = useState<ModelOption[]>([]);
   const [videoModels, setVideoModels] = useState<ModelOption[]>([]);
+  // Reset the form only when the saved settings really changed: every
+  // reload (polling, a cancelled confirmation) brings a new, equal object.
+  const savedConfig = JSON.stringify(scene.config);
   useEffect(() => {
-    setCfg(scene.config);
+    setCfg(JSON.parse(savedConfig));
     setAspect(scene.aspect_ratio);
-  }, [scene.config, scene.aspect_ratio]);
+  }, [savedConfig, scene.aspect_ratio]);
   useEffect(() => {
     const pick = (m: { id: string; name: string }[]) => m.map((x) => ({ id: x.id, name: x.name }));
     api.imageModels().then((m) => setImageModels(pick(m))).catch(() => setImageModels([]));
@@ -663,6 +764,8 @@ function SettingsPanel({
   const dirty = JSON.stringify(cfg) !== JSON.stringify(scene.config) || aspect !== scene.aspect_ratio;
   // Changes that force a new loop clip (mirrors services.ambient.update_scene).
   const invalidates =
+    // The clip was made for the old shape.
+    aspect !== scene.aspect_ratio ||
     cfg.scene_prompt !== scene.config.scene_prompt ||
     cfg.scene_preset !== scene.config.scene_preset ||
     // The rewrite changes the prompt only when one applies before or after.
@@ -685,8 +788,12 @@ function SettingsPanel({
       <div className="flex items-baseline justify-between">
         <h2 className="text-base font-medium">Settings</h2>
         {dirty && (
-          <span className="text-[11px] text-ink-400">
-            {invalidates ? "needs a new loop" : "re-render to apply"}
+          <span className={clsx("text-[11px] text-right", invalidates && scene.loop_at_stake ? "text-amber-300" : "text-ink-400")}>
+            {!invalidates
+              ? "re-render to apply"
+              : scene.loop_at_stake
+              ? `saving discards ${loopAtStakeText(scene)}`
+              : "needs a new loop"}
           </span>
         )}
       </div>
@@ -811,20 +918,19 @@ function SettingsPanel({
         />
       </div>
 
-      <div>
-        <div className="label">Aspect</div>
-        <ChipRow
-          label="Aspect ratio"
-          options={presets?.aspect_options ?? ["16:9", "9:16", "1:1"]}
-          value={aspect}
-          onChange={setAspect}
-          className="text-xs"
-        />
-      </div>
-
       <details className="text-xs">
         <summary className="cursor-pointer text-ink-200">Scene &amp; loop (needs a new clip)</summary>
         <div className="mt-3 space-y-3">
+          <div>
+            <div className="label">Aspect</div>
+            <ChipRow
+              label="Aspect ratio"
+              options={presets?.aspect_options ?? ["16:9", "9:16", "1:1"]}
+              value={aspect}
+              onChange={setAspect}
+              className="text-xs"
+            />
+          </div>
           <div>
             <div className="label">Preset</div>
             <select
@@ -929,7 +1035,7 @@ function SettingsPanel({
         type="button"
         className="btn-primary w-full disabled:opacity-50"
         disabled={!dirty || disabled}
-        onClick={() => onSave(cfg, aspect)}
+        onClick={() => onSave(cfg, aspect, invalidates)}
       >
         Save settings
       </button>

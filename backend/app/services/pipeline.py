@@ -20,7 +20,7 @@ from ..providers import (
 )
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
-from . import alerts, render_files, storage
+from . import alerts, fingerprints, render_files, storage
 from .captions import chunks_to_timed
 from .model_registry import active_model as _active_model
 from .prompting import effective_negative
@@ -239,14 +239,23 @@ def generate_plan(
         )
         raise
 
-    project.generated_plan_json = plan.model_dump()
+    new_plan = plan.model_dump()
+    old_plan = project.generated_plan_json or {}
+    if preserve_edits and old_plan:
+        # "Keep my edits" keeps what the Voiceover & captions card edits:
+        # the spoken script, the end-card text and the captions.
+        for key in ("cleaned_voice_script", "end_card_text", "caption_chunks"):
+            if key in old_plan:
+                new_plan[key] = old_plan[key]
+    project.generated_plan_json = new_plan
     project.status = "planned"
 
     # Reconcile shots against the new plan.
     #
     # When `preserve_edits` is set we keep user-editable fields (prompt,
-    # duration, references, caption) on shots that match an existing order,
-    # only refreshing fields the planner is authoritative for. New plan
+    # avoid text, duration, references, caption, model) on shots that match
+    # an existing order (position in the storyboard as it is now), only
+    # refreshing fields the planner is authoritative for. New plan
     # entries get added; existing shots whose order isn't in the new plan
     # get dropped. This lets a creator iterate on the script and re-plan
     # without losing the per-shot tweaks they've already made.
@@ -261,12 +270,16 @@ def generate_plan(
             if s.order in existing:
                 shot = existing[s.order]
                 # Planner-authoritative fields refresh; user-editable fields
-                # (prompt, duration_seconds, reference_asset_ids_json,
-                # caption_text) stay untouched.
+                # (prompt, negative_prompt, duration_seconds,
+                # reference_asset_ids_json, caption_text) stay untouched.
                 shot.shot_type = s.shot_type
-                shot.negative_prompt = s.negative_prompt
-                shot.reference_strategy = s.reference_strategy
-                shot.camera_direction = s.camera_direction
+                # Camera direction and reference strategy are part of what a
+                # clip was made from: on a shot that has a clip (or one being
+                # made) they stay, or "keep my edits" would mark the clip out
+                # of date and the next render would buy it again.
+                if not (shot.clip_path or shot.status in ("submitted", "running", "completed")):
+                    shot.reference_strategy = s.reference_strategy
+                    shot.camera_direction = s.camera_direction
             else:
                 db.add(
                     models.VideoShot(
@@ -351,9 +364,16 @@ def submit_shot_clip(
     shot.status = "submitted"
     shot.error = note
     shot.clip_path = ""
+    shot.clip_fingerprint = ""
     shot.provider = provider_label("video", model)
     shot.provider_model = model
     db.commit()
+    # What this clip is made from, kept with the job: the shot may be edited
+    # again before the clip lands. Storyboard shots only (the ambient chain
+    # passes its own references and never reuses by fingerprint).
+    fingerprint = ""
+    if purpose == "shot" and references is None:
+        fingerprint = fingerprints.video_fingerprint(project, shot)
 
     # Storyboard shots: the shot's own avoid text plus the Settings video
     # defaults. Ambient keeps its own list (it is slow on purpose, and the
@@ -381,7 +401,8 @@ def submit_shot_clip(
     try:
         job = video_jobs.submit(
             db, purpose=purpose, ref_id=shot.id, project_id=project.id, render_id=render_id,
-            context={"after": after, **({"note": note} if note else {}), **(context or {})}, start=start,
+            context={"after": after, **({"note": note} if note else {}),
+                     **({"fingerprint": fingerprint} if fingerprint else {}), **(context or {})}, start=start,
             webhooks=uses_webhooks(model),
         )
     except Exception as e:  # noqa: BLE001 — submit itself failed
@@ -400,6 +421,7 @@ def submit_shot_clip(
 
 
 def on_shot_clip_ready(db: Session, job: models.VideoJob) -> None:
+    db.refresh(job)  # a resumed render may have taken the job over meanwhile
     shot = db.get(models.VideoShot, job.ref_id)
     if shot is None:
         return
@@ -413,15 +435,65 @@ def on_shot_clip_ready(db: Session, job: models.VideoJob) -> None:
         path.unlink(missing_ok=True)
         path = trimmed
     shot.clip_path = str(path)
+    shot.clip_fingerprint = (job.context_json or {}).get("fingerprint", "")
     shot.status = "completed"
     shot.error = (job.context_json or {}).get("note", "")
     db.commit()
+    if _remake_outdated(db, job, shot):
+        return
     _after_shot(db, job)
 
 
+def _remake_outdated(db: Session, job: models.VideoJob, shot: models.VideoShot) -> bool:
+    """A clip that was still being made when its shot (or, for lip-sync, the
+    voiceover) was edited lands out of date. A render waiting on it must not
+    be put together with it: make the shot again for that render instead.
+    True when a new clip was submitted."""
+    if (job.context_json or {}).get("after", "compose") != "compose" or not job.render_id:
+        return False
+    render = db.get(models.Render, job.render_id)
+    if render is None or render.status != "generating_shots" or not fingerprints.shot_is_stale(shot):
+        return False
+    project = db.get(models.VideoProject, render.project_id)
+    if project is None:
+        return False
+    log.info("shot %s: the clip that just landed was made from older settings; making it again", shot.id)
+    try:
+        note = ""
+        if shot.shot_type == "talking_head":
+            ok = submit_talking_head(
+                db, project, shot, plan=StoryboardPlan.model_validate(project.generated_plan_json),
+                audio_path=render.audio_path,
+                start=_shot_start(project, shot), render_id=render.id,
+                voice_fingerprint=render.voice_fingerprint,
+            )
+            if ok is True:
+                return True
+            note = ok or ""
+            shot = db.get(models.VideoShot, shot.id)
+        submit_shot_clip(db, project, shot, render_id=render.id, after="compose", note=note)
+        return True
+    except Exception as e:  # noqa: BLE001 — the render fails with the reason
+        log.exception("remaking outdated shot %s failed", shot.id)
+        shot = db.get(models.VideoShot, shot.id)
+        shot.status = "failed"
+        shot.error = f"could not remake the edited shot: {str(e)[:300]}"
+        db.commit()
+        return False
+
+
 def on_shot_clip_failed(db: Session, job: models.VideoJob) -> None:
+    db.refresh(job)  # a resumed render may have taken the job over meanwhile
     shot = db.get(models.VideoShot, job.ref_id)
     if shot is None:
+        return
+    newer = (db.query(models.VideoJob.id)
+             .filter(models.VideoJob.ref_id == job.ref_id, models.VideoJob.id > job.id,
+                     models.VideoJob.purpose.in_(("shot", "avatar")),
+                     models.VideoJob.status != "failed").first())
+    if newer is not None:
+        # The shot was made again since (an old job that was stuck and is
+        # failed late by the sweeper): its newer clip stands.
         return
     project = db.get(models.VideoProject, job.project_id)
     if job.purpose == "avatar" and project is not None:
@@ -453,6 +525,15 @@ def _after_shot(db: Session, job: models.VideoJob) -> None:
         maybe_compose(db, job.render_id)
     elif after == "recompose" and job.project_id:
         maybe_recompose(db, job.project_id)
+    if job.project_id:
+        # A render that is waiting on this shot without owning its job (it
+        # was resumed while the clip was still being made) composes too.
+        waiting = [rid for (rid,) in db.query(models.Render.id).filter(
+            models.Render.project_id == job.project_id,
+            models.Render.status == "generating_shots",
+            models.Render.id != (job.render_id or 0))]
+        for rid in waiting:
+            maybe_compose(db, rid)
 
 
 def _body_shots(project: models.VideoProject) -> list[models.VideoShot]:
@@ -546,7 +627,7 @@ def _shot_start(project: models.VideoProject, shot: models.VideoShot) -> float:
 def submit_talking_head(
     db: Session, project: models.VideoProject, shot: models.VideoShot,
     *, plan: StoryboardPlan, audio_path: str, start: float, render_id: Optional[int],
-    after: str = "compose",
+    after: str = "compose", voice_fingerprint: str = "",
 ) -> bool | str:
     """Submit a lip-synced talking-head job (portrait + this shot's slice of
     the voiceover) when a lip-sync model is active. Returns True when
@@ -588,7 +669,13 @@ def submit_talking_head(
     shot.provider_model = getattr(avatar, "model", "")
     shot.error = ""
     shot.clip_path = ""
+    shot.clip_fingerprint = ""
     db.commit()
+    # The clip follows this voiceover: a new voiceover (or a new place in
+    # the video) makes it out of date. `voice_fingerprint` is the
+    # fingerprint of the audio in `audio_path` ("" when unknown).
+    fingerprint = fingerprints.lipsync_fingerprint(
+        project, shot, voice=voice_fingerprint if audio_url else "", start=start, portrait_id=portrait.id)
 
     def start_fn(callback: Optional[str]):
         return avatar.submit_avatar(
@@ -599,7 +686,8 @@ def submit_talking_head(
 
     try:
         video_jobs.submit(db, purpose="avatar", ref_id=shot.id, project_id=project.id, render_id=render_id,
-                          context={"after": after, "duration": dur, "speech_seconds": round(speech, 2)},
+                          context={"after": after, "duration": dur, "speech_seconds": round(speech, 2),
+                                   **({"fingerprint": fingerprint} if fingerprint else {})},
                           start=start_fn)
     except Exception as e:  # noqa: BLE001 — submit failed: use the video model
         log.warning("talking-head submit failed for shot %s, falling back: %s", shot.id, e)
@@ -616,7 +704,10 @@ def generate_audio(
 
       - "upload": return the user-uploaded file from `voiceover_upload_path`.
       - "silent": return None (renderer will skip the voice track).
-      - "tts" (default): call the TTS provider.
+      - "tts" (default): call the TTS provider. An empty spoken script is
+        the same as silent (providers reject empty text). A failure raises
+        VoiceoverFailed: the caller must not go on to pay for clips that
+        would end up in a video with no voice.
     """
     source = (project.voiceover_source or "tts").lower()
     if source == "upload":
@@ -628,7 +719,7 @@ def generate_audio(
             project.id,
         )
         source = "tts"
-    if source == "silent":
+    if source == "silent" or not (plan.cleaned_voice_script or "").strip():
         return None
 
     tts = get_tts()
@@ -662,7 +753,169 @@ def generate_audio(
             response_summary={"error": str(e)[:500]},
             status="error",
         )
-        return None
+        raise VoiceoverFailed(
+            "Voiceover failed, so no clips were made and nothing was spent on video. "
+            f"The voice provider said: {str(e)[:400] or type(e).__name__}. "
+            "Retry, or set the voiceover to an uploaded file or to silent in Audio."
+        ) from e
+
+
+class VoiceoverFailed(RuntimeError):
+    """The voiceover could not be synthesized."""
+
+
+def _latest_audio_render(db: Session, project_id: int) -> Optional[models.Render]:
+    """The newest render that has a voiceover, if its file is still on disk."""
+    for r in (db.query(models.Render)
+              .filter(models.Render.project_id == project_id, models.Render.audio_path != "")
+              .order_by(models.Render.id.desc()).limit(5)):
+        if Path(r.audio_path).is_file():
+            return r
+    return None
+
+
+def _reusable_voiceover(db: Session, project: models.VideoProject, fingerprint: str) -> Optional[str]:
+    """The voiceover already on disk, when it was made from exactly the
+    current spoken script, voice and voice model. Only the newest one is
+    looked at: each synthesis replaces the project's voice file."""
+    latest = _latest_audio_render(db, project.id)
+    if latest is not None and fingerprint and latest.voice_fingerprint == fingerprint:
+        return latest.audio_path
+    return None
+
+
+def adopt_unfingerprinted_voiceover(db: Session, project: models.VideoProject) -> bool:
+    """Retry on a project last rendered before voiceover fingerprints
+    existed: its voice file has an unknown ("") fingerprint, which would
+    never match and be bought again. Like a clip without a fingerprint, it
+    counts as current: stamp it with the current fingerprint so the retry
+    reuses it (and lip-synced clips cut from it stay in step). Returns
+    True when a voiceover was adopted."""
+    if fingerprints.voice_source(project) != "tts":
+        return False
+    latest = _latest_audio_render(db, project.id)
+    if latest is None or latest.voice_fingerprint:
+        return False
+    if project.voiceover_upload_path and Path(latest.audio_path) == Path(project.voiceover_upload_path):
+        return False  # that render used the uploaded file, not a synthesized voice
+    latest.voice_fingerprint = fingerprints.voice_fingerprint(db, project)
+    db.commit()
+    return True
+
+
+def _voiceover_changed(db: Session, project: models.VideoProject) -> bool:
+    """The newest voiceover on disk no longer matches the spoken script,
+    voice or voice model: the next render makes a new one."""
+    latest = _latest_audio_render(db, project.id)
+    return bool(
+        fingerprints.voice_source(project) != "silent" and latest is not None
+        and latest.voice_fingerprint
+        and latest.voice_fingerprint != fingerprints.voice_fingerprint(db, project))
+
+
+def _lipsync_available(db: Session, project: models.VideoProject) -> bool:
+    from ..providers import get_avatar
+
+    return (fingerprints.voice_source(project) != "silent" and get_avatar() is not None
+            and _hero_portrait(db, project) is not None)
+
+
+def regen_needs_new_voiceover(db: Session, project: models.VideoProject,
+                              shots: list[models.VideoShot]) -> list[models.VideoShot]:
+    """The shots a single re-roll cannot fix: lip-synced shots while the
+    voiceover is out of date. A re-roll lip-syncs to the voiceover on disk
+    (the old one), so the paid clip would still be out of date and the next
+    render would buy it again. Only Generate video makes the new voiceover."""
+    talking = [s for s in shots if s.shot_type == "talking_head"]
+    if not talking or not _voiceover_changed(db, project) or not _lipsync_available(db, project):
+        return []
+    return talking
+
+
+def _active_job_for(db: Session, shot_id: int) -> Optional[models.VideoJob]:
+    """A clip for this shot that is still being made and can still finish.
+    A job whose download was interrupted (stuck in "completing") does not
+    count: adopting it would leave the render waiting with no end."""
+    from . import video_jobs
+
+    return (db.query(models.VideoJob)
+            .filter(models.VideoJob.ref_id == shot_id,
+                    models.VideoJob.purpose.in_(("shot", "avatar")),
+                    video_jobs.still_in_progress())
+            .order_by(models.VideoJob.id.desc()).first())
+
+
+def _video_rate(shot: models.VideoShot) -> float:
+    """Rate-card price per second of a clip on the shot's video model."""
+    from ..providers import runware, sogni
+
+    model = (shot.model_override or _active_model("video") or "").strip()
+    if model.startswith(sogni.PREFIX):
+        return sogni.video_spend_rate_usd(model)
+    if model.startswith(runware.PREFIX):
+        return runware.video_rate_usd(model)
+    return get_settings().cost_video_per_second
+
+
+def render_plan(db: Session, project: models.VideoProject) -> dict:
+    """What "Generate video" would do right now, before anything is paid
+    for: whether a voiceover is made or reused, and which clips are reused,
+    still being made, or made new (and why), with a rate-card price."""
+    rates = get_settings()
+    source = fingerprints.voice_source(project)
+    voice_fp = fingerprints.voice_fingerprint(db, project)
+    script = str((project.generated_plan_json or {}).get("cleaned_voice_script") or "")
+    if source == "silent":
+        voiceover, voice_cost = "silent", 0.0
+    elif source == "upload":
+        voiceover, voice_cost = "upload", 0.0
+    elif _reusable_voiceover(db, project, voice_fp):
+        voiceover, voice_cost = "reuse", 0.0
+    else:
+        voiceover, voice_cost = "new", len(script) / 1000.0 * rates.cost_tts_per_1k_chars
+    # The finished video's voice no longer matches the spoken script / voice.
+    voiceover_changed = _voiceover_changed(db, project)
+    lipsync_on = _lipsync_available(db, project)
+
+    shots: list[dict] = []
+    clip_cost = 0.0
+    for shot in _body_shots(project):
+        has_clip = shot.status == "completed" and bool(shot.clip_path) and Path(shot.clip_path).exists()
+        if _active_job_for(db, shot.id) is not None:
+            action, reason = "in_flight", "already being made; it is kept and not paid for again"
+        elif has_clip and not fingerprints.shot_is_stale(shot):
+            action, reason = "reuse", ""
+        elif has_clip and shot.provider == "lipsync" and voiceover_changed:
+            action, reason = "generate", "lip-sync follows the voiceover, which changed"
+        elif has_clip:
+            action = "generate"
+            reason = ("its place or length in the voiceover changed" if shot.provider == "lipsync"
+                      else "edited since this clip was made")
+        else:
+            action, reason = "generate", "no clip yet"
+        cost = 0.0
+        lipsync = shot.shot_type == "talking_head" and lipsync_on
+        if action == "generate":
+            seconds = float(shot.duration_seconds or 5.0)
+            cost = seconds * (rates.cost_avatar_per_second if lipsync else _video_rate(shot))
+            clip_cost += cost
+        shots.append({"id": shot.id, "shot_order": shot.shot_order, "action": action, "reason": reason,
+                      "lipsync": lipsync, "cost": round(cost, 4),
+                      # A single re-roll would lip-sync to the old voiceover.
+                      "needs_new_voiceover": lipsync and voiceover_changed})
+    return {
+        "voiceover": voiceover,
+        "voiceover_changed": voiceover_changed,
+        "voiceover_cost": round(voice_cost, 4),
+        "shots": shots,
+        "reuse": sum(1 for s in shots if s["action"] == "reuse"),
+        "in_flight": sum(1 for s in shots if s["action"] == "in_flight"),
+        "generate": sum(1 for s in shots if s["action"] == "generate"),
+        "clip_cost": round(clip_cost, 4),
+        "total": round(clip_cost + voice_cost, 4),
+        "currency": "USD",
+        "is_estimate": True,
+    }
 
 
 def _music_path_if_any(project: models.VideoProject) -> Optional[Path]:
@@ -778,10 +1031,18 @@ def render_project(db: Session, project_id: int) -> models.Render:
 
     try:
         _check_cancel(db, render)
-        # 1. audio
-        audio_path = generate_audio(db, project, plan=plan)
+        # 1. audio. An unchanged voiceover is reused (not paid for again,
+        #    and lip-synced clips cut from it stay in step); a failed
+        #    synthesis stops here, before any clip is submitted.
+        voice_fp = fingerprints.voice_fingerprint(db, project)
+        audio_path = None
+        if fingerprints.voice_source(project) == "tts":
+            audio_path = _reusable_voiceover(db, project, voice_fp)
+        if audio_path is None:
+            audio_path = generate_audio(db, project, plan=plan)
         if audio_path:
             render.audio_path = str(audio_path)
+            render.voice_fingerprint = voice_fp
         render.status = "generating_shots"
         db.commit()
         _check_cancel(db, render)
@@ -790,6 +1051,14 @@ def render_project(db: Session, project_id: int) -> models.Render:
         #    provider); end cards are drawn by compose. Completion arrives by
         #    webhook / sweeper and maybe_compose() runs compose exactly once.
         project = db.get(models.VideoProject, project.id)  # refresh
+        # Shots whose clip no longer matches them wait for a new one: mark
+        # them first, so a clip that lands while the rest are still being
+        # submitted can't compose the video with their old clips.
+        for shot in _body_shots(project):
+            if shot.status == "completed" and fingerprints.shot_is_stale(shot) \
+                    and _active_job_for(db, shot.id) is None:
+                shot.status = "pending"
+        db.commit()
         body = 0
         for shot in project.shots:
             _check_cancel(db, render)
@@ -798,13 +1067,23 @@ def render_project(db: Session, project_id: int) -> models.Render:
                 db.commit()
                 continue
             body += 1
+            db.refresh(shot)
+            job = _active_job_for(db, shot.id)
+            if job is not None:
+                # Still being made (a cancelled run, or a re-roll): never
+                # submit and pay for it twice. This render waits for it.
+                job.render_id = render.id
+                job.context_json = {**(job.context_json or {}), "after": "compose"}
+                db.commit()
+                continue
             if shot.status == "completed" and shot.clip_path and Path(shot.clip_path).exists():
-                continue  # reuse a clip that's already there
+                continue  # reuse a clip that still matches the shot
             note = ""
             if shot.shot_type == "talking_head":
                 ok = submit_talking_head(
                     db, project, shot, plan=plan, audio_path=render.audio_path,
                     start=_shot_start(project, shot), render_id=render.id,
+                    voice_fingerprint=render.voice_fingerprint,
                 )
                 if ok is True:
                     continue
@@ -898,12 +1177,8 @@ def _settle_render_cost(db: Session, render: models.Render) -> None:
 
 def _latest_voiceover(db: Session, project: models.VideoProject) -> Optional[str]:
     """The newest render's voiceover file, if it's still on disk."""
-    for r in (db.query(models.Render).filter(models.Render.project_id == project.id,
-                                            models.Render.audio_path != "")
-              .order_by(models.Render.id.desc()).limit(5)):
-        if Path(r.audio_path).exists():
-            return r.audio_path
-    return None
+    latest = _latest_audio_render(db, project.id)
+    return latest.audio_path if latest is not None else None
 
 
 def _submit_regen(db: Session, project: models.VideoProject, shot: models.VideoShot, *, after: str) -> None:
@@ -913,11 +1188,12 @@ def _submit_regen(db: Session, project: models.VideoProject, shot: models.VideoS
     everything else goes to the video model."""
     note = ""
     if shot.shot_type == "talking_head" and project.generated_plan_json:
-        audio = _latest_voiceover(db, project)
-        if audio:
+        latest = _latest_audio_render(db, project.id)
+        if latest is not None:
             ok = submit_talking_head(
                 db, project, shot, plan=StoryboardPlan.model_validate(project.generated_plan_json),
-                audio_path=audio, start=_shot_start(project, shot), render_id=None, after=after,
+                audio_path=latest.audio_path, start=_shot_start(project, shot), render_id=None, after=after,
+                voice_fingerprint=latest.voice_fingerprint,
             )
             if ok is True:
                 return
@@ -1016,11 +1292,16 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
         raise ValueError("no shot clips available to recompose")
 
     audio = _latest_completed_audio(db, project_id)
+    source_render = _latest_audio_render(db, project_id)
 
     render = models.Render(
         project_id=project.id,
         status="rendering",
         audio_path=str(audio) if audio else "",
+        # Same voiceover file as before: keep knowing what it was made from.
+        voice_fingerprint=(source_render.voice_fingerprint
+                           if source_render is not None and audio and source_render.audio_path == str(audio)
+                           else ""),
     )
     db.add(render)
     db.commit()

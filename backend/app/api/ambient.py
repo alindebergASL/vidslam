@@ -8,7 +8,7 @@ only adds the ambient-specific lifecycle.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -65,15 +65,17 @@ def public_frame(token: str) -> FileResponse:
     return FileResponse(path, media_type="image/png")
 
 
-def _enqueue_generation(db: Session, project: models.VideoProject, *args) -> str:
+def _enqueue_generation(db: Session, project: models.VideoProject, *args,
+                        job: Callable = generate_ambient_loop_job, makes_music: Optional[bool] = None) -> str:
     """Mark the scene generating before queueing its job: on RQ the job may
     wait behind a render for a long time, and until a worker picks it up a
     second Generate would otherwise pass the 409 and queue a second paid run
     (which resets the clips and drops the first run's chain). The claim is a
     conditional UPDATE, so two simultaneous requests can't both get through."""
     # A provider switched off: 409, nothing queued (args[0]: regenerate_music).
-    provider_gate.require_ambient(svc._config_of(project), regenerate_music=bool(args[0]) if args else True,
-                                  project=project)
+    if makes_music is None:
+        makes_music = bool(args[0]) if args else True
+    provider_gate.require_ambient(svc._config_of(project), regenerate_music=makes_music, project=project)
     previous = project.status
     claimed = (
         db.query(models.VideoProject)
@@ -84,7 +86,7 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args) -> str
     if not claimed:
         raise HTTPException(409, "scene is already generating")
     try:
-        return enqueue(generate_ambient_loop_job, project.id, *args)
+        return enqueue(job, project.id, *args)
     except Exception:
         # QueueUnavailable, or Redis dropping between the health check and
         # the enqueue: no job was accepted, so nothing would ever clear the
@@ -209,14 +211,17 @@ def _generation_token(request: Request) -> Callable[[], bool]:
 
 
 @router.patch("/{scene_id}", response_model=AmbientOut)
-def update_scene(scene_id: int, body: AmbientUpdate, request: Request,
+def update_scene(scene_id: int, body: AmbientUpdate, request: Request, discard_loop: bool = False,
                  db: Session = Depends(get_db)) -> AmbientOut:
+    """Save settings. A change that needs a new loop clip is refused (409)
+    when clips are already made, unless discard_loop=true."""
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is generating; wait or cancel first")
     try:
-        project = svc.update_scene(db, project, body, allow_rewrite=_generation_token(request))
-    except svc.SceneBusy as e:
+        project = svc.update_scene(db, project, body, allow_rewrite=_generation_token(request),
+                                   discard_loop=discard_loop)
+    except (svc.SceneBusy, svc.LoopDiscard) as e:
         raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
@@ -235,6 +240,24 @@ def generate_loop(
         raise HTTPException(409, "scene is already generating")
     job_id = _enqueue_generation(db, project, regenerate_music)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
+
+
+@router.post("/{scene_id}/resume-loop", status_code=202,
+             dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
+def resume_loop(scene_id: int, db: Session = Depends(get_db)) -> dict:
+    """Continue a loop that failed part-way from the clip that failed; the
+    finished clips and takes are kept. (generate-loop starts over.)"""
+    project = _get_scene(db, scene_id)
+    if project.status == "generating":
+        raise HTTPException(409, "scene is already generating")
+    cfg = svc._config_of(project)
+    info = svc.resume_info(project, cfg)
+    if info is None:
+        raise HTTPException(409, "this scene has no failed loop to resume; generate the loop instead")
+    chain = (project.ambient_config_json or {}).get(svc._CHAIN_KEY) or {}
+    job_id = _enqueue_generation(db, project, job=svc.resume_loop_job,
+                                 makes_music=bool(chain.get("regenerate_music", True)))
+    return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued", "clip": info.clip, "take": info.take}
 
 
 @router.post("/{scene_id}/music", dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
@@ -281,8 +304,13 @@ def _picture_busy(project: models.VideoProject) -> None:
         raise HTTPException(409, "the loop is generating; change the picture when it's done")
 
 
+# Every picture change needs a new loop: when clips are already made it is
+# refused (409, nothing changed) unless the request says discard_loop=true.
+
+
 @router.post("/{scene_id}/picture")
-async def upload_picture(scene_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)) -> AmbientOut:
+async def upload_picture(scene_id: int, file: UploadFile = File(...), discard_loop: bool = False,
+                         db: Session = Depends(get_db)) -> AmbientOut:
     """Use your own image: it becomes the loop's first (and last) frame, or
     the still of a Still + drift scene. Cropped to the scene's aspect."""
     project = _get_scene(db, scene_id)
@@ -293,7 +321,9 @@ async def upload_picture(scene_id: int, file: UploadFile = File(...), db: Sessio
     except storage.UploadError as e:
         raise HTTPException(413 if e.status_code == 413 else 415, str(e)) from e
     try:
-        svc.set_picture(db, project, raw, "upload")
+        svc.set_picture(db, project, raw, "upload", discard_loop=discard_loop)
+    except svc.LoopDiscard as e:
+        raise HTTPException(409, str(e)) from e
     except svc.PictureTooLarge as e:
         raise HTTPException(413, str(e)) from e
     except svc.PictureError as e:
@@ -303,26 +333,32 @@ async def upload_picture(scene_id: int, file: UploadFile = File(...), db: Sessio
 
 @router.post("/{scene_id}/picture/generate",
              dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
-def generate_picture(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
+def generate_picture(scene_id: int, discard_loop: bool = False, db: Session = Depends(get_db)) -> AmbientOut:
     """Generate the picture now (one image call) to preview it before
     making the video; regenerate until it looks right."""
     project = _get_scene(db, scene_id)
     _picture_busy(project)
     provider_gate.require_still(svc._config_of(project))  # the scene's chosen model, not a silent swap
     try:
-        svc.generate_picture(db, project)
+        svc.generate_picture(db, project, discard_loop=discard_loop)
+    except svc.LoopDiscard as e:
+        raise HTTPException(409, str(e)) from e
     except svc.PictureError as e:
         raise HTTPException(422, str(e)) from e
     return svc.to_out(db, project)
 
 
 @router.post("/{scene_id}/picture/from")
-def picture_from(scene_id: int, body: PictureFrom, db: Session = Depends(get_db)) -> AmbientOut:
+def picture_from(scene_id: int, body: PictureFrom, discard_loop: bool = False,
+                 db: Session = Depends(get_db)) -> AmbientOut:
     """Use a Cast image (asset_id) or a Studio result (studio_job_id)."""
     project = _get_scene(db, scene_id)
     _picture_busy(project)
     try:
-        svc.picture_from(db, project, asset_id=body.asset_id, studio_job_id=body.studio_job_id)
+        svc.picture_from(db, project, asset_id=body.asset_id, studio_job_id=body.studio_job_id,
+                         discard_loop=discard_loop)
+    except svc.LoopDiscard as e:
+        raise HTTPException(409, str(e)) from e
     except LookupError as e:
         raise HTTPException(404, str(e)) from e
     except svc.PictureError as e:
@@ -331,11 +367,14 @@ def picture_from(scene_id: int, body: PictureFrom, db: Session = Depends(get_db)
 
 
 @router.delete("/{scene_id}/picture")
-def clear_picture(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
+def clear_picture(scene_id: int, discard_loop: bool = False, db: Session = Depends(get_db)) -> AmbientOut:
     """Back to generating the image from the prompt at loop time."""
     project = _get_scene(db, scene_id)
     _picture_busy(project)
-    svc.clear_picture(db, project)
+    try:
+        svc.clear_picture(db, project, discard_loop=discard_loop)
+    except svc.LoopDiscard as e:
+        raise HTTPException(409, str(e)) from e
     return svc.to_out(db, project)
 
 

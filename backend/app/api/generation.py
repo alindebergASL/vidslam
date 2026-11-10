@@ -116,6 +116,21 @@ def cost_estimate(project_id: int, db: Session = Depends(get_db)) -> dict:
     return estimate_for_project(db, project, plan)
 
 
+@router.get("/projects/{project_id}/render-plan")
+def render_plan(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """What "Generate video" would do right now, before anything is paid
+    for: voiceover made or reused, and which clips are reused, still being
+    made, or made new (with the reason and a rate-card price)."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    if not project.generated_plan_json:
+        raise HTTPException(409, "generate a storyboard plan first")
+    from ..services.pipeline import render_plan as _render_plan
+
+    return _render_plan(db, project)
+
+
 @router.post("/projects/{project_id}/generate-video", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_video(
     project_id: int,
@@ -158,6 +173,10 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     Returns 200 with the latest render's state — the caller polls /status as
     usual to see the cancellation land (may take up to one provider call to
     propagate, e.g. one in-flight video poll cycle).
+
+    Clips already submitted to the provider are not stopped: they finish and
+    are billed. `clips_in_flight` says how many; a later resume waits for
+    them instead of submitting them again.
     """
     project = db.get(models.VideoProject, project_id)
     if project is None:
@@ -170,26 +189,34 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     )
     if latest is None:
         raise HTTPException(409, "no render in flight")
+    from ..services import video_jobs
+
+    in_flight = video_jobs.pending_for(db, project_id=project_id)
     if latest.status in ("completed", "failed", "cancelled"):
-        return {"render_id": latest.id, "status": latest.status, "action": "noop"}
+        return {"render_id": latest.id, "status": latest.status, "action": "noop",
+                "clips_in_flight": in_flight}
     latest.status = "cancelled"
     # Shots are submitted asynchronously, so there may be no worker left in
     # render_project to mirror this; in-flight clips that land later see a
     # cancelled render and don't compose.
     project.status = "cancelled"
     db.commit()
-    return {"render_id": latest.id, "status": "cancelled", "action": "signalled"}
+    return {"render_id": latest.id, "status": "cancelled", "action": "signalled",
+            "clips_in_flight": in_flight}
 
 
 @router.post("/projects/{project_id}/retry", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     """Smart retry after a failed render. Picks the cheapest viable path:
 
-      - If every body shot already has a clip on disk AND the last render's audio
-        file is intact → just recompose (no provider calls).
-      - Otherwise → resume the pipeline; render_project (which skips shots that already have clips)
-        is idempotent on completed shots, so only the failed/missing ones get
-        regenerated. Failed shots are reset to 'pending' so they actually retry.
+      - If every body shot has a clip that still matches it AND the last
+        render's voiceover is intact and current → just recompose (no provider
+        calls).
+      - Otherwise → resume the pipeline. render_project reuses clips that
+        still match their shot, waits for clips that are still being made
+        (never submitting those twice) and reuses an unchanged voiceover, so
+        only failed, missing or edited shots are generated. Failed shots are
+        reset to 'pending' so they actually retry.
     """
     project = db.get(models.VideoProject, project_id)
     if project is None:
@@ -209,7 +236,19 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
             s.error = ""
     db.commit()
 
-    all_clips = all(s.clip_path and Path(s.clip_path).exists() for s in body_shots)
+    from ..services.pipeline import adopt_unfingerprinted_voiceover
+    from ..services.pipeline import render_plan as _render_plan
+
+    # A voiceover made before fingerprints existed counts as current here
+    # (same rule as clips): Retry finishes the failed render, it does not
+    # buy the voiceover again.
+    adopt_unfingerprinted_voiceover(db, project)
+    plan = _render_plan(db, project)
+    all_clips = (
+        all(s.clip_path and Path(s.clip_path).exists() for s in body_shots)
+        and plan["generate"] == 0 and plan["in_flight"] == 0
+        and plan["voiceover"] != "new" and not plan["voiceover_changed"]
+    )
     latest = (
         db.query(models.Render)
         .filter(models.Render.project_id == project_id)
@@ -221,7 +260,9 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     if all_clips and have_audio:
         job_id = enqueue(recompose_project_job, project_id)
         action = "recompose"
+        voiceover, voiceover_cost = "reuse", 0.0
     else:
+        voiceover, voiceover_cost = plan["voiceover"], plan["voiceover_cost"]
         provider_gate.require_project(db, project)  # only the shots it resubmits
         job_id = enqueue(generate_video_job, project_id)
         action = "resume"
@@ -230,7 +271,32 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
         "job_id": job_id,
         "action": action,
         "status": "enqueued",
+        # Clips still being made from the earlier run: waited for, not resubmitted.
+        "clips_in_flight": plan["in_flight"],
+        # What happens to the voiceover: "reuse", "new" (paid), "upload" or "silent".
+        "voiceover": voiceover,
+        "voiceover_cost": voiceover_cost,
     }
+
+
+def _refuse_stale_voice_reroll(db: Session, project: models.VideoProject, shots: list) -> None:
+    """409 when a re-roll would lip-sync a shot to a voiceover that is out
+    of date: the paid clip would still not match, and the next Generate
+    video would buy it again."""
+    from ..services.pipeline import regen_needs_new_voiceover
+
+    blocked = regen_needs_new_voiceover(db, project, shots)
+    if not blocked:
+        return
+    orders = ", ".join(str(s.shot_order) for s in sorted(blocked, key=lambda s: s.shot_order))
+    one = len(blocked) == 1
+    raise HTTPException(
+        409,
+        f"Shot{'' if one else 's'} {orders} {'is' if one else 'are'} lip-synced to the voiceover, "
+        "and the spoken script or voice changed since the voiceover was made. A re-roll would use "
+        "the old voiceover and be paid for twice. Use Generate video: it makes the new voiceover "
+        f"and {'this clip' if one else 'these clips'} together.",
+    )
 
 
 class BulkRegenIn(BaseModel):
@@ -248,6 +314,7 @@ def regenerate_shots_bulk(
     targets = [sid for sid in body.shot_ids if sid in valid]
     if not targets:
         raise HTTPException(422, "no regenerable shots in the selection")
+    _refuse_stale_voice_reroll(db, project, [s for s in project.shots if s.id in set(targets)])
     provider_gate.require_project(db, project, shot_ids=set(targets))
     job_id = enqueue(regenerate_shots_bulk_job, project_id, targets)
     return {
@@ -287,6 +354,7 @@ def regenerate_shot(
     shot = db.get(models.VideoShot, shot_id)
     if shot is None or shot.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
+    _refuse_stale_voice_reroll(db, shot.project, [shot])
     provider_gate.require_model("video", shot.model_override or None, db)
     job_id = enqueue(regenerate_shot_job, project_id, shot_id, recompose)
     return {

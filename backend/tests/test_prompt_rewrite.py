@@ -112,7 +112,8 @@ def test_turning_the_rewrite_off_needs_a_new_loop(auth_client):
     sid = auth_client.post("/api/ambient", json={"config": cfg, "generate": True}).json()["id"]
     assert auth_client.get(f"/api/ambient/{sid}").json()["loop_status"] == "completed"
     saved = auth_client.get(f"/api/ambient/{sid}").json()["config"]
-    r = auth_client.patch(f"/api/ambient/{sid}", json={"config": {**saved, "rewrite_prompt": False}})
+    r = auth_client.patch(f"/api/ambient/{sid}?discard_loop=true",
+                          json={"config": {**saved, "rewrite_prompt": False}})
     assert r.status_code == 200 and r.json()["loop_status"] != "completed"
 
 
