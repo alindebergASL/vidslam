@@ -187,9 +187,9 @@ def check_new_models(limit: int = CHECK_PER_REFRESH) -> int:
     for a in todo[:max(0, limit)]:
         try:
             done[a] = smoke_build(PREFIX + a) or ""
-        except Exception as e:  # noqa: BLE001 — couldn't read its schema: not offered
-            done[a] = str(e)[:200] or "check failed"
-    if todo[:limit]:
+        except Exception as e:  # noqa: BLE001 — couldn't read its schema: try again next refresh
+            log.info("runware: couldn't check %s yet (%s)", a, str(e)[:200])
+    if any(a in done for a in todo[:limit]):
         (_data_dir() / "checked.json").write_text(json.dumps(done))
     if len(todo) > limit:
         log.info("runware: %d new models left to check next refresh", len(todo) - limit)
@@ -1091,8 +1091,10 @@ def catalog_entries(usable: bool) -> list[dict]:
     unusable = set(b.get("unusable") or [])
     bundled_index = {r.get("air") for r in b["index"]}
     checked = _checked()
+    # Hidden: models the snapshot or check_new_models found the app can't
+    # drive. Not checked yet: shown, as before (a refresh checks them).
     later = [a for a in rows if a not in b["schemas"] and a not in unusable
-             and (a in bundled_index or checked.get(a) == "")]  # new ones only once checked
+             and (a in bundled_index or not checked.get(a))]
     for a in curated + later:
         sch = b["schemas"].get(a)
         row = rows.get(a) or {}
@@ -1254,16 +1256,25 @@ class RunwareVideoProvider(VideoProvider):
         return RunwareClient.download(result_url)
 
 
+_no_schema_until: dict[str, float] = {}
+
+
 def takes_reference(model: str) -> bool:
     """Whether a still model applies reference pictures (an edit model with
     inputs.referenceImages). Image-to-image-only models keep the layout but
     barely change the light, so they don't count for "same place" stills.
     Fetches a model's schema on first use (as the request builder would), so
     a model nobody has run yet isn't wrongly sent without its reference."""
-    try:
-        sch = schema(model)
-    except Exception:  # noqa: BLE001 — the docs unreachable: no reference
-        sch = None
+    if get_settings().mock_providers:
+        sch = schema(model, fetch=False)
+    elif time.monotonic() < _no_schema_until.get(air(model), 0.0):
+        sch = None  # failed to fetch a moment ago: don't wait 30 s again
+    else:
+        try:
+            sch = schema(model)
+        except Exception:  # noqa: BLE001 — the docs unreachable: no reference this time
+            _no_schema_until[air(model)] = time.monotonic() + 600
+            sch = None
     inputs = (_sub(_props(sch), "inputs") or {}).get("properties") or {} if sch else {}
     return "referenceImages" in inputs
 
