@@ -51,7 +51,7 @@ def upgrade() -> None:
             sa.Column('video_job_id', sa.Integer(), nullable=True),
             sa.Column('cost_usd', sa.Float(), nullable=True),
             sa.Column('note', sa.Text(), nullable=False, server_default=''),
-            sa.Column('created_at', sa.DateTime(), nullable=True),
+            sa.Column('created_at', sa.DateTime(), nullable=False),
             sa.ForeignKeyConstraint(['shot_id'], ['video_shots.id'], ondelete='CASCADE'),
             sa.PrimaryKeyConstraint('id'),
         )
