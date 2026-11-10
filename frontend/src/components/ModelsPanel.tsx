@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
+import { useContentMode } from "@/components/AdultModePanel";
 import { api, ActiveModel, CatalogEntry, ModelCatalog, ModelKind } from "@/lib/api";
 
 const KINDS: { id: ModelKind; label: string; hint: string }[] = [
@@ -79,6 +80,7 @@ export function ModelsPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [custom, setCustom] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const contentMode = useContentMode();
 
   useEffect(() => {
     const load = () => api.modelCatalog().then(setCat).catch((e) => setError(e.message));
@@ -262,6 +264,12 @@ export function ModelsPanel() {
               Only usable with my keys
             </label>
           </div>
+          {kind === "chat" && contentMode?.adult && (
+            <p role="note" className="text-[11px] text-amber-300 mb-2">
+              Adult mode is on: storyboard planning, ✨ Enhance and scene rewrites use {contentMode.text_model}. The
+              planner chosen here applies while Adult mode is off (Settings → Adult content).
+            </p>
+          )}
           {hiddenOff.count > 0 && (
             <p className="text-[11px] text-ink-400 mb-2">
               {hiddenOff.count} model{hiddenOff.count === 1 ? "" : "s"} hidden: {hiddenOff.providers.join(", ")}{" "}

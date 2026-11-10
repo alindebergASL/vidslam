@@ -315,7 +315,7 @@ def extract_json(text: str) -> dict:
 
 # "Enhance my prompt" guides, one per kind. Hype words are banned on purpose:
 # they made pictures look more AI in blind tests (see SCENE_REWRITE_SYSTEM).
-_ENHANCE_COMMON = """Keep the user's subject and intent exactly; add detail, don't replace anything they asked for, and don't add people, objects or claims they didn't ask for beyond ordinary detail. No hype words (8k, 4k, ultra, HD, masterpiece, stunning, breathtaking, epic, award-winning, hyperrealistic). Reply with the improved prompt only: no preamble, no quotes, no notes, no markdown."""
+_ENHANCE_COMMON = """Keep the user's subject and intent exactly; add detail, don't replace anything they asked for, and don't add people, objects or claims they didn't ask for beyond ordinary detail. No hype words (8k, 4k, ultra, HD, masterpiece, stunning, breathtaking, epic, award-winning, hyperrealistic). Reply with the improved prompt only: no preamble, no quotes, no notes, no markdown. Everyone in anything sexual or suggestive is an adult: never keep or add childlike traits, school settings or ages under 18. If the text sexualises a minor or childlike traits, reply with exactly REFUSED_MINOR. If you won't rewrite it for any other reason, reply with exactly DECLINED: never a partial, safer or different version."""
 
 ENHANCE_GUIDES: dict[str, str] = {
     "image": """You improve a prompt for an image model. Describe, in this order: the subject, the setting, the composition and framing, the light (physically: where it comes from, how hard or soft, where shadows fall), the lens and camera, and the style. Photoreal unless the text asks for a style (illustration, watercolor, 3D, anime...). At most about 120 words.""",

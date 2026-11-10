@@ -9,8 +9,10 @@ export function enhanceErrorMessage(e: unknown): string {
   const msg = (e as { message?: string })?.message || "";
   if (msg.startsWith("402")) return "Monthly budget reached. Raise it in Settings → Spend to enhance prompts.";
   if (msg.startsWith("429")) return "Too many requests right now. Try again in a minute.";
-  // The model declined, or the prompt was refused (minors): say why.
-  if (msg.startsWith("422") && /declined|refused/i.test(msg)) return msg.replace(/^422:\s*/, "");
+  // The model declined, or the prompt or rewrite was refused: the server says why.
+  if (/^422: (?:The (?:planner|text model) \(|This (?:prompt|script) was refused|The rewrite was refused)/.test(msg))
+    return msg.replace(/^422:\s*/, "");
+  if (msg.startsWith("422") && /string_too_long|at most 4000/i.test(msg)) return "Too long to enhance (4000 characters at most).";
   if (msg.startsWith("422")) return "Write something first, then enhance it.";
   return msg || "Enhance failed";
 }
@@ -28,7 +30,7 @@ function shortModel(id: string): string {
 }
 
 /**
- * "✨ Enhance": asks the enhance model (Settings → Prompting) to improve `text` for its `kind`, shows
+ * "✨ Enhance": asks the text model (the planner; DeepSeek in Adult mode) to improve `text` for its `kind`, shows
  * the suggestion inline with Use it / Keep mine, and after Use it offers Undo
  * (restores the text from before) for as long as the text is unchanged.
  *
@@ -91,7 +93,7 @@ export function EnhanceButton({
           onClick={run}
           disabled={disabled || empty || busy}
           className={clsx("chip text-xs disabled:opacity-50", buttonClassName)}
-          title={`Rewrite this ${KIND_LABEL[kind]} (Settings → Prompting chooses the model). You can keep yours.`}
+          title={`Rewrite this ${KIND_LABEL[kind]} with the text model (the planner, or DeepSeek in Adult mode). You can keep yours.`}
           aria-label={`Enhance ${KIND_LABEL[kind]}`}
         >
           {busy ? "Enhancing…" : "✨ Enhance"}

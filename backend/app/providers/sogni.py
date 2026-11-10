@@ -62,6 +62,12 @@ WORKFLOWS = "/v1/creative-agent/workflows"
 _sleep = time.sleep
 
 
+def _adult_mode() -> bool:
+    from ..services.content_mode import adult_mode
+
+    return adult_mode()
+
+
 def is_sogni(model: Optional[str]) -> bool:
     return bool(model) and str(model).startswith(PREFIX)
 
@@ -925,7 +931,8 @@ class SogniClient:
             ]},
             "token_type": "auto",
             "app_source": APP_SOURCE,
-            "safe_content_filter": bool(get_settings().sogni_safe_content_filter),
+            # On unless adult mode is (then SOGNI_SAFE_CONTENT_FILTER decides).
+            "safe_content_filter": bool(get_settings().sogni_safe_content_filter) or not _adult_mode(),
         }
         if media_references:
             body["media_references"] = media_references

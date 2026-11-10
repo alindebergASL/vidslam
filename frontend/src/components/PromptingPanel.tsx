@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
-import { api, EnhanceModelSettings, PromptDefaults } from "@/lib/api";
+import { api, PromptDefaults } from "@/lib/api";
 import { useToast } from "@/components/Toaster";
 
 const MAX = 1000;
@@ -12,26 +12,6 @@ export function PromptingPanel() {
   const [draft, setDraft] = useState<PromptDefaults>({ image: "", video: "" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [enh, setEnh] = useState<EnhanceModelSettings | null>(null);
-  const [enhBusy, setEnhBusy] = useState(false);
-
-  useEffect(() => {
-    api.getEnhanceModel().then(setEnh).catch(() => setEnh(null));
-  }, []);
-
-  const chooseEnhancer = async (model: string | null) => {
-    setEnhBusy(true);
-    try {
-      const r = await api.setEnhanceModel(model);
-      setEnh(r);
-      const label = r.choices.find((c) => c.id === r.model)?.label || r.model || "the planner model";
-      toast.success(`✨ Enhance now uses ${label}`);
-    } catch (e: any) {
-      toast.error(e.message || "Couldn't change the Enhance model");
-    } finally {
-      setEnhBusy(false);
-    }
-  };
 
   useEffect(() => {
     api
@@ -111,45 +91,6 @@ export function PromptingPanel() {
           Reset to built-in
         </button>
       </div>
-
-      {enh && (
-        <div className="mt-5 border-t border-ink-800 pt-4">
-          <label className="label" htmlFor="enhance-model">
-            ✨ Enhance prompts with
-          </label>
-          <select
-            id="enhance-model"
-            className="input text-sm max-w-md"
-            value={enh.model}
-            disabled={enhBusy}
-            onChange={(e) => chooseEnhancer(e.target.value)}
-          >
-            {enh.choices.map((c) => (
-              <option key={c.id || "planner"} value={c.id}>
-                {c.id ? c.label : `${c.label} (${enh.planner})`}
-                {c.id === enh.default ? " · default" : ""}
-              </option>
-            ))}
-            {!enh.choices.some((c) => c.id === enh.model) && <option value={enh.model}>{enh.model}</option>}
-          </select>
-          <p className="text-xs text-ink-400 mt-1">
-            {enh.choices.find((c) => c.id === enh.model)?.note ||
-              "Any OpenRouter chat model."}{" "}
-            If a model declines to rewrite a prompt, Enhance tries the default once, and otherwise leaves your
-            text as it is. Prompts involving minors are always refused.
-          </p>
-          {enh.model !== enh.default && (
-            <button
-              type="button"
-              className="btn-ghost text-xs mt-2"
-              disabled={enhBusy}
-              onClick={() => chooseEnhancer(null)}
-            >
-              Back to the default
-            </button>
-          )}
-        </div>
-      )}
     </section>
   );
 }

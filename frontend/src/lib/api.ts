@@ -408,14 +408,17 @@ export type StudioGenerateBody = {
 export type PromptDefaults = { image: string; video: string };
 export type EnhanceKind = "image" | "video" | "script" | "scene";
 
-/** The model "✨ Enhance" uses ("" = the storyboard planner). */
-export type EnhanceModelSettings = {
-  model: string;
-  /** The app default (also the fallback when a model declines). */
-  default: string;
-  /** The planner model, used when model is "". */
+/** Adult mode (Settings → Adult content). */
+export type ContentMode = {
+  adult: boolean;
+  /** ADULT_MODE: what null goes back to. */
+  default: boolean;
+  /** Set in Settings (not following the default). */
+  explicit: boolean;
+  /** The text model adult mode uses (planning, Enhance, scene rewrites). */
+  text_model: string;
+  /** The planner chosen in Settings → Models (used while adult mode is off). */
   planner: string;
-  choices: { id: string; label: string; note: string }[];
 };
 
 export type PromptPreset = {
@@ -1243,10 +1246,10 @@ export const api = {
   setPromptDefaults: (body: PromptDefaults) =>
     req<PromptDefaults>("/api/prompts/defaults", { method: "PUT", body: JSON.stringify(body) }),
   resetPromptDefaults: () => req<PromptDefaults>("/api/prompts/defaults", { method: "DELETE" }),
-  getEnhanceModel: () => req<EnhanceModelSettings>("/api/prompts/enhance-model"),
-  /** null = back to the app default. */
-  setEnhanceModel: (model: string | null) =>
-    req<EnhanceModelSettings>("/api/prompts/enhance-model", { method: "PUT", body: JSON.stringify({ model }) }),
+  getContentMode: () => req<ContentMode>("/api/settings/content"),
+  /** null = back to ADULT_MODE. */
+  setContentMode: (adult: boolean | null) =>
+    req<ContentMode>("/api/settings/content", { method: "PUT", body: JSON.stringify({ adult }) }),
   enhancePrompt: (body: { text: string; kind: EnhanceKind; model?: string | null }) =>
     req<{ text: string; model: string }>("/api/prompts/enhance", {
       method: "POST",
