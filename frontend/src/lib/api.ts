@@ -306,6 +306,54 @@ export type StudioJob = {
   aspect_ratio?: string;
   /** Only on the create response: every job id the request made (incl. this one). */
   batch_ids?: number[];
+  favorite?: boolean;
+  /** Short display tag, e.g. "Front view" on a character-sheet job; "" otherwise. */
+  label?: string;
+  /** Money recorded for this job so far; null = nothing recorded yet. */
+  cost_usd?: number | null;
+  cost_is_estimate?: boolean;
+};
+
+/** Filters for the Studio library list. All optional and combinable; newest first. */
+export type StudioJobsQuery = {
+  /** Case-insensitive substring of the prompt or label. */
+  q?: string;
+  favorite?: boolean;
+  output_kind?: "image" | "video_clip";
+  /** Both or neither. */
+  owner_kind?: "avatar" | "ingredient";
+  owner_id?: number;
+  /** "active" = still pending/running; "completed" includes saved ones. */
+  status?: "completed" | "failed" | "active";
+  /** 1..200, default 50. */
+  limit?: number;
+  /** Only jobs with a smaller id (the next page). */
+  before_id?: number;
+};
+
+export type StudioBulkSaveResult = {
+  saved: Asset[];
+  skipped: { id: number; reason: string }[];
+};
+
+export type StudioRetryBody = {
+  /** ""/null = keep the source job's model. */
+  model?: string | null;
+  prompt?: string | null;
+  negative_prompt?: string | null;
+  aspect_ratio?: "9:16" | "16:9" | "1:1" | null;
+};
+
+export type CharacterSheetView = { id: string; label: string; aspect_ratio: string };
+
+export type CharacterSheetBody = {
+  avatar_id: number;
+  views?: string[];
+  /** null = the avatar's own pictures. */
+  reference_asset_ids?: number[] | null;
+  model?: string | null;
+  style?: string;
+  negative_prompt?: string;
 };
 
 export type StudioAspect = "" | "9:16" | "16:9" | "1:1";
@@ -1122,7 +1170,49 @@ export const api = {
     req<void>(`/api/prompts/presets/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   // studio
-  listStudioJobs: () => req<StudioJob[]>("/api/studio/jobs"),
+  listStudioJobs: (params: StudioJobsQuery = {}) => {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === null || v === "") continue;
+      q.set(k, String(v));
+    }
+    const qs = q.toString();
+    return req<StudioJob[]>(`/api/studio/jobs${qs ? `?${qs}` : ""}`);
+  },
+  updateStudioJob: (id: number, body: { favorite?: boolean; label?: string }) =>
+    req<StudioJob>(`/api/studio/jobs/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  bulkDeleteStudioJobs: (ids: number[]) =>
+    req<{ deleted: number[]; missing: number[] }>("/api/studio/jobs/bulk-delete", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
+  bulkFavoriteStudioJobs: (ids: number[], favorite: boolean) =>
+    req<{ updated: number[]; missing: number[] }>("/api/studio/jobs/bulk-favorite", {
+      method: "POST",
+      body: JSON.stringify({ ids, favorite }),
+    }),
+  bulkSaveStudioJobs: (body: {
+    ids: number[];
+    owner_kind: "avatar" | "ingredient";
+    owner_id: number;
+    asset_type: string | null;
+  }) =>
+    req<StudioBulkSaveResult>("/api/studio/jobs/bulk-save", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // Makes a NEW job from a finished or failed one, with any overrides.
+  retryStudioJob: (id: number, body: StudioRetryBody = {}) =>
+    req<StudioJob>(`/api/studio/jobs/${id}/retry`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  characterSheetViews: () => req<CharacterSheetView[]>("/api/studio/character-sheet/views"),
+  makeCharacterSheet: (body: CharacterSheetBody) =>
+    req<{ batch_ids: number[]; jobs: StudioJob[] }>("/api/studio/character-sheet", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   generateImage: (body: StudioGenerateBody) =>
     req<StudioJob>("/api/studio/generate-image", {
       method: "POST",

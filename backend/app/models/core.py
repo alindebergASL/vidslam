@@ -13,6 +13,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -299,6 +300,10 @@ class AssetGenerationJob(Base):
         nullable=True,
     )
     error: Mapped[str] = mapped_column(Text, default="")
+    # Library: starred in Studio, and a short display tag ("Front view" for
+    # character-sheet jobs, "" otherwise). Migration 0004.
+    favorite: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    label: Mapped[str] = mapped_column(String(80), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
