@@ -467,7 +467,7 @@ class SpendEntry(Base):
     model: Mapped[str] = mapped_column(String(200), default="")
     project_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     render_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
-    ref: Mapped[str] = mapped_column(String(80), default="")  # e.g. "video_job:12", "studio_job:3"
+    ref: Mapped[str] = mapped_column(String(80), default="", index=True)  # e.g. "video_job:12", "studio_job:3"
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     is_estimate: Mapped[bool] = mapped_column(Boolean, default=False)
     source: Mapped[str] = mapped_column(String(20), default="provider", index=True)

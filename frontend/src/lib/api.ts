@@ -693,6 +693,15 @@ export type OpenRouterAccount = {
   limit_remaining?: number | null;
 };
 
+// Most ids one Studio bulk request may carry (the backend's limit).
+export const STUDIO_BULK_MAX = 200;
+
+function chunks<T>(xs: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += size) out.push(xs.slice(i, i + size));
+  return out;
+}
+
 export const api = {
   base: API_BASE,
 
@@ -1181,26 +1190,49 @@ export const api = {
   },
   updateStudioJob: (id: number, body: { favorite?: boolean; label?: string }) =>
     req<StudioJob>(`/api/studio/jobs/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-  bulkDeleteStudioJobs: (ids: number[]) =>
-    req<{ deleted: number[]; missing: number[] }>("/api/studio/jobs/bulk-delete", {
-      method: "POST",
-      body: JSON.stringify({ ids }),
-    }),
-  bulkFavoriteStudioJobs: (ids: number[], favorite: boolean) =>
-    req<{ updated: number[]; missing: number[] }>("/api/studio/jobs/bulk-favorite", {
-      method: "POST",
-      body: JSON.stringify({ ids, favorite }),
-    }),
-  bulkSaveStudioJobs: (body: {
+  // The bulk endpoints take at most STUDIO_BULK_MAX ids, so bigger
+  // selections go in several requests and the answers are merged.
+  bulkDeleteStudioJobs: async (ids: number[]) => {
+    const out = { deleted: [] as number[], missing: [] as number[] };
+    for (const part of chunks(ids, STUDIO_BULK_MAX)) {
+      const r = await req<{ deleted: number[]; missing: number[] }>("/api/studio/jobs/bulk-delete", {
+        method: "POST",
+        body: JSON.stringify({ ids: part }),
+      });
+      out.deleted.push(...r.deleted);
+      out.missing.push(...r.missing);
+    }
+    return out;
+  },
+  bulkFavoriteStudioJobs: async (ids: number[], favorite: boolean) => {
+    const out = { updated: [] as number[], missing: [] as number[] };
+    for (const part of chunks(ids, STUDIO_BULK_MAX)) {
+      const r = await req<{ updated: number[]; missing: number[] }>("/api/studio/jobs/bulk-favorite", {
+        method: "POST",
+        body: JSON.stringify({ ids: part, favorite }),
+      });
+      out.updated.push(...r.updated);
+      out.missing.push(...r.missing);
+    }
+    return out;
+  },
+  bulkSaveStudioJobs: async (body: {
     ids: number[];
     owner_kind: "avatar" | "ingredient";
     owner_id: number;
     asset_type: string | null;
-  }) =>
-    req<StudioBulkSaveResult>("/api/studio/jobs/bulk-save", {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+  }) => {
+    const out: StudioBulkSaveResult = { saved: [], skipped: [] };
+    for (const part of chunks(body.ids, STUDIO_BULK_MAX)) {
+      const r = await req<StudioBulkSaveResult>("/api/studio/jobs/bulk-save", {
+        method: "POST",
+        body: JSON.stringify({ ...body, ids: part }),
+      });
+      out.saved.push(...r.saved);
+      out.skipped.push(...r.skipped);
+    }
+    return out;
+  },
   // Makes a NEW job from a finished or failed one, with any overrides.
   retryStudioJob: (id: number, body: StudioRetryBody = {}) =>
     req<StudioJob>(`/api/studio/jobs/${id}/retry`, {

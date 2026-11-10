@@ -578,3 +578,18 @@ def test_character_sheet_refusals(auth_client):
     assert r.status_code == 422
     assert auth_client.post("/api/studio/character-sheet", json={"avatar_id": 99999}).status_code == 404
     assert _ids(auth_client) == []
+
+
+def test_character_sheet_checks_given_references(auth_client):
+    aid = _avatar(auth_client, "Mia")
+    other = _avatar(auth_client, "Zoe")
+    logo = _upload(auth_client, aid, "logo")
+    zoe_pic = _upload(auth_client, other, "hero")
+    for refs in ([99999], [logo], [zoe_pic]):
+        r = auth_client.post("/api/studio/character-sheet", json={"avatar_id": aid, "reference_asset_ids": refs})
+        assert r.status_code == 422, refs
+    mia_pic = _upload(auth_client, aid, "hero")
+    r = auth_client.post("/api/studio/character-sheet",
+                         json={"avatar_id": aid, "reference_asset_ids": [mia_pic, 99999]})
+    assert r.status_code == 422 and "99999" in r.json()["detail"]
+    assert _ids(auth_client) == []

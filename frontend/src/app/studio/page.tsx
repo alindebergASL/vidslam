@@ -233,17 +233,33 @@ function Studio() {
   }, [query]);
 
   // Poll in-flight jobs one by one, so paging and filters stay as they are.
+  // One poll at a time; ids added while a poll waits are kept, and only a
+  // finished or deleted (404) job stops polling. Any other error (network,
+  // 5xx, 429) keeps the id so the next tick tries again.
+  const pollBusy = useRef(false);
   useEffect(() => {
     if (pendingJobIds.length === 0) return;
+    const ids = pendingJobIds;
     const interval = setInterval(async () => {
-      const results = await Promise.all(
-        pendingJobIds.map((id) => api.getStudioJob(id).catch(() => null))
-      );
-      const fresh = results.filter((j): j is StudioJob => j !== null);
-      setJobs((cur) => cur.map((j) => fresh.find((f) => f.id === j.id) || j));
-      // Gone (deleted) or finished jobs stop polling.
-      const stillPending = fresh.filter((j) => !TERMINAL.includes(j.status)).map((j) => j.id);
-      setPendingJobIds(stillPending);
+      if (pollBusy.current) return;
+      pollBusy.current = true;
+      try {
+        const done = new Set<number>();
+        const results = await Promise.all(
+          ids.map((id) =>
+            api.getStudioJob(id).catch((e: any) => {
+              if (String(e?.message || "").startsWith("404:")) done.add(id);
+              return null;
+            })
+          )
+        );
+        const fresh = results.filter((j): j is StudioJob => j !== null);
+        for (const j of fresh) if (TERMINAL.includes(j.status)) done.add(j.id);
+        if (fresh.length > 0) setJobs((cur) => cur.map((j) => fresh.find((f) => f.id === j.id) || j));
+        if (done.size > 0) setPendingJobIds((cur) => cur.filter((id) => !done.has(id)));
+      } finally {
+        pollBusy.current = false;
+      }
     }, 1500);
     return () => clearInterval(interval);
   }, [pendingJobIds]);
@@ -357,6 +373,16 @@ function Studio() {
     );
   };
 
+  // Another media chip hides some results, so nothing stays selected.
+  const firstFilter = useRef(true);
+  useEffect(() => {
+    if (firstFilter.current) {
+      firstFilter.current = false;
+      return;
+    }
+    setChecked([]);
+  }, [filter]);
+
   const toggleChecked = (jobId: number) =>
     setChecked((cur) => (cur.includes(jobId) ? cur.filter((x) => x !== jobId) : [...cur, jobId]));
 
@@ -410,6 +436,8 @@ function Studio() {
       if (!favorite && libKind === "favorites") await loadJobs();
     } catch (e: any) {
       toast.error(e.message || "Couldn't update favorites");
+      // Large selections go in several requests; show what did change.
+      await loadJobs().catch(() => undefined);
     } finally {
       setBulkBusy(false);
     }
@@ -428,6 +456,7 @@ function Studio() {
       setChecked([]);
     } catch (e: any) {
       toast.error(e.message || "Delete failed");
+      await loadJobs().catch(() => undefined);
     } finally {
       setBulkBusy(false);
     }
@@ -614,7 +643,7 @@ function Studio() {
           </div>
         )}
 
-        {selectMode && (
+        {selectMode && showResults && (
           <div className="sticky top-0 z-20 mb-3 card flex flex-wrap items-center gap-2 p-2 text-xs">
             <span className="font-medium px-1" aria-live="polite">
               {checked.length} selected

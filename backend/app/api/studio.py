@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from sqlalchemy import String, case, cast, func, literal, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -106,15 +106,19 @@ def _with_costs(db: Session, jobs: list[models.AssetGenerationJob]) -> list[Stud
             costs[by_ref[ref]] = (float(total or 0.0), bool(est))
     clip_ids = [j.id for j in jobs if j.output_kind != "image"]
     if clip_ids:
-        rows = (
-            db.query(Video.ref_id, func.sum(Spend.cost_usd), estimate)
-            .join(Spend, Spend.ref == literal("video_job:") + cast(Video.id, String))
-            .filter(Video.purpose == "studio", Video.ref_id.in_(clip_ids))
-            .group_by(Video.ref_id)
-            .all()
-        )
-        for ref_id, total, est in rows:
-            costs[ref_id] = (float(total or 0.0), bool(est))
+        # Two indexed lookups: the clips' video jobs, then their ledger rows.
+        owner = {f"video_job:{vid}": ref_id for vid, ref_id in
+                 db.query(Video.id, Video.ref_id).filter(Video.purpose == "studio", Video.ref_id.in_(clip_ids))}
+        if owner:
+            rows = (
+                db.query(Spend.ref, func.sum(Spend.cost_usd), estimate)
+                .filter(Spend.ref.in_(list(owner)))
+                .group_by(Spend.ref)
+                .all()
+            )
+            for ref, total, est in rows:
+                prev_total, prev_est = costs.get(owner[ref], (0.0, False))
+                costs[owner[ref]] = (prev_total + float(total or 0.0), prev_est or bool(est))
     out = []
     for j in jobs:
         o = StudioJobOut.model_validate(j)
@@ -429,6 +433,23 @@ def _sheet_references(db: Session, avatar_id: int) -> list[int]:
     return [a.id for a in assets[:_SHEET_MAX_REFS]]
 
 
+def _checked_sheet_references(db: Session, avatar: models.Avatar, ids: list[int]) -> list[int]:
+    """The caller's own reference list, held to the same rules as the
+    default pick: each id is a picture of this avatar, never its logo."""
+    found = {a.id: a for a in db.query(models.Asset).filter(models.Asset.id.in_(ids)).all()}
+    for i in ids:
+        a = found.get(i)
+        if a is None:
+            raise HTTPException(422, f"reference picture {i} not found")
+        if not (a.mime_type or "").startswith("image/"):
+            raise HTTPException(422, f"reference {i} is not a picture")
+        if a.avatar_id != avatar.id:
+            raise HTTPException(422, f"reference picture {i} is not a picture of {avatar.name}")
+        if a.asset_type == "logo":
+            raise HTTPException(422, f"reference {i} is a logo, not a picture of {avatar.name}")
+    return list(dict.fromkeys(ids))
+
+
 def _sheet_prompt(avatar: models.Avatar, view: str, style: str) -> str:
     _label, _aspect, shot = CHARACTER_SHEET_VIEWS[view]
     parts = [
@@ -461,7 +482,10 @@ def character_sheet(body: CharacterSheetRequest, db: Session = Depends(get_db)) 
     avatar = db.get(models.Avatar, body.avatar_id)
     if avatar is None:
         raise HTTPException(404, "owner not found")
-    refs = list(body.reference_asset_ids or []) or _sheet_references(db, avatar.id)
+    if body.reference_asset_ids:
+        refs = _checked_sheet_references(db, avatar, list(body.reference_asset_ids))
+    else:
+        refs = _sheet_references(db, avatar.id)
     if not refs:
         raise HTTPException(422, f"add a picture of {avatar.name} first")
     provider_gate.require_model("image", body.model or None, db)
