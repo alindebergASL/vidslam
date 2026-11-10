@@ -211,7 +211,11 @@ def update_shot(
     s = db.get(models.VideoShot, shot_id)
     if s is None or s.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
-    for k, v in body.model_dump(exclude_none=True).items():
+    changes = body.model_dump(exclude_none=True)
+    if "duration_seconds" in changes and float(changes["duration_seconds"]) != float(s.duration_seconds or 0):
+        # A new length moves every later shot's slice of the voiceover.
+        refuse_while_busy(db, s.project, "Shot lengths")
+    for k, v in changes.items():
         setattr(s, k, v)
     db.commit()
     db.refresh(s)
@@ -265,6 +269,7 @@ def reorder_shots(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    refuse_while_busy(db, project, "The shot order")
     by_id = {s.id: s for s in project.shots}
     order = 1
     for sid in body.shot_ids:

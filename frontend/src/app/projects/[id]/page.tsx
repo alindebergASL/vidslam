@@ -52,7 +52,7 @@ function Inner() {
   const [adding, setAdding] = useState<{ after: Shot | null } | null>(null);
   const [deleting, setDeleting] = useState<Shot | null>(null);
   const [takesFor, setTakesFor] = useState<Shot | null>(null);
-  const [duplicating, setDuplicating] = useState<{ shot: Shot; impact: ShotEditImpact } | null>(null);
+  const [duplicating, setDuplicating] = useState<{ shot: Shot; impact: ShotEditImpact | null } | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
   const [videoModels, setVideoModels] = useState<
@@ -237,10 +237,7 @@ function Inner() {
         }
       } catch {
         // Can't tell what it affects: ask, and say so.
-        setDuplicating({
-          shot,
-          impact: { stale_shots: [], stale_count: 0, stale_cost: 0, new_clip_cost: 0, currency: "USD", is_estimate: true },
-        });
+        setDuplicating({ shot, impact: null });
         return;
       }
     }
@@ -674,9 +671,18 @@ function Inner() {
                   const next = [...project.shots];
                   const [moved] = next.splice(dragIndex, 1);
                   next.splice(idx, 0, moved);
+                  const before = project;
                   setProject({ ...project, shots: next });
                   setDragIndex(null);
-                  await api.reorderShots(projectId, next.map((x) => x.id));
+                  try {
+                    await api.reorderShots(projectId, next.map((x) => x.id));
+                    // A new order moves lip-synced shots within the voiceover:
+                    // reload so their out-of-date chips and the cost show.
+                    await refresh();
+                  } catch (err: any) {
+                    setProject(before);
+                    toast.error(err.message || "Couldn't reorder the shots");
+                  }
                 }}
                 onDragEnd={() => setDragIndex(null)}
               />

@@ -902,3 +902,27 @@ def test_a_stale_clip_without_a_take_row_is_kept_as_a_take_when_generate_remakes
     finally:
         db.close()
     assert shot["clip_path"] in kept, "the old clip stays selectable"
+
+
+def test_reorder_and_shot_length_are_refused_mid_render(auth_client):
+    """Moving shots or changing a length mid-render would shift voiceover
+    slices under the compose step; other shot edits still save."""
+    from app import models
+    from app.db import SessionLocal
+
+    from .test_storyboard_waste import _body, _rendered
+
+    pid = _rendered(auth_client)
+    shots = _body(auth_client, pid)
+    db = SessionLocal()
+    try:
+        db.get(models.VideoProject, pid).status = "generating"
+        db.commit()
+    finally:
+        db.close()
+    ids = [s["id"] for s in reversed(shots)]
+    assert auth_client.post(f"/api/projects/{pid}/shots/reorder", json={"shot_ids": ids}).status_code == 409
+    sid = shots[0]["id"]
+    assert auth_client.patch(f"/api/projects/{pid}/shots/{sid}",
+                             json={"duration_seconds": shots[0]["duration_seconds"] + 1}).status_code == 409
+    assert auth_client.patch(f"/api/projects/{pid}/shots/{sid}", json={"prompt": "a quiet street"}).status_code == 200

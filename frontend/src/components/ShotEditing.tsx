@@ -254,7 +254,7 @@ export function DuplicateShotDialog({
 }: {
   project: Project;
   shot: Shot;
-  impact: ShotEditImpact;
+  impact: ShotEditImpact | null;
   onClose: () => void;
   onConfirm: () => Promise<void>;
 }) {
@@ -264,7 +264,7 @@ export function DuplicateShotDialog({
       <ul className="text-sm text-ink-200 list-disc pl-5 space-y-1">
         <li>
           The copy has no clip yet. Its clip is made (and paid for
-          {impact.new_clip_cost > 0 ? `, about ${usd(impact.new_clip_cost)}` : ""}) when you generate the video.
+          {impact && impact.new_clip_cost > 0 ? `, about ${usd(impact.new_clip_cost)}` : ""}) when you generate the video.
         </li>
         <EditImpactNote impact={impact} verb="The copy" />
         <li>The video gets longer, so captions are spread over the new length.</li>
