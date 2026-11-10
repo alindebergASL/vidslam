@@ -40,6 +40,10 @@ ACTIVE = ("submitted", "running")
 # Providers with no completion callbacks: their jobs are always polled.
 NO_WEBHOOK_PROVIDERS = frozenset({"sogni", "runware"})
 TERMINAL = ("completed", "failed")
+# A job is "completing" only while one worker downloads its clip. If that
+# worker dies, nothing else moves the job on: past this age it is treated as
+# stuck, no longer counts as being made, and the sweeper fails it.
+COMPLETING_STALE_SECONDS = 600
 
 
 def _now() -> datetime:
@@ -316,12 +320,55 @@ def _dispatch_failed(db: Session, job: models.VideoJob) -> None:
         pipeline.on_studio_clip_failed(db, job)
 
 
+def still_in_progress():
+    """SQL filter for jobs that can still finish: submitted / running, or
+    being downloaded by a worker that claimed them recently. A "completing"
+    job whose worker died never finishes, so it stops counting."""
+    from sqlalchemy import and_, or_
+
+    cutoff = _now() - timedelta(seconds=COMPLETING_STALE_SECONDS)
+    return or_(models.VideoJob.status.in_(ACTIVE),
+               and_(models.VideoJob.status == "completing", models.VideoJob.updated_at >= cutoff))
+
+
 def pending_for(db: Session, *, project_id: int, purposes: tuple[str, ...] = ("shot", "avatar")) -> int:
     return (db.query(models.VideoJob)
             .filter(models.VideoJob.project_id == project_id,
                     models.VideoJob.purpose.in_(purposes),
-                    models.VideoJob.status.in_(ACTIVE + ("completing",)))
+                    still_in_progress())
             .count())
+
+
+def fail_stuck_completing(db: Session, limit: int = 50) -> int:
+    """Fail jobs left in "completing" by a worker that died mid-download
+    (deploy, out of memory, restart), so whatever waits on them moves on and
+    the shot can be made again. Returns how many were failed."""
+    cutoff = _now() - timedelta(seconds=COMPLETING_STALE_SECONDS)
+    stuck = [j.id for j in db.query(models.VideoJob.id)
+             .filter(models.VideoJob.status == "completing", models.VideoJob.updated_at <= cutoff)
+             .order_by(models.VideoJob.id).limit(limit)]
+    failed = 0
+    for jid in stuck:
+        res = db.execute(
+            update(models.VideoJob)
+            .where(models.VideoJob.id == jid, models.VideoJob.status == "completing",
+                   models.VideoJob.updated_at <= cutoff)
+            .values(status="running", updated_at=_now())  # let fail() claim it
+        )
+        db.commit()
+        if res.rowcount != 1:
+            continue
+        job = db.get(models.VideoJob, jid)
+        db.refresh(job)
+        # The provider finished (and billed) the clip; only our download died.
+        try:
+            _record_spend(db, job)
+        except Exception:  # noqa: BLE001 — never block marking the job failed
+            db.rollback()
+            log.exception("video job %s: couldn't record the spend of a stuck download", jid)
+        if fail(db, jid, "the clip was ready but saving it was interrupted; make it again") == "failed":
+            failed += 1
+    return failed
 
 
 # ---------- webhook ----------
@@ -408,6 +455,11 @@ def sweep(limit: int = 50) -> int:
             if res.rowcount == 1:
                 enqueue(check_video_job, jid)
                 claimed += 1
+        try:
+            fail_stuck_completing(db)
+        except Exception:  # noqa: BLE001 — never stop polling the other jobs
+            db.rollback()
+            log.exception("failing stuck video jobs failed")
         return claimed
     finally:
         db.close()

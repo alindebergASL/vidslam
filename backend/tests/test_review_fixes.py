@@ -296,7 +296,7 @@ def test_aspect_change_invalidates_loop(auth_client):
     scene = auth_client.post("/api/ambient", json={"config": {"loop_seconds": 5, "total_seconds": 20},
                                                    "generate": True}).json()
     assert scene["loop_status"] == "completed"
-    r = auth_client.patch(f"/api/ambient/{scene['id']}", json={"aspect_ratio": "9:16"}).json()
+    r = auth_client.patch(f"/api/ambient/{scene['id']}?discard_loop=true", json={"aspect_ratio": "9:16"}).json()
     assert r["loop_status"] == "pending" and r["loop_shot"]["clip_path"] == ""
     assert auth_client.post(f"/api/ambient/{scene['id']}/render").status_code == 409
     # Same aspect again is a no-op for the clip.

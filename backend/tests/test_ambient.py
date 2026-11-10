@@ -226,9 +226,9 @@ def test_update_scene_prompt_invalidates_clip_but_fade_does_not(auth_client):
     # 5s closed loop → 4.5s unit → ceil(40/4.5) = 9.
     assert r.json()["repeats"] == 9
 
-    # Scene change → clip must be regenerated.
+    # Scene change → clip must be regenerated (the made loop is discarded: say so).
     r = auth_client.patch(
-        f"/api/ambient/{sid}", json={"title": "Night", "config": {**SHORT, "scene_preset": "night_sky"}}
+        f"/api/ambient/{sid}?discard_loop=true", json={"title": "Night", "config": {**SHORT, "scene_preset": "night_sky"}}
     )
     assert r.status_code == 200, r.text
     body = r.json()
@@ -433,7 +433,8 @@ def test_chained_30s_loop_pins_first_and_last_frames(auth_client, monkeypatch):
     assert 119.0 <= _duration(Path(scene["latest_render"]["final_video_path"])) <= 121.0
 
     # Regenerating with fewer segments leaves no stale segment shots.
-    r = auth_client.patch(f"/api/ambient/{scene['id']}", json={"config": {**cfg, "loop_seconds": 10}})
+    r = auth_client.patch(f"/api/ambient/{scene['id']}?discard_loop=true",
+                          json={"config": {**cfg, "loop_seconds": 10}})
     assert r.json()["loop_status"] == "pending"
     auth_client.post(f"/api/ambient/{scene['id']}/generate-loop")
     p = auth_client.get(f"/api/projects/{scene['id']}").json()

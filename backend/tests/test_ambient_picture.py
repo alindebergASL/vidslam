@@ -114,7 +114,8 @@ def test_generated_preview_studio_and_asset_sources(auth_client):
 def test_picture_changes_invalidate_the_loop_and_settings_keep_it(auth_client):
     sid = _scene(auth_client, generate=True)
     assert auth_client.get(f"/api/ambient/{sid}").json()["loop_status"] == "completed"
-    r = _upload(auth_client, sid, make_png_bytes((1920, 1080)))
+    r = auth_client.post(f"/api/ambient/{sid}/picture?discard_loop=true",
+                         files={"file": ("pic.png", make_png_bytes((1920, 1080)), "image/png")})
     assert r.json()["loop_status"] == "pending"  # made from a different image
 
     # A settings save from a page that never saw the picture keeps it.

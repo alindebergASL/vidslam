@@ -38,6 +38,8 @@ function Inner() {
   const [loaded, setLoaded] = useState(false);
   const [busyPreset, setBusyPreset] = useState<string | null>(null);
   const [showBatch, setShowBatch] = useState(false);
+  // What one quick-start scene costs (same settings for each preset).
+  const [quickCost, setQuickCost] = useState<number | null>(null);
   const toast = useToast();
   const router = useRouter();
 
@@ -50,6 +52,7 @@ function Inner() {
   useEffect(() => {
     reload();
     api.ambientPresets().then(setPresets).catch(() => {});
+    api.ambientEstimate(DEFAULT_AMBIENT_CONFIG).then((e) => setQuickCost(e.total)).catch(() => {});
   }, []);
 
   // Keep statuses live while anything is generating/rendering.
@@ -135,7 +138,7 @@ function Inner() {
           ))}
         </div>
       ) : scenes.length === 0 ? (
-        <EmptyState presets={presets} busy={busyPreset} onQuickStart={quickStart} />
+        <EmptyState presets={presets} busy={busyPreset} cost={quickCost} onQuickStart={quickStart} />
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {scenes.map((s, i) => {
@@ -207,10 +210,12 @@ function Inner() {
 function EmptyState({
   presets,
   busy,
+  cost,
   onQuickStart,
 }: {
   presets: AmbientPresets | null;
   busy: string | null;
+  cost: number | null;
   onQuickStart: (p: ScenePreset) => void;
 }) {
   const quick = (presets?.scenes ?? []).filter((p) => QUICK_START.includes(p.id));
@@ -219,8 +224,10 @@ function EmptyState({
       <div className="max-w-xl">
         <div className="text-lg font-medium">Start with a one-hour classic</div>
         <p className="text-sm text-ink-300 mt-1">
-          Each of these creates a scene and immediately generates its 30-second loop and a
-          matching music bed. Rendering the full hour takes seconds — it&apos;s all local.
+          Each of these creates a scene and starts generating its 30-second loop and a matching
+          music bed as soon as you click{cost !== null ? `, for about $${cost.toFixed(2)}` : ""}. You
+          don&apos;t see the picture first; to check it before paying for the video, use the scene
+          builder. Rendering the full hour is free.
         </p>
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mt-6">
@@ -238,6 +245,9 @@ function EmptyState({
                 {busy === p.id ? "Creating…" : `${p.label} — 1h`}
               </div>
               <div className="text-xs text-ink-300 mt-0.5">{p.tagline}</div>
+              {cost !== null && (
+                <div className="text-xs text-ink-400 mt-1">Generates right away · about ${cost.toFixed(2)}</div>
+              )}
             </div>
           </button>
         ))}
@@ -293,8 +303,8 @@ function BatchPanel({ presets, onDone }: { presets: AmbientPresets; onDone: (n: 
     <section className="card p-5 mb-6" aria-labelledby="batch-h">
       <h2 id="batch-h" className="text-base font-medium">Batch create</h2>
       <p className="text-xs text-ink-400 mt-0.5">
-        One scene per preset with the same length and settings. They generate one at a time so the
-        provider isn&apos;t flooded.
+        One scene per preset with the same length and settings. Each one generates its loop and
+        music straight away, without a picture check, one at a time.
       </p>
       <div role="group" aria-label="Presets to create" className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-2 mt-4">
         {choices.map((p) => (
@@ -328,7 +338,12 @@ function BatchPanel({ presets, onDone }: { presets: AmbientPresets; onDone: (n: 
       <div className="flex flex-wrap items-center justify-between gap-3 mt-4">
         <div className="text-sm text-ink-300">
           {picked.length ? `${picked.length} scene${picked.length === 1 ? "" : "s"}` : "Pick presets"}
-          {estimate !== null && <> · est. <span className="text-ink-100 font-medium">${estimate.toFixed(2)}</span></>}
+          {estimate !== null && (
+            <>
+              {" "}· about <span className="text-ink-100 font-medium">${estimate.toFixed(2)}</span> in total, charged
+              as each scene generates
+            </>
+          )}
         </div>
         <button type="button" className="btn-primary disabled:opacity-50" disabled={!picked.length || busy} onClick={submit}>
           {busy ? "Creating…" : `Create ${picked.length || ""} scene${picked.length === 1 ? "" : "s"}`}

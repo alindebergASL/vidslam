@@ -54,7 +54,10 @@ function Inner() {
   const [cfg, setCfg] = useState<AmbientConfig>(DEFAULT_AMBIENT_CONFIG);
   const [title, setTitle] = useState("");
   const [aspect, setAspect] = useState("16:9");
-  const [generateNow, setGenerateNow] = useState(true);
+  // What happens after Create. "picture": make only the picture, so it can be
+  // checked before the video is bought (video scenes without their own picture).
+  const [after, setAfter] = useState<"picture" | "generate" | "save">("picture");
+  const [phase, setPhase] = useState<"" | "creating" | "picture">("");
   const [promptTouched, setPromptTouched] = useState(false);
   const [musicTouched, setMusicTouched] = useState(false);
   const [estimate, setEstimate] = useState<CostEstimate | null>(null);
@@ -136,8 +139,16 @@ function Inner() {
     !submitting &&
     (!!picture || (effectivePrompt.trim().length > 0 && (cfg.scene_preset !== "custom" || cfg.scene_prompt.trim())));
 
+  // Picture first only when the video is built from a generated picture: with
+  // Still + drift the still is the whole cost, your own picture is already
+  // seen, and some video models work from text alone.
+  const pictureFirstOk = cfg.source === "video" && !picture && plan?.picture_usable !== false;
+  const mode = after === "picture" && !pictureFirstOk ? "generate" : after;
+  const generateNow = mode === "generate";
+
   const submit = async () => {
     setSubmitting(true);
+    setPhase("creating");
     setError(null);
     try {
       // With your own picture the text only describes motion: don't rewrite it as a place.
@@ -172,11 +183,24 @@ function Inner() {
         }
         if (generateNow) await api.generateAmbientLoop(scene.id);
       }
+      if (mode === "picture") {
+        // One image call. The loop is made from the scene page, after a look.
+        setPhase("picture");
+        try {
+          await api.generateAmbientPicture(scene.id);
+          toast.success("Picture ready. Check it, then make the loop.");
+        } catch (e: any) {
+          toast.error(`Scene created, but the picture failed: ${e.message || e}. Try again on the scene page.`);
+        }
+        router.push(`/ambient/${scene.id}`);
+        return;
+      }
       toast.success(generateNow ? "Scene created — generating the loop" : "Scene created");
       router.push(`/ambient/${scene.id}`);
     } catch (e: any) {
       setError(e.message || "Could not create scene");
       setSubmitting(false);
+      setPhase("");
     }
   };
 
@@ -357,7 +381,7 @@ function Inner() {
                 <p className="text-xs text-ink-400 mt-1">
                   {picture
                     ? pictureUse(cfg.source)
-                    : "Use your own photo or artwork instead of a generated image. You can also generate and preview one on the scene page."}
+                    : "Use your own photo or artwork instead of a generated image."}
                 </p>
               </div>
             </div>
@@ -714,15 +738,40 @@ function Inner() {
                 </p>
               </div>
 
-              <label className="flex items-center gap-2 text-sm text-ink-200">
-                <input
-                  type="checkbox"
-                  checked={generateNow}
-                  onChange={(e) => setGenerateNow(e.target.checked)}
-                  className="accent-iris"
+              <fieldset className="space-y-2">
+                <legend className="text-ink-300 uppercase tracking-wider text-[10px] mb-2">After creating</legend>
+                {pictureFirstOk && (
+                  <AfterOption
+                    checked={mode === "picture"}
+                    onChange={() => setAfter("picture")}
+                    title="Make the picture first"
+                    cost={estimate ? money(estimate.picture_cost) : ""}
+                    desc={`The video is built from this picture. You check it, then make the loop${
+                      estimate?.after_picture_total != null ? ` (${money(estimate.after_picture_total)})` : ""
+                    }. Nothing else is charged until then.`}
+                  />
+                )}
+                <AfterOption
+                  checked={mode === "generate"}
+                  onChange={() => setAfter("generate")}
+                  title={pictureFirstOk ? "Skip the check and generate now" : "Generate now"}
+                  cost={estimate ? money(estimate.total) : ""}
+                  desc={
+                    pictureFirstOk
+                      ? "Makes the picture, the loop and the music in one go. You pay for the video before seeing the picture."
+                      : cfg.source === "video" && !picture
+                      ? "This video model works from text alone, so there is no picture to check first."
+                      : "Makes the loop and the music straight away."
+                  }
                 />
-                Generate the loop right away
-              </label>
+                <AfterOption
+                  checked={mode === "save"}
+                  onChange={() => setAfter("save")}
+                  title="Just save the scene"
+                  cost="free"
+                  desc="Nothing is generated or charged yet."
+                />
+              </fieldset>
 
               <button
                 type="button"
@@ -730,13 +779,61 @@ function Inner() {
                 disabled={!canSubmit}
                 onClick={submit}
               >
-                {submitting ? "Creating…" : generateNow ? "Create & generate" : "Create scene"}
+                {phase === "picture"
+                  ? "Making the picture…"
+                  : submitting
+                  ? "Creating…"
+                  : mode === "picture"
+                  ? "Create and make the picture"
+                  : generateNow
+                  ? "Create and generate"
+                  : "Create scene"}
               </button>
+              {phase === "picture" && (
+                <p className="text-[11px] text-ink-400" role="status">
+                  This can take a couple of minutes. The scene page opens when the picture is ready.
+                </p>
+              )}
             </div>
           </div>
         </aside>
       </div>
     </div>
+  );
+}
+
+/** A rate-card estimate: "about $4.50", or "free". */
+const money = (n: number | undefined) => (n == null ? "" : n < 0.005 ? "free" : `about $${n.toFixed(2)}`);
+
+function AfterOption({
+  checked,
+  onChange,
+  title,
+  cost,
+  desc,
+}: {
+  checked: boolean;
+  onChange: () => void;
+  title: string;
+  cost: string;
+  desc: string;
+}) {
+  return (
+    <label
+      className={clsx(
+        "flex items-start gap-2 rounded-lg border p-2.5 cursor-pointer",
+        checked ? "border-iris bg-iris/10" : "border-ink-700 hover:border-ink-500"
+      )}
+    >
+      <input type="radio" name="amb-after" checked={checked} onChange={onChange} className="accent-iris mt-0.5" />
+      <span className="min-w-0 flex-1">
+        <span className="flex items-baseline justify-between gap-2 text-sm text-ink-100">
+          <span>{title}</span>
+          <span className="tabular-nums text-xs text-ink-300 shrink-0">{cost}</span>
+        </span>
+        <span className="block text-xs text-ink-400 mt-0.5">{desc}</span>
+      </span>
+    </label>
   );
 }
 

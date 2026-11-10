@@ -260,6 +260,37 @@ class LoopPlanOut(BaseModel):
     # A still is the first frame of the loop (the anchor, the scene picture,
     # or, with variations on a first-frame-only model, a shared start frame).
     first_frame_still: bool = False
+    # Whether the loop is built from a picture of the scene when it has one
+    # (False: the video model works from text alone, so checking a picture
+    # first says nothing about the video).
+    picture_usable: bool = True
+
+
+class LoopAtStakeOut(BaseModel):
+    """Loop clips already made for a scene: what a new picture or a setting
+    that needs a new clip would discard."""
+
+    # About what they cost to make, in USD: from the spend ledger when it has
+    # entries for this loop, else the rate-card estimate.
+    cost: float
+    from_ledger: bool
+    # Finished clips of a loop that failed part-way (no whole loop yet).
+    partial: bool = False
+
+
+class LoopResumeOut(BaseModel):
+    """A loop that failed part-way and can be continued from the failed clip."""
+
+    clip: int  # the clip to make next, 1-based; clips + 1 = all made, only joining is left
+    clips: int  # clips per take
+    take: int  # 1-based
+    takes: int
+    kept_clips: int  # finished clips of this take that are kept
+    cost: float  # rate-card estimate of what continuing still buys
+    error: str = ""
+    # Resuming keeps the video model the kept clips were made with.
+    model: str = ""
+    model_changed: bool = False  # the scene would use a different model if started over now
 
 
 class AmbientOut(BaseModel):
@@ -291,6 +322,14 @@ class AmbientOut(BaseModel):
     # How many times the loop unit tiles into the total output.
     repeats: int
     plan: LoopPlanOut
+    # Rate-card estimate of what Generate loop would buy now (the loop, plus
+    # the music and sound beds the scene doesn't have yet).
+    generate_cost: float = 0.0
+    # Set when loop clips exist: changing the picture or a clip setting
+    # discards them, and needs discard_loop=true.
+    loop_at_stake: Optional[LoopAtStakeOut] = None
+    # Set when a failed loop can be continued (POST .../resume-loop).
+    resume: Optional[LoopResumeOut] = None
     latest_render: Optional[RenderOut] = None
     render_count: int = 0
     created_at: datetime

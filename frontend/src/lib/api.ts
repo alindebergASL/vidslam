@@ -184,6 +184,34 @@ export type Shot = {
   status: string;
   clip_path: string;
   error: string;
+  /** Edited since its clip was made: the next render makes a new clip. */
+  clip_stale?: boolean;
+};
+
+/** What "Generate video" would do right now, before anything is paid for. */
+export type RenderPlanShot = {
+  id: number;
+  shot_order: number;
+  action: "reuse" | "in_flight" | "generate";
+  reason: string;
+  lipsync: boolean;
+  cost: number;
+  /** Lip-synced and the voiceover is out of date: only Generate video fixes it, a re-roll would not. */
+  needs_new_voiceover?: boolean;
+};
+export type RenderPlan = {
+  voiceover: "silent" | "upload" | "reuse" | "new";
+  /** The voice in the latest video no longer matches the spoken script or voice. */
+  voiceover_changed: boolean;
+  voiceover_cost: number;
+  shots: RenderPlanShot[];
+  reuse: number;
+  in_flight: number;
+  generate: number;
+  clip_cost: number;
+  total: number;
+  currency: string;
+  is_estimate: boolean;
 };
 
 export type Render = {
@@ -259,6 +287,9 @@ export type CostEstimate = {
   is_estimate: boolean;
   note: string;
   plan?: LoopPlan; // ambient estimates only
+  /** Ambient: what the scene's picture alone costs, and what generating costs once it has one. */
+  picture_cost?: number;
+  after_picture_total?: number;
 };
 
 /** How an ambient loop is produced on the configured video model. */
@@ -282,6 +313,8 @@ export type LoopPlan = {
   variants?: number;
   variant_labels?: string[];
   repeat_every_seconds?: number;
+  /** False: the video model works from text alone, so a picture isn't used for the video. */
+  picture_usable?: boolean;
 };
 
 export type StudioJob = {
@@ -524,6 +557,24 @@ export type AmbientScene = {
   picture_version?: string;
   repeats: number;
   plan: LoopPlan;
+  /** Rate-card estimate of what Generate loop would buy now (USD). */
+  generate_cost?: number;
+  /** Loop clips already made: a new picture or a setting that needs a new clip discards them. */
+  loop_at_stake?: { cost: number; from_ledger: boolean; partial: boolean } | null;
+  /** A loop that failed part-way and can be continued from the failed clip. */
+  resume?: {
+    clip: number;
+    clips: number;
+    take: number;
+    takes: number;
+    kept_clips: number;
+    cost: number;
+    error: string;
+    /** Resuming keeps the video model the kept clips were made with. */
+    model?: string;
+    /** Starting over would use a different model (the default changed since). */
+    model_changed?: boolean;
+  } | null;
   latest_render: Render | null;
   render_count: number;
   created_at: string;
@@ -735,23 +786,34 @@ export const api = {
     config: AmbientConfig;
     generate?: boolean;
   }) => req<AmbientScene>("/api/ambient", { method: "POST", body: JSON.stringify(body) }),
+  // discardLoop: go ahead even though the change discards loop clips that are
+  // already made (the server answers 409 without it). Same for the picture calls.
   updateAmbient: (
     id: number,
-    body: { title?: string; aspect_ratio?: string; config?: AmbientConfig }
-  ) => req<AmbientScene>(`/api/ambient/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+    body: { title?: string; aspect_ratio?: string; config?: AmbientConfig },
+    discardLoop = false
+  ) =>
+    req<AmbientScene>(`/api/ambient/${id}${discardLoop ? "?discard_loop=true" : ""}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
   generateAmbientLoop: (id: number, regenerateMusic = true) =>
     req<{ scene_id: number; job_id: string; status: string }>(
       `/api/ambient/${id}/generate-loop?regenerate_music=${regenerateMusic}`,
       { method: "POST" }
     ),
+  resumeAmbientLoop: (id: number) =>
+    req<{ scene_id: number; job_id: string; status: string }>(`/api/ambient/${id}/resume-loop`, {
+      method: "POST",
+    }),
   regenerateAmbientMusic: (id: number) =>
     req<AmbientScene>(`/api/ambient/${id}/music`, { method: "POST" }),
   regenerateAmbientSound: (id: number) =>
     req<AmbientScene>(`/api/ambient/${id}/sound`, { method: "POST" }),
-  uploadAmbientPicture: async (id: number, file: File) => {
+  uploadAmbientPicture: async (id: number, file: File, discardLoop = false) => {
     const fd = new FormData();
     fd.append("file", file);
-    const r = await fetch(`${API_BASE}/api/ambient/${id}/picture`, {
+    const r = await fetch(`${API_BASE}/api/ambient/${id}/picture${discardLoop ? "?discard_loop=true" : ""}`, {
       method: "POST",
       credentials: "include",
       body: fd,
@@ -767,12 +829,17 @@ export const api = {
     }
     return (await r.json()) as AmbientScene;
   },
-  generateAmbientPicture: (id: number) =>
-    req<AmbientScene>(`/api/ambient/${id}/picture/generate`, { method: "POST" }),
-  ambientPictureFrom: (id: number, body: { asset_id?: number; studio_job_id?: number }) =>
-    req<AmbientScene>(`/api/ambient/${id}/picture/from`, { method: "POST", body: JSON.stringify(body) }),
-  clearAmbientPicture: (id: number) =>
-    req<AmbientScene>(`/api/ambient/${id}/picture`, { method: "DELETE" }),
+  generateAmbientPicture: (id: number, discardLoop = false) =>
+    req<AmbientScene>(`/api/ambient/${id}/picture/generate${discardLoop ? "?discard_loop=true" : ""}`, {
+      method: "POST",
+    }),
+  ambientPictureFrom: (id: number, body: { asset_id?: number; studio_job_id?: number }, discardLoop = false) =>
+    req<AmbientScene>(`/api/ambient/${id}/picture/from${discardLoop ? "?discard_loop=true" : ""}`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  clearAmbientPicture: (id: number, discardLoop = false) =>
+    req<AmbientScene>(`/api/ambient/${id}/picture${discardLoop ? "?discard_loop=true" : ""}`, { method: "DELETE" }),
   ambientPictureUrl: (id: number, v?: string | number) =>
     `${API_BASE}/api/ambient/${id}/picture${v ? `?v=${encodeURIComponent(String(v))}` : ""}`,
   ambientSoundUrl: (id: number, v?: string) => `${API_BASE}/api/ambient/${id}/sound${v ? `?v=${encodeURIComponent(v)}` : ""}`,
@@ -1075,6 +1142,7 @@ export const api = {
     req<PreflightResult>(`/api/projects/${id}/preflight`),
   costEstimate: (id: number) =>
     req<CostEstimate>(`/api/projects/${id}/cost-estimate`),
+  renderPlan: (id: number) => req<RenderPlan>(`/api/projects/${id}/render-plan`),
   regenerateShotsBulk: (id: number, shotIds: number[]) =>
     req<any>(`/api/projects/${id}/shots/regenerate-bulk`, {
       method: "POST",
@@ -1093,9 +1161,12 @@ export const api = {
       job_id: string;
       action: "recompose" | "resume";
       status: string;
+      clips_in_flight?: number;
+      voiceover?: "silent" | "upload" | "reuse" | "new";
+      voiceover_cost?: number;
     }>(`/api/projects/${id}/retry`, { method: "POST" }),
   cancelRender: (id: number) =>
-    req<{ render_id: number; status: string; action: "noop" | "signalled" }>(
+    req<{ render_id: number; status: string; action: "noop" | "signalled"; clips_in_flight?: number }>(
       `/api/projects/${id}/cancel`,
       { method: "POST" }
     ),

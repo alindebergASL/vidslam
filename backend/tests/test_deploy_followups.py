@@ -116,11 +116,12 @@ def test_preflight_blocks_mock_video_model_in_live_mode(auth_client, monkeypatch
     assert _check(auth_client, pid, "models_selected")["status"] == "warn"
 
 
-def test_preflight_warns_when_elevenlabs_has_no_voice(auth_client, monkeypatch):
+def test_preflight_blocks_when_elevenlabs_has_no_voice(auth_client, monkeypatch):
+    # A failed voiceover now stops the render, so a missing voice blocks.
     pid = _project(auth_client)
     _live(monkeypatch, ELEVENLABS_API_KEY="el")
     c = _check(auth_client, pid, "voice_selected")
-    assert c["status"] == "warn" and "no voiceover" in c["message"]
+    assert c["status"] == "fail" and "voiceover can't be made" in c["message"]
     _live(monkeypatch, ELEVENLABS_API_KEY="el", ELEVENLABS_DEFAULT_VOICE_ID="v1")
     assert _check(auth_client, pid, "voice_selected")["status"] == "ok"
 

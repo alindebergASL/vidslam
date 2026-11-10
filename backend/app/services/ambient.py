@@ -14,6 +14,7 @@ import math
 import re
 import secrets
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -33,7 +34,9 @@ from ..schemas.ambient import (
     AmbientOut,
     AmbientPresetsOut,
     AmbientUpdate,
+    LoopAtStakeOut,
     LoopPlanOut,
+    LoopResumeOut,
     ModelChoiceOut,
     MusicMoodOut,
     OptionOut,
@@ -893,18 +896,98 @@ def _reset_clips(project: models.VideoProject) -> None:
             shot.status, shot.clip_path, shot.error = "pending", "", ""
 
 
+class LoopDiscard(Exception):
+    """The change would discard loop clips that are already made, and the
+    request didn't say to (the API answers 409; discard_loop=true goes ahead)."""
+
+
+def _has_loop_work(project: models.VideoProject) -> bool:
+    """Loop clips, or the kept clips of a loop that failed part-way."""
+    return (any(s.clip_path for s in project.shots if s.shot_type in (LOOP_SHOT_TYPE, VARIANT_SHOT_TYPE))
+            or bool((project.ambient_config_json or {}).get(_CHAIN_KEY)))
+
+
+def _kept_segments(project: models.VideoProject) -> list[models.VideoShot]:
+    """Finished clips of a chain that failed part-way."""
+    chain = (project.ambient_config_json or {}).get(_CHAIN_KEY) or {}
+    if not chain.get("failed"):
+        return []
+    ids = set(chain.get("segment_ids") or [])
+    return [s for s in project.shots if s.id in ids and _segment_done(s)]
+
+
+def _segment_done(seg: Optional[models.VideoShot]) -> bool:
+    return bool(seg is not None and seg.status == "completed" and seg.clip_path and Path(seg.clip_path).exists())
+
+
+def loop_at_stake(db: Session, project: models.VideoProject) -> Optional[LoopAtStakeOut]:
+    """The loop clips a new picture or a clip setting would discard, with
+    about what they cost: the scene's video and image spend since its loop
+    was started when the ledger has any, else the rate-card estimate of the
+    part that's made (nothing on a mock provider)."""
+    made = [s for s in project.shots if s.shot_type in (LOOP_SHOT_TYPE, VARIANT_SHOT_TYPE) and s.clip_path]
+    kept = _kept_segments(project)
+    if not made and not kept:
+        return None
+    cfg = _config_of(project)
+    partial = _loop_shot(project) is None or _loop_shot(project).status != "completed"
+    started = (project.ambient_config_json or {}).get(_STARTED_KEY)
+    try:
+        q = db.query(models.SpendEntry).filter(models.SpendEntry.project_id == project.id,
+                                               models.SpendEntry.kind.in_(("video", "image")))
+        if started:
+            q = q.filter(models.SpendEntry.created_at >= datetime.fromisoformat(started))
+        spent = sum(e.cost_usd or 0.0 for e in q.all())
+    except Exception as e:  # noqa: BLE001 — the estimate still answers
+        log.warning("couldn't read what scene %s's loop cost (%s)", project.id, str(e)[:200])
+        spent = 0.0
+    if spent > 0:
+        return LoopAtStakeOut(cost=round(spent, 2), from_ledger=True, partial=partial)
+    plan = plan_loop(cfg)
+    if provider_label("image" if plan.strategy == "drift" else "video", plan.model) == "mock":
+        return LoopAtStakeOut(cost=0.0, from_ledger=False, partial=partial)
+    whole = sum(ln["cost"] for ln in estimate_ambient_cost(cfg, plan)["lines"] if ln["unit"] in ("sec", "image"))
+    n, k = max(1, len(plan.segments)), max(1, plan.variants)
+    share = min(1.0, (len(made) * n + len(kept)) / (n * k))
+    return LoopAtStakeOut(cost=round(whole * share, 2), from_ledger=False, partial=partial)
+
+
+def discard_message(stake: LoopAtStakeOut) -> str:
+    what = "the clips already made for this loop" if stake.partial else "the loop already made for this scene"
+    cost = f"about ${stake.cost:.2f} to make" if stake.cost >= 0.005 else "it cost nothing to make"
+    return f"This would discard {what} ({cost}). Confirm to go ahead."
+
+
+def _check_discard(db: Session, project: models.VideoProject, allowed: bool) -> None:
+    """Refuse, with nothing changed, a change that would discard made loop
+    clips unless the request allowed it."""
+    if allowed:
+        return
+    stake = loop_at_stake(db, project)
+    if stake is not None:
+        db.rollback()
+        raise LoopDiscard(discard_message(stake))
+
+
+def _drop_loop_work(project: models.VideoProject) -> None:
+    """The loop needs regenerating: blank its clips and what was kept of a
+    failed chain."""
+    _reset_clips(project)
+    _set_state(project, _GENERATED_KEY, None)
+    _set_state(project, _CHAIN_KEY, None)
+
+
 def _invalidate_loop(project: models.VideoProject) -> None:
     """The loop clip was made from a different image: it needs regenerating."""
-    shot = _loop_shot(project)
-    if shot is not None and shot.clip_path:
-        _reset_clips(project)
-    data = dict(project.ambient_config_json or {})
-    data.pop(_GENERATED_KEY, None)
-    project.ambient_config_json = data
+    if _has_loop_work(project):
+        _drop_loop_work(project)
+    _set_state(project, _GENERATED_KEY, None)
 
 
-def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: str) -> models.VideoProject:
+def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: str, *,
+                discard_loop: bool = False) -> models.VideoProject:
     png = _crop_to_aspect(raw, project.aspect_ratio)
+    _check_discard(db, project, discard_loop)
     picture_path(project).write_bytes(png)
     _invalidate_loop(project)
     _set_state(project, "picture_origin", origin)
@@ -913,9 +996,12 @@ def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: s
     return project
 
 
-def clear_picture(db: Session, project: models.VideoProject) -> models.VideoProject:
+def clear_picture(db: Session, project: models.VideoProject, *, discard_loop: bool = False) -> models.VideoProject:
+    had = bool(_config_of(project).picture_origin)
+    if had:
+        _check_discard(db, project, discard_loop)
     picture_path(project).unlink(missing_ok=True)
-    if _config_of(project).picture_origin:
+    if had:
         _invalidate_loop(project)
     _set_state(project, "picture_origin", "")
     db.commit()
@@ -942,30 +1028,40 @@ def still_prompt(cfg: AmbientConfig) -> str:
     return " ".join(x for x in parts if x)
 
 
-def generate_picture(db: Session, project: models.VideoProject) -> models.VideoProject:
+def picture_prompt(cfg: AmbientConfig) -> str:
+    """Prompt for the scene's picture. The picture becomes the first frame
+    of the first variation, so it is made in that variation's light (day to
+    night starts at golden hour, midday or dawn, not the preset's light)."""
+    return still_prompt(variant_config(cfg, 0))
+
+
+def generate_picture(db: Session, project: models.VideoProject, *,
+                     discard_loop: bool = False) -> models.VideoProject:
     """Generate the scene's picture now (one image call), so it can be
     previewed and regenerated before any video is made."""
+    _check_discard(db, project, discard_loop)  # before the paid call
     cfg = _with_current_rewrite(db, project, _config_of(project))
     # Same model choice as the loop path (still_model_chain), so the picture
     # previewed here is what the scene would have made anyway.
-    png, _ = generate_still(db, cfg, prompt=still_prompt(cfg), aspect_ratio=project.aspect_ratio,
+    png, _ = generate_still(db, cfg, prompt=picture_prompt(cfg), aspect_ratio=project.aspect_ratio,
                             project_id=project.id, endpoint="image.generate(picture)")
-    return set_picture(db, project, png, "generated")
+    return set_picture(db, project, png, "generated", discard_loop=discard_loop)
 
 
 def picture_from(db: Session, project: models.VideoProject, *, asset_id: Optional[int] = None,
-                 studio_job_id: Optional[int] = None) -> models.VideoProject:
+                 studio_job_id: Optional[int] = None, discard_loop: bool = False) -> models.VideoProject:
     if asset_id is not None:
         asset = db.get(models.Asset, asset_id)
         if asset is None or not asset.file_path or not Path(asset.file_path).exists():
             raise LookupError("asset not found")
-        return set_picture(db, project, Path(asset.file_path).read_bytes(), "asset")
+        return set_picture(db, project, Path(asset.file_path).read_bytes(), "asset", discard_loop=discard_loop)
     if studio_job_id is not None:
         job = db.get(models.AssetGenerationJob, studio_job_id)
         if (job is None or job.output_kind != "image" or job.status not in ("completed", "saved")
                 or not job.result_path or not Path(job.result_path).exists()):
             raise LookupError("studio image not found")
-        return set_picture(db, project, Path(job.result_path).read_bytes(), "studio")
+        return set_picture(db, project, Path(job.result_path).read_bytes(), "studio",
+                           discard_loop=discard_loop)
     raise PictureError("give asset_id or studio_job_id")
 
 
@@ -1306,6 +1402,7 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
         variant_labels=labels,
         repeat_every_seconds=round(repeat_every, 2),
         first_frame_still=first_still,
+        picture_usable=caps.first_frame or caps.needs_reference,
     )
 
 
@@ -1391,9 +1488,15 @@ def estimate_ambient_cost(cfg: AmbientConfig, plan: Optional[LoopPlanOut] = None
         "cost": 0.0,
     })
     total = round(sum(line["cost"] for line in lines), 4)
+    # Picture first: what the picture alone costs, and what generating then
+    # costs with that picture as the scene's own.
+    after_picture = total if own else estimate_ambient_cost(
+        cfg.model_copy(update={"picture_origin": "generated"}))["total"]
     return {
         "currency": "USD",
         "total": total,
+        "picture_cost": 0.0 if own else round(still_cost(cfg), 4),
+        "after_picture_total": after_picture,
         "lines": lines,
         "is_estimate": True,
         "note": "Only the loop clip(s), anchor still and music bed hit a provider; the full-length "
@@ -1509,6 +1612,9 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         picture_version=(str(picture_path(project).stat().st_mtime_ns) if has_picture(project, cfg) else ""),
         repeats=plan.repeats,
         plan=plan,
+        generate_cost=generate_cost(project, cfg, plan),
+        loop_at_stake=None if project.status == "generating" else loop_at_stake(db, project),
+        resume=resume_info(project, cfg),
         latest_render=RenderOut.model_validate(latest) if latest else None,
         render_count=len(renders),
         created_at=project.created_at,
@@ -1560,9 +1666,33 @@ class SceneBusy(Exception):
     """The scene started generating while a save was in progress (the API answers 409)."""
 
 
+# A different scene/source/length/model needs a new clip. Pure compositing
+# knobs (crossfade, fade, volume, total) keep the one that's made.
+_CLIP_KEYS = ("scene_preset", "scene_prompt", "source", "loop_seconds",
+              "model_override", "chain_segments", "look", "look_strength",
+              "time_of_day", "weather", "variety", "variations")
+
+
+def _clip_changed(old: AmbientConfig, cfg: AmbientConfig) -> bool:
+    """Whether saving `cfg` over `old` needs a new loop clip."""
+    cfg = cfg.model_copy(update={"picture_origin": old.picture_origin})
+    # The still model only matters when generating this scene calls it.
+    still_changed = old.still_model != cfg.still_model and uses_still_model(cfg)
+    # The rewrite changes the prompt only when one applies before or after.
+    rewrite_changed = _rewrite_key(old) != _rewrite_key(cfg)
+    return any(getattr(old, k) != getattr(cfg, k) for k in _CLIP_KEYS) or still_changed or rewrite_changed
+
+
 def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate, *,
-                 allow_rewrite: Optional[Callable[[], bool]] = None) -> models.VideoProject:
+                 allow_rewrite: Optional[Callable[[], bool]] = None,
+                 discard_loop: bool = False) -> models.VideoProject:
+    """Save settings. A change that needs a new clip (see _clip_changed, or
+    a new aspect) discards the clips that are made: without `discard_loop`
+    it raises LoopDiscard instead and nothing is saved."""
     cfg: Optional[AmbientConfig] = None
+    aspect_changed = body.aspect_ratio is not None and body.aspect_ratio != project.aspect_ratio
+    if aspect_changed and _has_loop_work(project):
+        _check_discard(db, project, discard_loop)
     if body.config is not None:
         cfg = body.config
         resolve_scene_prompt(cfg)
@@ -1570,6 +1700,9 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate,
         # Keep a rewrite the page didn't send back (an older page, a partial edit).
         if cfg.photo is None and old.photo is not None:
             cfg = cfg.model_copy(update={"photo": old.photo})
+        # Refused before the (paid) rewrite below when that's already clear.
+        if _clip_changed(old, cfg) and _has_loop_work(project):
+            _check_discard(db, project, discard_loop)
         # Rewrite only when what it depends on changed, so an unrelated save
         # never swaps the prompt the existing clip was made from. This is a
         # network call of up to a minute, so it comes before anything is
@@ -1587,21 +1720,22 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate,
 
     if body.title is not None:
         project.title = body.title.strip()
-    aspect_changed = body.aspect_ratio is not None and body.aspect_ratio != project.aspect_ratio
     if body.aspect_ratio is not None:
         project.aspect_ratio = body.aspect_ratio
-    if aspect_changed:
+    if aspect_changed and _has_loop_work(project):
         # The clip was generated (and drift stills rendered) for the old
         # aspect; reusing it would letterbox it into the new frame.
-        shot = _loop_shot(project)
-        if shot is not None and shot.clip_path:
-            _reset_clips(project)
-            _set_state(project, _GENERATED_KEY, None)
+        _drop_loop_work(project)
     if cfg is not None:
         old = _config_of(project)
         # The picture is set through its own endpoints; a settings save
         # (maybe from a page loaded before the upload) must not clear it.
         cfg = cfg.model_copy(update={"picture_origin": old.picture_origin})
+        # Flip the clips back to pending so the UI asks for a regenerate.
+        # (Checked again: the rewrite above may be what changed the prompt.)
+        if _clip_changed(old, cfg) and _has_loop_work(project):
+            _check_discard(db, project, discard_loop)
+            _drop_loop_work(project)
         # Internal state (_generated, _chain, ...) isn't part of the config
         # the page sends; keep it.
         data = {k: v for k, v in (project.ambient_config_json or {}).items() if k.startswith("_")}
@@ -1609,21 +1743,7 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate,
         project.ambient_config_json = data
         project.target_duration_seconds = int(cfg.total_seconds)
         project.music_volume = float(cfg.music_volume)
-        shot = _ensure_loop_shot(db, project, cfg)
-        # A different scene/source/length/model invalidates the existing clip —
-        # flip it back to pending so the UI asks for a regenerate. Pure
-        # compositing knobs (crossfade, fade, volume, total) keep it.
-        clip_keys = ("scene_preset", "scene_prompt", "source", "loop_seconds",
-                     "model_override", "chain_segments", "look", "look_strength",
-                     "time_of_day", "weather", "variety", "variations")
-        # The still model only matters when generating this scene calls it.
-        still_changed = old.still_model != cfg.still_model and uses_still_model(cfg)
-        # The rewrite changes the prompt only when one applies before or after.
-        rewrite_changed = _rewrite_key(old) != _rewrite_key(cfg)
-        if ((any(getattr(old, k) != getattr(cfg, k) for k in clip_keys) or still_changed or rewrite_changed)
-                and shot.clip_path):
-            _reset_clips(project)
-            _set_state(project, _GENERATED_KEY, None)
+        _ensure_loop_shot(db, project, cfg)
     db.commit()
     db.refresh(project)
     return project
@@ -1678,7 +1798,10 @@ def _segment_shots(db: Session, project: models.VideoProject, n: int) -> list[mo
     return out
 
 
-_CHAIN_KEY = "_chain"  # in-flight chain state (cleared when the loop is done)
+# Chain state: in flight, or kept (with "failed": True) when a clip failed so
+# the loop can be resumed from that clip. Cleared when the loop is done.
+_CHAIN_KEY = "_chain"
+_STARTED_KEY = "_loop_started"  # when the current loop's generation began (UTC, ISO)
 
 
 def _set_state(project: models.VideoProject, key: str, value: Optional[object]) -> None:
@@ -1734,7 +1857,10 @@ def _start_video_chain(
         )
         seg.negative_prompt = shot.negative_prompt
         seg.duration_seconds = float(dur)
-        seg.model_override = shot.model_override
+        # Pinned to the model the loop was planned for (clip lengths, frame
+        # references, price): a resume after the default model changed in
+        # Settings keeps making this loop's clips with the same model.
+        seg.model_override = plan.model or shot.model_override
     shot.status = "polling"
     _set_state(project, _CHAIN_KEY, {
         "segment_ids": [s.id for s in segs], "anchor_url": anchor_url, "plan": plan.model_dump(),
@@ -1769,7 +1895,7 @@ def on_segment_ready(db: Session, job: models.VideoJob) -> None:
     if project is None or seg is None:
         return
     chain = (project.ambient_config_json or {}).get(_CHAIN_KEY)
-    if not chain:
+    if not chain or seg.id not in (chain.get("segment_ids") or []):
         return  # chain was superseded (scene regenerated / edited)
     seg.clip_path = job.result_path
     seg.status = "completed"
@@ -1815,13 +1941,21 @@ def _finish_chain(db: Session, project: models.VideoProject) -> None:
     shot.provider_model = segs[0].provider_model
     shot.duration_seconds = round(length, 2)
     variant, k = int(chain.get("variant") or 0), variant_count(cfg)
-    _set_state(project, _CHAIN_KEY, None)
     if variant < k - 1:
         # More variations to make: the loop shot stays "polling" until the last.
         if variant > 0:
             shot.status = "completed"
-        db.commit()
         nxt = _variant_shots(project)[variant]
+        # Until the next variation's chain replaces it: if starting that one
+        # fails (its still, its first submit), the loop resumes there and the
+        # finished variations are kept.
+        _set_state(project, _CHAIN_KEY, {
+            "segment_ids": [], "anchor_url": None, "plan": chain["plan"],
+            "regenerate_music": bool(chain.get("regenerate_music", True)),
+            "render_after": bool(chain.get("render_after")),
+            "variant": variant + 1, "shot_id": nxt.id, "anchor0_url": chain.get("anchor0_url"),
+        })
+        db.commit()
         _start_video_chain(db, project, nxt, cfg, plan,
                            regenerate_music=bool(chain.get("regenerate_music", True)),
                            render_after=bool(chain.get("render_after")),
@@ -1862,6 +1996,9 @@ def _finalize_generation(
     # Nature sound: same rule as music.
     if regenerate_music or (cfg.sound != "none" and not sound_path(project).exists()):
         generate_sound_bed(db, project, cfg)
+    # Only now: had the music or sound failed, the kept chain lets the loop
+    # be finished from its clips instead of bought again.
+    _set_state(project, _CHAIN_KEY, None)
     project.status = "planned"
     db.commit()
     if render_after:
@@ -1879,7 +2016,11 @@ def _fail_generation(db: Session, project_id: int, e: Exception) -> None:
     if shot is not None and shot.status != "failed":
         shot.status = "failed"
         shot.error = str(e)[:500]
-    _set_state(project, _CHAIN_KEY, None)
+    # Keep the chain (and with it the finished clips): resume_loop continues
+    # from the clip that failed. Generate loop still starts over.
+    chain = (project.ambient_config_json or {}).get(_CHAIN_KEY)
+    if chain:
+        _set_state(project, _CHAIN_KEY, {**chain, "failed": True, "error": str(e)[:300]})
     project.status = "failed"
     db.commit()
     alerts.render_failed("ambient loop", project_id, project.title, str(e))
@@ -1901,7 +2042,8 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
     # Generate and a settings save in the meantime.
     _reset_clips(project)
     project.status = "generating"
-    _set_state(project, _CHAIN_KEY, None)  # supersede any in-flight chain
+    _set_state(project, _CHAIN_KEY, None)  # supersede any in-flight (or kept) chain
+    _set_state(project, _STARTED_KEY, datetime.utcnow().isoformat())
     db.commit()
     try:
         cfg = _with_current_rewrite(db, project, _config_of(project))
@@ -1962,6 +2104,121 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
         log.exception("ambient loop generation failed")
         _fail_generation(db, project_id, e)
         raise
+
+
+def _resume_point(project: models.VideoProject) -> Optional[tuple[dict, list[models.VideoShot], int]]:
+    """(chain, its segment shots, index of the first clip still to make) for
+    a loop that failed part-way; None when there is nothing to resume."""
+    chain = (project.ambient_config_json or {}).get(_CHAIN_KEY) or {}
+    if not chain.get("failed") or project.status == "generating":
+        return None
+    by_id = {s.id: s for s in project.shots}
+    segs = [by_id.get(i) for i in chain.get("segment_ids") or []]
+    if any(s is None for s in segs) or (chain.get("shot_id") and chain["shot_id"] not in by_id):
+        return None
+    index = next((i for i, s in enumerate(segs) if not _segment_done(s)), len(segs))
+    return chain, segs, index
+
+
+def resume_info(project: models.VideoProject, cfg: AmbientConfig) -> Optional[LoopResumeOut]:
+    """What resuming would do and about what it still buys (rate card)."""
+    point = _resume_point(project)
+    if point is None:
+        return None
+    chain, segs, index = point
+    plan = LoopPlanOut.model_validate(chain["plan"])
+    variant, k = int(chain.get("variant") or 0), max(1, variant_count(cfg))
+    if not segs:
+        index = 0  # this take hasn't started: every clip of it is still to make
+    seconds = float(sum(plan.segments[index:]) + sum(plan.segments) * (k - variant - 1))
+    cost = seconds * _video_rate(plan.model)
+    if cfg.variety == "day_night" and plan.first_frame_still:
+        cost += reference_still_cost(cfg) * ((k - variant - 1) + (0 if segs else 1))
+    s = get_settings()
+    has_music = bool(project.music_upload_path and Path(project.music_upload_path).exists())
+    if resolve_music_prompt(cfg) and (chain.get("regenerate_music", True) or not has_music):
+        cost += s.cost_music_per_generation * len(music_parts(cfg))
+    if resolve_sound_prompt(cfg) and (chain.get("regenerate_music", True) or not sound_path(project).exists()):
+        cost += s.cost_sound_per_generation
+    if provider_label("video", plan.model) == "mock":
+        cost = 0.0
+    return LoopResumeOut(clip=index + 1, clips=len(plan.segments), take=variant + 1, takes=k,
+                         kept_clips=index, cost=round(cost, 2), error=str(chain.get("error") or ""),
+                         model=plan.model,
+                         model_changed=bool(plan.model and _video_model_for(cfg) != plan.model))
+
+
+def resume_loop(db: Session, project_id: int) -> None:
+    """Continue a loop that failed part-way: submit only the clip that
+    failed, from the previous clip's last frame, and carry on from there
+    (later clips, later takes, music). Finished clips and takes are kept."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None or project.mode != AMBIENT_MODE:
+        raise ValueError(f"ambient scene {project_id} not found")
+    chain = dict((project.ambient_config_json or {}).get(_CHAIN_KEY) or {})
+    if not chain.get("failed"):
+        raise ValueError("this scene has no failed loop to resume")
+    chain.pop("failed", None)
+    chain.pop("error", None)
+    _set_state(project, _CHAIN_KEY, chain)
+    project.status = "generating"
+    loop = _loop_shot(project)
+    shot = (db.get(models.VideoShot, chain["shot_id"]) if chain.get("shot_id") else None) or loop
+    for sh in (loop, shot):
+        sh.status, sh.error = "polling", ""
+    db.commit()
+    try:
+        segs = [db.get(models.VideoShot, i) for i in chain.get("segment_ids") or []]
+        if not segs:
+            # The take never started (its still or its first submit failed).
+            _start_video_chain(db, project, shot, _config_of(project), LoopPlanOut.model_validate(chain["plan"]),
+                               regenerate_music=bool(chain.get("regenerate_music", True)),
+                               render_after=bool(chain.get("render_after")),
+                               variant=int(chain.get("variant") or 0), anchor0_url=chain.get("anchor0_url"))
+            return
+        index = next((i for i, s in enumerate(segs) if not _segment_done(s)), len(segs))
+        if index == len(segs):
+            _finish_chain(db, project)  # every clip is made: join them and finish
+            return
+        planned_model = LoopPlanOut.model_validate(chain["plan"]).model
+        if planned_model:
+            # Chains kept from before clips were pinned to their model.
+            for sh in segs[index:]:
+                sh.model_override = planned_model
+            db.commit()
+        prev_url = chain.get("anchor_url")
+        if index > 0:
+            frames_dir = storage.render_subdir(project.id) / "frames"
+            frames_dir.mkdir(exist_ok=True)
+            last = extract_frame(Path(segs[index - 1].clip_path), frames_dir / f"seg{index}_last.png", last=True)
+            _, prev_url = _save_frame_public(last)
+        _submit_segment(db, project, index, prev_url=prev_url)
+    except Exception as e:  # noqa: BLE001
+        log.exception("resuming the ambient loop failed")
+        _fail_generation(db, project_id, e)
+        raise
+
+
+def resume_loop_job(project_id: int) -> None:
+    """Queue entry point for resume_loop."""
+    from ..db import SessionLocal
+    from . import provider_keys, spend
+
+    db = SessionLocal()
+    try:
+        with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
+            resume_loop(db, project_id)
+    finally:
+        db.close()
+
+
+def generate_cost(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPlanOut) -> float:
+    """Rate-card estimate of what Generate loop buys now: the loop, plus the
+    music and sound beds the scene doesn't have yet (the scene page keeps
+    the beds it has)."""
+    has_music = bool(project.music_upload_path and Path(project.music_upload_path).exists())
+    skip = {"repeat"} | ({"track"} if has_music else set()) | ({"sound"} if has_music and sound_path(project).exists() else set())
+    return round(sum(ln["cost"] for ln in estimate_ambient_cost(cfg, plan)["lines"] if ln["unit"] not in skip), 2)
 
 
 def render_scene(db: Session, project_id: int) -> models.Render:

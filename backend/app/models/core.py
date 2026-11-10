@@ -238,11 +238,22 @@ class VideoShot(Base):
     status: Mapped[str] = mapped_column(String(40), default="pending")
     # pending|submitted|polling|downloaded|completed|failed
     clip_path: Mapped[str] = mapped_column(String(500), default="")
+    # Hash of what the clip was made from (services/fingerprints.py).
+    # "" = made before fingerprints existed: counts as current.
+    clip_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     project: Mapped[VideoProject] = relationship(back_populates="shots")
+
+    @property
+    def clip_stale(self) -> bool:
+        """The shot was edited since its clip was made: the next render
+        makes (and bills) a new clip for it."""
+        from ..services.fingerprints import shot_is_stale
+
+        return shot_is_stale(self)
 
 
 class Render(Base):
@@ -253,6 +264,8 @@ class Render(Base):
     status: Mapped[str] = mapped_column(String(40), default="pending")
     # pending|planning|generating_audio|generating_shots|polling|rendering|completed|failed
     audio_path: Mapped[str] = mapped_column(String(500), default="")
+    # Hash of what the voiceover in audio_path was made from; "" = unknown.
+    voice_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
     final_video_path: Mapped[str] = mapped_column(String(500), default="")
     thumbnail_path: Mapped[str] = mapped_column(String(500), default="")
     render_log: Mapped[str] = mapped_column(Text, default="")

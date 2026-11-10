@@ -26,6 +26,45 @@ export function fmtDuration(seconds: number): string {
   return `${sec}s`;
 }
 
+/** "about $4.50" ("nothing" when free): a rate-card or ledger amount in USD. */
+export function aboutUsd(n: number | null | undefined): string {
+  return !n || n < 0.005 ? "nothing" : `about $${n.toFixed(2)}`;
+}
+
+/** The loop clips that are already made, and about what they cost. */
+export function loopAtStakeText(scene: AmbientScene): string {
+  const stake = scene.loop_at_stake;
+  if (!stake) return "";
+  const what = stake.partial ? "the clips already made for this loop" : "the loop you already made";
+  return `${what} (${stake.cost >= 0.005 ? `about $${stake.cost.toFixed(2)} to make` : "it cost nothing to make"})`;
+}
+
+/**
+ * Run an action that may discard loop clips that are already made, asking
+ * first. `discards`: the page already knows it does (a new picture, a
+ * setting that needs a new clip). Otherwise the server decides: it refuses
+ * (409) and we ask then. `fn(true)` tells the server to go ahead. Resolves
+ * to null when the user says no.
+ */
+export async function askBeforeDiscard<T>(
+  scene: AmbientScene,
+  discards: boolean,
+  action: string,
+  fn: (discardLoop: boolean) => Promise<T>
+): Promise<T | null> {
+  const after = "You will need to generate the loop again. Continue?";
+  if (discards && scene.loop_at_stake) {
+    return window.confirm(`${action} discards ${loopAtStakeText(scene)}. ${after}`) ? fn(true) : null;
+  }
+  try {
+    return await fn(false);
+  } catch (e: any) {
+    const refused = /^409: (This would discard .*?) Confirm to go ahead/.exec(String(e?.message || ""));
+    if (!refused) throw e;
+    return window.confirm(`${refused[1]} ${after}`) ? fn(true) : null;
+  }
+}
+
 export function sceneStatusLabel(s: AmbientScene): string {
   if (s.status === "generating") {
     return s.loop_status === "completed" ? "Rendering…" : "Generating loop…";

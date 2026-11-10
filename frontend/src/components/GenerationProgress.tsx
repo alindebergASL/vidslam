@@ -44,13 +44,26 @@ export function GenerationProgress({
   const cancelled = render.status === "cancelled";
   const active = !["completed", "failed", "cancelled"].includes(render.status);
 
+  // Clips already at the provider can't be stopped: they finish and are billed.
+  const inFlight = bodyShots.filter((s) => ["submitted", "polling", "running"].includes(s.status)).length;
+  const clips = (n: number) => `${n} clip${n === 1 ? "" : "s"}`;
+
   const cancel = async () => {
-    if (!window.confirm("Cancel this render? Any work already done is kept; you can Retry to resume.")) return;
+    const message =
+      inFlight > 0
+        ? `Cancel this render? No new clips are started, but ${clips(inFlight)} already sent to the provider will still finish and be billed. They are kept, and Resume uses them without paying again.`
+        : "Cancel this render? No new clips are started. Finished clips are kept, and Resume carries on from here.";
+    if (!window.confirm(message)) return;
     setCancelling(true);
     try {
       const r = await api.cancelRender(projectId);
       if (r.action === "signalled") {
-        toast.info("Cancel signalled — stops at the next checkpoint");
+        const n = r.clips_in_flight ?? 0;
+        toast.info(
+          n > 0
+            ? `Cancelled. ${clips(n)} already at the provider will still finish and be billed; Resume uses them.`
+            : "Cancelled. Finished clips are kept."
+        );
       } else {
         toast.info("Nothing to cancel");
       }
@@ -65,10 +78,21 @@ export function GenerationProgress({
     setRetrying(true);
     try {
       const r = await api.retryRender(projectId);
+      const n = r.clips_in_flight ?? 0;
+      const voice =
+        r.voiceover === "new"
+          ? ` A new voiceover is made too${
+              r.voiceover_cost ? ` (about $${r.voiceover_cost.toFixed(2)})` : ""
+            }, because the spoken script or voice changed.`
+          : r.voiceover === "reuse"
+          ? " The voiceover is reused, not paid for again."
+          : "";
       toast.info(
         r.action === "recompose"
-          ? "Retrying: all clips present, just re-composing"
-          : "Retrying: resuming generation for failed shots"
+          ? "All clips and the voiceover are ready: putting the video together, no new charges"
+          : (n > 0
+              ? `Resuming: waiting for ${clips(n)} already being made (not paid for again); only missing, failed or edited shots are generated.`
+              : "Resuming: only missing, failed or edited shots are generated.") + voice
       );
       onRetry?.();
     } catch (e: any) {
@@ -101,7 +125,7 @@ export function GenerationProgress({
               className="btn-ghost text-xs disabled:opacity-50"
               onClick={cancel}
               disabled={cancelling}
-              title="Stop at the next safe checkpoint; completed clips are kept."
+              title="Stops new clips from starting. Clips already sent to the provider still finish and are billed; they are kept."
             >
               {cancelling ? "Cancelling…" : "Cancel"}
             </button>
@@ -176,8 +200,8 @@ export function GenerationProgress({
             </button>
             <span className="text-[11px] text-ink-400">
               {cancelled
-                ? "Picks up where the cancel landed — clips already rendered are kept."
-                : "Reuses any clips that already rendered — only failed shots are regenerated."}
+                ? "Carries on from here: finished clips and the voiceover are reused, clips still being made are waited for (not paid for twice), and only missing or edited shots are generated."
+                : "Finished clips and an unchanged voiceover are reused. Only failed, missing or edited shots are generated."}
             </span>
           </div>
         </div>

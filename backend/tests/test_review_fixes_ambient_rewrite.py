@@ -60,8 +60,8 @@ def test_a_combined_save_keeps_title_and_aspect(auth_client, rewrites, cfg):
     scene = auth_client.get(f"/api/ambient/{sid}").json()
     assert scene["aspect_ratio"] == "16:9" and scene["loop_status"] == "completed"
     new_cfg = {**scene["config"], "scene_prompt": "a quiet misty lake at the edge of a pine forest"}
-    r = auth_client.patch(f"/api/ambient/{sid}", json={"title": "Renamed", "aspect_ratio": "9:16",
-                                                       "config": new_cfg})
+    r = auth_client.patch(f"/api/ambient/{sid}?discard_loop=true",
+                          json={"title": "Renamed", "aspect_ratio": "9:16", "config": new_cfg})
     assert r.status_code == 200, r.text
     for out in (r.json(), auth_client.get(f"/api/ambient/{sid}").json()):
         assert out["title"] == "Renamed" and out["aspect_ratio"] == "9:16"
@@ -113,9 +113,10 @@ def test_a_generation_started_during_the_rewrite_is_not_overwritten(auth_client,
 def test_a_save_keeps_internal_state(auth_client, rewrites):
     sid = auth_client.post("/api/ambient", json={"config": _custom(), "generate": False}).json()["id"]
     _other_session(lambda p: setattr(p, "ambient_config_json",
-                                     {**p.ambient_config_json, "_chain": {"variant": 0}}))(sid)
+                                     {**p.ambient_config_json, "_chain": {"variant": 0},
+                                      "_loop_started": "2026-01-01T00:00:00"}))(sid)
     cfg = auth_client.get(f"/api/ambient/{sid}").json()["config"]
-    r = auth_client.patch(f"/api/ambient/{sid}", json={"config": {**cfg, "scene_prompt": "a quiet lake"}})
+    r = auth_client.patch(f"/api/ambient/{sid}", json={"config": {**cfg, "music_volume": 0.3}})
     assert r.status_code == 200, r.text
     from app import models
     from app.db import SessionLocal
@@ -123,6 +124,16 @@ def test_a_save_keeps_internal_state(auth_client, rewrites):
     db = SessionLocal()
     try:
         assert db.get(models.VideoProject, sid).ambient_config_json["_chain"] == {"variant": 0}
+    finally:
+        db.close()
+    # A change that needs a new clip drops the chain (it was for the old
+    # prompt) and keeps the rest.
+    r = auth_client.patch(f"/api/ambient/{sid}", json={"config": {**cfg, "scene_prompt": "a quiet lake"}})
+    assert r.status_code == 200, r.text
+    db = SessionLocal()
+    try:
+        state = db.get(models.VideoProject, sid).ambient_config_json
+        assert "_chain" not in state and state["_loop_started"] == "2026-01-01T00:00:00"
     finally:
         db.close()
 
@@ -212,7 +223,7 @@ def _still_change_resets(auth_client, **cfg):
     sid = auth_client.post("/api/ambient", json={"config": {**SHORT, **cfg}, "generate": True}).json()["id"]
     scene = auth_client.get(f"/api/ambient/{sid}").json()
     assert scene["loop_status"] == "completed"
-    r = auth_client.patch(f"/api/ambient/{sid}", json={
+    r = auth_client.patch(f"/api/ambient/{sid}?discard_loop=true", json={
         "config": {**scene["config"], "still_model": "black-forest-labs/flux-3-image"}})
     assert r.status_code == 200, r.text
     return r.json()["loop_status"] != "completed"

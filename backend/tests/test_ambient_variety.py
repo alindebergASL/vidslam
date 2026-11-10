@@ -291,7 +291,8 @@ def test_drift_day_night_starts_from_the_picture(auth_client, monkeypatch):
 
 def test_changing_variety_invalidates_and_resizes(auth_client):
     sid = _make(auth_client, variety="takes", variations=3)
-    r = auth_client.patch(f"/api/ambient/{sid}", json={"config": {**SHORT, "variety": "takes", "variations": 2}})
+    r = auth_client.patch(f"/api/ambient/{sid}?discard_loop=true",
+                          json={"config": {**SHORT, "variety": "takes", "variations": 2}})
     out = r.json()
     assert out["loop_status"] == "pending" and len(out["variant_shots"]) == 1
     assert not out["variant_shots"][0]["clip_path"]

@@ -210,6 +210,8 @@ class ShotOut(BaseModel):
     status: str
     clip_path: str
     error: str
+    # Edited since its clip was made: the next render makes a new clip.
+    clip_stale: bool = False
 
 
 class ShotUpdate(BaseModel):
