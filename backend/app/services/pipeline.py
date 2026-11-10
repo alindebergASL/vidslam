@@ -825,6 +825,7 @@ def make_voiceover_preview(db: Session, project: models.VideoProject) -> dict:
         raise ValueError("generate a storyboard plan first")
     if fingerprints.voice_source(project) != "tts":
         raise VoiceoverNotSynthesized(project)
+    adopt_unfingerprinted_voiceover(db, project)
     fingerprint = fingerprints.voice_fingerprint(db, project)
     existing = _reusable_voiceover(db, project, fingerprint)
     if existing:
@@ -868,6 +869,9 @@ def current_voiceover(db: Session, project: models.VideoProject) -> Optional[dic
     still matches."""
     from .renderer import _probe_duration
 
+    # A voiceover from before fingerprints existed is current until the
+    # script or voice changes (same rule as Retry and as clips).
+    adopt_unfingerprinted_voiceover(db, project)
     fp_now = fingerprints.voice_fingerprint(db, project) if fingerprints.voice_source(project) == "tts" else ""
     candidates: list[dict] = []
     preview = voiceover_preview_path(project)
@@ -1030,6 +1034,34 @@ def _active_job_for(db: Session, shot_id: int) -> Optional[models.VideoJob]:
             .order_by(models.VideoJob.id.desc()).first())
 
 
+# Project / render states during which a planning, render or re-roll step is
+# running (anything else: draft, planned, completed, failed, cancelled).
+_IDLE_PROJECT = ("draft", "planned", "completed", "failed", "cancelled")
+_DONE_RENDER = ("completed", "failed", "cancelled")
+
+
+def busy_reason(db: Session, project: models.VideoProject) -> Optional[str]:
+    """Why the storyboard can't be changed in a way that affects clips right
+    now: a plan, render or re-roll is running. None when nothing is."""
+    from . import video_jobs
+
+    if (project.status or "draft") not in _IDLE_PROJECT:
+        step = "planning" if project.status == "planning" else "making the video"
+        return f"Wait until the current step ({step}) finishes."
+    latest = (db.query(models.Render).filter(models.Render.project_id == project.id)
+              .order_by(models.Render.id.desc()).first())
+    if latest is not None and latest.status not in _DONE_RENDER:
+        return "Wait until the current step (making the video) finishes."
+    shot_ids = [s.id for s in project.shots]
+    if shot_ids and (db.query(models.VideoJob.id)
+                     .filter(models.VideoJob.ref_id.in_(shot_ids),
+                             models.VideoJob.purpose.in_(("shot", "avatar")),
+                             video_jobs.still_in_progress()).first()) is not None:
+        return ("A clip for this project is still being made (and is already paid for). "
+                "Wait until it is back.")
+    return None
+
+
 def _video_rate(shot: models.VideoShot) -> float:
     """Rate-card price per second of a clip on the shot's video model."""
     from ..providers import runware, sogni
@@ -1047,6 +1079,7 @@ def render_plan(db: Session, project: models.VideoProject) -> dict:
     for: whether a voiceover is made or reused, and which clips are reused,
     still being made, or made new (and why), with a rate-card price."""
     rates = get_settings()
+    adopt_unfingerprinted_voiceover(db, project)  # an old voiceover is current, as on Retry
     source = fingerprints.voice_source(project)
     voice_fp = fingerprints.voice_fingerprint(db, project)
     script = str((project.generated_plan_json or {}).get("cleaned_voice_script") or "")
@@ -1100,6 +1133,82 @@ def render_plan(db: Session, project: models.VideoProject) -> dict:
         "generate": sum(1 for s in shots if s["action"] == "generate"),
         "clip_cost": round(clip_cost, 4),
         "total": round(clip_cost + voice_cost, 4),
+        "currency": "USD",
+        "is_estimate": True,
+    }
+
+
+def edit_impact(db: Session, project: models.VideoProject, *, op: str,
+                shot_id: Optional[int] = None, after_shot_id: Optional[int] = None,
+                duration: Optional[float] = None, shot_type: str = "b_roll") -> dict:
+    """What adding (`op="add"`), duplicating or deleting a shot would put out
+    of date, before it is done. Lip-synced clips are cut from their slice of
+    the voiceover: a shot added or removed before them moves that slice, so
+    the next Generate video makes them again (paid). Same rule and prices as
+    render_plan. Also prices the new shot's own clip (add / duplicate)."""
+    rates = get_settings()
+    ordered = sorted(project.shots, key=lambda s: (s.shot_order, s.id))
+    by_id = {s.id: s for s in ordered}
+    lipsync_on = _lipsync_available(db, project)
+
+    def rate(s: models.VideoShot) -> float:
+        lipsync = s.shot_type == "talking_head" and lipsync_on
+        return rates.cost_avatar_per_second if lipsync else _video_rate(s)
+
+    new_shot: Optional[models.VideoShot] = None
+    after: Optional[models.VideoShot] = None
+    layout: list[Optional[models.VideoShot]] = list(ordered)  # None = the new shot
+    if op == "delete":
+        layout = [s for s in ordered if s.id != shot_id]
+    else:
+        if op == "duplicate":
+            src = by_id.get(shot_id) if shot_id is not None else None
+            if src is None:
+                raise ValueError("shot not found in project")
+            after = src
+            new_shot = models.VideoShot(shot_type=src.shot_type, duration_seconds=src.duration_seconds,
+                                        model_override=src.model_override)
+        else:
+            after = by_id.get(after_shot_id) if after_shot_id is not None else None
+            new_shot = models.VideoShot(shot_type=shot_type, duration_seconds=float(duration or 5.0),
+                                        model_override="")
+        if after is not None and after.shot_type != "end_card":
+            idx = ordered.index(after) + 1
+        else:
+            idx = len(ordered)
+            while idx > 0 and ordered[idx - 1].shot_type == "end_card":
+                idx -= 1
+        layout.insert(idx, None)
+
+    new_starts: dict[int, float] = {}
+    t = 0.0
+    for s in layout:
+        if s is not None:
+            new_starts[s.id] = t
+        kind = new_shot.shot_type if s is None else s.shot_type
+        if kind != "end_card":
+            t += float((new_shot if s is None else s).duration_seconds or 0)
+
+    stale: list[dict] = []
+    if fingerprints.voice_source(project) != "silent":
+        for s in _body_shots(project):
+            if s.id not in new_starts or s.provider != "lipsync" or not s.clip_fingerprint:
+                continue
+            if s.status != "completed" or not s.clip_path or fingerprints.shot_is_stale(s):
+                continue  # no clip, or already out of date (already priced by the render plan)
+            if _active_job_for(db, s.id) is not None:
+                continue
+            if round(new_starts[s.id], 3) == round(_shot_start(project, s), 3):
+                continue
+            cost = float(s.duration_seconds or 5.0) * rate(s)
+            stale.append({"id": s.id, "shot_order": s.shot_order, "cost": round(cost, 4)})
+    new_cost = float(new_shot.duration_seconds or 5.0) * rate(new_shot) if new_shot is not None else 0.0
+    stale_cost = sum(x["cost"] for x in stale)
+    return {
+        "stale_shots": stale,
+        "stale_count": len(stale),
+        "stale_cost": round(stale_cost, 4),
+        "new_clip_cost": round(new_cost, 4),
         "currency": "USD",
         "is_estimate": True,
     }
@@ -1221,6 +1330,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
         # 1. audio. An unchanged voiceover is reused (not paid for again,
         #    and lip-synced clips cut from it stay in step); a failed
         #    synthesis stops here, before any clip is submitted.
+        adopt_unfingerprinted_voiceover(db, project)  # an old voiceover is reused, as on Retry
         voice_fp = fingerprints.voice_fingerprint(db, project)
         audio_path = None
         if fingerprints.voice_source(project) == "tts":
@@ -1244,6 +1354,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
         for shot in _body_shots(project):
             if shot.status == "completed" and fingerprints.shot_is_stale(shot) \
                     and _active_job_for(db, shot.id) is None:
+                takes.ensure_current_take(db, shot)  # the old clip stays selectable
                 shot.status = "pending"
         db.commit()
         body = 0

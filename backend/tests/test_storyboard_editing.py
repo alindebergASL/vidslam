@@ -649,3 +649,256 @@ def test_migration_0006(tmp_path, monkeypatch):
     assert "shot_takes" not in insp.get_table_names()
     assert "voice_id" not in {c["name"] for c in insp.get_columns("video_projects")}
     assert "clip_aspect_ratio" not in {c["name"] for c in insp.get_columns("video_shots")}
+
+
+# ---------- review follow-ups ----------
+
+
+def _set(pid, **fields) -> None:
+    from app import models
+
+    db = _db()
+    try:
+        p = db.get(models.VideoProject, pid)
+        for k, v in fields.items():
+            setattr(p, k, v)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _running_job(pid, shot_id) -> None:
+    from app import models
+
+    db = _db()
+    db.add(models.VideoJob(purpose="shot", ref_id=shot_id, project_id=pid, provider="mock",
+                           provider_job_id="x", status="running", context_json={"after": "none"},
+                           deadline_at=datetime.utcnow() + timedelta(hours=1)))
+    db.commit()
+    db.close()
+
+
+def test_add_duplicate_delete_are_refused_while_the_video_is_being_made(auth_client):
+    pid = _rendered(auth_client)
+    body = _body(auth_client, pid)
+    before = [s["id"] for s in _shots(auth_client, pid)]
+    for status in ("generating", "regenerating", "submitting"):
+        _set(pid, status=status)
+        r = auth_client.post(f"/api/projects/{pid}/shots", json={"after_shot_id": body[0]["id"]})
+        assert r.status_code == 409 and "being made" in r.json()["detail"], r.text
+        assert auth_client.post(f"/api/projects/{pid}/shots/{body[0]['id']}/duplicate").status_code == 409
+        assert auth_client.delete(f"/api/projects/{pid}/shots/{body[1]['id']}").status_code == 409
+    assert [s["id"] for s in _shots(auth_client, pid)] == before, "nothing changed"
+
+    # A clip-only re-roll leaves the project "completed": still refused.
+    _set(pid, status="completed")
+    _running_job(pid, body[0]["id"])
+    r = auth_client.post(f"/api/projects/{pid}/shots", json={})
+    assert r.status_code == 409 and "still being made" in r.json()["detail"]
+    assert auth_client.delete(f"/api/projects/{pid}/shots/{body[1]['id']}").status_code == 409
+
+
+def test_add_is_refused_while_a_render_row_is_still_running(auth_client):
+    from app import models
+
+    pid = _rendered(auth_client)
+    db = _db()
+    db.add(models.Render(project_id=pid, status="generating_shots"))
+    db.commit()
+    db.close()
+    assert auth_client.post(f"/api/projects/{pid}/shots", json={}).status_code == 409
+
+
+def test_clip_settings_are_refused_mid_render_but_harmless_ones_save(auth_client):
+    pid = _rendered(auth_client)
+    p = _project(auth_client, pid)
+    _set(pid, status="generating")
+    for change in ({"aspect_ratio": "16:9"}, {"mode": "static_motion"}, {"voice_id": "voice-b"},
+                   {"voiceover_source": "silent"}):
+        r = auth_client.patch(f"/api/projects/{pid}", json=change)
+        assert r.status_code == 409 and "being made" in r.json()["detail"], (change, r.text)
+    r = auth_client.patch(f"/api/projects/{pid}/cast", json=[])
+    assert r.status_code == 409, r.text
+    r = auth_client.post(f"/api/projects/{pid}/voiceover", files={"file": ("v.mp3", b"ID3xx", "audio/mpeg")})
+    assert r.status_code == 409, r.text
+    r = auth_client.patch(f"/api/projects/{pid}/plan", json={"cleaned_voice_script": "Other words now."})
+    assert r.status_code == 409, r.text
+    after = _project(auth_client, pid)
+    assert (after["aspect_ratio"], after["mode"], after["voice_id"], after["voiceover_source"]) == (
+        p["aspect_ratio"], p["mode"], p["voice_id"], p["voiceover_source"])
+    assert len(after["cast_members"]) == len(p["cast_members"])
+
+    # Harmless fields save, and so does a clip field sent unchanged with them.
+    r = auth_client.patch(f"/api/projects/{pid}", json={
+        "title": "Renamed", "caption_style": "influencer_bold", "include_disclosure": False,
+        "cta_text": "Shop now", "aspect_ratio": p["aspect_ratio"], "voice_id": None})
+    assert r.status_code == 200, r.text
+    assert r.json()["title"] == "Renamed"
+    cast = [{k: c[k] for k in ("member_kind", "avatar_id", "ingredient_id", "role")} for c in p["cast_members"]]
+    assert auth_client.patch(f"/api/projects/{pid}/cast", json=cast).status_code == 200
+
+
+def _lipsync_rendered(client) -> int:
+    _lipsync_on(client)
+    pid = _talking_project(client, extra_shot=True)
+    client.post(f"/api/projects/{pid}/generate-video?force=true")
+    assert client.get(f"/api/projects/{pid}/status").json()["project_status"] == "completed"
+    return pid
+
+
+def _stale_ids(client, pid) -> set[int]:
+    return {s["id"] for s in _body(client, pid) if s["clip_stale"]}
+
+
+def test_edit_impact_names_the_lip_synced_clips_an_add_puts_out_of_date(auth_client):
+    pid = _lipsync_rendered(auth_client)
+    talking = [s for s in _body(auth_client, pid) if s["shot_type"] == "talking_head"]
+    assert len(talking) >= 2 and all(s["provider"] == "lipsync" for s in talking)
+    assert not _stale_ids(auth_client, pid)
+    jobs = _video_jobs(pid)
+
+    q = {"op": "add", "after_shot_id": talking[0]["id"], "duration_seconds": 2}
+    impact = auth_client.get(f"/api/projects/{pid}/shots/edit-impact", params=q).json()
+    later = {s["id"] for s in _body(auth_client, pid)
+             if s["provider"] == "lipsync" and s["shot_order"] > talking[0]["shot_order"]}
+    assert later and {x["id"] for x in impact["stale_shots"]} == later
+    assert impact["stale_count"] == len(later) and impact["stale_cost"] > 0
+    assert impact["new_clip_cost"] > 0
+    assert not _stale_ids(auth_client, pid) and _video_jobs(pid) == jobs, "a dry run changes nothing"
+
+    auth_client.post(f"/api/projects/{pid}/shots", json={"after_shot_id": talking[0]["id"], "duration_seconds": 2})
+    assert _stale_ids(auth_client, pid) == later, "the dialog named exactly the clips that went stale"
+    plan = auth_client.get(f"/api/projects/{pid}/render-plan").json()
+    priced = sum(s["cost"] for s in plan["shots"] if s["id"] in later)
+    assert round(priced, 4) == impact["stale_cost"]
+
+
+def test_edit_impact_for_delete_and_duplicate(auth_client):
+    pid = _lipsync_rendered(auth_client)
+    talking = [s for s in _body(auth_client, pid) if s["shot_type"] == "talking_head"]
+    first, last = talking[0], talking[-1]
+
+    dup = auth_client.get(f"/api/projects/{pid}/shots/edit-impact",
+                          params={"op": "duplicate", "shot_id": first["id"]}).json()
+    assert last["id"] in {x["id"] for x in dup["stale_shots"]}
+    # Duplicating / adding after the last shot moves nothing.
+    tail = auth_client.get(f"/api/projects/{pid}/shots/edit-impact",
+                           params={"op": "duplicate", "shot_id": last["id"]}).json()
+    assert tail["stale_count"] == 0 and tail["stale_cost"] == 0
+
+    gone = auth_client.get(f"/api/projects/{pid}/shots/edit-impact",
+                           params={"op": "delete", "shot_id": first["id"]}).json()
+    assert {x["id"] for x in gone["stale_shots"]} >= {last["id"]} and gone["new_clip_cost"] == 0
+    auth_client.delete(f"/api/projects/{pid}/shots/{first['id']}")
+    assert _stale_ids(auth_client, pid) == {x["id"] for x in gone["stale_shots"]}
+
+    assert auth_client.get(f"/api/projects/{pid}/shots/edit-impact",
+                           params={"op": "delete"}).status_code == 422
+
+
+def test_video_clips_never_go_stale_from_an_add(auth_client):
+    pid = _rendered(auth_client)
+    body = _body(auth_client, pid)
+    impact = auth_client.get(f"/api/projects/{pid}/shots/edit-impact",
+                             params={"op": "add", "after_shot_id": body[0]["id"]}).json()
+    assert impact["stale_count"] == 0
+    auth_client.post(f"/api/projects/{pid}/shots", json={"after_shot_id": body[0]["id"]})
+    assert not _stale_ids(auth_client, pid)
+
+
+def test_cast_change_puts_clips_without_own_pictures_out_of_date(auth_client):
+    """What "Project settings" reports after a cast change comes from the
+    render plan: clips made from the cast's pictures are remade, priced."""
+    pid = _rendered(auth_client)
+    body = _body(auth_client, pid)
+    p = _project(auth_client, pid)
+    own = body[0]
+    asset_ids = [a["id"] for a in auth_client.get(f"/api/projects/{pid}/cast-assets").json()][:1]
+    db_shot_refs = {"reference_asset_ids_json": asset_ids}
+    # Give one shot its own pictures (and remake its clip to match).
+    auth_client.patch(f"/api/projects/{pid}/shots/{own['id']}", json=db_shot_refs)
+    auth_client.post(f"/api/projects/{pid}/generate-video")
+    assert not _stale_ids(auth_client, pid)
+
+    aid = auth_client.post("/api/avatars", json={"name": "Other"}).json()["id"]
+    from .conftest import make_png_bytes
+    auth_client.post(f"/api/avatars/{aid}/assets", files={"file": ("o.png", make_png_bytes(), "image/png")},
+                     data={"asset_type": "hero", "rights_confirmed": "true"})
+    cast = [{k: c[k] for k in ("member_kind", "avatar_id", "ingredient_id", "role")} for c in p["cast_members"]]
+    assert auth_client.patch(f"/api/projects/{pid}/cast",
+                             json=cast + [{"member_kind": "avatar", "avatar_id": aid, "role": "host"}]).status_code == 200
+    stale = _stale_ids(auth_client, pid)
+    assert own["id"] not in stale and stale == {s["id"] for s in body if s["id"] != own["id"]}
+    plan = auth_client.get(f"/api/projects/{pid}/render-plan").json()
+    rows = [s for s in plan["shots"] if s["id"] in stale]
+    assert all(s["action"] == "generate" and s["cost"] > 0 for s in rows)
+
+
+def _forget_voice_fingerprint(pid) -> None:
+    from app import models
+
+    db = _db()
+    db.query(models.Render).filter_by(project_id=pid).update({"voice_fingerprint": ""})
+    db.commit()
+    db.close()
+
+
+def test_voiceover_from_before_fingerprints_is_current_until_the_script_changes(auth_client, monkeypatch):
+    pid = _rendered(auth_client)
+    _forget_voice_fingerprint(pid)
+    calls = _count_tts(monkeypatch)
+
+    got = auth_client.get(f"/api/projects/{pid}/voiceover/preview").json()
+    assert got["source"] == "render" and got["current"] is True, "not 'Out of date' for a missing fingerprint"
+    plan = auth_client.get(f"/api/projects/{pid}/render-plan").json()
+    assert plan["voiceover"] == "reuse" and plan["voiceover_cost"] == 0 and not plan["voiceover_changed"]
+    made = auth_client.post(f"/api/projects/{pid}/voiceover/preview").json()
+    assert made["reused"] is True and made["cost_estimate"] == 0 and calls == []
+
+    auth_client.patch(f"/api/projects/{pid}/plan", json={"cleaned_voice_script": "Different words entirely."})
+    assert auth_client.get(f"/api/projects/{pid}/voiceover/preview").json()["current"] is False
+    assert auth_client.get(f"/api/projects/{pid}/render-plan").json()["voiceover"] == "new"
+
+
+def test_old_voiceover_counts_as_what_the_script_is_changed_from(auth_client):
+    """Edited before anything looked at it: the change is still seen."""
+    pid = _rendered(auth_client)
+    _forget_voice_fingerprint(pid)
+    auth_client.patch(f"/api/projects/{pid}", json={"voice_id": "voice-b"})
+    assert auth_client.get(f"/api/projects/{pid}/voiceover/preview").json()["current"] is False
+    assert auth_client.get(f"/api/projects/{pid}/render-plan").json()["voiceover_changed"] is True
+
+
+def test_resync_captions_uses_the_shots_as_they_are_now(auth_client):
+    pid = _rendered(auth_client)
+    body = _body(auth_client, pid)
+    r = auth_client.delete(f"/api/projects/{pid}/shots/{body[0]['id']}").json()
+    after_delete = r["project"]["generated_plan_json"]["caption_chunks"]
+    total = sum(s["duration_seconds"] for s in _body(auth_client, pid))
+    assert len(after_delete) == 2 and after_delete[1]["start_hint"] == round(total / 2, 2)
+
+    out = auth_client.patch(f"/api/projects/{pid}/plan", json={"resync_captions": True}).json()
+    assert out["generated_plan_json"]["caption_chunks"] == after_delete, "not the planner's old shot list"
+
+
+def test_a_stale_clip_without_a_take_row_is_kept_as_a_take_when_generate_remakes_it(auth_client):
+    from app import models
+
+    pid = _rendered(auth_client)
+    shot = _body(auth_client, pid)[0]
+    db = _db()
+    db.query(models.ShotTake).delete()  # a clip from before takes existed
+    db.commit()
+    db.close()
+    auth_client.patch(f"/api/projects/{pid}/shots/{shot['id']}", json={"prompt": "something else entirely"})
+    assert auth_client.post(f"/api/projects/{pid}/generate-video").status_code == 202
+    takes = _takes(auth_client, pid, shot["id"])["takes"]
+    paths = {t.get("url") for t in takes}
+    assert len(takes) == 2 and len(paths) == 2
+    assert Path(shot["clip_path"]).exists()
+    db = _db()
+    try:
+        kept = {t.clip_path for t in db.query(models.ShotTake).filter_by(shot_id=shot["id"])}
+    finally:
+        db.close()
+    assert shot["clip_path"] in kept, "the old clip stays selectable"

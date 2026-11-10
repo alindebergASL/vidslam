@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
-import { api, Avatar, BrandKit, CastMember, Ingredient, Project } from "@/lib/api";
+import { api, Avatar, BrandKit, CastMember, Ingredient, Project, RenderPlan } from "@/lib/api";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
@@ -84,8 +84,23 @@ const FIELD_LABEL: Partial<Record<keyof Draft, string>> = {
 type Outcome = {
   recompose: string[];
   replan: string[];
-  aspect: { from: string; to: string; clips: number; cost: number | null } | null;
+  aspect: { from: string; to: string } | null;
+  /** Clips already made that this save put out of date (from the render plan
+   *  before and after saving); null when it could not be worked out. */
+  stale: { count: number; cost: number; orders: number[] } | null;
+  castChanged: boolean;
 };
+
+// Fields clips or the voiceover are made from: refused while the video is being made.
+const CLIP_FIELDS: (keyof Draft)[] = ["aspect_ratio", "mode", "cast"];
+
+/** Shots that have a clip which the next Generate video would make again. */
+const staleRows = (rp: RenderPlan | null) =>
+  new Map(
+    (rp?.shots || [])
+      .filter((r) => r.action === "generate" && r.reason !== "no clip yet")
+      .map((r) => [r.id, r] as const)
+  );
 
 /**
  * "Project settings": everything chosen on the New Project page, editable
@@ -167,11 +182,24 @@ export function ProjectSettingsCard({
     );
 
   const clipsMade = project.shots.filter((s) => s.clip_path && s.shot_type !== "end_card").length;
+  // A render or re-roll is running: fields clips are made from wait (the server refuses them too).
+  const busy =
+    !["draft", "planned", "completed", "failed", "cancelled"].includes(project.status) ||
+    project.shots.some((x) => ["submitted", "polling", "running"].includes(x.status));
+  const blockedFields = busy ? changed.filter((k) => CLIP_FIELDS.includes(k)) : [];
 
   const save = async () => {
-    if (changed.length === 0) return;
+    if (changed.length === 0 || blockedFields.length > 0) return;
     setSaving(true);
     try {
+      let before: RenderPlan | null = null;
+      if (project.generated_plan_json) {
+        try {
+          before = await api.renderPlan(project.id);
+        } catch {
+          before = null;
+        }
+      }
       const body: Record<string, unknown> = {};
       for (const k of changed) if (k !== "cast") body[k] = draft[k];
       // Keep the main character in the cast (its voice and look lead the video).
@@ -189,19 +217,23 @@ export function ProjectSettingsCard({
         replan: changed
           .filter((k) => k === "cast" || k === "mode" || k === "target_duration_seconds")
           .map((k) => FIELD_LABEL[k] || k),
-        aspect: null,
+        aspect: changed.includes("aspect_ratio") ? { from: saved.aspect_ratio, to: draft.aspect_ratio } : null,
+        stale: clipsMade > 0 ? null : { count: 0, cost: 0, orders: [] },
+        castChanged: changed.includes("cast"),
       };
-      if (changed.includes("aspect_ratio")) {
-        let cost: number | null = null;
-        if (project.generated_plan_json) {
-          try {
-            const rp = await api.renderPlan(project.id);
-            cost = rp.clip_cost;
-          } catch {
-            cost = null;
-          }
+      if (clipsMade > 0 && project.generated_plan_json && before) {
+        try {
+          const after = await api.renderPlan(project.id);
+          const was = staleRows(before);
+          const now = [...staleRows(after).values()].filter((r) => !was.has(r.id));
+          result.stale = {
+            count: now.length,
+            cost: now.reduce((sum, r) => sum + r.cost, 0),
+            orders: now.map((r) => r.shot_order).sort((a, b) => a - b),
+          };
+        } catch {
+          result.stale = null;
         }
-        result.aspect = { from: saved.aspect_ratio, to: draft.aspect_ratio, clips: clipsMade, cost };
       }
       setOutcome(result);
       toast.success("Project settings saved");
@@ -423,7 +455,7 @@ export function ProjectSettingsCard({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <button className="btn-primary text-xs disabled:opacity-50" onClick={save} disabled={saving || changed.length === 0}>
+            <button className="btn-primary text-xs disabled:opacity-50" onClick={save} disabled={saving || changed.length === 0 || blockedFields.length > 0}>
               {saving ? "Saving…" : "Save settings"}
             </button>
             <button
@@ -435,6 +467,13 @@ export function ProjectSettingsCard({
             </button>
             <span className="text-[11px] text-ink-400">Saving is free. Nothing is generated until you ask.</span>
           </div>
+          {blockedFields.length > 0 && (
+            <div className="text-[11px] text-amber-300">
+              The {list(blockedFields.map((k) => FIELD_LABEL[k] || (k === "aspect_ratio" ? "aspect ratio" : k)))} can&apos;t
+              change while the video or a clip is being made: the clips on their way would be out of date and paid for
+              again. Wait until it finishes, or undo that change to save the rest.
+            </div>
+          )}
 
           {outcome && (outcome.recompose.length > 0 || outcome.replan.length > 0 || outcome.aspect) && (
             <div className="rounded-md border border-ink-700 p-3 space-y-2 text-xs text-ink-200">
@@ -454,14 +493,27 @@ export function ProjectSettingsCard({
               )}
               {outcome.aspect && (
                 <div>
-                  Aspect ratio {outcome.aspect.from} → {outcome.aspect.to}:{" "}
-                  {outcome.aspect.clips > 0
-                    ? `the ${outcome.aspect.clips === 1 ? "clip" : `${outcome.aspect.clips} clips`} made at ${outcome.aspect.from} ${
-                        outcome.aspect.clips === 1 ? "is" : "are"
-                      } now marked out of date. Generate video makes new clips${
-                        outcome.aspect.cost != null ? `, about ${usd(outcome.aspect.cost)}` : ""
-                      }. Re-compose would keep the old ones.`
-                    : "new clips are made at the new shape when you generate the video."}
+                  Aspect ratio {outcome.aspect.from} → {outcome.aspect.to}: clips are made at the new shape when you
+                  generate the video.
+                </div>
+              )}
+              {(outcome.aspect || outcome.castChanged) && (
+                <div className={clsx(outcome.stale && outcome.stale.count > 0 && "text-amber-300")}>
+                  {outcome.stale === null
+                    ? "Couldn't work out which clips are now out of date: the shot list shows them, with their price."
+                    : outcome.stale.count === 0
+                    ? "No clip already made went out of date."
+                    : `${outcome.stale.count === 1 ? "1 clip" : `${outcome.stale.count} clips`} already made ${
+                        outcome.stale.count === 1 ? "is" : "are"
+                      } now out of date (${outcome.stale.count === 1 ? "shot" : "shots"} ${outcome.stale.orders.join(
+                        ", "
+                      )}${
+                        outcome.castChanged && !outcome.aspect
+                          ? ": they have no pictures of their own, so they were made from the old cast's"
+                          : ""
+                      }). The next Generate video makes ${outcome.stale.count === 1 ? "it" : "them"} again: about ${usd(
+                        outcome.stale.cost
+                      )}. Re-compose keeps the old ${outcome.stale.count === 1 ? "clip" : "clips"}.`}
                 </div>
               )}
               {outcome.replan.length > 0 && (

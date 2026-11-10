@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -20,7 +20,7 @@ from ..schemas import (
     ShotOut,
     ShotUpdate,
 )
-from ..schemas.api import ShotCreate, ShotEditOut, TakeOut, TakesOut
+from ..schemas.api import ShotCreate, ShotEditImpactOut, ShotEditOut, TakeOut, TakesOut
 from ..schemas.storyboard import StoryboardPlan
 from ..services import takes as takes_svc
 from ..services.captions import chunk_script
@@ -52,6 +52,16 @@ def _apply_cast(db: Session, project: models.VideoProject, cast: list[CastMember
                     role=c.role or "scene",
                 )
             )
+
+
+def _cast_key(cast) -> list[tuple]:
+    out = []
+    for c in cast:
+        if c.member_kind == "avatar" and c.avatar_id:
+            out.append(("avatar", c.avatar_id, c.role or "host"))
+        elif c.member_kind == "ingredient" and c.ingredient_id:
+            out.append(("ingredient", c.ingredient_id, c.role or "scene"))
+    return sorted(out)
 
 
 @router.get("/projects", response_model=list[ProjectOut])
@@ -112,6 +122,53 @@ def get_project(project_id: int, db: Session = Depends(get_db)) -> models.VideoP
     return p
 
 
+def refuse_while_busy(db: Session, project: models.VideoProject, what: str) -> None:
+    """409 while a plan, render or re-roll runs: `what` would change clips
+    or timing under it (a render could hang, lose a file, or pay for clips
+    that are out of date before they land)."""
+    from ..services.pipeline import busy_reason
+
+    why = busy_reason(db, project)
+    if why:
+        raise HTTPException(409, f"{what} can't be changed while the video is being made. {why}")
+
+
+# Settings a clip or the voiceover is made from: changing one mid-render
+# would make the clips in flight out of date before they land (paid twice).
+_CLIP_FIELDS = {
+    "aspect_ratio": "The aspect ratio",
+    "mode": "The mode",
+    "voice_id": "The voice",
+    "voiceover_source": "The voiceover",
+    "primary_avatar_id": "The main character",
+    "generated_plan_json": "The storyboard",
+}
+
+
+def _refuse_clip_changes_while_busy(db: Session, project: models.VideoProject, body: ProjectUpdate) -> None:
+    """Title, captions, disclosure, end card, brand kit, music volume: fine
+    at any time. Fields clips are made from: only when nothing is running."""
+    for field, label in _CLIP_FIELDS.items():
+        if field not in body.model_fields_set:
+            continue
+        new = getattr(body, field)
+        if field == "voice_id":
+            new = (new or "").strip() or None
+        elif new is None:
+            continue  # not sent (None means "leave as is" for these fields)
+        if new != getattr(project, field):
+            refuse_while_busy(db, project, label)
+
+
+def _adopt_old_voiceover(db: Session, project: models.VideoProject) -> None:
+    """Before the script or voice changes: a voiceover from before
+    fingerprints existed is known to match what it is changed *from*, so it
+    shows as out of date afterwards (and as current until then)."""
+    from ..services.pipeline import adopt_unfingerprinted_voiceover
+
+    adopt_unfingerprinted_voiceover(db, project)
+
+
 @router.patch("/projects/{project_id}", response_model=ProjectOut)
 def update_project(
     project_id: int, body: ProjectUpdate, db: Session = Depends(get_db)
@@ -119,6 +176,8 @@ def update_project(
     p = db.get(models.VideoProject, project_id)
     if p is None:
         raise HTTPException(404, "project not found")
+    _refuse_clip_changes_while_busy(db, p, body)
+    _adopt_old_voiceover(db, p)
     for k, v in body.model_dump(exclude_none=True).items():
         if k != "voice_id":
             setattr(p, k, v)
@@ -136,6 +195,9 @@ def update_cast(
     p = db.get(models.VideoProject, project_id)
     if p is None:
         raise HTTPException(404, "project not found")
+    if _cast_key(p.cast_members) != _cast_key(cast):
+        # Shots without their own references are made from the cast's pictures.
+        refuse_while_busy(db, p, "The cast")
     _apply_cast(db, p, cast)
     db.commit()
     db.refresh(p)
@@ -170,6 +232,9 @@ def edit_plan(
         raise HTTPException(409, "generate a storyboard plan first")
 
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
+    if body.cleaned_voice_script is not None and body.cleaned_voice_script != plan.cleaned_voice_script:
+        refuse_while_busy(db, project, "The spoken script")  # the voiceover is made from it
+        _adopt_old_voiceover(db, project)
     if body.cleaned_voice_script is not None:
         plan.cleaned_voice_script = body.cleaned_voice_script
     if body.end_card_text is not None:
@@ -177,11 +242,11 @@ def edit_plan(
         project.cta_text = body.end_card_text  # keep the project's end card in sync
     if body.disclosure_text is not None:
         plan.disclosure_text = body.disclosure_text
-    if body.resync_captions:
-        total = sum(s.duration_seconds for s in plan.shots if s.shot_type != "end_card")
-        plan.caption_chunks = chunk_script(plan.cleaned_voice_script, max(total, 1.0))
-
     project.generated_plan_json = plan.model_dump()
+    if body.resync_captions:
+        # The shots as they are now (added, deleted, resized), not the
+        # planner's original list in the plan JSON.
+        _resync_captions(project)
     db.commit()
     db.refresh(project)
     return project
@@ -334,10 +399,32 @@ def _edit_out(db: Session, project: models.VideoProject, shot: Optional[models.V
                        captions_resynced=resynced, clips_discarded=discarded)
 
 
+@router.get("/projects/{project_id}/shots/edit-impact", response_model=ShotEditImpactOut)
+def shot_edit_impact(project_id: int, op: Literal["add", "duplicate", "delete"],
+                     shot_id: Optional[int] = None, after_shot_id: Optional[int] = None,
+                     duration_seconds: float = Query(5.0, ge=1.0, le=60.0),
+                     shot_type: str = "b_roll", db: Session = Depends(get_db)) -> dict:
+    """Before adding, duplicating or deleting a shot: which lip-synced clips
+    it would put out of date (their slice of the voiceover moves) and what
+    the next Generate video would pay to make them again. Nothing changes."""
+    from ..services.pipeline import edit_impact
+
+    project = _project_with_plan(db, project_id)
+    if op in ("duplicate", "delete"):
+        if shot_id is None:
+            raise HTTPException(422, "shot_id is required")
+        _shot_in(project, shot_id)
+    if after_shot_id is not None:
+        _shot_in(project, after_shot_id)
+    return edit_impact(db, project, op=op, shot_id=shot_id, after_shot_id=after_shot_id,
+                       duration=duration_seconds, shot_type=shot_type)
+
+
 @router.post("/projects/{project_id}/shots", response_model=ShotEditOut, status_code=201)
 def add_shot(project_id: int, body: ShotCreate, db: Session = Depends(get_db)) -> ShotEditOut:
     """A new shot with no clip (nothing is generated or paid for here)."""
     project = _project_with_plan(db, project_id)
+    refuse_while_busy(db, project, "Shots")
     after = _shot_in(project, body.after_shot_id) if body.after_shot_id is not None else None
     shot = models.VideoShot(
         project_id=project.id, shot_type=body.shot_type, prompt=body.prompt,
@@ -355,6 +442,7 @@ def add_shot(project_id: int, body: ShotCreate, db: Session = Depends(get_db)) -
 def duplicate_shot(project_id: int, shot_id: int, db: Session = Depends(get_db)) -> ShotEditOut:
     """A copy of the shot's settings, right after it, with no clip."""
     project = _project_with_plan(db, project_id)
+    refuse_while_busy(db, project, "Shots")
     src = _shot_in(project, shot_id)
     if src.shot_type == "end_card":
         raise HTTPException(409, "The end card can't be duplicated: a video has one end card.")
@@ -382,6 +470,10 @@ def delete_shot(project_id: int, shot_id: int, db: Session = Depends(get_db)) ->
 
     project = _project_with_plan(db, project_id)
     shot = _shot_in(project, shot_id)
+    if _active_job_for(db, shot.id) is not None:
+        raise HTTPException(409, f"Shot {shot.shot_order}'s clip is still being made (and is already paid "
+                                 "for). Wait until it is back, then delete the shot.")
+    refuse_while_busy(db, project, "Shots")
     if shot.shot_type == "end_card":
         if (project.cta_text or "").strip():
             raise HTTPException(409, "The end card shows your end-card text. Clear the end-card text in "
@@ -390,9 +482,6 @@ def delete_shot(project_id: int, shot_id: int, db: Session = Depends(get_db)) ->
         body = [s for s in project.shots if s.shot_type not in ("end_card", "ambient_segment")]
         if len(body) <= 1:
             raise HTTPException(409, "A video needs at least one shot. Add another shot before deleting this one.")
-    if _active_job_for(db, shot.id) is not None:
-        raise HTTPException(409, f"Shot {shot.shot_order}'s clip is still being made (and is already paid "
-                                 "for). Wait until it is back, then delete the shot.")
     paths = {t.clip_path for t in shot.takes if t.clip_path}
     if shot.clip_path:
         paths.add(shot.clip_path)

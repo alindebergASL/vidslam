@@ -40,7 +40,8 @@ def current_take(shot: models.VideoShot) -> Optional[models.ShotTake]:
 def ensure_current_take(db: Session, shot: models.VideoShot) -> Optional[models.ShotTake]:
     """Record the shot's current clip as a take if it is not one yet (a
     clip from before takes existed). Returns the current take, if any."""
-    if not shot.clip_path or shot.status != "completed" or not _is_storyboard_shot(shot):
+    # "pending": a render marked the clip out of date but has not replaced it yet.
+    if not shot.clip_path or shot.status not in ("completed", "pending") or not _is_storyboard_shot(shot):
         return current_take(shot)
     take = current_take(shot)
     if take is not None:

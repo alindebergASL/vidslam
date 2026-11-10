@@ -4,10 +4,64 @@ import clsx from "clsx";
 import { Dialog } from "@/components/Dialog";
 import { useToast } from "@/components/Toaster";
 import { shotTypeLabel } from "@/lib/labels";
-import { AddShotType, api, Project, Shot, ShotEdit, Take } from "@/lib/api";
+import { AddShotType, api, Project, Shot, ShotEdit, ShotEditImpact, Take } from "@/lib/api";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 const ADD_TYPES: AddShotType[] = ["b_roll", "hero", "talking_head", "transition"];
+
+type ImpactQuery = Parameters<typeof api.shotEditImpact>[1];
+
+/** What the edit would put out of date, fetched again when the query changes. */
+export function useEditImpact(projectId: number, q: ImpactQuery): ShotEditImpact | null | undefined {
+  // undefined = loading; null = could not be worked out.
+  const [impact, setImpact] = useState<ShotEditImpact | null | undefined>(undefined);
+  const key = JSON.stringify(q);
+  useEffect(() => {
+    let live = true;
+    setImpact(undefined);
+    const t = setTimeout(() => {
+      api
+        .shotEditImpact(projectId, q)
+        .then((r) => live && setImpact(r))
+        .catch(() => live && setImpact(null));
+    }, 150);
+    return () => {
+      live = false;
+      clearTimeout(t);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, key]);
+  return impact;
+}
+
+const shotList = (orders: number[]) =>
+  orders.length === 1
+    ? `shot ${orders[0]}`
+    : `shots ${orders.slice(0, -1).join(", ")} and ${orders[orders.length - 1]}`;
+
+/** Says which lip-synced clips the edit puts out of date, and what remaking them costs. */
+export function EditImpactNote({ impact, verb }: { impact: ShotEditImpact | null | undefined; verb: string }) {
+  if (impact === undefined)
+    return <li className="text-ink-400">Checking which clips this affects…</li>;
+  if (impact === null)
+    return (
+      <li className="text-amber-300">
+        Couldn&apos;t check which clips this affects. Lip-synced clips after this point may go out of date and be
+        made again (paid) at the next Generate video.
+      </li>
+    );
+  if (impact.stale_count === 0)
+    return <li>No clip already made goes out of date.</li>;
+  const orders = impact.stale_shots.map((x) => x.shot_order).sort((a, b) => a - b);
+  const one = impact.stale_count === 1;
+  return (
+    <li className="text-amber-300">
+      {verb} moves the voiceover under {one ? "1 lip-synced clip" : `${impact.stale_count} lip-synced clips`} (
+      {shotList(orders)}), so {one ? "it goes" : "they go"} out of date. The next Generate video makes{" "}
+      {one ? "it" : "them"} again: about {usd(impact.stale_cost)}.
+    </li>
+  );
+}
 
 /** "+ Add shot": a new shot with no clip. Nothing is generated or paid for. */
 export function AddShotDialog({
@@ -48,6 +102,12 @@ export function AddShotDialog({
   };
 
   const where = after && after.shot_type !== "end_card" ? `after shot ${after.shot_order}` : "at the end";
+  const impact = useEditImpact(project.id, {
+    op: "add",
+    after_shot_id: after?.id ?? null,
+    duration_seconds: duration >= 1 && duration <= 60 ? duration : 5,
+    shot_type: shotType,
+  });
 
   return (
     <Dialog title={`Add a shot ${where}`} onClose={onClose}>
@@ -90,10 +150,15 @@ export function AddShotDialog({
           onChange={(e) => setDuration(parseFloat(e.target.value) || 1)}
         />
       </div>
-      <p className="text-xs text-ink-400">
-        Free: the shot starts without a clip. Its clip is made (and paid for) when you generate the video or
-        regenerate the shot. The video gets longer, so captions are spread over the new length.
-      </p>
+      <ul className="text-xs text-ink-300 list-disc pl-5 space-y-1">
+        <li>
+          Adding it is free: the shot starts without a clip. Its clip is made (and paid for
+          {impact && impact.new_clip_cost > 0 ? `, about ${usd(impact.new_clip_cost)}` : ""}) when you generate the
+          video or regenerate the shot.
+        </li>
+        <EditImpactNote impact={impact} verb="Adding it" />
+        <li>The video gets longer, so captions are spread over the new length.</li>
+      </ul>
       <div className="flex justify-end gap-2">
         <button className="btn-ghost text-xs" onClick={onClose}>
           Cancel
@@ -128,6 +193,7 @@ export function DeleteShotDialog({
   const paidClip = shot.clip_path !== "" || takes > 0;
   const clipCount = Math.max(takes, shot.clip_path ? 1 : 0);
   const endCard = shot.shot_type === "end_card";
+  const impact = useEditImpact(project.id, { op: "delete", shot_id: shot.id });
 
   const del = async () => {
     setBusy(true);
@@ -158,6 +224,7 @@ export function DeleteShotDialog({
         ) : (
           <li>It has no clip yet, so nothing paid for is lost.</li>
         )}
+        {!endCard && <EditImpactNote impact={impact} verb="Deleting it" />}
         {!endCard && <li>The video gets shorter, so captions are spread over the new length.</li>}
         <li>Finished videos in the render history stay as they are.</li>
       </ul>
@@ -171,6 +238,51 @@ export function DeleteShotDialog({
           disabled={busy}
         >
           {busy ? "Deleting…" : "Delete shot"}
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+
+/** Asks before duplicating a shot when that puts lip-synced clips out of date. */
+export function DuplicateShotDialog({
+  project,
+  shot,
+  impact,
+  onClose,
+  onConfirm,
+}: {
+  project: Project;
+  shot: Shot;
+  impact: ShotEditImpact;
+  onClose: () => void;
+  onConfirm: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  return (
+    <Dialog title={`Duplicate shot ${shot.shot_order}?`} onClose={onClose}>
+      <ul className="text-sm text-ink-200 list-disc pl-5 space-y-1">
+        <li>
+          The copy has no clip yet. Its clip is made (and paid for
+          {impact.new_clip_cost > 0 ? `, about ${usd(impact.new_clip_cost)}` : ""}) when you generate the video.
+        </li>
+        <EditImpactNote impact={impact} verb="The copy" />
+        <li>The video gets longer, so captions are spread over the new length.</li>
+      </ul>
+      <div className="flex justify-end gap-2">
+        <button className="btn-ghost text-xs" onClick={onClose}>
+          Cancel
+        </button>
+        <button
+          className="btn-primary text-xs disabled:opacity-50"
+          disabled={busy || project.shots.every((x) => x.id !== shot.id)}
+          onClick={async () => {
+            setBusy(true);
+            await onConfirm();
+            setBusy(false);
+          }}
+        >
+          {busy ? "Duplicating…" : "Duplicate shot"}
         </button>
       </div>
     </Dialog>

@@ -297,6 +297,24 @@ class ShotEditOut(BaseModel):
     clips_discarded: int = 0
 
 
+class StaleShotOut(BaseModel):
+    id: int
+    shot_order: int
+    cost: float
+
+
+class ShotEditImpactOut(BaseModel):
+    """What adding, duplicating or deleting a shot would put out of date."""
+    # Lip-synced clips whose slice of the voiceover would move.
+    stale_shots: list[StaleShotOut]
+    stale_count: int
+    stale_cost: float
+    # The new shot's own clip (add / duplicate), made at the next Generate video.
+    new_clip_cost: float
+    currency: str = "USD"
+    is_estimate: bool = True
+
+
 class TakeOut(BaseModel):
     id: int
     shot_id: int

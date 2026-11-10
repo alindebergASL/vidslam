@@ -16,6 +16,7 @@ from ..services import pipeline, storage
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from .auth import require_auth
+from .projects import refuse_while_busy
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 settings = get_settings()
@@ -65,6 +66,7 @@ async def upload_voiceover(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    refuse_while_busy(db, project, "The voiceover")
     path = _save_audio(file, project_id=project_id, kind="voiceover")
     project.voiceover_upload_path = str(path)
     project.voiceover_source = "upload"
@@ -78,6 +80,8 @@ def delete_voiceover(project_id: int, db: Session = Depends(get_db)) -> models.V
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    if project.voiceover_upload_path or project.voiceover_source == "upload":
+        refuse_while_busy(db, project, "The voiceover")
     if project.voiceover_upload_path:
         try:
             Path(project.voiceover_upload_path).unlink(missing_ok=True)

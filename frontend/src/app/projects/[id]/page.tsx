@@ -12,9 +12,9 @@ import { GenerationProgress } from "@/components/GenerationProgress";
 import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { ProjectSettingsCard } from "@/components/ProjectSettingsCard";
-import { AddShotDialog, DeleteShotDialog, TakesDialog } from "@/components/ShotEditing";
+import { AddShotDialog, DeleteShotDialog, DuplicateShotDialog, TakesDialog } from "@/components/ShotEditing";
 import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
-import { api, Asset, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, Render } from "@/lib/api";
+import { api, Asset, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 
 // Project states in which a render (or a re-plan) can be started.
@@ -52,6 +52,7 @@ function Inner() {
   const [adding, setAdding] = useState<{ after: Shot | null } | null>(null);
   const [deleting, setDeleting] = useState<Shot | null>(null);
   const [takesFor, setTakesFor] = useState<Shot | null>(null);
+  const [duplicating, setDuplicating] = useState<{ shot: Shot; impact: ShotEditImpact } | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
   const [videoModels, setVideoModels] = useState<
@@ -225,7 +226,24 @@ function Inner() {
     refresh();
   };
 
-  const duplicateShot = async (shot: Shot) => {
+  // Duplicating asks first only when it puts lip-synced clips out of date.
+  const duplicateShot = async (shot: Shot, confirmed = false) => {
+    if (!confirmed) {
+      try {
+        const impact = await api.shotEditImpact(projectId, { op: "duplicate", shot_id: shot.id });
+        if (impact.stale_count > 0) {
+          setDuplicating({ shot, impact });
+          return;
+        }
+      } catch {
+        // Can't tell what it affects: ask, and say so.
+        setDuplicating({
+          shot,
+          impact: { stale_shots: [], stale_count: 0, stale_cost: 0, new_clip_cost: 0, currency: "USD", is_estimate: true },
+        });
+        return;
+      }
+    }
     try {
       const r = await api.duplicateShot(projectId, shot.id);
       toast.success(
@@ -272,8 +290,12 @@ function Inner() {
     .sort((a, b) => a - b);
 
   // Adding, duplicating or deleting shots waits while a render or re-plan runs.
-  const canEditShots = !!project && CAN_GENERATE.includes(project.status);
-  const editLockedWhy = "Wait until the current step (planning or making the video) finishes.";
+  // A clip still being made (a re-roll, or one left from a cancelled run) counts too.
+  const clipsInFlight = !!project?.shots.some((s) => IN_FLIGHT.includes(s.status));
+  const canEditShots = !!project && CAN_GENERATE.includes(project.status) && !clipsInFlight;
+  const editLockedWhy = clipsInFlight
+    ? "Wait until the clips being made are back (they are already paid for)."
+    : "Wait until the current step (planning or making the video) finishes.";
   const bodyCount = project ? project.shots.filter((s) => s.shot_type !== "end_card").length : 0;
   const deleteBlockedWhy = (s: Shot): string | null => {
     if (!project) return null;
@@ -580,7 +602,11 @@ function Inner() {
                   <button
                     className="btn-ghost text-xs disabled:opacity-50"
                     disabled={!canEditShots}
-                    title={canEditShots ? "Adds a shot without a clip. Free." : editLockedWhy}
+                    title={
+                      canEditShots
+                        ? "Adds a shot without a clip. Adding is free; the dialog says if lip-synced clips after it go out of date."
+                        : editLockedWhy
+                    }
                     onClick={() => setAdding({ after: null })}
                   >
                     + Add shot
@@ -662,7 +688,7 @@ function Inner() {
                     className="text-[11px] text-ink-500 hover:text-ink-100 focus:text-ink-100 opacity-60 group-hover:opacity-100 focus:opacity-100 px-1"
                     onClick={() => setAdding({ after: s })}
                     aria-label={`Add a shot after shot ${s.shot_order}`}
-                    title={`Add a shot after shot ${s.shot_order}. Free: no clip is made until you generate.`}
+                    title={`Add a shot after shot ${s.shot_order}. No clip is made until you generate; the dialog says if lip-synced clips after it go out of date.`}
                   >
                     + Add shot here
                   </button>
@@ -722,6 +748,20 @@ function Inner() {
           onDone={(r) => {
             setDeleting(null);
             applyShotEdit(r);
+          }}
+        />
+      )}
+
+      {duplicating && (
+        <DuplicateShotDialog
+          project={project}
+          shot={duplicating.shot}
+          impact={duplicating.impact}
+          onClose={() => setDuplicating(null)}
+          onConfirm={async () => {
+            const shot = duplicating.shot;
+            setDuplicating(null);
+            await duplicateShot(shot, true);
           }}
         />
       )}
@@ -1096,10 +1136,14 @@ function ShotRow({
                   " Re-compose keeps the old clip."
                 }
               >
-                {shot.provider === "lipsync"
-                  ? "Voiceover changed since this clip"
-                  : shot.clip_aspect_ratio && shot.clip_aspect_ratio !== projectAspect
+                {/* The label follows the actual reason; a changed shape comes first (it remakes every clip). */}
+                {shot.clip_aspect_ratio && shot.clip_aspect_ratio !== projectAspect
                   ? `Clip is ${shot.clip_aspect_ratio}`
+                  : shot.provider === "lipsync" &&
+                    (needsNewVoice || (planRow?.reason || "").includes("voiceover, which changed"))
+                  ? "Voiceover changed since this clip"
+                  : shot.provider === "lipsync"
+                  ? "Moved or edited since this clip"
                   : "Edited since this clip"}
                 {planRow && planRow.cost > 0 ? ` · new clip about ${usd(planRow.cost)}` : ""}
               </span>
@@ -1267,7 +1311,10 @@ function ShotRow({
                 className="btn-ghost flex-1 text-[11px] px-2 py-1 disabled:opacity-50"
                 onClick={onDuplicate}
                 disabled={!!editLocked}
-                title={editLocked || "A copy of this shot's settings right after it, without a clip. Free."}
+                title={
+                  editLocked ||
+                  "A copy of this shot's settings right after it, without a clip. Asks first if lip-synced clips after it would go out of date."
+                }
               >
                 Duplicate
               </button>

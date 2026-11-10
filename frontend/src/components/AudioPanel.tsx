@@ -145,6 +145,27 @@ export function AudioPanel({
     renderPlan && renderPlan.voiceover === "new" ? renderPlan.voiceover_cost : null;
   const voiceoverIsCurrent = !!voiceover?.current;
   const pickedVoice = voices.find((v) => v.voice_id === project.voice_id);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [characterVoiceId, setCharacterVoiceId] = useState<string>("");
+  useEffect(() => {
+    if (!project.primary_avatar_id) {
+      setCharacterVoiceId("");
+      return;
+    }
+    api
+      .listAvatars()
+      .then((avs) => setCharacterVoiceId(avs.find((a) => a.id === project.primary_avatar_id)?.elevenlabs_voice_id || ""))
+      .catch(() => setCharacterVoiceId(""));
+  }, [project.primary_avatar_id]);
+  const characterVoice = voices.find((v) => !!characterVoiceId && v.voice_id === characterVoiceId);
+  const currentVoiceName = project.voice_id
+    ? pickedVoice?.name || `Custom voice (${project.voice_id.slice(0, 8)}…)`
+    : `Character's voice (default)${characterVoice ? `: ${characterVoice.name}` : ""}`;
+  // The voice can't change while clips are being made: they would be out of date before they land.
+  const voiceLocked = ["draft", "planned", "completed", "failed", "cancelled"].includes(project.status)
+    && !project.shots.some((x) => ["submitted", "polling", "running"].includes(x.status))
+    ? null
+    : "Wait until the video (or the clips being made) is finished, then change the voice.";
 
   const setVoice = async (voiceId: string) => {
     setBusy("voice-pick");
@@ -152,6 +173,7 @@ export function AudioPanel({
       const next = await api.updateProject(project.id, { voice_id: voiceId || null });
       onChange(next);
       onRefresh?.();
+      setPickerOpen(false);
       toast.info(
         voiceover
           ? "Voice changed. The next video needs a new voiceover: make it below to hear it first"
@@ -245,28 +267,58 @@ export function AudioPanel({
                 Voice
               </label>
               <div className="flex items-center gap-2">
-                <select
-                  id={`project-${project.id}-voice`}
-                  className="input text-sm flex-1 min-w-0"
-                  value={project.voice_id || ""}
-                  disabled={busy === "voice-pick"}
-                  onChange={(e) => setVoice(e.target.value)}
+                <span id={`project-${project.id}-voice`} className="text-sm text-ink-100 flex-1 min-w-0 truncate">
+                  {currentVoiceName}
+                </span>
+                <VoiceSampleButton
+                  url={project.voice_id ? pickedVoice?.preview_url : characterVoice?.preview_url}
+                  name={currentVoiceName}
+                />
+                <button
+                  type="button"
+                  className="btn-ghost text-xs disabled:opacity-50"
+                  onClick={() => setPickerOpen(!pickerOpen)}
+                  aria-expanded={pickerOpen}
+                  disabled={!!voiceLocked}
+                  title={voiceLocked || "Listen to the voices, then pick one"}
                 >
-                  <option value="">Character&apos;s voice (default)</option>
-                  {voices.map((v) => (
-                    <option key={v.voice_id} value={v.voice_id}>
-                      {v.name}
-                    </option>
-                  ))}
-                  {project.voice_id && !pickedVoice && (
-                    <option value={project.voice_id}>Custom voice ({project.voice_id.slice(0, 8)}…)</option>
-                  )}
-                </select>
-                <VoiceSampleButton url={pickedVoice?.preview_url} name={pickedVoice?.name} />
+                  {pickerOpen ? "Close" : "Change voice…"}
+                </button>
               </div>
+              {pickerOpen && (
+                <ul
+                  className="mt-2 max-h-64 overflow-y-auto rounded-md border border-ink-700 divide-y divide-ink-800"
+                  aria-label="Voices"
+                >
+                  {[{ voice_id: "", name: "Character's voice (default)", preview_url: characterVoice?.preview_url }, ...voices].map(
+                    (v) => {
+                      const inUse = (project.voice_id || "") === v.voice_id;
+                      return (
+                        <li key={v.voice_id || "default"} className="flex items-center gap-2 px-2 py-1.5">
+                          <VoiceSampleButton url={v.preview_url} name={v.name} />
+                          <span className="text-sm flex-1 min-w-0 truncate">{v.name}</span>
+                          {inUse ? (
+                            <span className="chip text-[10px] py-0.5 chip-active">In use</span>
+                          ) : (
+                            <button
+                              type="button"
+                              className="btn-ghost text-xs disabled:opacity-50"
+                              disabled={busy === "voice-pick" || !!voiceLocked}
+                              onClick={() => setVoice(v.voice_id)}
+                            >
+                              Use this voice
+                            </button>
+                          )}
+                        </li>
+                      );
+                    }
+                  )}
+                </ul>
+              )}
               <div className="text-[11px] text-ink-400 mt-1">
-                For this project only. ▶ plays the voice&apos;s free sample. A different voice needs a new
-                voiceover (paid) and new clips for lip-synced shots.
+                For this project only. ▶ plays the voice&apos;s free sample (nothing is paid for, nothing
+                changes); &quot;Use this voice&quot; picks it. A different voice needs a new voiceover (paid) and
+                new clips for lip-synced shots.
               </div>
             </div>
           )}

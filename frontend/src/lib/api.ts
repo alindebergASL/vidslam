@@ -204,6 +204,19 @@ export type ShotEdit = {
 
 export type AddShotType = "hero" | "b_roll" | "talking_head" | "transition";
 
+/** Before adding, duplicating or deleting a shot: what it would put out of date. */
+export type ShotEditImpact = {
+  /** Lip-synced clips whose slice of the voiceover would move. */
+  stale_shots: { id: number; shot_order: number; cost: number }[];
+  stale_count: number;
+  /** What the next Generate video would pay to make them again. */
+  stale_cost: number;
+  /** Add / duplicate: the new shot's own clip, made at the next Generate video. */
+  new_clip_cost: number;
+  currency: string;
+  is_estimate: boolean;
+};
+
 /** One kept clip of a shot. */
 export type Take = {
   id: number;
@@ -1154,6 +1167,23 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  shotEditImpact: (
+    projectId: number,
+    q: {
+      op: "add" | "duplicate" | "delete";
+      shot_id?: number | null;
+      after_shot_id?: number | null;
+      duration_seconds?: number;
+      shot_type?: string;
+    }
+  ) => {
+    const params = new URLSearchParams({ op: q.op });
+    if (q.shot_id != null) params.set("shot_id", String(q.shot_id));
+    if (q.after_shot_id != null) params.set("after_shot_id", String(q.after_shot_id));
+    if (q.duration_seconds != null) params.set("duration_seconds", String(q.duration_seconds));
+    if (q.shot_type) params.set("shot_type", q.shot_type);
+    return req<ShotEditImpact>(`/api/projects/${projectId}/shots/edit-impact?${params.toString()}`);
+  },
   duplicateShot: (projectId: number, shotId: number) =>
     req<ShotEdit>(`/api/projects/${projectId}/shots/${shotId}/duplicate`, { method: "POST" }),
   deleteShot: (projectId: number, shotId: number) =>
