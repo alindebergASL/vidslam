@@ -136,6 +136,8 @@ export function ModelsPanel() {
       const act = await api.setActiveModel(kind, model, opts);
       setCat((c) => (c ? { ...c, active: act } : c));
       toast.success(model === null ? "Reset to default" : model === "" ? "Lip-sync off" : `Now using ${model}`);
+      // The Adult content card names the planner.
+      if (kind === "chat") window.dispatchEvent(new Event("content-mode-changed"));
     } catch (e: any) {
       toast.error(e.message || "Switch failed");
     } finally {

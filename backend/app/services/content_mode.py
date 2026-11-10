@@ -31,19 +31,37 @@ KEY = "content.adult_mode"  # {"enabled": bool, "updated_at": iso}
 def explicit() -> Optional[bool]:
     """The switch as set in Settings, None when following ADULT_MODE. Read
     every time (one small row), so a flip applies at once in every web and
-    job worker."""
-    try:
-        from .model_registry import get_setting
+    job worker. A failed read counts as off (filters on), never as on."""
+    from sqlalchemy.exc import SQLAlchemyError
 
-        rec = get_setting(KEY)
-    except Exception:  # noqa: BLE001 — no database (scripts): the config default
-        return None
+    from .. import models
+    from ..db import SessionLocal
+
+    try:
+        db = SessionLocal()
+    except Exception:  # noqa: BLE001 — no database configured (scripts)
+        return False
+    try:
+        row = db.get(models.AppSetting, KEY)
+        rec = row.value if row else None
+    except SQLAlchemyError as e:
+        log.warning("adult mode unreadable (%s); treating it as off", type(e).__name__)
+        return False
+    finally:
+        db.close()
     return bool(rec["enabled"]) if isinstance(rec, dict) and "enabled" in rec else None
 
 
 def adult_mode() -> bool:
     exp = explicit()
     return bool(get_settings().adult_mode) if exp is None else exp
+
+
+def chat_model() -> str:
+    """The text model that will actually run (gates and labels use this)."""
+    from .model_registry import active_model
+
+    return text_model() or active_model("chat")
 
 
 def text_model() -> str:

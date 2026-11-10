@@ -28,7 +28,12 @@ export function AdultModePanel() {
       .then(setMode)
       .catch((e) => setError(e.message || "Couldn't load the adult content setting"));
   };
-  useEffect(load, []);
+  useEffect(() => {
+    load();
+    // The planner changed in Models (or the switch elsewhere): re-read.
+    window.addEventListener("content-mode-changed", load);
+    return () => window.removeEventListener("content-mode-changed", load);
+  }, []);
 
   const toggle = async () => {
     if (!mode || busy) return;

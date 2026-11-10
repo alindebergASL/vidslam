@@ -216,7 +216,10 @@ def _check_models(db: Session, project: models.VideoProject) -> CheckResult:
     if get_settings().mock_providers:
         return CheckResult(id="models_selected", label="Models", status="ok",
                            message="Mock mode — placeholder models are expected.")
-    mocked = {k: reg.active_model(k) for k in ("chat", "video", "image")}
+    from .content_mode import chat_model
+
+    # The planner that will run (the adult text model in adult mode).
+    mocked = {k: (chat_model() if k == "chat" else reg.active_model(k)) for k in ("chat", "video", "image")}
     mocked = {k: m for k, m in mocked.items() if m.startswith("mock/")}
     if not mocked:
         return CheckResult(id="models_selected", label="Models", status="ok",

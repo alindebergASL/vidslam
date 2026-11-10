@@ -10,6 +10,7 @@ from .. import models
 from ..config import get_settings
 from ..db import get_db
 from ..services import provider_keys
+from ..services.content_mode import chat_model as _chat_model
 from ..services.model_registry import active_model as _active_model
 from .auth import require_auth
 
@@ -37,7 +38,7 @@ def system_info(db: Session = Depends(get_db)) -> dict:
         "redis_configured": bool(s.redis_url),
         "keys": {name: provider_keys.has(name) for name in provider_keys.KEYS},
         "models": {
-            "chat": _active_model("chat") or None,
+            "chat": _chat_model() or None,
             "image": _active_model("image") or None,
             "video": _active_model("video") or None,
             "tts": (s.elevenlabs_model_id if _active_model("tts") == "elevenlabs" else _active_model("tts")) or None,

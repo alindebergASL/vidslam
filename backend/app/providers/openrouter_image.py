@@ -73,6 +73,9 @@ class OpenRouterImageProvider(ImageProvider):
     ) -> bytes:
         # Image API: POST /images {model, prompt, aspect_ratio?, n,
         # input_references?} → {data: [{b64_json, media_type}]}.
+        from ..services.safety import check_prompt
+
+        check_prompt(prompt)  # minors: refused here too, not only by the vendor
         url = f"{get_settings().openrouter_base_url.rstrip('/')}/images"
         body: dict = {
             "model": model or self.model,
