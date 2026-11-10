@@ -14,9 +14,9 @@ from ..providers import (
     get_chat,
     get_tts,
     get_video,
-    is_sogni_model,
     provider_label,
     routes_per_model,
+    uses_webhooks,
 )
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
@@ -345,7 +345,7 @@ def submit_shot_clip(
     # Per-shot override (raw id or custom:<id> trained-LoRA selector) wins
     # over the deployment-wide default.
     model = _resolve_model(db, shot.model_override or _active_model("video"))
-    # A sogni/ model is served by Sogni whatever video model is active.
+    # A sogni/ or runware/ model is served by its provider whatever video model is active.
     per_model = routes_per_model("video", model)
     video = get_video(model) if per_model else get_video()
     shot.status = "submitted"
@@ -382,7 +382,7 @@ def submit_shot_clip(
         job = video_jobs.submit(
             db, purpose=purpose, ref_id=shot.id, project_id=project.id, render_id=render_id,
             context={"after": after, **({"note": note} if note else {}), **(context or {})}, start=start,
-            webhooks=not is_sogni_model(model),
+            webhooks=uses_webhooks(model),
         )
     except Exception as e:  # noqa: BLE001 — submit itself failed
         shot.status = "failed"
@@ -1162,7 +1162,7 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
                 db.rollback()
                 return job
             vj = video_jobs.submit(db, purpose="studio", ref_id=job.id, project_id=None, start=start,
-                                   webhooks=not is_sogni_model(model))
+                                   webhooks=uses_webhooks(model))
             job.provider_job_id = vj.provider_job_id
             db.refresh(job)
             return job

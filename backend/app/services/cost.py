@@ -139,7 +139,7 @@ def estimate_for_project(db, project, plan: StoryboardPlan, *, music_will_genera
             ShotPlan(order=r.shot_order, shot_type=r.shot_type, duration_seconds=float(r.duration_seconds or 0),
                      visual_prompt=r.prompt or "-")
             for r in rows if r.shot_type in _SHOT_TYPES]})
-    from ..providers import sogni
+    from ..providers import runware, sogni
     from .model_registry import active_model
 
     active_video = active_model("video") or ""
@@ -148,6 +148,8 @@ def estimate_for_project(db, project, plan: StoryboardPlan, *, music_will_genera
         m = (r.model_override or active_video or "").strip()
         if m.startswith(sogni.PREFIX):
             video_rates[r.shot_order] = sogni.video_spend_rate_usd(m)
+        elif m.startswith(runware.PREFIX):
+            video_rates[r.shot_order] = runware.video_rate_usd(m)
     lipsync = get_avatar() is not None and _hero_portrait(db, project) is not None
     voice: Optional[float] = None
     if lipsync:

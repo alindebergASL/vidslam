@@ -10,6 +10,7 @@ import { formatDuration, modeLabel } from "@/lib/labels";
 
 const PROVIDER_NAMES: Record<string, string> = {
   openrouter: "OpenRouter", elevenlabs: "ElevenLabs", gemini: "Google", replicate: "Replicate",
+  sogni: "Sogni", runware: "Runware",
 };
 // Every kind that can call a paid provider, or "nothing is billed" could lie
 // (e.g. a live lip-sync model while the video model is still a mock).

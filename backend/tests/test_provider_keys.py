@@ -55,7 +55,8 @@ def test_set_get_clear_round_trip_never_returns_value(auth_client):
 
     listing = auth_client.get("/api/settings/keys").json()
     assert listing["mock_providers"] is True
-    assert [k["name"] for k in listing["keys"]] == ["openrouter", "elevenlabs", "gemini", "replicate", "sogni"]
+    assert [k["name"] for k in listing["keys"]] == ["openrouter", "elevenlabs", "gemini", "replicate", "sogni",
+                                                     "runware"]
     assert _row(listing, "sogni")["docs_url"] == "https://dashboard.sogni.ai/api-keys"
     assert _row(listing, "openrouter")["source"] == "none"
 
@@ -288,7 +289,7 @@ def test_system_info_and_catalog_follow_keys(auth_client):
 
     info = auth_client.get("/api/system/info").json()
     assert info["keys"] == {"openrouter": False, "elevenlabs": False, "gemini": False,
-                            "replicate": False, "sogni": False}
+                            "replicate": False, "sogni": False, "runware": False}
     model_registry.put_setting(model_catalog.CATALOG_KEY, {"entries": [
         {"id": "openai/gpt-image-2", "kind": "image", "provider": "openrouter", "usable": False},
         {"id": "mock/x", "kind": "image", "provider": "mock", "usable": True},

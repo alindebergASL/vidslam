@@ -278,3 +278,50 @@ bundled copy.
   estimate: Sogni's workflow results carry no cost. Free-Spark jobs didn't
   change the account balance (`/v2/account/balance`) in our tests.
 
+
+## Runware (image + video, paid per request)
+
+With a Runware key (Settings → API keys, or `RUNWARE_API_KEY`), Runware's
+models appear in the pickers as `runware/<AIR>`, e.g. `runware/runware:107@1`
+(FLUX.1 Krea dev) or `runware/lightricks:ltx@2.3-fast`. The Runware row turns
+on by itself once a key is saved, and can be switched off like any provider.
+Without a key, a `runware/` model is refused ("isn't set up yet"), never
+replaced by placeholder output.
+
+- **Which models.** 19 curated models are listed first: photoreal stills
+  (FLUX.1 Krea dev, FLUX.1 dev SRPO, Juggernaut Pro Flux, Z-Image-Turbo,
+  Krea 2 Raw, Qwen-Image-2512), edits with reference pictures
+  (Qwen-Image-Edit 2511 and Plus, FLUX.2 klein and dev, FLUX.1 Kontext dev),
+  and first + last frame video (LTX-2.3 and LTX-2.3 Fast, Veo 3.1 Lite,
+  Vidu Q3 Turbo, Wan 2.7, Luma Ray 3.2, Kling 2.5 Turbo Pro, Seedance 1.0
+  Pro). Every other live image and video model in Runware's public index
+  follows. The index is synced with the model catalog (`If-None-Match`), with
+  a copy bundled in `backend/app/providers/runware_models.json`
+  (`python scripts/runware_snapshot.py` regenerates it).
+- **Open vs moderated.** "open" models are open weights hosted by Runware:
+  with the content check off (the default), they're uncensored. "moderated"
+  models run on their vendor's API through Runware and the vendor's own
+  moderation applies (refusals come back as a clear message, not a charge).
+- **Safety that always applies.** Prompts involving minors are refused before
+  anything is sent (`safety.check_prompt`). A request carrying a Cast member's
+  picture always goes through Runware's content check. Real people's likeness
+  needs their consent (Runware's terms; the Cast consent flow).
+- **Requests follow each model's schema.** Runware rejects unknown fields, so
+  requests are built from each model's published JSON schema (bundled for the
+  curated models, fetched once and cached in `DATA_DIR/runware` for others)
+  and validated before they're sent. Sizes: 16:9 stills are 1920×1088 on
+  models that need multiples of 64 (the app crops to the frame); videos use
+  `RUNWARE_VIDEO_RESOLUTION` (1080p, or 720p at about half the price per
+  second). Audio, prompt rewriting ("enhance prompt", "prompt extend") and
+  similar paid defaults are turned off; a closed loop locks Seedance's camera.
+- **Never paid twice.** After a timeout or a server error the app asks
+  Runware for the same task's result instead of resending it. Overloaded
+  (429/503) requests, which didn't run, are retried. Videos are submitted and
+  then polled (Runware's callbacks aren't signed, so none are used).
+- **Spend.** Every request asks for its cost, which is recorded as billed (not
+  estimated). Pre-flight estimates use the schemas' prices (per image, per
+  megapixel, or per second at the chosen resolution). Requests stop once the
+  monthly budget's hard cap is reached.
+- **Not yet:** Runware lip-sync and avatars, uploading Cast LoRAs to Runware,
+  and Runware models in the ambient "Suggested" lists (pick them from "All
+  image/video models").

@@ -22,6 +22,9 @@ dependencies = [
   "alembic>=1.13",
   # Postgres driver (production DB). SQLite needs nothing extra.
   "psycopg[binary]>=3.2",
+  # Runware requests are checked against each model's published schema
+  # before they're sent (providers/runware.py).
+  "jsonschema>=4.21",
 ]
 
 # The alembic `migrations/` directory sits next to `app/` and would trip

@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
+from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -80,6 +82,25 @@ async def put_enabled(name: str, request: Request) -> dict:
     return row
 
 
+@router.put("/{name}/options")
+async def put_options(name: str, request: Request) -> dict:
+    """Set a provider's options, e.g. Runware {"check_content": true | false
+    | null} (null = back to its default)."""
+    _known(name)
+    allowed = dict(provider_keys.KEYS[name].options)
+    try:
+        body = json.loads((await request.body()) or b"null")
+    except (ValueError, UnicodeDecodeError):
+        body = None
+    if not isinstance(body, dict) or not body or any(
+            k not in allowed or v not in (True, False, None) for k, v in body.items()):
+        raise HTTPException(422, f"body must be JSON with options {sorted(allowed) or '(none)'}: true | false | null")
+    row: dict = {}
+    for k, v in body.items():
+        row = provider_keys.set_option(name, k, v)
+    return row
+
+
 def _in_use(name: str) -> list[str]:
     """The active model kinds (Settings → Models) this provider serves now
     that it's off, so the UI can say what stops working."""
@@ -107,12 +128,24 @@ def _probe_request(name: str, key: str) -> tuple[str, dict, dict]:
     if name == "sogni":
         return (f"{s.sogni_base_url.rstrip('/')}/v2/account/me",
                 {"Authorization": f"Bearer {key}", "X-App-Source": "vidslam"}, {})
+    if name == "runware":
+        return (s.runware_base_url.rstrip("/"), {"Authorization": f"Bearer {key}"}, {})
     raise HTTPException(404, "unknown provider key")
+
+
+def _probe_body(name: str) -> Optional[list]:
+    """A POST body for providers whose only endpoint is POST (Runware: the
+    free account-details task)."""
+    if name == "runware":
+        return [{"taskType": "accountManagement", "operation": "getDetails", "taskUUID": str(uuid.uuid4())}]
+    return None
 
 
 def _account_name(name: str, r: httpx.Response) -> str:
     """The account a working key belongs to, where the probe returns it
-    (Sogni: data.username). Never the key."""
+    (Sogni: data.username; Runware: the team and its balance). Never the key."""
+    if name == "runware":
+        return _runware_account(r)
     if name != "sogni":
         return ""
     try:
@@ -123,6 +156,24 @@ def _account_name(name: str, r: httpx.Response) -> str:
     return who[:60]
 
 
+def _runware_account(r: httpx.Response) -> str:
+    try:
+        rows = (r.json() or {}).get("data") or []
+    except (ValueError, AttributeError):
+        return ""
+    row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
+    team = row.get("teamName") or row.get("organizationName") or row.get("name") or ""
+    if not team and isinstance(row.get("team"), dict):
+        team = row["team"].get("name") or ""
+    bal = row.get("balance")
+    if bal is None and isinstance(row.get("team"), dict):
+        bal = row["team"].get("balance")
+    bits = [str(team).strip()[:60]] if team else []
+    if isinstance(bal, (int, float)):
+        bits.append(f"balance ${bal:.2f}")
+    return ", ".join(bits)
+
+
 def _provider_message(r: httpx.Response) -> str:
     """A short human message from the provider's error body, if any."""
     try:
@@ -130,7 +181,11 @@ def _provider_message(r: httpx.Response) -> str:
     except ValueError:
         return ""
     msg = ""
-    if isinstance(body, dict):
+    if isinstance(body, dict) and isinstance(body.get("errors"), list) and body["errors"]:
+        first = body["errors"][0]  # Runware: {"errors": [{"code", "message"}]}
+        if isinstance(first, dict):
+            msg = str(first.get("message") or first.get("code") or "")
+    if isinstance(body, dict) and not msg:
         err = body.get("error")
         if isinstance(err, dict):
             msg = err.get("message") or err.get("status") or ""
@@ -168,11 +223,18 @@ def test_key(name: str) -> dict:
         # cross-origin hop, so xi-api-key / x-goog-api-key would leak. A 3xx
         # falls through to "Unexpected response" below.
         with httpx.Client(timeout=_PROBE_TIMEOUT, follow_redirects=False) as client:
-            r = client.get(url, headers=headers, params=params)
+            body = _probe_body(name)
+            if body is not None:
+                r = client.post(url, headers=headers, json=body)
+            else:
+                r = client.get(url, headers=headers, params=params)
     except httpx.HTTPError as e:
         # Exception text carries the URL at most, never headers.
         return {"ok": False, "detail": _scrub(f"Couldn't reach the provider: {type(e).__name__}", key)}
     ms = int((time.monotonic() - t0) * 1000)
+    if r.status_code == 200 and name == "runware" and _provider_message(r):
+        # Runware can answer 200 with an errors[] body.
+        return {"ok": False, "detail": _scrub(f"Key rejected: {_provider_message(r)}", key)}
     if r.status_code == 200:
         # Sogni worker keys pass account routes but get 403 on paid work.
         warning = provider_keys.key_warning(name, key)

@@ -110,6 +110,8 @@ export type ApiKeyStatus = {
   enabled_explicit?: boolean;
   /** Set on the reply to switching off: active model kinds this provider was serving. */
   in_use?: string[];
+  /** Provider options, e.g. Runware's { check_content }. */
+  options?: Record<string, boolean>;
 };
 
 export type ApiKeysResponse = {
@@ -127,7 +129,7 @@ export type SystemInfo = {
   data_dir: string;
   public_base_url: string;
   redis_configured: boolean;
-  keys: { openrouter: boolean; elevenlabs: boolean; gemini?: boolean; replicate?: boolean; sogni?: boolean };
+  keys: { openrouter: boolean; elevenlabs: boolean; gemini?: boolean; replicate?: boolean; sogni?: boolean; runware?: boolean };
   models: {
     chat: string | null;
     image: string | null;
@@ -561,7 +563,7 @@ export type CatalogEntry = {
   id: string;
   kind: ModelKind;
   name: string;
-  provider: "openrouter" | "gemini" | "elevenlabs" | "sogni" | (string & {});
+  provider: "openrouter" | "gemini" | "elevenlabs" | "sogni" | "runware" | (string & {});
   description: string;
   usable: boolean;
   /** False when its provider is switched off in Settings → API keys (pickers hide it). */
@@ -818,6 +820,11 @@ export const api = {
     req<ApiKeyStatus>(`/api/settings/keys/${encodeURIComponent(name)}`, { method: "DELETE" }),
   testApiKey: (name: string) =>
     req<ApiKeyTestResult>(`/api/settings/keys/${encodeURIComponent(name)}/test`, { method: "POST" }),
+  setProviderOptions: (name: string, options: Record<string, boolean | null>) =>
+    req<ApiKeyStatus>(`/api/settings/keys/${encodeURIComponent(name)}/options`, {
+      method: "PUT",
+      body: JSON.stringify(options),
+    }),
   setProviderEnabled: (name: string, enabled: boolean | null) =>
     req<ApiKeyStatus>(`/api/settings/keys/${encodeURIComponent(name)}/enabled`, {
       method: "PUT",

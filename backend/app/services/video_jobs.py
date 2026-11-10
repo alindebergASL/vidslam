@@ -38,7 +38,7 @@ log = logging.getLogger("avs.video_jobs")
 
 ACTIVE = ("submitted", "running")
 # Providers with no completion callbacks: their jobs are always polled.
-NO_WEBHOOK_PROVIDERS = frozenset({"sogni"})
+NO_WEBHOOK_PROVIDERS = frozenset({"sogni", "runware"})
 TERMINAL = ("completed", "failed")
 
 
@@ -114,9 +114,9 @@ def submit(
         job.uses_webhook = False  # nothing will call back: poll at the normal cadence
     job.model = submitted.model or ""
     sent = (submitted.raw or {}).get("duration") if isinstance(submitted.raw, dict) else None
-    if job.provider == "sogni" and sent:
-        # The length actually requested (Sogni snaps it): poll() and the spend
-        # estimate use it when the result does not report its own duration.
+    if job.provider in NO_WEBHOOK_PROVIDERS and sent:
+        # The length actually requested (Sogni and Runware snap it): poll()
+        # and the spend estimate use it when the result doesn't report one.
         job.context_json = {**(job.context_json or {}), "duration": sent}
     job.provider_job_id = submitted.job_id
     job.polling_url = submitted.polling_url or ""
@@ -140,6 +140,10 @@ def provider_for(job: models.VideoJob):
         from ..providers.sogni import SogniVideoProvider
 
         return SogniVideoProvider(model=job.model or None)
+    if job.provider == "runware":
+        from ..providers.runware import RunwareVideoProvider
+
+        return RunwareVideoProvider(model=job.model or None)
     from ..providers.openrouter_video import OpenRouterVideoProvider
 
     return OpenRouterVideoProvider(model=job.model or None)
@@ -173,6 +177,14 @@ def check(db: Session, job_id: int) -> str:
         return fail(db, job_id, st.error or "provider reported failure")
     if _now() > job.deadline_at:
         db.commit()
+        if job.provider == "runware":
+            # Accepted by Runware, which may still finish (and bill) it after
+            # we stop asking: count the estimate (ledger and monthly cap).
+            try:
+                _record_spend(db, job)
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                log.exception("video job %s: couldn't record the spend of a timed-out job", job_id)
         return fail(db, job_id, f"timed out after {get_settings().video_job_timeout_minutes} min")
     if st is not None and st.state == "running":
         job.status = "running"
@@ -209,8 +221,17 @@ def complete(db: Session, job_id: int, *, cost: Optional[float] = None,
         path = out_dir / f"vjob_{job.id}.mp4"
         path.write_bytes(data)
     except Exception as e:  # noqa: BLE001
+        # The provider finished (and billed) the clip; only our download
+        # failed. Record the spend before failing, or the ledger and the
+        # monthly cap never see it.
+        job.cost_usd = cost
         job.status = "running"  # let fail() claim it
         db.commit()
+        try:
+            _record_spend(db, job)
+        except Exception:  # noqa: BLE001 — never block marking the job failed
+            db.rollback()
+            log.exception("video job %s: couldn't record the spend of a failed download", job_id)
         return fail(db, job_id, f"download failed: {e}")
     job.result_path = str(path)
     job.cost_usd = cost
