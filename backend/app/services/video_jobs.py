@@ -177,6 +177,14 @@ def check(db: Session, job_id: int) -> str:
         return fail(db, job_id, st.error or "provider reported failure")
     if _now() > job.deadline_at:
         db.commit()
+        if job.provider == "runware":
+            # Accepted by Runware, which may still finish (and bill) it after
+            # we stop asking: count the estimate (ledger and monthly cap).
+            try:
+                _record_spend(db, job)
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                log.exception("video job %s: couldn't record the spend of a timed-out job", job_id)
         return fail(db, job_id, f"timed out after {get_settings().video_job_timeout_minutes} min")
     if st is not None and st.state == "running":
         job.status = "running"
@@ -213,8 +221,17 @@ def complete(db: Session, job_id: int, *, cost: Optional[float] = None,
         path = out_dir / f"vjob_{job.id}.mp4"
         path.write_bytes(data)
     except Exception as e:  # noqa: BLE001
+        # The provider finished (and billed) the clip; only our download
+        # failed. Record the spend before failing, or the ledger and the
+        # monthly cap never see it.
+        job.cost_usd = cost
         job.status = "running"  # let fail() claim it
         db.commit()
+        try:
+            _record_spend(db, job)
+        except Exception:  # noqa: BLE001 — never block marking the job failed
+            db.rollback()
+            log.exception("video job %s: couldn't record the spend of a failed download", job_id)
         return fail(db, job_id, f"download failed: {e}")
     job.result_path = str(path)
     job.cost_usd = cost

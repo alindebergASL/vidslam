@@ -332,6 +332,7 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
                 from ..providers import runware
 
                 runware.refresh_index(None if own else client)
+                runware.check_new_models()
             except Exception as e:  # noqa: BLE001 — keeps the last good list
                 log.warning("catalog source runware_index failed: %s", e)
                 errors["runware_index"] = str(e)[:300]

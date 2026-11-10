@@ -165,6 +165,37 @@ def refresh_index(client: Optional[httpx.Client] = None) -> int:
     return len(rows)
 
 
+CHECK_PER_REFRESH = 25
+
+
+def _checked() -> dict:
+    """{air: "" (the app can drive it) | why not} for models that came in
+    through the live index after the bundle was made."""
+    path = _data_dir() / "checked.json" if _data_ok() else None
+    data = _read_json(path) if path else None
+    return data if isinstance(data, dict) else {}
+
+
+def check_new_models(limit: int = CHECK_PER_REFRESH) -> int:
+    """Smoke-test models the live index added since the bundle (the same
+    test the snapshot script runs), so pickers don't offer one the app
+    can't build a request for. Up to `limit` per call; returns how many."""
+    b = bundle()
+    known = {r.get("air") for r in b["index"]} | set(b["schemas"]) | set(b.get("unusable") or [])
+    done = _checked()
+    todo = [r["air"] for r in index_rows() if r.get("air") not in known and r.get("air") not in done]
+    for a in todo[:max(0, limit)]:
+        try:
+            done[a] = smoke_build(PREFIX + a) or ""
+        except Exception as e:  # noqa: BLE001 — couldn't read its schema: not offered
+            done[a] = str(e)[:200] or "check failed"
+    if todo[:limit]:
+        (_data_dir() / "checked.json").write_text(json.dumps(done))
+    if len(todo) > limit:
+        log.info("runware: %d new models left to check next refresh", len(todo) - limit)
+    return min(len(todo), max(0, limit))
+
+
 def kind_of(caps) -> Optional[str]:
     c = set(caps or [])
     if c & VIDEO_CAPS:
@@ -475,6 +506,26 @@ def _snap(v: int, spec: dict, multiple: Optional[int] = None) -> Optional[int]:
     return min(max(int(round(v / m)) * m, lo), hi)
 
 
+def _fit_scale(w: int, h: int, ws: dict, hs: dict) -> float:
+    """The factor that brings w×h inside both sides' minimum..maximum while
+    keeping its shape (shrink first; grow only when a side is too small)."""
+    def lim(spec: dict, key: str) -> Optional[float]:
+        v = spec.get(key)
+        return float(v) if isinstance(v, (int, float)) and v > 0 else None
+
+    k = 1.0
+    for v, spec in ((w, ws), (h, hs)):
+        hi = lim(spec, "maximum")
+        if hi is not None and v * k > hi:
+            k = hi / v
+    if k == 1.0:
+        for v, spec in ((w, ws), (h, hs)):
+            lo = lim(spec, "minimum")
+            if lo is not None and v * k < lo:
+                k = lo / v
+    return k
+
+
 def _size_pairs(request: dict) -> list[tuple[int, int]]:
     """Every fixed (width, height) the schema lists (oneOf/const rules)."""
     out: list[tuple[int, int]] = []
@@ -531,7 +582,10 @@ def _size_variants(sch: dict, aspect: str, long_side: int, resolutions: list[str
         # The property's own multiple first; some models state theirs only
         # in an allOf rule, so common multiples follow.
         for m in (None, 64, 32, 16):
-            sw, sh = _snap(w, ws, m), _snap(h, hs, m)
+            # Scale both sides together to fit the limits, then snap: clamping
+            # each side alone would change the picture's shape.
+            k = _fit_scale(w, h, ws, hs)
+            sw, sh = _snap(round(w * k), ws, m), _snap(round(h * k), hs, m)
             if sw and sh and {"width": sw, "height": sh} not in snapped:
                 snapped.append({"width": sw, "height": sh})
     order = (res, pairs, snapped) if frames else (snapped, pairs, res)
@@ -655,9 +709,9 @@ def build_image_task(model: str, prompt: str, references: list[ImageRef], *, neg
     # A Cast member's likeness, or a prompt about children, always goes
     # through Runware's content check.
     cast = any(r.role == "character" for r in used)
-    checked = (check_content_default() if check_content is None else check_content) or cast \
-        or mentions_minor(prompt)
-    bases = _bases(sch, "imageInference", a, _name_refs(prompt, used), negative_prompt, checked, cast)
+    sent = _name_refs(prompt, used)
+    checked = _content_check(check_content, cast, sent, negative_prompt)
+    bases = _bases(sch, "imageInference", a, sent, negative_prompt, checked, cast)
     for base in bases:
         for key, value in (("deliveryMethod", "sync"), ("outputFormat", "JPG"), ("outputQuality", 95)):
             if key in props:
@@ -716,10 +770,9 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
         log.warning("runware %s: %d reference picture(s) not used (the model takes %s)", a,
                     len(refs) - len(used), "fewer" if used else "only pinned frames")
     cast = any(r.role == "character" for r in used)
-    checked = (check_content_default() if check_content is None else check_content) or cast \
-        or mentions_minor(prompt)
-    bases = _bases(sch, "videoInference", a, _name_refs(prompt, used if not first else []),
-                   negative_prompt, checked, cast)
+    sent = _name_refs(prompt, used if not first else [])
+    checked = _content_check(check_content, cast, sent, negative_prompt)
+    bases = _bases(sch, "videoInference", a, sent, negative_prompt, checked, cast)
     loop = first is not None and last is not None and first.url == last.url
     for base in bases:
         _put(base, props, ("deliveryMethod",), "async")
@@ -754,10 +807,11 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
 
 class RunwareError(RuntimeError):
     def __init__(self, message: str, *, status: int = 0, code: Any = None, refused: bool = False,
-                 final: bool = False, task_failed: bool = False) -> None:
+                 final: bool = False, task_failed: bool = False, pending: bool = False) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
+        self.pending = pending  # sent and maybe still running (and billing) at Runware
         self.refused = refused  # declined for its content
         self.final = final  # retrying won't help (no credit, bad key)
         self.task_failed = task_failed  # the task itself failed (not the request about it)
@@ -935,7 +989,7 @@ class RunwareClient:
             if row is not None and str(row.get("status") or "success").lower() not in ("processing", "pending"):
                 return row
             if time.monotonic() + delay > deadline:
-                raise RunwareError(f"Runware task {task_uuid} didn't finish in time")
+                raise RunwareError(f"Runware task {task_uuid} didn't finish in time", pending=True)
             _sleep(delay)
             delay = min(delay * 1.5, 10.0)
 
@@ -965,6 +1019,18 @@ def mentions_minor(text: str) -> bool:
     return _m(text)
 
 
+def _content_check(explicit: Optional[bool], cast: bool, sent: str, negative: str) -> bool:
+    """Refuse the exact prompt that will be sent (reference names
+    included), then decide Runware's content check: the setting, forced on
+    for a Cast member's picture, a prompt that mentions a child or a minor's
+    age, or a sexual prompt whose "avoid" list removes signs of adulthood."""
+    from ..services.safety import check_prompt, steers_young
+
+    check_prompt(sent)
+    default = check_content_default() if explicit is None else explicit
+    return bool(default or cast or mentions_minor(sent) or steers_young(sent, negative))
+
+
 def _guard(prompt: str) -> None:
     """Before any paid request: refuse prompts involving minors, and stop
     once the monthly budget's hard cap is reached (a batch of jobs would
@@ -977,11 +1043,39 @@ def _guard(prompt: str) -> None:
 
     db = SessionLocal()
     try:
-        msg = spend.over_budget(db)
+        msg = spend.over_budget(db) or _over_with_in_flight(db)
     finally:
         db.close()
     if msg:
         raise RunwareError(msg, status=402, final=True)
+
+
+def _over_with_in_flight(db) -> Optional[str]:  # noqa: ANN001
+    """The hard cap counting Runware videos still being made: their spend is
+    only recorded when they finish, so a render submitting every shot at
+    once would otherwise pass the check on each one."""
+    from .. import models
+    from ..services import spend
+    from ..services.video_jobs import ACTIVE
+
+    b = spend.get_budget(db)
+    if not b["hard_stop"] or b["monthly_usd"] <= 0 or get_settings().mock_providers:
+        return None
+    pending = 0.0
+    for model, ctx in db.query(models.VideoJob.model, models.VideoJob.context_json).filter(
+            models.VideoJob.provider == "runware", models.VideoJob.status.in_(ACTIVE)):
+        try:
+            pending += video_cost_usd(model, float((ctx or {}).get("duration") or 5.0))
+        except Exception:  # noqa: BLE001 — an unknown model: count nothing
+            continue
+    if pending <= 0:
+        return None
+    spent = spend.month_total(db)
+    if spent + pending >= b["monthly_usd"]:
+        return (f"Monthly budget of ${b['monthly_usd']:.2f} reached (${spent:.2f} spent this month, "
+                f"plus about ${pending:.2f} of Runware videos still being made). "
+                "Raise it in Settings → Spend to keep generating.")
+    return None
 
 
 # ---------- catalog ----------
@@ -995,7 +1089,11 @@ def catalog_entries(usable: bool) -> list[dict]:
     rows = {r["air"]: r for r in index_rows()}
     curated = [a for a in b["curated"] if a in b["schemas"]]
     unusable = set(b.get("unusable") or [])
-    for a in curated + [a for a in rows if a not in b["schemas"] and a not in unusable]:
+    bundled_index = {r.get("air") for r in b["index"]}
+    checked = _checked()
+    later = [a for a in rows if a not in b["schemas"] and a not in unusable
+             and (a in bundled_index or checked.get(a) == "")]  # new ones only once checked
+    for a in curated + later:
         sch = b["schemas"].get(a)
         row = rows.get(a) or {}
         kind = kind_of((sch or {}).get("capabilities") or row.get("caps"))
@@ -1058,9 +1156,19 @@ class RunwareImageProvider(ImageProvider):
         _guard(prompt)
         task = build_image_task(model, prompt, list(references or []), negative_prompt=negative_prompt,
                                 settings=settings)
-        row = self.client.run(task, timeout=get_settings().runware_image_timeout_seconds)
-        # Billed now, whether or not the download works: record it first.
         from ..services import spend
+
+        try:
+            row = self.client.run(task, timeout=get_settings().runware_image_timeout_seconds)
+        except RunwareError as e:
+            if e.pending:
+                # Sent, and Runware may still finish (and bill) it: count the
+                # estimate so the ledger and the monthly cap see it.
+                spend.record(provider="runware", kind="image", model=model, cost=image_cost_usd(model),
+                             is_estimate=True, source="rate_card", generation_id=task["taskUUID"],
+                             note="didn't finish in time; Runware may still bill it")
+            raise
+        # Billed now, whether or not the download works: record it first.
 
         cost = row.get("cost")
         if isinstance(cost, (int, float)):
@@ -1149,8 +1257,13 @@ class RunwareVideoProvider(VideoProvider):
 def takes_reference(model: str) -> bool:
     """Whether a still model applies reference pictures (an edit model with
     inputs.referenceImages). Image-to-image-only models keep the layout but
-    barely change the light, so they don't count for "same place" stills."""
-    sch = schema(model, fetch=False)
+    barely change the light, so they don't count for "same place" stills.
+    Fetches a model's schema on first use (as the request builder would), so
+    a model nobody has run yet isn't wrongly sent without its reference."""
+    try:
+        sch = schema(model)
+    except Exception:  # noqa: BLE001 — the docs unreachable: no reference
+        sch = None
     inputs = (_sub(_props(sch), "inputs") or {}).get("properties") or {} if sch else {}
     return "referenceImages" in inputs
 
