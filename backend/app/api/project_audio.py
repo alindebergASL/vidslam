@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -200,6 +201,16 @@ def _preview_out(db: Session, project: models.VideoProject, info: dict, *, reuse
     }
 
 
+_preview_locks: dict[int, threading.Lock] = {}
+_preview_locks_guard = threading.Lock()
+
+
+def _preview_lock(project_id: int) -> threading.Lock:
+    """One voiceover at a time per project (a double click must not pay twice)."""
+    with _preview_locks_guard:
+        return _preview_locks.setdefault(project_id, threading.Lock())
+
+
 @router.post("/projects/{project_id}/voiceover/preview", response_model=VoiceoverPreviewOut,
              dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def make_voiceover_preview(project_id: int, db: Session = Depends(get_db)) -> dict:
@@ -216,13 +227,20 @@ def make_voiceover_preview(project_id: int, db: Session = Depends(get_db)) -> di
         raise HTTPException(409, "generate a storyboard plan first")
     if fingerprints.voice_source(project) != "tts":
         raise HTTPException(409, str(pipeline.VoiceoverNotSynthesized(project)))
+    # A render makes its own voiceover; making one here at the same time
+    # would pay for the same voiceover twice.
+    refuse_while_busy(db, project, "The voiceover")
     if not pipeline._reusable_voiceover(db, project, fingerprints.voice_fingerprint(db, project)):
         provider_gate.require_model("tts")
+    if not _preview_lock(project.id).acquire(blocking=False):
+        raise HTTPException(409, "A voiceover for this project is already being made. Wait for it to finish.")
     try:
         with spend.scope(project_id=project.id):
             made = pipeline.make_voiceover_preview(db, project)
     except pipeline.VoiceoverFailed as e:
         raise HTTPException(502, f"Voiceover failed: {e}") from e
+    finally:
+        _preview_lock(project.id).release()
     db.refresh(project)
     info = pipeline.current_voiceover(db, project) or {}
     if info.get("path") != made["path"]:  # (cannot happen: the one just made is current)

@@ -926,3 +926,46 @@ def test_reorder_and_shot_length_are_refused_mid_render(auth_client):
     assert auth_client.patch(f"/api/projects/{pid}/shots/{sid}",
                              json={"duration_seconds": shots[0]["duration_seconds"] + 1}).status_code == 409
     assert auth_client.patch(f"/api/projects/{pid}/shots/{sid}", json={"prompt": "a quiet street"}).status_code == 200
+
+
+def test_removing_every_character_clears_the_main_character(auth_client):
+    """A character taken out of the cast no longer lends its face or voice."""
+    from .test_storyboard_waste import _planned
+
+    pid = _planned(auth_client)
+    assert auth_client.get(f"/api/projects/{pid}").json()["primary_avatar_id"] is not None
+    r = auth_client.patch(f"/api/projects/{pid}/cast", json=[])
+    assert r.status_code == 200 and r.json()["primary_avatar_id"] is None
+
+
+def test_voiceover_preview_is_refused_while_a_render_runs(auth_client):
+    """The render makes its own voiceover: making one here too would pay twice."""
+    from app import models
+    from app.db import SessionLocal
+
+    from .test_storyboard_waste import _planned
+
+    pid = _planned(auth_client)
+    db = SessionLocal()
+    try:
+        db.get(models.VideoProject, pid).status = "generating"
+        db.commit()
+    finally:
+        db.close()
+    assert auth_client.post(f"/api/projects/{pid}/voiceover/preview").status_code == 409
+
+
+def test_two_voiceover_previews_at_once_make_only_one(auth_client):
+    from app.api import project_audio
+
+    from .test_storyboard_waste import _planned
+
+    pid = _planned(auth_client)
+    lock = project_audio._preview_lock(pid)
+    assert lock.acquire(blocking=False)  # one already being made
+    try:
+        r = auth_client.post(f"/api/projects/{pid}/voiceover/preview")
+        assert r.status_code == 409 and "already being made" in r.json()["detail"]
+    finally:
+        lock.release()
+    assert auth_client.post(f"/api/projects/{pid}/voiceover/preview").status_code == 200

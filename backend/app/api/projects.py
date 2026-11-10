@@ -199,6 +199,11 @@ def update_cast(
         # Shots without their own references are made from the cast's pictures.
         refuse_while_busy(db, p, "The cast")
     _apply_cast(db, p, cast)
+    # The main character must be in the cast: a removed one would keep
+    # lending its face and voice to talking-head shots.
+    avatars = [c.avatar_id for c in cast if c.member_kind == "avatar" and c.avatar_id]
+    if p.primary_avatar_id not in avatars:
+        p.primary_avatar_id = avatars[0] if avatars else None
     db.commit()
     db.refresh(p)
     return p

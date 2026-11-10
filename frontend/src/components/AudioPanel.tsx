@@ -365,7 +365,7 @@ export function AudioPanel({
                   <button
                     className="btn-primary text-xs disabled:opacity-50"
                     onClick={makeVoiceover}
-                    disabled={busy === "voiceover" || !spoken.trim()}
+                    disabled={busy === "voiceover" || !spoken.trim() || !!voiceLocked}
                     title="Reads the spoken script aloud with this project's voice. Paid text-to-speech, no video."
                   >
                     {busy === "voiceover"
