@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     # Settings → Models. claude-haiku-5.5 (Oct 2026) replaced gpt-4o-mini
     # (Jul 2024) as the default: newer, cheaper, supports structured outputs.
     openrouter_chat_model: str = "anthropic/claude-haiku-5.5"
+    # Adult mode (Settings → Adult content overrides this default): text work
+    # (planning, ✨ Enhance, scene rewrites) moves to ADULT_TEXT_MODEL and the
+    # picture/video filters follow their own settings; off, the planner above
+    # and the filters on. See services/content_mode.py. DeepSeek V4 Flash
+    # rewrote and planned the owner's adult prompts where the planner refused
+    # or toned them down; V4 Pro is Enhance's fallback when Flash declines.
+    adult_mode: bool = False
+    adult_text_model: str = "deepseek/deepseek-v4-flash"
+    adult_text_fallback_model: str = "deepseek/deepseek-v4-pro"
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"

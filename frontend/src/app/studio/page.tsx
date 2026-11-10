@@ -8,6 +8,7 @@ import { AssignDialog, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { PresetsMenu } from "@/components/PresetsMenu";
+import { StudioViewer } from "@/components/StudioViewer";
 import {
   BulkSaveDialog,
   CharacterSheetDialog,
@@ -172,12 +173,18 @@ function Studio() {
   // Only the newest list request may write the list (typing fires several).
   const listSeq = useRef(0);
 
-  const loadJobs = async () => {
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
+  // fresh: the first page (new filters). Otherwise (a reload after an
+  // action) as many as are loaded, so "Load more" pages don't disappear
+  // under the viewer or the user's scroll position.
+  const loadJobs = async (fresh = false) => {
     const seq = ++listSeq.current;
-    const jb = await api.listStudioJobs({ ...queryRef.current, limit: PAGE_SIZE });
+    const limit = fresh ? PAGE_SIZE : Math.min(200, Math.max(PAGE_SIZE, jobsRef.current.length + 10));
+    const jb = await api.listStudioJobs({ ...queryRef.current, limit });
     if (seq !== listSeq.current) return;
     setJobs(jb);
-    setHasMore(jb.length === PAGE_SIZE);
+    setHasMore(jb.length === limit);
   };
 
   const loadMore = async () => {
@@ -237,7 +244,7 @@ function Studio() {
       return;
     }
     setChecked([]);
-    loadJobs().catch((e: any) => toast.error(e.message || "Couldn't load results"));
+    loadJobs(true).catch((e: any) => toast.error(e.message || "Couldn't load results"));
   }, [listQuery]);
 
   // Poll in-flight jobs one by one, so paging and filters stay as they are.
@@ -377,6 +384,11 @@ function Studio() {
 
   const tiles = useMemo(() => [...jobTiles, ...assetTiles], [jobTiles, assetTiles]);
 
+  // The full-screen viewer: the tile key it shows, null = closed. It steps
+  // through every tile that has a picture or clip, in grid order.
+  const [viewKey, setViewKey] = useState<string | null>(null);
+  const viewItems = useMemo(() => tiles.filter((t) => t.imageUrl || t.videoUrl), [tiles]);
+
   const toggleRef = (assetId: number) => {
     setSelectedRefs((cur) =>
       cur.includes(assetId) ? cur.filter((x) => x !== assetId) : [...cur, assetId]
@@ -474,7 +486,9 @@ function Studio() {
 
   // Studio results and cast images are separate files, so deleting one
   // never removes the other.
-  const deleteTile = async (t: Tile) => {
+  // onDeleted runs as soon as the delete succeeds, before the reload (the
+  // viewer moves to the next result while this one still exists).
+  const deleteTile = async (t: Tile, onDeleted?: () => void) => {
     const what =
       t.kind === "job"
         ? "this Studio result"
@@ -488,6 +502,7 @@ function Studio() {
         await api.deleteAsset(t.assetId);
         setSelectedRefs((cur) => cur.filter((x) => x !== t.assetId));
       }
+      onDeleted?.();
       toast.success("Deleted");
     } catch (e: any) {
       toast.error(e.message || "Delete failed");
@@ -522,6 +537,24 @@ function Studio() {
     setOwnerFilter("");
   };
 
+  const startProject = async (job: StudioJob) => {
+    // Save image results back to the cast first so the project
+    // can pick them up as a reference; clip results stay in /studio.
+    if (job.output_kind === "image" && job.status === "completed") {
+      try {
+        await api.saveStudioJob(job.id);
+        await reload();
+      } catch {
+        /* already saved */
+      }
+    }
+    const params = new URLSearchParams({
+      owner_kind: job.owner_kind,
+      owner_id: String(job.owner_id),
+    });
+    router.push(`/projects/new?${params.toString()}`);
+  };
+
   const renderTile = (t: Tile) => (
     <TileCard
       key={t.key}
@@ -541,25 +574,11 @@ function Studio() {
         const job = jobs.find((j) => j.id === jobId);
         if (job) remix(job);
       }}
-      onUseInProject={async (jobId) => {
+      onUseInProject={(jobId) => {
         const job = jobs.find((j) => j.id === jobId);
-        if (!job) return;
-        // Save image results back to the cast first so the project
-        // can pick them up as a reference; clip results stay in /studio.
-        if (job.output_kind === "image" && job.status === "completed") {
-          try {
-            await api.saveStudioJob(job.id);
-            await reload();
-          } catch {
-            /* already saved */
-          }
-        }
-        const params = new URLSearchParams({
-          owner_kind: job.owner_kind,
-          owner_id: String(job.owner_id),
-        });
-        router.push(`/projects/new?${params.toString()}`);
+        if (job) startProject(job);
       }}
+      onOpen={() => setViewKey(t.key)}
     />
   );
 
@@ -745,6 +764,41 @@ function Studio() {
         {tiles.length === 0 && moreButton}
       </div>
 
+      {viewKey && (
+        <StudioViewer
+          items={viewItems}
+          openKey={viewKey}
+          onNavigate={setViewKey}
+          onClose={() => setViewKey(null)}
+          actions={{
+            onFavorite: (job) => {
+              // Un-starring under the Favorites filter drops it from the list:
+              // step to the next result instead of closing.
+              if (job.favorite && libKind === "favorites") {
+                const i = viewItems.findIndex((x) => x.jobId === job.id);
+                const neighbour = viewItems[i + 1] || viewItems[i - 1];
+                setViewKey(neighbour ? neighbour.key : null);
+              }
+              toggleFavorite(job);
+            },
+            onQuickSave: (job) => quickSave(job.id),
+            onAssign: setAssigning,
+            onRemix: remix,
+            onTryModel: setRetrying,
+            onUseInProject: startProject,
+            onDelete: (item) => {
+              const t = tiles.find((x) => x.key === item.key);
+              if (!t) return;
+              const i = viewItems.findIndex((x) => x.key === item.key);
+              const neighbour = viewItems[i + 1] || viewItems[i - 1];
+              deleteTile(t, () => setViewKey(neighbour ? neighbour.key : null));
+            },
+            onToggleRef: toggleRef,
+            isRef: (id) => selectedRefs.includes(id),
+          }}
+        />
+      )}
+
       {assigning && (
         <AssignDialog
           job={assigning}
@@ -820,6 +874,7 @@ function TileCard({
   onFavorite,
   onRetry,
   onTryModel,
+  onOpen,
 }: {
   tile: Tile;
   selected: boolean;
@@ -835,8 +890,11 @@ function TileCard({
   onFavorite: () => void;
   onRetry: () => void;
   onTryModel: () => void;
+  onOpen: () => void;
 }) {
   const finished = tile.status === "completed" || tile.status === "saved";
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const viewable = Boolean(tile.imageUrl || tile.videoUrl);
   const failed = tile.status === "failed";
   const actionCls = "chip text-xs py-1 bg-ink-900/85 border-ink-700";
   const job = tile.job;
@@ -849,20 +907,50 @@ function TileCard({
         selectMode && "cursor-pointer"
       )}
       onClick={selectMode ? onToggleChecked : undefined}
+      // Clips preview on hover with a mouse (a tap would start it behind the viewer).
+      onPointerEnter={(e) => e.pointerType === "mouse" && videoRef.current?.play().catch(() => {})}
+      onPointerLeave={() => videoRef.current?.pause()}
     >
       {tile.imageUrl && (
         <img src={tile.imageUrl} alt={tile.label} className="w-full h-full object-cover" />
       )}
       {tile.videoUrl && (
         <video
-          src={tile.videoUrl}
+          ref={videoRef}
+          // #t=0.1: iOS Safari shows the first frame instead of a blank tile.
+          src={`${tile.videoUrl}#t=0.1`}
           className="w-full h-full object-cover"
           muted
           loop
           playsInline
-          onMouseEnter={(e) => (e.currentTarget as HTMLVideoElement).play()}
-          onMouseLeave={(e) => (e.currentTarget as HTMLVideoElement).pause()}
+          preload="metadata"
         />
+      )}
+      {viewable && !selectMode && (
+        // The whole tile opens the full-size viewer; the action buttons and
+        // the favorite star sit above it. A link, so right-click, long-press
+        // and Cmd/Ctrl-click still reach the file itself.
+        <a
+          href={tile.imageUrl || tile.videoUrl}
+          data-view-key={tile.key}
+          onClick={(e) => {
+            if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            e.preventDefault();
+            videoRef.current?.pause();
+            onOpen();
+          }}
+          className="absolute inset-0 cursor-zoom-in focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-accent"
+          aria-label={`Open ${tile.label}`}
+          title="Open full size"
+        />
+      )}
+      {tile.videoUrl && (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-black/55 border border-white/30 text-white text-sm flex items-center justify-center transition md:group-hover:opacity-0"
+        >
+          ▶
+        </span>
       )}
       {!tile.imageUrl && !tile.videoUrl && (
         <div className="w-full h-full flex flex-col items-center justify-center gap-1 text-ink-400 text-xs p-3 text-center">
@@ -871,14 +959,14 @@ function TileCard({
         </div>
       )}
 
-      <div className="absolute inset-x-0 bottom-0 p-2 bg-linear-to-t from-black/85 to-transparent flex items-end gap-1">
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 p-2 bg-linear-to-t from-black/85 to-transparent flex items-end gap-1">
         <div className="min-w-0 flex-1">
           <div className="text-xs text-white font-medium truncate">{tile.label}</div>
           <div className="text-[10px] text-ink-300 truncate">
             {tile.sub}
             {cost && (
               <span
-                className="ml-1 text-ink-200"
+                className="pointer-events-auto ml-1 text-ink-200"
                 title={job?.cost_is_estimate ? "Estimated cost" : "Recorded cost"}
               >
                 · {cost}
@@ -893,7 +981,7 @@ function TileCard({
             aria-label={job.favorite ? "Unfavorite" : "Favorite"}
             title={job.favorite ? "Unfavorite" : "Favorite"}
             className={clsx(
-              "shrink-0 w-6 h-6 rounded-full text-sm leading-none flex items-center justify-center",
+              "pointer-events-auto shrink-0 w-6 h-6 rounded-full text-sm leading-none flex items-center justify-center",
               job.favorite ? "text-yellow-300" : "text-ink-200 hover:text-white"
             )}
           >
@@ -938,9 +1026,17 @@ function TileCard({
       )}
 
       {tile.kind === "job" && tile.jobId && !selectMode && (
-        // Desktop: shown on hover/focus so they don't cover the image.
-        // Touch screens have no hover, so there they stay visible.
-        <div className="absolute top-2 right-2 flex flex-col items-end gap-1 transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100">
+        // Desktop: shown on hover/focus so they don't cover the image, and
+        // clicks between the buttons reach the open button. Touch screens have
+        // no hover: a result with a picture or clip opens in the viewer (which
+        // has all these actions) so the tile stays clear; one without (failed,
+        // still running) keeps them visible here.
+        <div
+          className={clsx(
+            "pointer-events-none *:pointer-events-auto absolute top-2 right-2 flex flex-col items-end gap-1 transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100",
+            viewable ? "pointer-coarse:hidden" : "pointer-coarse:opacity-100!"
+          )}
+        >
           {failed && (
             <button
               onClick={onRetry}
@@ -1027,7 +1123,8 @@ function TileCard({
           onClick={onDelete}
           className={clsx(
             actionCls,
-            "absolute top-2 left-2 hover:text-accent transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100"
+            "absolute top-2 left-2 hover:text-accent transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100",
+            viewable && "pointer-coarse:hidden"
           )}
           title="Delete this image from the cast"
           aria-label={`Delete ${tile.label} from the cast`}

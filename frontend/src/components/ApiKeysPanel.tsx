@@ -1,6 +1,7 @@
 "use client";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { api, ApiKeyStatus, ApiKeyTestResult } from "@/lib/api";
+import { useContentMode } from "@/components/AdultModePanel";
 
 // Settings → API keys. Keys are write-only from the browser: the server
 // returns presence, source and the last 4 characters, never the value. The
@@ -29,6 +30,7 @@ export function ApiKeysPanel() {
   const [keys, setKeys] = useState<ApiKeyStatus[] | null>(null);
   const [mock, setMock] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const contentMode = useContentMode();
 
   const load = useCallback(async () => {
     try {
@@ -84,7 +86,7 @@ export function ApiKeysPanel() {
       {keys && (
         <ul className="space-y-3">
           {keys.map((k) => (
-            <KeyRow key={k.name} row={k} onChange={replace} />
+            <KeyRow key={k.name} row={k} onChange={replace} adult={contentMode?.adult ?? null} />
           ))}
         </ul>
       )}
@@ -92,7 +94,16 @@ export function ApiKeysPanel() {
   );
 }
 
-function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStatus) => void }) {
+function KeyRow({
+  row,
+  onChange,
+  adult,
+}: {
+  row: ApiKeyStatus;
+  onChange: (r: ApiKeyStatus) => void;
+  /** Adult mode (null: unknown). Off forces the content check on. */
+  adult: boolean | null;
+}) {
   const uid = useId();
   const inputId = `${uid}-input`;
   const helpId = `${uid}-help`;
@@ -263,14 +274,21 @@ function KeyRow({ row, onChange }: { row: ApiKeyStatus; onChange: (r: ApiKeyStat
           <input
             type="checkbox"
             className="mt-0.5"
-            checked={!!row.options.check_content}
-            disabled={busy !== null}
+            checked={adult === false || !!row.options.check_content}
+            disabled={busy !== null || adult === false}
             onChange={(e) => setCheck(e.target.checked)}
           />
           <span>
-            {row.label} content check{busy === "option" ? " …" : ""}. Off = uncensored output on the open models
-            {" "}{row.label} hosts; vendor models (Google, Kling, Wan…) stay moderated by their vendor. Prompts involving
-            minors are always refused, and pictures of your Cast are always checked.
+            {row.label} content check{busy === "option" ? " …" : ""}.{" "}
+            {adult === false ? (
+              <>Always on while Adult mode is off (Settings → Adult content).</>
+            ) : (
+              <>
+                Off = uncensored output on the open models {row.label} hosts; vendor models (Google, Kling, Wan…)
+                stay moderated by their vendor.
+              </>
+            )}{" "}
+            Prompts involving minors are always refused, and pictures of your Cast are always checked.
           </span>
         </label>
       )}

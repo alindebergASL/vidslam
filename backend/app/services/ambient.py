@@ -407,9 +407,10 @@ def ensure_photo_rewrite(cfg: AmbientConfig, *, allow: Optional[Callable[[], boo
     if not _rewrite_affordable() or (allow is not None and not allow()):
         log.info("scene description rewrite skipped (budget or rate limit); using it as typed")
         return cfg.model_copy(update={"photo": None})
+    from .content_mode import chat_model
     from .model_registry import switched_off
 
-    if switched_off("chat"):
+    if switched_off("chat", chat_model()):
         log.info("scene description rewrite skipped (the planner's provider is switched off)")
         return cfg.model_copy(update={"photo": None})
     text = cfg.scene_prompt.strip()
@@ -761,6 +762,10 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
             png = image.generate(model=model, prompt=call_prompt, references=(references or []) if with_refs else [],
                                  negative_prompt=negative_prompt, settings=settings)
         except Exception as e:  # noqa: BLE001 — try the fallback model
+            from .safety import UnsafeScriptError
+
+            if isinstance(e, UnsafeScriptError):
+                raise  # refused for minors: no other model gets it either
             last = e
             log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
             if isinstance(e, _ProviderUnavailable):

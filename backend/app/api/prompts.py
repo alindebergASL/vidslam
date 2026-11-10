@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from ..services import prompting
 from ..services.ratelimit import rate_limit
+from ..services.safety import UnsafePromptError, UnsafeScriptError
 from ..services.spend import budget_guard
 from .auth import require_auth
 
@@ -93,19 +94,37 @@ def reset_defaults() -> dict:
     return prompting.reset_negative_defaults()
 
 
+def _refused_message(e: "prompting.EnhanceRefused") -> str:
+    if e.reason == "minor":
+        return "This prompt was refused: it appears to sexualise a minor. Your text is unchanged."
+    if e.reason == "unsafe_rewrite":
+        return "The rewrite was refused by the minors check, so your text is unchanged."
+    if e.adult:
+        return f"The text model ({e.model}) declined to rewrite this prompt, so yours is unchanged."
+    return (f"The planner ({e.model}) declined to rewrite this prompt, so yours is unchanged. "
+            "For adult prompts, turn on Adult mode in Settings.")
+
+
 @router.post("/enhance", response_model=EnhanceOut,
              dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def enhance(body: EnhanceIn) -> dict:
     try:
         out = prompting.enhance(body.text, body.kind, body.model or "")
+    except UnsafePromptError as e:
+        raise HTTPException(422, str(e)) from None
+    except prompting.EnhanceRefused as e:
+        log.info("prompt enhance refused (%s) by %s", e.reason, e.model)
+        raise HTTPException(422, _refused_message(e)) from None
+    except UnsafeScriptError as e:  # a script the script check refuses (what generating it would do)
+        raise HTTPException(422, f"This script was refused: {e}") from None
     except httpx.HTTPStatusError as e:
         log.warning("prompt enhance failed: HTTP %s", e.response.status_code)
-        raise HTTPException(502, f"The planner model returned HTTP {e.response.status_code}; try again.") from None
+        raise HTTPException(502, f"The text model returned HTTP {e.response.status_code}; try again.") from None
     except (httpx.HTTPError, RuntimeError, ValueError) as e:
         log.warning("prompt enhance failed: %s", str(e)[:300])
         raise HTTPException(502, "Couldn't enhance the prompt right now; try again.") from None
     if not out["text"].strip():
-        raise HTTPException(502, "The planner model returned an empty prompt; try again.")
+        raise HTTPException(502, "The text model returned an empty prompt; try again.")
     return out
 
 

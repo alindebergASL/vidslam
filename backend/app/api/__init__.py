@@ -6,6 +6,7 @@ from . import (
     auth,
     avatars,
     brand_kits,
+    content,
     generation,
     ingredients,
     models_api,
@@ -42,6 +43,7 @@ api_router.include_router(youtube.router, prefix="/api", tags=["publishing"])
 api_router.include_router(prompts.router, prefix="/api/prompts", tags=["prompts"])
 api_router.include_router(spend.router, prefix="/api/spend", tags=["spend"])
 api_router.include_router(settings_keys.router, prefix="/api/settings/keys", tags=["settings"])
+api_router.include_router(content.router, prefix="/api/settings/content", tags=["settings"])
 api_router.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
 api_router.include_router(ambient.public_router, prefix="/api", tags=["public"])
 
