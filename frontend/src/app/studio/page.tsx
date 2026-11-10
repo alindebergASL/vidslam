@@ -173,12 +173,18 @@ function Studio() {
   // Only the newest list request may write the list (typing fires several).
   const listSeq = useRef(0);
 
-  const loadJobs = async () => {
+  const jobsRef = useRef(jobs);
+  jobsRef.current = jobs;
+  // fresh: the first page (new filters). Otherwise (a reload after an
+  // action) as many as are loaded, so "Load more" pages don't disappear
+  // under the viewer or the user's scroll position.
+  const loadJobs = async (fresh = false) => {
     const seq = ++listSeq.current;
-    const jb = await api.listStudioJobs({ ...queryRef.current, limit: PAGE_SIZE });
+    const limit = fresh ? PAGE_SIZE : Math.min(200, Math.max(PAGE_SIZE, jobsRef.current.length + 10));
+    const jb = await api.listStudioJobs({ ...queryRef.current, limit });
     if (seq !== listSeq.current) return;
     setJobs(jb);
-    setHasMore(jb.length === PAGE_SIZE);
+    setHasMore(jb.length === limit);
   };
 
   const loadMore = async () => {
@@ -238,7 +244,7 @@ function Studio() {
       return;
     }
     setChecked([]);
-    loadJobs().catch((e: any) => toast.error(e.message || "Couldn't load results"));
+    loadJobs(true).catch((e: any) => toast.error(e.message || "Couldn't load results"));
   }, [listQuery]);
 
   // Poll in-flight jobs one by one, so paging and filters stay as they are.
@@ -480,7 +486,9 @@ function Studio() {
 
   // Studio results and cast images are separate files, so deleting one
   // never removes the other.
-  const deleteTile = async (t: Tile) => {
+  // onDeleted runs as soon as the delete succeeds, before the reload (the
+  // viewer moves to the next result while this one still exists).
+  const deleteTile = async (t: Tile, onDeleted?: () => void) => {
     const what =
       t.kind === "job"
         ? "this Studio result"
@@ -494,6 +502,7 @@ function Studio() {
         await api.deleteAsset(t.assetId);
         setSelectedRefs((cur) => cur.filter((x) => x !== t.assetId));
       }
+      onDeleted?.();
       toast.success("Deleted");
     } catch (e: any) {
       toast.error(e.message || "Delete failed");
@@ -762,7 +771,16 @@ function Studio() {
           onNavigate={setViewKey}
           onClose={() => setViewKey(null)}
           actions={{
-            onFavorite: toggleFavorite,
+            onFavorite: (job) => {
+              // Un-starring under the Favorites filter drops it from the list:
+              // step to the next result instead of closing.
+              if (job.favorite && libKind === "favorites") {
+                const i = viewItems.findIndex((x) => x.jobId === job.id);
+                const neighbour = viewItems[i + 1] || viewItems[i - 1];
+                setViewKey(neighbour ? neighbour.key : null);
+              }
+              toggleFavorite(job);
+            },
             onQuickSave: (job) => quickSave(job.id),
             onAssign: setAssigning,
             onRemix: remix,
@@ -770,7 +788,10 @@ function Studio() {
             onUseInProject: startProject,
             onDelete: (item) => {
               const t = tiles.find((x) => x.key === item.key);
-              if (t) deleteTile(t);
+              if (!t) return;
+              const i = viewItems.findIndex((x) => x.key === item.key);
+              const neighbour = viewItems[i + 1] || viewItems[i - 1];
+              deleteTile(t, () => setViewKey(neighbour ? neighbour.key : null));
             },
             onToggleRef: toggleRef,
             isRef: (id) => selectedRefs.includes(id),
@@ -886,9 +907,9 @@ function TileCard({
         selectMode && "cursor-pointer"
       )}
       onClick={selectMode ? onToggleChecked : undefined}
-      // Clips preview on hover (desktop); the open button sits over them.
-      onMouseEnter={() => videoRef.current?.play().catch(() => {})}
-      onMouseLeave={() => videoRef.current?.pause()}
+      // Clips preview on hover with a mouse (a tap would start it behind the viewer).
+      onPointerEnter={(e) => e.pointerType === "mouse" && videoRef.current?.play().catch(() => {})}
+      onPointerLeave={() => videoRef.current?.pause()}
     >
       {tile.imageUrl && (
         <img src={tile.imageUrl} alt={tile.label} className="w-full h-full object-cover" />
@@ -907,10 +928,17 @@ function TileCard({
       )}
       {viewable && !selectMode && (
         // The whole tile opens the full-size viewer; the action buttons and
-        // the favorite star sit above it.
-        <button
-          type="button"
-          onClick={onOpen}
+        // the favorite star sit above it. A link, so right-click, long-press
+        // and Cmd/Ctrl-click still reach the file itself.
+        <a
+          href={tile.imageUrl || tile.videoUrl}
+          data-view-key={tile.key}
+          onClick={(e) => {
+            if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+            e.preventDefault();
+            videoRef.current?.pause();
+            onOpen();
+          }}
           className="absolute inset-0 cursor-zoom-in focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-accent"
           aria-label={`Open ${tile.label}`}
           title="Open full size"
@@ -1006,7 +1034,7 @@ function TileCard({
         <div
           className={clsx(
             "pointer-events-none *:pointer-events-auto absolute top-2 right-2 flex flex-col items-end gap-1 transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100",
-            viewable && "pointer-coarse:hidden"
+            viewable ? "pointer-coarse:hidden" : "pointer-coarse:opacity-100!"
           )}
         >
           {failed && (

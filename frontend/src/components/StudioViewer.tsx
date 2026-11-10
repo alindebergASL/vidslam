@@ -69,22 +69,23 @@ export function StudioViewer({
   const titleId = useId();
   const boxRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
-  const lastIndex = useRef(0);
   const swipe = useRef<{ x: number; y: number } | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  // The key shown now, for returning focus to its tile on close.
+  const keyRef = useRef(openKey);
+  keyRef.current = openKey;
 
   const idx = items.findIndex((i) => i.key === openKey);
   const item = idx >= 0 ? items[idx] : null;
-  if (idx >= 0) lastIndex.current = idx;
   const prev = idx > 0 ? items[idx - 1] : null;
   const next = idx >= 0 && idx < items.length - 1 ? items[idx + 1] : null;
 
-  // The item went away (deleted, or a filter changed): show its neighbour,
-  // or close when nothing is left.
+  // The item went away without the viewer being told where to go (a reload
+  // or a filter change): close rather than show something the user didn't
+  // pick. (Deleting from the viewer moves to the next result first.)
   useEffect(() => {
-    if (item) return;
-    if (items.length === 0) onClose();
-    else onNavigate(items[Math.min(lastIndex.current, items.length - 1)].key);
-  }, [item, items, onClose, onNavigate]);
+    if (!item) onClose();
+  }, [item, onClose]);
 
   // Keyboard: Escape closes, arrows step (unless a control has them), Tab
   // stays inside; the page behind doesn't scroll; focus returns on close.
@@ -132,9 +133,31 @@ export function StudioViewer({
     return () => {
       window.removeEventListener("keydown", onKey);
       document.body.style.overflow = overflow;
-      if (opener && document.contains(opener)) opener.focus?.();
+      // Back to the tile of the result shown last (it may differ from the
+      // one opened), else whatever opened the viewer.
+      const tile = document.querySelector<HTMLElement>(`[data-view-key="${CSS.escape(keyRef.current)}"]`);
+      if (tile) tile.focus();
+      else if (opener && document.contains(opener)) opener.focus?.();
     };
   }, []);
+
+  // A focused control that went away (Next on the last result, Save once
+  // saved, Delete): keep focus inside the viewer.
+  useEffect(() => {
+    const box = boxRef.current;
+    if (box && !box.contains(document.activeElement)) closeRef.current?.focus();
+  });
+
+  // Clips start playing; where sound isn't allowed without a tap (iPhone),
+  // they play muted instead of sitting still (the controls unmute).
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.play().catch(() => {
+      v.muted = true;
+      v.play().catch(() => {});
+    });
+  }, [openKey]);
 
   // Warm the neighbours so stepping through pictures is instant.
   useEffect(() => {
@@ -183,7 +206,7 @@ export function StudioViewer({
       className="fixed inset-0 z-40 bg-ink-950 flex flex-col text-ink-100"
     >
       <div className="flex items-center gap-3 px-3 sm:px-5 py-2 border-b border-white/10">
-        <span className="text-xs text-ink-400 tabular-nums shrink-0" aria-live="polite">
+        <span className="text-xs text-ink-400 tabular-nums shrink-0" aria-live="polite" aria-atomic="true">
           {idx + 1} / {items.length}
         </span>
         <h2 id={titleId} className="text-sm font-medium truncate flex-1 min-w-0">
@@ -212,9 +235,13 @@ export function StudioViewer({
       </div>
 
       <div
-        className="relative flex-1 min-h-0 flex items-center justify-center p-2 sm:px-16"
+        // pan-y: horizontal touch moves stay with the page (a swipe), vertical
+        // scroll and pinch-zoom stay with the browser.
+        className="relative flex-1 min-h-0 flex items-center justify-center p-2 sm:px-16 touch-pan-y touch-pinch-zoom"
         onPointerDown={(e) => {
-          if (e.pointerType !== "mouse") swipe.current = { x: e.clientX, y: e.clientY };
+          // Not on the clip: dragging its timeline isn't a swipe.
+          if (e.pointerType === "mouse" || !e.isPrimary || (e.target as HTMLElement).tagName === "VIDEO") return;
+          swipe.current = { x: e.clientX, y: e.clientY };
         }}
         onPointerUp={(e) => {
           const s = swipe.current;
@@ -230,8 +257,10 @@ export function StudioViewer({
       >
         {isVideo ? (
           <video
+            ref={videoRef}
             key={item.key}
-            src={item.videoUrl}
+            // #t=0.1: a frame shows on iPhones even before it plays.
+            src={`${item.videoUrl}#t=0.1`}
             className="max-w-full max-h-full object-contain"
             controls
             autoPlay
