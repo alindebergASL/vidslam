@@ -4,6 +4,8 @@ GET  /api/prompts/defaults            {"image": str, "video": str}
 PUT  /api/prompts/defaults            same body → same shape
 DELETE /api/prompts/defaults          back to the built-in lists → same shape
 POST /api/prompts/enhance             {"text", "kind", "model"?} → {"text", "model"}
+GET  /api/prompts/enhance-model       {"model", "default", "planner", "choices"}
+PUT  /api/prompts/enhance-model       {"model": str | null} → same (null = default)
 GET  /api/prompts/presets             newest first
 POST /api/prompts/presets             → preset (201)
 PUT  /api/prompts/presets/{id}        → preset
@@ -20,6 +22,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from ..services import prompting
 from ..services.ratelimit import rate_limit
+from ..services.safety import UnsafePromptError
 from ..services.spend import budget_guard
 from .auth import require_auth
 
@@ -49,6 +52,23 @@ class EnhanceIn(BaseModel):
 class EnhanceOut(BaseModel):
     text: str
     model: str
+
+
+class EnhanceChoice(BaseModel):
+    id: str
+    label: str
+    note: str = ""
+
+
+class EnhanceModelOut(BaseModel):
+    model: str
+    default: str
+    planner: str
+    choices: list[EnhanceChoice]
+
+
+class EnhanceModelIn(BaseModel):
+    model: Optional[str] = Field(default=None, max_length=prompting.ENHANCE_MODEL_MAX)
 
 
 class PresetIn(BaseModel):
@@ -98,6 +118,13 @@ def reset_defaults() -> dict:
 def enhance(body: EnhanceIn) -> dict:
     try:
         out = prompting.enhance(body.text, body.kind, body.model or "")
+    except UnsafePromptError as e:
+        raise HTTPException(422, str(e)) from None
+    except prompting.EnhanceRefused as e:
+        log.info("prompt enhance declined by %s", e.model)
+        raise HTTPException(
+            422, f"The model ({e.model}) declined to rewrite this prompt, so yours is unchanged. "
+                 "Settings → Prompting chooses the model Enhance uses.") from None
     except httpx.HTTPStatusError as e:
         log.warning("prompt enhance failed: HTTP %s", e.response.status_code)
         raise HTTPException(502, f"The planner model returned HTTP {e.response.status_code}; try again.") from None
@@ -107,6 +134,19 @@ def enhance(body: EnhanceIn) -> dict:
     if not out["text"].strip():
         raise HTTPException(502, "The planner model returned an empty prompt; try again.")
     return out
+
+
+@router.get("/enhance-model", response_model=EnhanceModelOut)
+def get_enhance_model() -> dict:
+    return prompting.enhance_settings()
+
+
+@router.put("/enhance-model", response_model=EnhanceModelOut)
+def put_enhance_model(body: EnhanceModelIn) -> dict:
+    try:
+        return prompting.set_enhance_model(body.model)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from None
 
 
 @router.get("/presets", response_model=list[PresetOut])

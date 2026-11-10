@@ -69,6 +69,11 @@ class Settings(BaseSettings):
     # Settings → Models. claude-haiku-5.5 (Oct 2026) replaced gpt-4o-mini
     # (Jul 2024) as the default: newer, cheaper, supports structured outputs.
     openrouter_chat_model: str = "anthropic/claude-haiku-5.5"
+    # "✨ Enhance" (prompt rewrites). The planner refused or toned down the
+    # user's adult prompts; DeepSeek V4 Flash rewrote them all, fast and for a
+    # fraction of a cent (Nov 2026). Also the fallback when the chosen model
+    # declines. "" = use the planner. Switch live in Settings → Prompting.
+    prompt_enhance_model: str = "deepseek/deepseek-v4-flash"
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"

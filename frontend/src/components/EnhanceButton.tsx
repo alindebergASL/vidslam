@@ -9,6 +9,8 @@ export function enhanceErrorMessage(e: unknown): string {
   const msg = (e as { message?: string })?.message || "";
   if (msg.startsWith("402")) return "Monthly budget reached. Raise it in Settings → Spend to enhance prompts.";
   if (msg.startsWith("429")) return "Too many requests right now. Try again in a minute.";
+  // The model declined, or the prompt was refused (minors): say why.
+  if (msg.startsWith("422") && /declined|refused/i.test(msg)) return msg.replace(/^422:\s*/, "");
   if (msg.startsWith("422")) return "Write something first, then enhance it.";
   return msg || "Enhance failed";
 }
@@ -20,8 +22,13 @@ const KIND_LABEL: Record<EnhanceKind, string> = {
   scene: "scene description",
 };
 
+/** "deepseek/deepseek-v4-flash" → "deepseek-v4-flash" (the suggestion's byline). */
+function shortModel(id: string): string {
+  return id.replace(/^~/, "").split("/").pop() || id;
+}
+
 /**
- * "✨ Enhance": asks the planner model to improve `text` for its `kind`, shows
+ * "✨ Enhance": asks the enhance model (Settings → Prompting) to improve `text` for its `kind`, shows
  * the suggestion inline with Use it / Keep mine, and after Use it offers Undo
  * (restores the text from before) for as long as the text is unchanged.
  *
@@ -48,6 +55,7 @@ export function EnhanceButton({
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const [suggestion, setSuggestion] = useState<string | null>(null);
+  const [byModel, setByModel] = useState("");
   // Set after "Use it": what to restore, and the text it was replaced with.
   const [undo, setUndo] = useState<{ before: string; after: string } | null>(null);
 
@@ -60,6 +68,7 @@ export function EnhanceButton({
     try {
       const r = await api.enhancePrompt({ text, kind, model: model || null });
       setSuggestion(r.text);
+      setByModel(r.model || "");
     } catch (e) {
       toast.error(enhanceErrorMessage(e));
     } finally {
@@ -82,7 +91,7 @@ export function EnhanceButton({
           onClick={run}
           disabled={disabled || empty || busy}
           className={clsx("chip text-xs disabled:opacity-50", buttonClassName)}
-          title={`Rewrite this ${KIND_LABEL[kind]} with the planner model. You can keep yours.`}
+          title={`Rewrite this ${KIND_LABEL[kind]} (Settings → Prompting chooses the model). You can keep yours.`}
           aria-label={`Enhance ${KIND_LABEL[kind]}`}
         >
           {busy ? "Enhancing…" : "✨ Enhance"}
@@ -109,7 +118,10 @@ export function EnhanceButton({
       >
         {suggestion !== null && (
           <div className="mt-2 rounded-md border border-ink-700 bg-ink-900 p-2 text-xs">
-            <div className="text-ink-400 mb-1">Suggested {KIND_LABEL[kind]}:</div>
+            <div className="text-ink-400 mb-1">
+              Suggested {KIND_LABEL[kind]}
+              {byModel && <span className="text-ink-500"> · {shortModel(byModel)}</span>}:
+            </div>
             <p className="whitespace-pre-wrap text-ink-100">{suggestion}</p>
             <div className="mt-2 flex gap-2">
               <button type="button" onClick={use} className="btn-primary text-xs py-1">

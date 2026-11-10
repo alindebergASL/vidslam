@@ -160,17 +160,130 @@ def delete_preset(preset_id: str) -> bool:
 
 # ---------- enhance ----------
 
+ENHANCE_MODEL_KEY = "prompting.enhance_model"  # {"model": str} ("" = the planner)
+ENHANCE_MODEL_MAX = 200
+_MODEL_ID = re.compile(r"^~?[A-Za-z0-9][\w.\-]*/[\w.:@\-]+$")
 
-def enhance(text: str, kind: str, model: str = "") -> dict:
-    """Ask the planner model for a better prompt: {"text", "model"} where
-    model is the planner model used. `model` is the target generation model
-    (for a model-family hint)."""
-    if kind not in ENHANCE_KINDS:
-        raise ValueError(f"unknown prompt kind {kind!r}")
-    from ..providers import get_chat
+# Offered in Settings → Prompting (any OpenRouter chat model id also works).
+ENHANCE_CHOICES = (
+    {"id": "deepseek/deepseek-v4-flash", "label": "DeepSeek V4 Flash",
+     "note": "Fast and nearly free. Rewrote every adult prompt in a test where the planner refused or toned them down."},
+    {"id": "deepseek/deepseek-v4-pro", "label": "DeepSeek V4 Pro",
+     "note": "Keeps the most detail; slower (up to about 45 s)."},
+    {"id": "", "label": "The planner model",
+     "note": "The storyboard planner (Settings → Models). It may refuse or tone down adult prompts; "
+             "a refusal is retried with DeepSeek V4 Flash."},
+)
+
+# A reply that declines instead of rewriting ("I can't write a prompt for
+# explicit sexual content, but here's a version…"): never offered as the
+# user's prompt.
+_DECLINE_VERBS = (r"(?:help(?!\s+but)|assist|write|create|provide|generate|produce|fulfill|comply|"
+                  r"do that|make (?:that|this))")
+_REFUSAL = re.compile(
+    r"\bi(?:\s+(?:can[’']?t|cannot|won[’']?t|will not|am (?:not able|unable))|[’']m (?:not able|unable))"
+    rf"\s+(?:to\s+)?{_DECLINE_VERBS}"
+    r"|\bi must decline|\bagainst (?:my|our|the) (?:guidelines|polic(?:y|ies)|content polic\w*)"
+    r"|\bnon-explicit version|\ba (?:safer|tamer|more tasteful|non-explicit) version",
+    re.I,
+)
+
+
+class EnhanceRefused(RuntimeError):
+    """The model declined to rewrite the prompt (the user's text stands)."""
+
+    def __init__(self, model: str) -> None:
+        super().__init__(f"{model} declined to rewrite this prompt")
+        self.model = model
+
+
+def looks_refused(text: str) -> bool:
+    """The reply declines (judged on its opening, where models say so)."""
+    return bool(_REFUSAL.search(" ".join((text or "").split())[:400]))
+
+
+def enhance_model() -> str:
+    """The model "✨ Enhance" uses: as set in Settings → Prompting, else
+    PROMPT_ENHANCE_MODEL. "" = the planner (Settings → Models)."""
+    saved = _get(ENHANCE_MODEL_KEY)
+    if isinstance(saved, dict) and isinstance(saved.get("model"), str):
+        return saved["model"]
+    from ..config import get_settings
+
+    return get_settings().prompt_enhance_model or ""
+
+
+def set_enhance_model(model: Optional[str]) -> dict:
+    """Choose the enhance model ("" = the planner); None = back to the default."""
+    if model is not None:
+        model = model.strip()
+        if len(model) > ENHANCE_MODEL_MAX or (model and not _MODEL_ID.match(model)):
+            raise ValueError("model must be an OpenRouter model id like deepseek/deepseek-v4-flash, or empty")
+    _put(ENHANCE_MODEL_KEY, None if model is None else {"model": model})
+    return enhance_settings()
+
+
+def enhance_settings() -> dict:
+    from ..config import get_settings
     from . import model_registry
 
-    chat = get_chat()
-    out = chat.enhance_prompt(text, kind, model or "")
-    used = getattr(chat, "model", "") or model_registry.active_model("chat")
+    return {
+        "model": enhance_model(),
+        "default": get_settings().prompt_enhance_model or "",
+        "planner": model_registry.active_model("chat"),
+        "choices": [dict(c) for c in ENHANCE_CHOICES],
+    }
+
+
+def _chat_for(model: str):
+    """The chat provider for an enhance model ("" = the planner), routed like
+    any chat call: placeholder in mock mode or without a key, refused (409)
+    when OpenRouter is switched off."""
+    from ..providers import get_chat
+
+    if not model:
+        return get_chat()
+    from . import model_registry
+
+    provider, blocked = model_registry.route_info("chat", model)
+    if provider == "unavailable":
+        raise model_registry.unavailable("chat", model, blocked)
+    if provider == "mock":
+        from ..providers.mock_chat import MockChatProvider
+
+        return MockChatProvider()
+    from ..providers.openrouter_chat import OpenRouterChatProvider
+
+    return OpenRouterChatProvider(model=model)
+
+
+def enhance(text: str, kind: str, model: str = "") -> dict:
+    """A better prompt from the enhance model: {"text", "model"} where model
+    is the one that wrote it. `model` is the target generation model (for a
+    model-family hint). A reply that declines is retried once with the
+    default enhance model, then refused (EnhanceRefused): it is never handed
+    back as the user's prompt. Prompts involving minors are refused before
+    any call (safety.UnsafePromptError), and so is such a rewrite."""
+    if kind not in ENHANCE_KINDS:
+        raise ValueError(f"unknown prompt kind {kind!r}")
+    from ..config import get_settings
+    from . import model_registry
+    from .safety import check_prompt
+
+    check_prompt(text)
+
+    def run(m: str) -> tuple[str, str]:
+        chat = _chat_for(m)
+        out = chat.enhance_prompt(text, kind, model or "")
+        return out, getattr(chat, "model", "") or m or model_registry.active_model("chat")
+
+    out, used = run(enhance_model())
+    if looks_refused(out):
+        fallback = get_settings().prompt_enhance_model or ""
+        if fallback and fallback != used:
+            log.info("enhance: %s declined; retrying with %s", used, fallback)
+            out, used = run(fallback)
+        if looks_refused(out):
+            raise EnhanceRefused(used)
+    check_prompt(out)
     return {"text": out, "model": used}

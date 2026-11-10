@@ -408,6 +408,16 @@ export type StudioGenerateBody = {
 export type PromptDefaults = { image: string; video: string };
 export type EnhanceKind = "image" | "video" | "script" | "scene";
 
+/** The model "✨ Enhance" uses ("" = the storyboard planner). */
+export type EnhanceModelSettings = {
+  model: string;
+  /** The app default (also the fallback when a model declines). */
+  default: string;
+  /** The planner model, used when model is "". */
+  planner: string;
+  choices: { id: string; label: string; note: string }[];
+};
+
 export type PromptPreset = {
   id: string;
   name: string;
@@ -1233,6 +1243,10 @@ export const api = {
   setPromptDefaults: (body: PromptDefaults) =>
     req<PromptDefaults>("/api/prompts/defaults", { method: "PUT", body: JSON.stringify(body) }),
   resetPromptDefaults: () => req<PromptDefaults>("/api/prompts/defaults", { method: "DELETE" }),
+  getEnhanceModel: () => req<EnhanceModelSettings>("/api/prompts/enhance-model"),
+  /** null = back to the app default. */
+  setEnhanceModel: (model: string | null) =>
+    req<EnhanceModelSettings>("/api/prompts/enhance-model", { method: "PUT", body: JSON.stringify({ model }) }),
   enhancePrompt: (body: { text: string; kind: EnhanceKind; model?: string | null }) =>
     req<{ text: string; model: string }>("/api/prompts/enhance", {
       method: "POST",
