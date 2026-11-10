@@ -17,7 +17,7 @@ const ORIGIN_LABEL: Record<string, string> = {
 /** Studio image results + Cast images, for the "Choose" dialog. */
 async function loadChoices(): Promise<PickedImage[]> {
   const [jobs, avatars, ingredients] = await Promise.all([
-    api.listStudioJobs().catch(() => []),
+    api.listStudioJobs({ output_kind: "image", status: "completed", limit: 200 }).catch(() => []),
     api.listAvatars().catch(() => []),
     api.listIngredients().catch(() => []),
   ]);

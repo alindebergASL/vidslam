@@ -346,16 +346,133 @@ class StudioJobOut(BaseModel):
     updated_at: datetime
     # Every job a create request made (the first included); only on that response.
     batch_ids: list[int] = Field(default_factory=list)
+    favorite: bool = False
+    label: str = ""  # "" = no tag; character-sheet jobs carry their view
+    # Money in the spend ledger for this job (an image's own calls, a clip's
+    # video jobs), summed; None until something is recorded.
+    cost_usd: Optional[float] = None
+    cost_is_estimate: bool = False
 
     @field_validator("reference_asset_ids", mode="before")
     @classmethod
     def _ref_ids(cls, v):
         return list(v or [])
 
-    @field_validator("negative_prompt", "aspect_ratio", mode="before")
+    @field_validator("negative_prompt", "aspect_ratio", "label", mode="before")
     @classmethod
     def _none_is_empty(cls, v):
         return v or ""
+
+    @field_validator("favorite", mode="before")
+    @classmethod
+    def _none_is_false(cls, v):
+        return bool(v)
+
+
+class StudioJobUpdate(BaseModel):
+    """Body for PATCH /api/studio/jobs/{id}; a field left out stays as is."""
+    favorite: Optional[bool] = None
+    label: Optional[str] = Field(None, max_length=80)
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def _strip(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+
+class StudioBulkIds(BaseModel):
+    ids: list[int] = Field(..., min_length=1, max_length=200)
+
+    @field_validator("ids")
+    @classmethod
+    def _unique(cls, v: list[int]) -> list[int]:
+        if len(set(v)) != len(v):
+            raise ValueError("ids must be unique")
+        return v
+
+
+class StudioBulkFavorite(StudioBulkIds):
+    favorite: bool
+
+
+class StudioBulkSave(StudioBulkIds):
+    owner_kind: Literal["avatar", "ingredient"]
+    owner_id: int
+    asset_type: Optional[str] = None
+
+
+class StudioBulkDeleteOut(BaseModel):
+    deleted: list[int]
+    missing: list[int]
+
+
+class StudioBulkFavoriteOut(BaseModel):
+    updated: list[int]
+    missing: list[int]
+
+
+class StudioSkipped(BaseModel):
+    id: int
+    reason: str
+
+
+class StudioBulkSaveOut(BaseModel):
+    saved: list[AssetOut]
+    skipped: list[StudioSkipped]
+
+
+class StudioRetryRequest(BaseModel):
+    """Body for POST /api/studio/jobs/{id}/retry: every field optional, a
+    field left out (or null) keeps the source job's value."""
+    model: Optional[str] = None  # "" = keep the source's model too
+    prompt: Optional[str] = Field(None, min_length=1)
+    negative_prompt: Optional[str] = None
+    aspect_ratio: Optional[Literal["9:16", "16:9", "1:1"]] = None
+
+
+# Character-sheet views: id → (label, aspect, what the picture shows).
+CHARACTER_SHEET_VIEWS: dict[str, tuple[str, str, str]] = {
+    "front": ("Front view", "9:16", "full body, facing the camera, neutral pose, arms relaxed"),
+    "three_quarter": ("Three-quarter view", "9:16", "full body turned 45° to the left"),
+    "profile": ("Side profile", "9:16", "full body in profile facing right"),
+    "back": ("Back view", "9:16", "full body from behind"),
+    "portrait": ("Close-up portrait", "1:1", "head and shoulders, neutral expression, facing the camera"),
+    "smile": ("Smiling close-up", "1:1", "head and shoulders, natural smile"),
+    "action": ("Walking", "9:16", "full body walking toward the camera, mid-stride"),
+    "seated": ("Seated", "9:16", "sitting on a plain stool, full body"),
+}
+DEFAULT_SHEET_VIEWS = ["front", "three_quarter", "profile", "back"]
+
+
+class CharacterSheetRequest(BaseModel):
+    avatar_id: int
+    views: list[str] = Field(default_factory=lambda: list(DEFAULT_SHEET_VIEWS), min_length=1, max_length=8)
+    # None (or empty) = the avatar's own pictures.
+    reference_asset_ids: Optional[list[int]] = None
+    model: Optional[str] = None
+    style: str = Field("", max_length=300)  # extra words, e.g. "studio photo, plain grey background"
+    negative_prompt: str = ""
+
+    @field_validator("views")
+    @classmethod
+    def _known_views(cls, v: list[str]) -> list[str]:
+        unknown = [x for x in v if x not in CHARACTER_SHEET_VIEWS]
+        if unknown:
+            raise ValueError(f"unknown view {', '.join(unknown)}; one of {', '.join(CHARACTER_SHEET_VIEWS)}")
+        if len(set(v)) != len(v):
+            raise ValueError("views must be unique")
+        return v
+
+
+class CharacterSheetView(BaseModel):
+    id: str
+    label: str
+    aspect_ratio: str
+
+
+class CharacterSheetOut(BaseModel):
+    batch_ids: list[int]
+    jobs: list[StudioJobOut]
 
 
 # --- Custom model training ---

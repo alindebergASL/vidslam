@@ -90,7 +90,7 @@ export function AssignDialog({
     api.listIngredients().then(setIngredients).catch(() => setIngredients([]));
     if (!job) {
       api
-        .listStudioJobs()
+        .listStudioJobs({ output_kind: "image", status: "completed", limit: 200 })
         .then((js) => setJobs(finishedImageJobs(js)))
         .catch(() => setJobs([]));
     }
