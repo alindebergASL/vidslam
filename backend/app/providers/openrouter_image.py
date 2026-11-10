@@ -9,6 +9,23 @@ from ..services import provider_keys
 from .base import ImageProvider, ImageRef, ModelInfo
 
 
+def _error_reason(r: httpx.Response) -> str:
+    """OpenRouter's error message from a failed response (never headers)."""
+    try:
+        err = (r.json() or {}).get("error")
+    except ValueError:
+        err = None
+    if isinstance(err, dict):
+        msg = str(err.get("message") or "").strip()
+        meta = err.get("metadata") if isinstance(err.get("metadata"), dict) else {}
+        extra = "; ".join(str(meta[k]) for k in ("reason", "provider_name") if meta.get(k))
+        if msg:
+            return f"{msg}{f' ({extra})' if extra else ''}"[:300]
+    if isinstance(err, str) and err.strip():
+        return err.strip()[:300]
+    return (r.reason_phrase or "error")[:300]
+
+
 class OpenRouterImageProvider(ImageProvider):
     """Thin adapter for OpenRouter's image generation endpoint.
 
@@ -92,7 +109,11 @@ class OpenRouterImageProvider(ImageProvider):
         # Quality "max" on GPT Image 2.6 takes ~2 minutes.
         with httpx.Client(timeout=300.0) as client:
             r = client.post(url, headers=self._headers(), json=body)
-            r.raise_for_status()
+            if r.status_code >= 400:
+                # Keep OpenRouter's reason ("Key limit exceeded", a moderation
+                # flag…): a bare "403 Forbidden" can't be acted on.
+                raise httpx.HTTPStatusError(f"OpenRouter image {r.status_code}: {_error_reason(r)}",
+                                            request=r.request, response=r)
             data = r.json()
         from ..services import spend
 
