@@ -159,8 +159,16 @@ function Studio() {
     return out;
   }, [q, libKind, ownerFilter]);
   const filtersActive = Object.keys(query).length > 0;
-  const queryRef = useRef(query);
-  queryRef.current = query;
+  // What the server is asked for: the library filters plus the top Images /
+  // Videos tab, so paging reaches older results of that kind.
+  const listQuery = useMemo<StudioJobsQuery>(() => {
+    if (query.output_kind) return query;
+    if (filter === "images") return { ...query, output_kind: "image" };
+    if (filter === "videos") return { ...query, output_kind: "video_clip" };
+    return query;
+  }, [query, filter]);
+  const queryRef = useRef(listQuery);
+  queryRef.current = listQuery;
   // Only the newest list request may write the list (typing fires several).
   const listSeq = useRef(0);
 
@@ -230,7 +238,7 @@ function Studio() {
     }
     setChecked([]);
     loadJobs().catch((e: any) => toast.error(e.message || "Couldn't load results"));
-  }, [query]);
+  }, [listQuery]);
 
   // Poll in-flight jobs one by one, so paging and filters stay as they are.
   // One poll at a time; ids added while a poll waits are kept, and only a
@@ -324,8 +332,10 @@ function Studio() {
 
   const assetTiles = useMemo<Tile[]>(() => {
     const out: Tile[] = [];
-    // Library filters narrow Studio results; cast pictures would only get in the way.
-    if (filtersActive) return out;
+    // Library filters narrow Studio results; on those tabs cast pictures
+    // would only get in the way. The Characters / Scenes / Uploads tabs don't
+    // show Studio results (or their filters), so they always list the cast.
+    if (filtersActive && showResults) return out;
     const showAvatarAssets = filter === "all" || filter === "characters" || filter === "uploads";
     const showIngredientAssets =
       filter === "all" || filter === "scenes" || filter === "uploads";
@@ -363,7 +373,7 @@ function Studio() {
       }
     }
     return out;
-  }, [avatars, ingredients, filter, filtersActive]);
+  }, [avatars, ingredients, filter, filtersActive, showResults]);
 
   const tiles = useMemo(() => [...jobTiles, ...assetTiles], [jobTiles, assetTiles]);
 
@@ -555,6 +565,14 @@ function Studio() {
 
   const gridCls = "grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3";
 
+  const moreButton = showResults && hasMore && (
+    <div className="flex justify-center py-4">
+      <button className="btn-ghost text-sm disabled:opacity-50" onClick={loadMore} disabled={loadingMore}>
+        {loadingMore ? "Loading…" : "Load more"}
+      </button>
+    </div>
+  );
+
   return (
     <div className="flex flex-col h-screen">
       <header className="border-b border-ink-800 px-6 py-4 flex items-center gap-3">
@@ -717,18 +735,14 @@ function Studio() {
         ) : (
           <>
             {jobTiles.length > 0 && <div className={gridCls}>{jobTiles.map(renderTile)}</div>}
-            {showResults && hasMore && (
-              <div className="flex justify-center py-4">
-                <button className="btn-ghost text-sm disabled:opacity-50" onClick={loadMore} disabled={loadingMore}>
-                  {loadingMore ? "Loading…" : "Load more"}
-                </button>
-              </div>
-            )}
+            {moreButton}
             {assetTiles.length > 0 && (
               <div className={clsx(gridCls, jobTiles.length > 0 && "mt-3")}>{assetTiles.map(renderTile)}</div>
             )}
           </>
         )}
+        {/* A page with nothing to show here can still have older results. */}
+        {tiles.length === 0 && moreButton}
       </div>
 
       {assigning && (
