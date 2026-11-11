@@ -75,6 +75,9 @@ def test_provider_status_endpoint(auth_client):
         "music": "mock",
         # Lip-sync is off until a model (e.g. heygen/avatar-iv) is selected.
         "lipsync": "off",
+        # Picture operations: the mock in mock mode (Runware ids by default).
+        "bg_removal": "mock",
+        "upscale": "mock",
         # Custom-model training routes by kind: voice clones go through
         # ElevenLabs when the key is set, LoRAs through Replicate.
         # Both default to the mock training provider in tests.

@@ -35,7 +35,7 @@ router = APIRouter(dependencies=[Depends(require_auth)])
 # Project states a plan or render may start from (anything else: a plan,
 # render or re-roll is running).
 _IDLE = ("draft", "planned", "completed", "failed", "cancelled")
-_DONE_RENDER = ("completed", "failed", "cancelled")
+_DONE_RENDER = ("completed", "failed", "cancelled", "expired")
 
 
 def claim_project(db: Session, project: models.VideoProject, to: str, busy: str) -> tuple[str, str]:

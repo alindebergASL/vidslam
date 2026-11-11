@@ -400,6 +400,19 @@ class AssetGenerationJob(Base):
     # "inline:..." when it ran inline): the sweeper only gives up on a
     # pending job whose queue entry is gone.
     queue_job_id: Mapped[str] = mapped_column(String(80), default="", server_default="")
+    # An operation on an existing picture instead of a generation: "" =
+    # generate, "remove_background" or "upscale". The source is a finished
+    # Studio picture (source_job_id: no FK, jobs are tombstoned and ids are
+    # never reused) or a Cast picture (source_asset_id). options_json holds
+    # the operation's settings, e.g. {"factor": 2}. Migration 0010.
+    operation: Mapped[str] = mapped_column(String(30), default="", server_default="")
+    source_job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    source_asset_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("assets.id", use_alter=True, name="fk_asset_generation_jobs_source_asset_id",
+                   ondelete="SET NULL"),
+        nullable=True,
+    )
+    options_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 

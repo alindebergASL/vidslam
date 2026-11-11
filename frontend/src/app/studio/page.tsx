@@ -8,7 +8,17 @@ import { AssignDialog, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { PresetsMenu } from "@/components/PresetsMenu";
-import { StudioViewer, ViewerItem, downloadName } from "@/components/StudioViewer";
+import { StudioViewer, ViewerItem, downloadName, mayBeTransparent } from "@/components/StudioViewer";
+import {
+  OpModels,
+  UpscaleDialog,
+  priceFromText,
+  removeBgLabel,
+  sourceChipText,
+  useOpModels,
+  usd,
+  withKnownPrice,
+} from "@/components/ImageOps";
 import { TileMenu, TileMenuItem } from "@/components/TileMenu";
 import { UseInProjectDialog } from "@/components/UseInProjectDialog";
 import {
@@ -26,6 +36,8 @@ import {
   errorText,
   Asset,
   Avatar,
+  ImageOp,
+  ImageOpSource,
   Ingredient,
   PromptPreset,
   StudioAspect,
@@ -182,6 +194,29 @@ function Studio() {
   const [bulkSave, setBulkSave] = useState<{ owner?: string; slot?: string } | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [retrying, setRetrying] = useState<StudioJob | null>(null);
+  // Picture operations: the models offered (with prices) and the Upscale dialog.
+  const opModels = useOpModels();
+  // Server estimates for running an upscale again on its own source
+  // (job id → USD, null when it couldn't be priced).
+  const [upscaleEstimates, setUpscaleEstimates] = useState<Record<number, number | null>>({});
+  const asked = useRef(new Set<number>());
+  useEffect(() => {
+    for (const j of jobs) {
+      if (j.operation !== "upscale" || !j.provider_model || asked.current.has(j.id)) continue;
+      const source: ImageOpSource | null = j.source_job_id
+        ? { jobId: j.source_job_id }
+        : j.source_asset_id
+        ? { assetId: j.source_asset_id }
+        : null;
+      if (!source) continue;
+      asked.current.add(j.id);
+      api
+        .imageOpEstimate("upscale", { model: j.provider_model, factor: j.options?.factor || 2, source })
+        .then((e) => setUpscaleEstimates((cur) => ({ ...cur, [j.id]: e.free ? 0 : e.cost_usd })))
+        .catch(() => setUpscaleEstimates((cur) => ({ ...cur, [j.id]: null })));
+    }
+  }, [jobs]);
+  const [upscaling, setUpscaling] = useState<{ source: ImageOpSource; label: string } | null>(null);
   // The last character sheet made here, for "Select this sheet".
   const [lastSheet, setLastSheet] = useState<{ avatarId: number; ids: number[] } | null>(null);
   const toast = useToast();
@@ -327,8 +362,21 @@ function Studio() {
 
   useEffect(() => {
     reload();
-    api.imageModels().then(setImageModels).catch(() => setImageModels([]));
-    api.videoModels().then(setVideoModels).catch(() => setVideoModels([]));
+    api.imageModels().then((ms) => setImageModels(ms.map(withKnownPrice))).catch(() => setImageModels([]));
+    api.videoModels().then((ms) => setVideoModels(ms.map(withKnownPrice))).catch(() => setVideoModels([]));
+    // Cast → "Open in Studio" lands here with ?job=<id>: open that result.
+    const linked = Number(new URLSearchParams(window.location.search).get("job"));
+    if (linked > 0) {
+      api
+        .getStudioJob(linked)
+        .then((j) => {
+          setJobs((cur) => (cur.some((x) => x.id === j.id) ? cur : [j, ...cur]));
+          if (!TERMINAL.includes(j.status)) setPendingJobIds((cur) => Array.from(new Set([...cur, j.id])));
+          // A finished one opens in the viewer; a running one is the newest tile at the top.
+          if (FINISHED.includes(j.status)) setViewKey(`job-${j.id}`);
+        })
+        .catch(() => toast.info("That result was deleted"));
+    }
   }, []);
 
   // Debounce the search box.
@@ -407,6 +455,54 @@ function Studio() {
       if (e instanceof ApiError && e.status === 503) await loadJobs().catch(() => undefined);
       return false;
     }
+  };
+
+  // Remove background / upscale: a new pending tile at the top.
+  const opSource = (item: { job?: StudioJob; assetId?: number }): ImageOpSource | null =>
+    item.job ? { jobId: item.job.id } : item.assetId ? { assetId: item.assetId } : null;
+  const opStarted = (op: ImageOp, j: StudioJob) => {
+    addCreated(batchPlaceholders(j));
+    toast.success(op === "remove_background" ? "Removing the background…" : "Upscaling…");
+  };
+  const removeBackground = async (item: { job?: StudioJob; assetId?: number }) => {
+    const source = opSource(item);
+    if (!source) return;
+    try {
+      opStarted("remove_background", await api.runImageOp("remove_background", source));
+    } catch (e) {
+      toast.error(errorText(e, "Couldn't remove the background"));
+    }
+  };
+  const startUpscale = (item: { job?: StudioJob; assetId?: number; label: string }) => {
+    const source = opSource(item);
+    if (source) setUpscaling({ source, label: item.job ? `#${item.job.id}` : item.label });
+  };
+
+  // Rough price of running a job again with this model ("" = unknown).
+  const modelOptionsFor = (job: StudioJob): ModelOption[] =>
+    job.operation
+      ? opModels[job.operation].map((m) => withKnownPrice({ id: m.id, name: m.name, price_text: m.free ? "free" : m.price_text }))
+      : job.output_kind === "image"
+      ? imageModels
+      : job.first_frame_job_id || job.first_frame_asset_id
+      ? videoModels.filter((m) => m.first_frame)
+      : videoModels;
+  const retryPrice = (job: StudioJob): string => {
+    const m = modelOptionsFor(job).find((x) => x.id === job.provider_model);
+    if (!m?.price_text) return "";
+    if (m.price_text === "free") return "free";
+    // An upscale is priced by its source's size (the catalog price is for
+    // 1 MP), so it shows the server's estimate for this picture, and no
+    // price until that has arrived.
+    if (job.operation === "upscale") {
+      const est = upscaleEstimates[job.id];
+      return est === undefined || est === null ? "" : est === 0 ? "free" : `about ${usd(est)}`;
+    }
+    const p = priceFromText(m.price_text);
+    if (p === null) return "";
+    // Clips are priced per 5 s in the picker.
+    const n = job.output_kind === "video_clip" && !job.operation ? p * ((job.duration_seconds || 5) / 5) : p;
+    return `about ${usd(n)}`;
   };
 
   // Stop waiting for a running job. The provider may still finish (and
@@ -656,6 +752,36 @@ function Studio() {
     for (const ing of ingredients) for (const a of ing.assets) map.set(a.id, a);
     return map;
   }, [avatars, ingredients]);
+  // An operation result's original: its URL (Compare) and its tile key.
+  const sourceUrl = (job: StudioJob): string | null => {
+    if (job.source_job_id) return api.studioPreview(job.source_job_id);
+    const a = job.source_asset_id ? assetById.get(job.source_asset_id) : undefined;
+    return a ? api.publicAsset(a.public_token) : null;
+  };
+  // Show the picture an operation ran on in the viewer (loaded first when
+  // it isn't in the list right now).
+  const openSource = async (job: StudioJob) => {
+    if (job.source_asset_id) {
+      const key = [`av-${job.source_asset_id}`, `ing-${job.source_asset_id}`].find((k) => tiles.some((t) => t.key === k));
+      if (key) setViewKey(key);
+      else toast.info(assetById.has(job.source_asset_id) ? "Pick All Media to see the Cast picture" : "That Cast picture was deleted");
+      return;
+    }
+    const id = job.source_job_id;
+    if (!id) return;
+    const key = `job-${id}`;
+    if (tiles.some((t) => t.key === key)) {
+      setViewKey(key);
+      return;
+    }
+    try {
+      const src = await api.getStudioJob(id);
+      setJobs((cur) => (cur.some((j) => j.id === src.id) ? cur : [...cur, src]));
+      setViewKey(key);
+    } catch (e) {
+      toast.error(errorText(e, "That picture was deleted"));
+    }
+  };
   const selectedAssets: Asset[] = useMemo(
     () => selectedRefs.map((id) => assetById.get(id)).filter((x): x is Asset => Boolean(x)),
     [selectedRefs, assetById]
@@ -722,6 +848,11 @@ function Studio() {
         });
       }}
       onOpen={() => setViewKey(t.key)}
+      opModels={opModels}
+      onRemoveBackground={() => removeBackground(t)}
+      onUpscale={() => startUpscale(t)}
+      onOpenSource={() => t.job && openSource(t.job)}
+      retryPrice={t.job ? retryPrice(t.job) : ""}
     />
   );
 
@@ -940,6 +1071,11 @@ function Studio() {
             },
             onToggleRef: toggleRef,
             isRef: (id) => selectedRefs.includes(id),
+            onRemoveBackground: removeBackground,
+            removeBackgroundLabel: removeBgLabel(opModels),
+            onUpscale: startUpscale,
+            sourceUrl,
+            onOpenSource: openSource,
           }}
         />
       )}
@@ -960,16 +1096,24 @@ function Studio() {
       {retrying && (
         <ModelPickerDialog
           job={retrying}
-          models={
-            retrying.output_kind === "image"
-              ? imageModels
-              : retrying.first_frame_job_id || retrying.first_frame_asset_id
-              ? videoModels.filter((m) => m.first_frame)
-              : videoModels
-          }
+          models={modelOptionsFor(retrying)}
           onClose={() => setRetrying(null)}
           onPick={async (model) => {
             if (await retry(retrying, model)) setRetrying(null);
+          }}
+        />
+      )}
+
+      {upscaling && (
+        <UpscaleDialog
+          source={upscaling.source}
+          sourceLabel={upscaling.label}
+          models={opModels.upscale}
+          modelsLoaded={opModels.loaded}
+          onClose={() => setUpscaling(null)}
+          onStarted={(j) => {
+            setUpscaling(null);
+            opStarted("upscale", j);
           }}
         />
       )}
@@ -1034,6 +1178,11 @@ function TileCard({
   onRetry,
   onTryModel,
   onOpen,
+  opModels,
+  onRemoveBackground,
+  onUpscale,
+  onOpenSource,
+  retryPrice,
 }: {
   tile: Tile;
   selected: boolean;
@@ -1054,6 +1203,12 @@ function TileCard({
   onRetry: () => void;
   onTryModel: () => void;
   onOpen: () => void;
+  opModels: OpModels;
+  onRemoveBackground: () => void;
+  onUpscale: () => void;
+  onOpenSource: () => void;
+  /** "about $0.04" for running it again with the same model; "" = unknown. */
+  retryPrice: string;
 }) {
   const finished = tile.status === "completed" || tile.status === "saved";
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -1063,6 +1218,22 @@ function TileCard({
   const job = tile.job;
   const cost = job ? costText(job) : null;
   const statusText = job ? studioStatusLabel(job) : tile.status || "";
+  const checker = mayBeTransparent(tile);
+  const fromText = job ? sourceChipText(job) : null;
+  // Landscape and square pictures are shown whole (not cropped to the
+  // portrait tile); known sizes decide at once, others once loaded.
+  const knownW = job?.result_width || tile.asset?.width || 0;
+  const knownH = job?.result_height || tile.asset?.height || 0;
+  const [wide, setWide] = useState<boolean | null>(knownW && knownH ? knownW / knownH > 0.62 : null);
+  const contain = wide === true || checker;
+  const opMenu: TileMenuItem[] = [
+    {
+      label: removeBgLabel(opModels),
+      onSelect: onRemoveBackground,
+      title: "Make a copy with the background cut out (transparent PNG); the original stays",
+    },
+    { label: "Upscale…", onSelect: onUpscale, title: "Make a larger copy (×2 or ×4); the price shows before it runs" },
+  ];
 
   // The same actions as before, per state, in the "⋯" menu. Delete is last.
   const menu: TileMenuItem[] = [];
@@ -1070,8 +1241,15 @@ function TileCard({
     if (running) {
       menu.push({ label: "Cancel…", onSelect: onCancel, title: "Stop waiting for this result" });
     }
-    if (failed) menu.push({ label: "Retry", onSelect: onRetry, title: "Run this generation again with the same settings" });
+    if (failed) {
+      menu.push({
+        label: retryPrice ? `Retry · ${retryPrice}` : "Retry",
+        onSelect: onRetry,
+        title: job.operation ? "Run this step again on the same picture" : "Run this generation again with the same settings",
+      });
+    }
     if (finished && tile.imageUrl) {
+      menu.push(...opMenu);
       menu.push({ label: "Animate this", onSelect: onAnimate, title: "Make a clip that starts from this picture" });
     }
     if (finished && tile.videoUrl) {
@@ -1097,7 +1275,7 @@ function TileCard({
         title: "Save this image to a character or scene, as its main picture or another slot",
       });
     }
-    if (finished) {
+    if (finished && !job.operation) {
       menu.push({
         label: "Remix",
         onSelect: () => onRemix(job.id),
@@ -1132,6 +1310,7 @@ function TileCard({
       menu.push({ label: selected ? "Stop using as reference" : "Use as reference", onSelect: onSelect });
     }
     if (viewable) {
+      menu.push(...opMenu);
       menu.push({ label: "Animate this", onSelect: onAnimate, title: "Make a clip that starts from this picture" });
       menu.push({ label: "Download", onSelect: onDownload, title: "Download the full-size file" });
     }
@@ -1150,7 +1329,15 @@ function TileCard({
       onPointerLeave={() => videoRef.current?.pause()}
     >
       {tile.imageUrl && (
-        <img src={tile.imageUrl} alt={tile.label} className="w-full h-full object-cover" />
+        <img
+          src={tile.imageUrl}
+          alt={tile.label}
+          onLoad={(e) => {
+            const im = e.currentTarget;
+            if (im.naturalWidth && im.naturalHeight) setWide(im.naturalWidth / im.naturalHeight > 0.62);
+          }}
+          className={clsx("w-full h-full", contain ? "object-contain" : "object-cover", checker && "checker")}
+        />
       )}
       {tile.videoUrl && (
         <video
@@ -1293,6 +1480,17 @@ function TileCard({
               {job.label}
             </div>
           )}
+          {fromText && !selectMode && (
+            <button
+              type="button"
+              onClick={onOpenSource}
+              className="pointer-events-auto chip text-[10px] py-0.5 bg-ink-900/85 hover:text-white truncate max-w-full"
+              title="Show the picture this was made from"
+              aria-label={`Show the original picture (${fromText})`}
+            >
+              {fromText}
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -1386,6 +1584,17 @@ function PromptBar({
     else if (firstFrame && currentModels.some((m) => m.id === model)) return;
     else setModel(currentModels[0]?.id || "");
   }, [outputKind, imageModels, videoModels, firstFrame?.kind, firstFrame?.id]);
+
+  // "About $0.08" next to Generate: the picked model's rough price, times
+  // the variations (images) or scaled to the clip length (priced per 5 s).
+  const pickedModel = currentModels.find((m) => m.id === model);
+  const unitPrice = priceFromText(pickedModel?.price_text);
+  const total =
+    unitPrice === null ? null : outputKind === "image" ? unitPrice * variations : unitPrice * (clipSeconds / 5);
+  const aboutText = total === null ? "" : total === 0 ? "Free" : `About ${usd(total)}`;
+  const priceTitle = pickedModel?.price_text
+    ? `${pickedModel.name}: ${pickedModel.price_text}${outputKind === "image" && variations > 1 ? ` × ${variations}` : ""}`
+    : undefined;
 
   // Fill the bar from Remix or a preset.
   const apply = (p: Omit<PromptLoad, "nonce">) => {
@@ -1655,6 +1864,7 @@ function PromptBar({
               {currentModels.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.name || m.id}
+                  {m.price_text ? ` · ${m.price_text}` : ""}
                 </option>
               ))}
             </select>
@@ -1752,6 +1962,15 @@ function PromptBar({
               promptRef.current?.focus();
             }}
           />
+          {aboutText && (
+            <span
+              className="text-xs text-ink-300 ml-auto sm:ml-0 whitespace-nowrap"
+              title={priceTitle}
+              aria-label={`Rough cost: ${aboutText}`}
+            >
+              {aboutText}
+            </span>
+          )}
           <button
             onClick={submit}
             disabled={submitting || !prompt.trim() || (startsFromPicture && frameModels.length === 0)}

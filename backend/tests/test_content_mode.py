@@ -487,3 +487,34 @@ def test_sogni_video_with_a_marked_and_another_picture_keeps_the_filter(auth_cli
                                         references=refs, duration_seconds=5)
     assert [b["safe_content_filter"] for b in bodies] == [False, True]
     _reset()
+
+
+def test_a_cutout_or_upscale_counts_only_as_its_source_picture(auth_client):
+    """Remove background / upscale results saved to a marked character's
+    card count only when their source is one of that character's counted
+    Cast pictures, never a Studio result (made from anyone's photo)."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import content_mode
+
+    maya, sam = _avatar("Maya"), _avatar("Sam")
+    content_mode.set_avatar_adult_ok(maya, True)
+    own, sam_pic = _asset(maya), _asset(sam)
+
+    def op_job(**source):
+        db = SessionLocal()
+        try:
+            j = models.AssetGenerationJob(owner_kind="avatar", owner_id=maya, output_kind="image", prompt="",
+                                          status="saved", operation="upscale", options_json={"factor": 2},
+                                          **source)
+            db.add(j)
+            db.commit()
+            return j.id
+        finally:
+            db.close()
+
+    from_own = _asset(maya, source="generated", job=op_job(source_asset_id=own))
+    from_sam = _asset(maya, source="generated", job=op_job(source_asset_id=sam_pic))
+    from_studio = _asset(maya, source="generated", job=op_job(source_job_id=_job(sam)))
+    no_source = _asset(maya, source="generated", job=op_job())
+    assert _exempt_ids([from_own, from_sam, from_studio, no_source]) == [True, False, False, False]

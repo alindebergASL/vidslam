@@ -482,6 +482,24 @@ class StudioJobOut(BaseModel):
     result_duration_seconds: Optional[float] = None
     # Reference pictures in reference_asset_ids that were deleted since.
     missing_reference_ids: list[int] = Field(default_factory=list)
+    # Picture operations: "" = generated from the prompt, else
+    # "remove_background" | "upscale", made from a Studio picture
+    # (source_job_id) or a Cast picture (source_asset_id); options holds
+    # e.g. {"factor": 2}.
+    operation: str = ""
+    source_job_id: Optional[int] = None
+    source_asset_id: Optional[int] = None
+    options: dict = Field(default_factory=dict, validation_alias=AliasChoices("options", "options_json"))
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _options(cls, v):
+        return dict(v or {})
+
+    @field_validator("operation", mode="before")
+    @classmethod
+    def _op(cls, v):
+        return v or ""
 
     @field_validator("reference_asset_ids", mode="before")
     @classmethod
@@ -549,6 +567,46 @@ class StudioSkipped(BaseModel):
 class StudioBulkSaveOut(BaseModel):
     saved: list[AssetOut]
     skipped: list[StudioSkipped]
+
+
+class StudioRemoveBackgroundRequest(BaseModel):
+    """Body for POST .../remove-background; no model = the active one."""
+    model: Optional[str] = Field(None, max_length=300)
+
+
+class StudioUpscaleRequest(BaseModel):
+    """Body for POST .../upscale; no model = the active one."""
+    factor: Literal[2, 4] = 2
+    model: Optional[str] = Field(None, max_length=300)
+
+
+class ImageOpEstimateOut(BaseModel):
+    """GET /api/studio/operations/estimate: what a run would cost and make."""
+    op: str
+    model: str
+    model_name: str
+    provider: str  # "runware" | "local" | "mock" | "unavailable"
+    cost_usd: float
+    is_estimate: bool = True
+    free: bool
+    factor: Optional[int] = None
+    output_width: Optional[int] = None  # null when no source picture was given
+    output_height: Optional[int] = None
+    too_large: bool = False
+    message: str
+
+
+class ImageOpModelOut(BaseModel):
+    """One model offered for a picture operation."""
+    id: str
+    name: str
+    description: str = ""
+    provider: str = ""
+    price_text: str = ""
+    free: bool = False
+    usable: bool = True
+    factors: list[int] = Field(default_factory=list)
+    active: bool = False
 
 
 class StudioRetryRequest(BaseModel):

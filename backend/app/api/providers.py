@@ -12,6 +12,7 @@ from ..db import get_db
 from ..providers import get_image, get_video, provider_status
 from ..providers.base import ModelInfo
 from ..services import provider_keys
+from ..services.prices import price_text
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -56,6 +57,7 @@ def _trained_lora_entries(db: Session, kind: str) -> list[dict]:
         {
             "id": f"custom:{cm.id}",
             "name": cm.name or f"#{cm.id}",
+            "price_text": "",
             "description": (
                 f"{cm.kind.replace('_', ' ').title()} · "
                 f"trained {cm.completed_at.date().isoformat() if cm.completed_at else 'recently'} · "
@@ -90,8 +92,20 @@ def _catalog_entries(kind: str) -> list[dict]:
             "id": e["id"],
             "name": f"{name} ({' · '.join(bits)})" if bits else name,
             "description": ("" if e.get("usable") else "needs API key · ") + (e.get("description") or ""),
+            "price_text": price_text(e, kind),
         })
     return out
+
+
+def _priced(kind: str, entries: list[dict]) -> list[dict]:
+    """Each picker entry with `price_text` ("about $0.04 per image", "about
+    $0.30 per 5 s"; "" when unknown), from the catalog's pricing."""
+    from ..services import model_catalog
+
+    snap = model_catalog.get_snapshot() or {}
+    by_id = {e.get("id"): e for e in snap.get("entries") or [] if e.get("kind") == kind}
+    return [{**e, "price_text": e.get("price_text") or price_text(by_id.get(e.get("id")), kind)}
+            for e in entries]
 
 
 def _merged(kind: str, provider_list) -> list[dict]:
@@ -108,7 +122,7 @@ def _merged(kind: str, provider_list) -> list[dict]:
     extra = [m for m in _catalog_entries(kind) if m["id"] not in seen]
     if not base and not extra and not switched_off:
         raise HTTPException(502, f"failed to list {kind} models")
-    return base + extra
+    return _priced(kind, base + extra)
 
 
 @router.get("/openrouter/video-models")

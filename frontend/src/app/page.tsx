@@ -16,7 +16,7 @@ const PROVIDER_NAMES: Record<string, string> = {
 // (e.g. a live lip-sync model while the video model is still a mock).
 const KIND_NAMES: Record<string, string> = {
   chat: "planner", image: "images", video: "video", tts: "voice", music: "music",
-  lipsync: "lip-sync", training_lora: "LoRA training", training_voice: "voice cloning",
+  lipsync: "lip-sync", bg_removal: "background removal", upscale: "upscaling", training_lora: "LoRA training", training_voice: "voice cloning",
 };
 
 /** One sentence for the provider status instead of raw flags. */

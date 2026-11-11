@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     adult_text_fallback_model: str = "deepseek/deepseek-v4-pro"
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
+    # Studio picture operations (Settings → Models: "Remove background",
+    # "Upscale"). Ids are "runware/<AIR>", "local/lanczos" (upscale only,
+    # free, no AI) or "mock/...". Defaults: Runware's cheap BiRefNet General
+    # remover and Real-ESRGAN.
+    bg_removal_model: str = "runware/runware:112@5"
+    upscale_model: str = "runware/runware:504@1"
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     # Video jobs complete by webhook (OpenRouter POSTs to callback_url, which
     # must be HTTPS) with a polling sweeper as safety net. "auto" = webhooks

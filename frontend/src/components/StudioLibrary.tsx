@@ -6,7 +6,8 @@ import { ASSET_SLOTS, OwnerKind } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { api, Avatar, CharacterSheetView, Ingredient, StudioJob, errorText } from "@/lib/api";
 
-export type ModelOption = { id: string; name: string };
+/** A model in a Studio picker; price_text is the rough price in plain words ("" = unknown). */
+export type ModelOption = { id: string; name: string; price_text?: string };
 
 /** "$0.04", "~$0.04" for an estimate, "free" for 0, null when nothing is recorded. */
 export function costText(job: Pick<StudioJob, "cost_usd" | "cost_is_estimate">): string | null {
@@ -55,6 +56,8 @@ export function ModelPickerDialog({
   const [model, setModel] = useState(others[0]?.id || models[0]?.id || "");
   const [busy, setBusy] = useState(false);
   const kind = job.output_kind === "image" ? "image" : "clip";
+  const picked = models.find((m) => m.id === model);
+  const isOp = Boolean(job.operation);
   return (
     <Dialog title="Try another model" onClose={onClose}>
       <p className="text-xs text-ink-300 line-clamp-3">{job.prompt || `Studio ${kind}`}</p>
@@ -70,14 +73,22 @@ export function ModelPickerDialog({
             {models.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.name || m.id}
+                {m.price_text ? ` · ${m.price_text}` : ""}
                 {m.id === job.provider_model ? " (same as before)" : ""}
               </option>
             ))}
           </select>
+          {picked?.price_text && (
+            <p className="text-xs text-ink-200 mt-1.5">
+              {picked.price_text.charAt(0).toUpperCase() + picked.price_text.slice(1)}
+            </p>
+          )}
         </div>
       )}
       <p className="text-[11px] text-ink-400">
-        Makes a new {kind} with the same prompt, avoid list, references and aspect. The original stays.
+        {isOp
+          ? "Runs the same step again on the same picture with this model. The original stays."
+          : `Makes a new ${kind} with the same prompt, avoid list, references and aspect. The original stays.`}
       </p>
       <div className="flex justify-end gap-2 pt-1">
         <button className="btn-ghost" onClick={onClose}>

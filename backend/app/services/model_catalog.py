@@ -279,8 +279,18 @@ def _runware_entries() -> list[dict]:
     return runware.catalog_entries(provider_keys.has("runware"))
 
 
+def _local_entries() -> list[dict]:
+    """Picture operations that run in this app: free, no key, no AI."""
+    return [{
+        "id": "local/lanczos", "kind": "upscale", "name": "Basic upscale (free, no AI)", "provider": "local",
+        "description": "Enlarges the picture here, without AI: smooth, but adds no new detail.",
+        "notes": "free", "pricing": {"x2": 0.0, "x4": 0.0}, "price_text": "free", "factors": [2, 4],
+        "suggested": True, "usable": True, "enabled": True,
+    }]
+
+
 # Providers whose entries are built locally (not by a polled listing).
-_LOCAL = {"sogni": _sogni_entries, "runware": _runware_entries}
+_LOCAL = {"sogni": _sogni_entries, "runware": _runware_entries, "local": _local_entries}
 # Local sync errors that don't mean a provider's models went missing.
 _SYNC_SOURCES = ("sogni_tools", "runware_index")
 
@@ -339,6 +349,7 @@ def refresh(*, client: Optional[httpx.Client] = None) -> dict:
         entries += _static_entries()
         entries += _sogni_entries()
         entries += _runware_entries()
+        entries += _local_entries()
         # A Lyria model served by both OpenRouter and Google appears once,
         # as the OpenRouter entry (one key for everything); the Google route
         # stays available as a fallback for it.

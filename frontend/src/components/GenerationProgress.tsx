@@ -42,7 +42,7 @@ export function GenerationProgress({
   const doneShots = bodyShots.filter((s) => s.status === "completed").length;
   const shotsActive = render.status === "generating_shots" || render.status === "polling";
   const cancelled = render.status === "cancelled";
-  const active = !["completed", "failed", "cancelled"].includes(render.status);
+  const active = !["completed", "failed", "cancelled", "expired"].includes(render.status);
 
   // Clips already at the provider can't be stopped: they finish and are billed.
   const inFlight = bodyShots.filter((s) => ["submitted", "polling", "running"].includes(s.status)).length;
