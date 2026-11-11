@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useToast } from "@/components/Toaster";
+import { useEvents } from "@/components/NotificationsProvider";
 import { api, Project } from "@/lib/api";
 import { formatDuration, modeLabel } from "@/lib/labels";
 
@@ -41,6 +42,14 @@ function Inner() {
   useEffect(() => {
     reload();
   }, []);
+  // Status chips stay current: a finished, failed or started render or plan
+  // reloads the list (no timer).
+  useEvents(
+    (ev) => (ev.kind === "render" || ev.kind === "plan") && ev.status !== "progress",
+    () => {
+      reload().catch(() => {});
+    }
+  );
 
   const q = query.trim().toLowerCase();
   const filtered = projects.filter((p) => {

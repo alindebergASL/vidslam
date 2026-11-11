@@ -162,3 +162,84 @@ def out(project_id: int, shot: models.VideoShot, take: models.ShotTake) -> dict:
         "inspection": take.inspection_json,
         "created_at": take.created_at.isoformat() if take.created_at else None,
     }
+
+
+# ---------- a Studio clip as a take ----------
+
+_ASPECTS = {"9:16": 9 / 16, "16:9": 16 / 9, "1:1": 1.0}
+
+
+def nearest_aspect(width: int, height: int) -> str:
+    """"9:16", "16:9" or "1:1", whichever the size's shape is closest to."""
+    import math
+
+    r = width / height
+    return min(_ASPECTS, key=lambda k: abs(math.log(r / _ASPECTS[k])))
+
+
+class StudioImportError(Exception):
+    def __init__(self, status: int, msg: str):
+        super().__init__(msg)
+        self.status = status
+
+
+def import_studio_clip(db: Session, shot: models.VideoShot,
+                       job: models.AssetGenerationJob) -> tuple[models.ShotTake, str, float]:
+    """Copy a finished Studio clip into the project as a new take of `shot`
+    and make it the shot's clip. Nothing is generated or paid for. A clip
+    longer than the shot is trimmed to it; a shorter one or another shape is
+    kept, with a plain warning. Returns (take, warning, clip seconds)."""
+    import shutil
+    import uuid
+
+    from . import fingerprints, storage
+    from .renderer import _probe_duration, _probe_size, trim_clip
+
+    project = shot.project
+    src = Path(job.result_path or "")
+    size = _probe_size(src)
+    length = _probe_duration(src)
+    if size is None or length <= 0:
+        raise StudioImportError(422, "This clip can't be read, so it can't be used in a project.")
+    aspect = nearest_aspect(*size)
+    planned = float(shot.duration_seconds or 5.0)
+    dest = storage.render_subdir(project.id) / f"shot_{shot.shot_order:02d}_{shot.id}_studio{job.id}_{uuid.uuid4().hex[:8]}.mp4"
+    warnings: list[str] = []
+    if length > planned + 0.05:
+        trim_clip(src, dest, duration=planned)  # the video stays in step with captions and voiceover
+        length = planned
+    else:
+        shutil.copyfile(src, dest)  # a copy: Studio delete and take prune each keep their own file
+        if length < planned - 0.05:
+            warnings.append(f"This clip is {length:.1f} s; the shot is {planned:.1f} s, "
+                            f"so the video will be {planned - length:.1f} s shorter.")
+    if project.aspect_ratio and aspect != project.aspect_ratio:
+        warnings.append(f"This clip is {aspect}; the project is {project.aspect_ratio}, "
+                        f"so it will be cropped/letterboxed.")
+    vjob = (db.query(models.VideoJob).filter(models.VideoJob.purpose == "studio",
+                                             models.VideoJob.ref_id == job.id)
+            .order_by(models.VideoJob.id.desc()).first())
+    cost = None
+    if vjob is not None:
+        cost = _ledger_cost(db, vjob.id)
+        if cost is None and vjob.cost_usd is not None:
+            cost = round(float(vjob.cost_usd), 6)
+    ensure_current_take(db, shot)  # keep the clip being swapped out
+    # Chosen for this project as it is: another shape is fitted at compose
+    # (warned above), not re-made at the next Generate video. The take
+    # counts as the project's shape, so using it again later (takes.use)
+    # keeps it current too; its real shape is kept in the note.
+    other_shape = bool(project.aspect_ratio) and aspect != project.aspect_ratio
+    note = f"From Studio #{job.id}" + (f" ({aspect} clip)" if other_shape else "")
+    take = models.ShotTake(
+        shot_id=shot.id, clip_path=str(dest), clip_fingerprint=fingerprints.video_fingerprint(project, shot),
+        aspect_ratio=project.aspect_ratio if other_shape else aspect, provider=job.provider or "",
+        provider_model=job.provider_model or "", video_job_id=vjob.id if vjob is not None else None,
+        cost_usd=cost, note=note,
+    )
+    shot.takes.append(take)
+    db.commit()
+    use(db, shot, take)
+    prune(db, shot)
+    db.refresh(take)
+    return take, " ".join(warnings), round(length, 3)

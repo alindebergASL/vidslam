@@ -48,6 +48,8 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
             try {
               await api.login(password);
               setState("in");
+              // The notifications provider (one live stream per tab) waits for this.
+              window.dispatchEvent(new CustomEvent("avs:authenticated"));
             } catch (err: any) {
               setError(err.message || "Invalid password");
             }

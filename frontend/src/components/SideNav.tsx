@@ -3,16 +3,20 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import clsx from "clsx";
-import { api } from "@/lib/api";
+import { api, Activity } from "@/lib/api";
+import { ActivityBell } from "@/components/ActivityPanel";
+import { useActivity } from "@/components/NotificationsProvider";
 
-const items = [
+type CountKey = keyof Activity["counts"];
+
+const items: { href: string; label: string; icon: string; running?: CountKey }[] = [
   { href: "/", label: "Dashboard", icon: "▦" },
-  { href: "/studio", label: "Studio", icon: "✦" },
-  { href: "/projects", label: "Projects", icon: "▷" },
-  { href: "/ambient", label: "Ambient", icon: "∿" },
-  { href: "/publishing", label: "Publishing", icon: "⇪" },
+  { href: "/studio", label: "Studio", icon: "✦", running: "studio" },
+  { href: "/projects", label: "Projects", icon: "▷", running: "projects" },
+  { href: "/ambient", label: "Ambient", icon: "∿", running: "ambient" },
+  { href: "/publishing", label: "Publishing", icon: "⇪", running: "publish" },
   { href: "/results", label: "Results", icon: "↗" },
-  { href: "/cast", label: "Cast", icon: "☺" },
+  { href: "/cast", label: "Cast", icon: "☺", running: "training" },
   { href: "/brand", label: "Brand", icon: "◆" },
   { href: "/settings", label: "Settings", icon: "⚙" },
 ];
@@ -20,6 +24,21 @@ const items = [
 function isActive(path: string | null | undefined, href: string): boolean {
   if (!path) return false;
   return href === "/" ? path === "/" : path.startsWith(href);
+}
+
+/** A small spinner and count beside a nav item while work runs there. */
+function Running({ n }: { n: number }) {
+  if (n <= 0) return null;
+  return (
+    <span className="ml-auto inline-flex items-center gap-1 text-[11px] text-iris-soft" title={`${n} running`}>
+      <span
+        aria-hidden
+        className="inline-block w-2.5 h-2.5 rounded-full border-2 border-iris-soft border-t-transparent animate-spin"
+      />
+      <span aria-hidden>{n}</span>
+      <span className="sr-only">, {n} running</span>
+    </span>
+  );
 }
 
 async function doLogout(router: ReturnType<typeof useRouter>) {
@@ -37,6 +56,8 @@ export function SideNav() {
   const path = usePathname();
   const router = useRouter();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const { activity } = useActivity();
+  const runningFor = (k?: CountKey) => (k && activity ? activity.counts[k] || 0 : 0);
 
   // Close the mobile drawer when the route changes.
   useEffect(() => {
@@ -60,7 +81,9 @@ export function SideNav() {
           ☰
         </button>
         <div className="text-sm font-bold text-grad">AvatarVideoStudio</div>
-        <div className="w-6" aria-hidden />
+        <div className="min-w-6 flex justify-end">
+          <ActivityBell className="-mr-1.5" />
+        </div>
       </div>
 
       {/* Mobile drawer */}
@@ -101,6 +124,7 @@ export function SideNav() {
                 >
                   <span className="w-5 text-center text-ink-400" aria-hidden>{it.icon}</span>
                   <span>{it.label}</span>
+                  <Running n={runningFor(it.running)} />
                 </Link>
               ))}
             </div>
@@ -123,11 +147,14 @@ export function SideNav() {
         aria-label="Primary"
         className="w-56 shrink-0 border-r border-ink-800 bg-ink-900/60 backdrop-blur-md p-4 hidden md:flex md:flex-col"
       >
-        <div className="px-2 py-3 mb-4">
-          <div className="text-base font-bold tracking-tight text-grad whitespace-nowrap">
-            AvatarVideoStudio
+        <div className="px-2 py-3 mb-4 flex items-start justify-between gap-1">
+          <div className="min-w-0">
+            <div className="text-base font-bold tracking-tight text-grad whitespace-nowrap">
+              AvatarVideoStudio
+            </div>
+            <div className="text-xs text-ink-400 mt-0.5">Cast → Studio → Video</div>
           </div>
-          <div className="text-xs text-ink-400 mt-0.5">Cast → Studio → Video</div>
+          <ActivityBell className="-mr-2 -mt-1.5 shrink-0" />
         </div>
         <nav className="flex flex-col gap-1">
           {items.map((it) => {
@@ -158,6 +185,7 @@ export function SideNav() {
                   {it.icon}
                 </span>
                 <span>{it.label}</span>
+                <Running n={runningFor(it.running)} />
               </Link>
             );
           })}

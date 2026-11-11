@@ -8,7 +8,9 @@ import { AssignDialog, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { PresetsMenu } from "@/components/PresetsMenu";
-import { StudioViewer } from "@/components/StudioViewer";
+import { StudioViewer, ViewerItem, downloadName } from "@/components/StudioViewer";
+import { TileMenu, TileMenuItem } from "@/components/TileMenu";
+import { UseInProjectDialog } from "@/components/UseInProjectDialog";
 import {
   BulkSaveDialog,
   CharacterSheetDialog,
@@ -16,9 +18,12 @@ import {
   ModelPickerDialog,
   costText,
   sheetSlot,
+  studioStatusLabel,
 } from "@/components/StudioLibrary";
 import {
   api,
+  ApiError,
+  errorText,
   Asset,
   Avatar,
   Ingredient,
@@ -26,7 +31,11 @@ import {
   StudioAspect,
   StudioJob,
   StudioJobsQuery,
+  VideoModelOption,
 } from "@/lib/api";
+import { downloadFile } from "@/lib/download";
+import { usePoll } from "@/lib/usePoll";
+import { useActivity, useEvents } from "@/components/NotificationsProvider";
 
 const ASPECTS: { id: StudioAspect; label: string }[] = [
   { id: "", label: "Auto" },
@@ -68,6 +77,33 @@ function batchPlaceholders(first: StudioJob): StudioJob[] {
 
 const FINISHED = ["completed", "saved"];
 const TERMINAL = ["completed", "failed", "saved"];
+/** How often in-flight jobs are checked (one batched request). */
+const POLL_MS = 3000;
+/** Most ids one batched check may carry (the backend's limit). */
+const POLL_MAX_IDS = 200;
+
+/** The picture a clip starts from ("Animate this"). */
+type FirstFrame = { kind: "job" | "asset"; id: number; thumbUrl: string; label: string };
+
+/** Ids of the jobs in `rows` that are still running. */
+function runningIds(rows: StudioJob[]): number[] {
+  return rows.filter((j) => !TERMINAL.includes(j.status)).map((j) => j.id);
+}
+
+/** The cancel / delete note for a job that is still running. */
+function chargeNote(job: StudioJob): string {
+  if (job.status === "pending") return "It hasn't started, so nothing is charged.";
+  const c = job.cost_usd;
+  const about = c && c > 0 ? ` (about $${c >= 0.01 ? c.toFixed(2) : c.toFixed(3)})` : "";
+  return `The provider may still finish and charge for it${about}.`;
+}
+
+/** "1 reference picture was deleted, so it's left out". */
+function missingRefsText(n: number): string {
+  return n === 1
+    ? "1 reference picture was deleted, so it's left out"
+    : `${n} reference pictures were deleted, so they're left out`;
+}
 
 type Filter = "all" | "images" | "videos" | "characters" | "scenes" | "uploads";
 
@@ -114,6 +150,7 @@ type Tile = {
   jobId?: number;
   job?: StudioJob;
   ownerKind?: "avatar" | "ingredient";
+  asset?: Asset;
 };
 
 function Studio() {
@@ -127,7 +164,11 @@ function Studio() {
   const [assigning, setAssigning] = useState<StudioJob | null>(null);
   const [load, setLoad] = useState<PromptLoad | null>(null);
   const [imageModels, setImageModels] = useState<ModelOption[]>([]);
-  const [videoModels, setVideoModels] = useState<ModelOption[]>([]);
+  const [videoModels, setVideoModels] = useState<VideoModelOption[]>([]);
+  // "Animate this": the picture the next clip starts from.
+  const [firstFrame, setFirstFrame] = useState<FirstFrame | null>(null);
+  // "Use in project…": the finished clip being placed in a shot.
+  const [placing, setPlacing] = useState<StudioJob | null>(null);
   // Library: search, chips, owner filter and paging.
   const [search, setSearch] = useState("");
   const [q, setQ] = useState("");
@@ -175,6 +216,19 @@ function Studio() {
 
   const jobsRef = useRef(jobs);
   jobsRef.current = jobs;
+  // The newest copy of every job the batched check saw, including jobs not
+  // in the list right now (another filter or page): merged in when a list
+  // load brings them back, so a load never shows an older state.
+  const latest = useRef(new Map<number, StudioJob>());
+  const newest = (j: StudioJob): StudioJob => {
+    const l = latest.current.get(j.id);
+    return l && (l.updated_at || "") > (j.updated_at || "") ? { ...j, ...l } : j;
+  };
+  // Every job a list load shows still running is checked until it finishes.
+  const trackRunning = (rows: StudioJob[]) => {
+    const ids = runningIds(rows);
+    if (ids.length > 0) setPendingJobIds((prev) => Array.from(new Set([...prev, ...ids])));
+  };
   // fresh: the first page (new filters). Otherwise (a reload after an
   // action) as many as are loaded, so "Load more" pages don't disappear
   // under the viewer or the user's scroll position.
@@ -183,8 +237,10 @@ function Studio() {
     const limit = fresh ? PAGE_SIZE : Math.min(200, Math.max(PAGE_SIZE, jobsRef.current.length + 10));
     const jb = await api.listStudioJobs({ ...queryRef.current, limit });
     if (seq !== listSeq.current) return;
-    setJobs(jb);
+    const rows = jb.map(newest);
+    setJobs(rows);
     setHasMore(jb.length === limit);
+    trackRunning(rows);
   };
 
   const loadMore = async () => {
@@ -193,12 +249,13 @@ function Studio() {
     const seq = listSeq.current;
     try {
       const before_id = Math.min(...jobs.map((j) => j.id));
-      const page = await api.listStudioJobs({ ...queryRef.current, limit: PAGE_SIZE, before_id });
+      const page = (await api.listStudioJobs({ ...queryRef.current, limit: PAGE_SIZE, before_id })).map(newest);
       if (seq !== listSeq.current) return;
       setJobs((cur) => [...cur, ...page.filter((p) => !cur.some((c) => c.id === p.id))]);
       setHasMore(page.length === PAGE_SIZE);
+      trackRunning(page);
     } catch (e: any) {
-      toast.error(e.message || "Couldn't load more results");
+      toast.error(errorText(e, "Couldn't load more results"));
     } finally {
       setLoadingMore(false);
     }
@@ -206,7 +263,28 @@ function Studio() {
 
   // Remix: put a finished result's settings back into the prompt bar.
   const remix = (job: StudioJob) => {
-    setSelectedRefs(job.reference_asset_ids || []);
+    const missing = new Set(job.missing_reference_ids || []);
+    setSelectedRefs((job.reference_asset_ids || []).filter((id) => !missing.has(id)));
+    if (missing.size > 0) toast.info(missingRefsText(missing.size), { duration: 5000 });
+    // A clip that started from a picture starts from it again.
+    if (job.output_kind === "video_clip" && job.first_frame_job_id) {
+      setFirstFrame({
+        kind: "job",
+        id: job.first_frame_job_id,
+        thumbUrl: api.studioPreview(job.first_frame_job_id),
+        label: `Studio #${job.first_frame_job_id}`,
+      });
+    } else if (job.output_kind === "video_clip" && job.first_frame_asset_id) {
+      const a = assetById.get(job.first_frame_asset_id);
+      if (a) {
+        setFirstFrame({ kind: "asset", id: a.id, thumbUrl: api.publicAsset(a.public_token), label: `Cast #${a.id}` });
+      } else {
+        setFirstFrame(null);
+        toast.info("The picture this clip started from was deleted, so it's left out", { duration: 5000 });
+      }
+    } else {
+      setFirstFrame(null);
+    }
     setLoad({
       nonce: Date.now(),
       outputKind: job.output_kind,
@@ -215,6 +293,29 @@ function Studio() {
       model: job.provider_model || "",
       aspect_ratio: asAspect(job.aspect_ratio),
       duration_seconds: job.output_kind === "video_clip" ? job.duration_seconds : undefined,
+    });
+  };
+
+  // "Animate this": a clip that starts from this picture, with its prompt
+  // as a starting point.
+  const animate = (item: { job?: StudioJob; asset?: Asset; assetId?: number; label: string }) => {
+    if (item.job) {
+      const j = item.job;
+      setFirstFrame({ kind: "job", id: j.id, thumbUrl: api.studioPreview(j.id), label: `Studio #${j.id}` });
+    } else if (item.asset || item.assetId) {
+      const a = item.asset || assetById.get(item.assetId!);
+      if (!a) return;
+      setFirstFrame({ kind: "asset", id: a.id, thumbUrl: api.publicAsset(a.public_token), label: item.label });
+    } else {
+      return;
+    }
+    setLoad({
+      nonce: Date.now(),
+      outputKind: "video_clip",
+      prompt: item.job?.prompt || "",
+      negative_prompt: item.job?.negative_prompt || "",
+      model: "",
+      aspect_ratio: asAspect(item.job?.aspect_ratio),
     });
   };
 
@@ -244,43 +345,51 @@ function Studio() {
       return;
     }
     setChecked([]);
-    loadJobs(true).catch((e: any) => toast.error(e.message || "Couldn't load results"));
+    loadJobs(true).catch((e: any) => toast.error(errorText(e, "Couldn't load results")));
   }, [listQuery]);
 
-  // Poll in-flight jobs one by one, so paging and filters stay as they are.
-  // One poll at a time; ids added while a poll waits are kept, and only a
-  // finished or deleted (404) job stops polling. Any other error (network,
-  // 5xx, 429) keeps the id so the next tick tries again.
+  // Check every in-flight job in one request every few seconds while any
+  // is running, paused while the tab is hidden (and once more on coming
+  // back). A finished job, or one that is gone (deleted), stops being
+  // checked; an error keeps them all for the next tick.
+  const pendingRef = useRef(pendingJobIds);
+  pendingRef.current = pendingJobIds;
   const pollBusy = useRef(false);
-  useEffect(() => {
-    if (pendingJobIds.length === 0) return;
-    const ids = pendingJobIds;
-    const interval = setInterval(async () => {
-      if (pollBusy.current) return;
-      pollBusy.current = true;
-      try {
-        const done = new Set<number>();
-        const results = await Promise.all(
-          ids.map((id) =>
-            api.getStudioJob(id).catch((e: any) => {
-              if (String(e?.message || "").startsWith("404:")) done.add(id);
-              return null;
-            })
-          )
-        );
-        const fresh = results.filter((j): j is StudioJob => j !== null);
-        for (const j of fresh) if (TERMINAL.includes(j.status)) done.add(j.id);
-        if (fresh.length > 0) setJobs((cur) => cur.map((j) => fresh.find((f) => f.id === j.id) || j));
-        if (done.size > 0) setPendingJobIds((cur) => cur.filter((id) => !done.has(id)));
-      } finally {
-        pollBusy.current = false;
-      }
-    }, 1500);
-    return () => clearInterval(interval);
-  }, [pendingJobIds]);
+  const pollNow = async () => {
+    const ids = pendingRef.current.slice(0, POLL_MAX_IDS);
+    if (ids.length === 0 || pollBusy.current) return;
+    if (typeof document !== "undefined" && document.hidden) return;
+    pollBusy.current = true;
+    try {
+      const fresh = await api.studioJobsByIds(ids);
+      const seen = new Map(fresh.map((j) => [j.id, j]));
+      for (const j of fresh) latest.current.set(j.id, j);
+      const done = new Set(ids.filter((id) => !seen.has(id) || TERMINAL.includes(seen.get(id)!.status)));
+      if (fresh.length > 0) setJobs((cur) => cur.map((j) => (seen.has(j.id) ? { ...j, ...seen.get(j.id)! } : j)));
+      // Deleted elsewhere: drop the tile too.
+      const gone = ids.filter((id) => !seen.has(id));
+      if (gone.length > 0) setJobs((cur) => cur.filter((j) => !gone.includes(j.id)));
+      if (done.size > 0) setPendingJobIds((cur) => cur.filter((id) => !done.has(id)));
+    } catch {
+      /* keep them; the next tick tries again */
+    } finally {
+      pollBusy.current = false;
+    }
+  };
+  const polling = pendingJobIds.length > 0;
+  // Every few seconds while any job runs (every 12 s while the live stream is
+  // connected), paused while the tab is hidden; a studio_job event checks
+  // right away.
+  const pokePoll = usePoll(pollNow, { enabled: polling, interval: POLL_MS });
+  useEvents({ kind: "studio_job" }, (ev) => {
+    if (ev === null || pendingRef.current.includes(ev.entity_id)) pokePoll();
+  });
 
   // Show freshly created jobs as pending tiles at the top.
+  const { refresh: refreshActivity } = useActivity();
   const addCreated = (rows: StudioJob[]) => {
+    // The SideNav's "running" count has no "started" event for Studio jobs.
+    if (rows.length > 0) refreshActivity();
     const ids = rows.map((r) => r.id);
     setJobs((prev) => [...rows, ...prev.filter((p) => !ids.includes(p.id))]);
     setPendingJobIds((prev) => Array.from(new Set([...prev, ...ids])));
@@ -293,8 +402,25 @@ function Studio() {
       toast.success(model ? "Trying another model" : "Retrying");
       return true;
     } catch (e: any) {
-      toast.error(e.message || "Retry failed");
+      toast.error(errorText(e, "Retry failed"));
+      // Queue down (503): the new job is already marked failed; show it.
+      if (e instanceof ApiError && e.status === 503) await loadJobs().catch(() => undefined);
       return false;
+    }
+  };
+
+  // Stop waiting for a running job. The provider may still finish (and
+  // bill) a clip it already has.
+  const cancelJob = async (job: StudioJob) => {
+    if (!window.confirm(`Cancel this ${job.output_kind === "image" ? "picture" : "clip"}? ${chargeNote(job)}`)) return;
+    try {
+      const fresh = await api.cancelStudioJob(job.id);
+      latest.current.set(fresh.id, fresh);
+      setJobs((cur) => cur.map((j) => (j.id === fresh.id ? { ...j, ...fresh } : j)));
+      if (TERMINAL.includes(fresh.status)) setPendingJobIds((cur) => cur.filter((x) => x !== fresh.id));
+      toast.success(fresh.error === "Cancelled" ? "Cancelled" : "It had already finished");
+    } catch (e) {
+      toast.error(errorText(e, "Couldn't cancel it"));
     }
   };
 
@@ -306,7 +432,7 @@ function Studio() {
       setJobs((cur) => cur.map((j) => (j.id === fresh.id ? { ...j, ...fresh } : j)));
     } catch (e: any) {
       setJobs((cur) => cur.map((j) => (j.id === job.id ? { ...j, favorite: !favorite } : j)));
-      toast.error(e.message || "Couldn't update the favorite");
+      toast.error(errorText(e, "Couldn't update the favorite"));
     }
   };
 
@@ -358,6 +484,7 @@ function Studio() {
             sub: `Character · ${a.source}`,
             selectable: true,
             assetId: a.id,
+            asset: a,
           });
         }
       }
@@ -375,6 +502,7 @@ function Studio() {
             sub: `${ing.kind} · ${a.source}`,
             selectable: true,
             assetId: a.id,
+            asset: a,
           });
         }
       }
@@ -457,7 +585,7 @@ function Studio() {
       setChecked([]);
       if (!favorite && libKind === "favorites") await loadJobs();
     } catch (e: any) {
-      toast.error(e.message || "Couldn't update favorites");
+      toast.error(errorText(e, "Couldn't update favorites"));
       // Large selections go in several requests; show what did change.
       await loadJobs().catch(() => undefined);
     } finally {
@@ -477,7 +605,7 @@ function Studio() {
       toast.success(`Deleted ${res.deleted.length === 1 ? "1 result" : `${res.deleted.length} results`}`);
       setChecked([]);
     } catch (e: any) {
-      toast.error(e.message || "Delete failed");
+      toast.error(errorText(e, "Delete failed"));
       await loadJobs().catch(() => undefined);
     } finally {
       setBulkBusy(false);
@@ -493,7 +621,8 @@ function Studio() {
       t.kind === "job"
         ? "this Studio result"
         : `"${t.label}" from the cast (projects that use it lose this picture)`;
-    if (!window.confirm(`Delete ${what}? This can't be undone.`)) return;
+    const running = t.job && !TERMINAL.includes(t.job.status) ? ` ${chargeNote(t.job)}` : "";
+    if (!window.confirm(`Delete ${what}? This can't be undone.${running}`)) return;
     try {
       if (t.kind === "job" && t.jobId) {
         await api.deleteStudioJob(t.jobId);
@@ -505,7 +634,7 @@ function Studio() {
       onDeleted?.();
       toast.success("Deleted");
     } catch (e: any) {
-      toast.error(e.message || "Delete failed");
+      toast.error(errorText(e, "Delete failed"));
     }
     await reload();
   };
@@ -516,19 +645,21 @@ function Studio() {
       const asset = await api.saveStudioJob(jobId);
       toast.success(`Saved to the cast as ${slotLabel(asset.owner_kind, asset.asset_type)}`);
     } catch (e: any) {
-      toast.error(e.message || "Save failed");
+      toast.error(errorText(e, "Save failed"));
     }
     await reload();
   };
 
-  const selectedAssets: Asset[] = useMemo(() => {
+  const assetById = useMemo(() => {
     const map = new Map<number, Asset>();
     for (const av of avatars) for (const a of av.assets) map.set(a.id, a);
     for (const ing of ingredients) for (const a of ing.assets) map.set(a.id, a);
-    return selectedRefs
-      .map((id) => map.get(id))
-      .filter((x): x is Asset => Boolean(x));
-  }, [selectedRefs, avatars, ingredients]);
+    return map;
+  }, [avatars, ingredients]);
+  const selectedAssets: Asset[] = useMemo(
+    () => selectedRefs.map((id) => assetById.get(id)).filter((x): x is Asset => Boolean(x)),
+    [selectedRefs, assetById]
+  );
 
   const clearFilters = () => {
     setSearch("");
@@ -574,9 +705,21 @@ function Studio() {
         const job = jobs.find((j) => j.id === jobId);
         if (job) remix(job);
       }}
-      onUseInProject={(jobId) => {
+      onNewProject={(jobId) => {
         const job = jobs.find((j) => j.id === jobId);
         if (job) startProject(job);
+      }}
+      onUseInProject={() => t.job && setPlacing(t.job)}
+      onAnimate={() => animate(t)}
+      onCancel={() => t.job && cancelJob(t.job)}
+      onDownload={() => {
+        const url = t.imageUrl || t.videoUrl;
+        if (!url) return;
+        const n = downloadName(t as ViewerItem);
+        downloadFile(url, n.base, n.ext).then((ok) => {
+          if (!ok)
+            toast.error("Couldn't download the file", { action: { label: "Open", href: url }, key: "download" });
+        });
       }}
       onOpen={() => setViewKey(t.key)}
     />
@@ -785,7 +928,9 @@ function Studio() {
             onAssign: setAssigning,
             onRemix: remix,
             onTryModel: setRetrying,
-            onUseInProject: startProject,
+            onNewProject: startProject,
+            onUseInProject: setPlacing,
+            onAnimate: animate,
             onDelete: (item) => {
               const t = tiles.find((x) => x.key === item.key);
               if (!t) return;
@@ -810,10 +955,18 @@ function Studio() {
         />
       )}
 
+      {placing && <UseInProjectDialog job={placing} onClose={() => setPlacing(null)} />}
+
       {retrying && (
         <ModelPickerDialog
           job={retrying}
-          models={retrying.output_kind === "image" ? imageModels : videoModels}
+          models={
+            retrying.output_kind === "image"
+              ? imageModels
+              : retrying.first_frame_job_id || retrying.first_frame_asset_id
+              ? videoModels.filter((m) => m.first_frame)
+              : videoModels
+          }
           onClose={() => setRetrying(null)}
           onPick={async (model) => {
             if (await retry(retrying, model)) setRetrying(null);
@@ -853,6 +1006,8 @@ function Studio() {
         onAddRefs={(ids) =>
           setSelectedRefs((cur) => Array.from(new Set([...cur, ...ids])))
         }
+        firstFrame={firstFrame}
+        onClearFirstFrame={() => setFirstFrame(null)}
         onReload={reload}
       />
     </div>
@@ -869,7 +1024,11 @@ function TileCard({
   onQuickSave,
   onAssign,
   onDelete,
+  onNewProject,
   onUseInProject,
+  onAnimate,
+  onCancel,
+  onDownload,
   onRemix,
   onFavorite,
   onRetry,
@@ -885,7 +1044,11 @@ function TileCard({
   onQuickSave: (jobId: number) => void;
   onAssign: (jobId: number) => void;
   onDelete: () => void;
-  onUseInProject: (jobId: number) => void;
+  onNewProject: (jobId: number) => void;
+  onUseInProject: () => void;
+  onAnimate: () => void;
+  onCancel: () => void;
+  onDownload: () => void;
   onRemix: (jobId: number) => void;
   onFavorite: () => void;
   onRetry: () => void;
@@ -896,9 +1059,84 @@ function TileCard({
   const videoRef = useRef<HTMLVideoElement>(null);
   const viewable = Boolean(tile.imageUrl || tile.videoUrl);
   const failed = tile.status === "failed";
-  const actionCls = "chip text-xs py-1 bg-ink-900/85 border-ink-700";
+  const running = tile.kind === "job" && Boolean(tile.status) && !finished && !failed;
   const job = tile.job;
   const cost = job ? costText(job) : null;
+  const statusText = job ? studioStatusLabel(job) : tile.status || "";
+
+  // The same actions as before, per state, in the "⋯" menu. Delete is last.
+  const menu: TileMenuItem[] = [];
+  if (tile.kind === "job" && job) {
+    if (running) {
+      menu.push({ label: "Cancel…", onSelect: onCancel, title: "Stop waiting for this result" });
+    }
+    if (failed) menu.push({ label: "Retry", onSelect: onRetry, title: "Run this generation again with the same settings" });
+    if (finished && tile.imageUrl) {
+      menu.push({ label: "Animate this", onSelect: onAnimate, title: "Make a clip that starts from this picture" });
+    }
+    if (finished && tile.videoUrl) {
+      menu.push({
+        label: "Use in project…",
+        onSelect: onUseInProject,
+        title: "Use this clip as a shot in a storyboard project (free)",
+      });
+    }
+    if (tile.status === "completed" && tile.imageUrl) {
+      menu.push({
+        label: "Save",
+        onSelect: () => onQuickSave(job.id),
+        title: `Save to this job's ${
+          tile.ownerKind === "ingredient" ? "scene as a reference" : "character as a lifestyle shot"
+        }`,
+      });
+    }
+    if (finished && tile.imageUrl) {
+      menu.push({
+        label: "Assign to…",
+        onSelect: () => onAssign(job.id),
+        title: "Save this image to a character or scene, as its main picture or another slot",
+      });
+    }
+    if (finished) {
+      menu.push({
+        label: "Remix",
+        onSelect: () => onRemix(job.id),
+        title: "Load this result's prompt, avoid list, references, model and aspect into the prompt bar",
+      });
+    }
+    if (finished || failed) {
+      menu.push({
+        label: "Try another model…",
+        onSelect: onTryModel,
+        title: "Make it again with a different model; the original stays",
+      });
+    }
+    if (finished) {
+      menu.push({
+        label: "New project →",
+        onSelect: () => onNewProject(job.id),
+        title: "Start a new project with this result's character or scene",
+      });
+    }
+    if (finished && tile.imageUrl) {
+      menu.push({
+        label: "Ambient scene →",
+        href: `/ambient/new?studio_job=${job.id}`,
+        title: "Make an hour-long ambient scene from this image",
+      });
+    }
+    if (viewable) menu.push({ label: "Download", onSelect: onDownload, title: "Download the full-size file" });
+    menu.push({ label: "Delete", onSelect: onDelete, danger: true, title: "Delete this Studio result" });
+  } else if (tile.kind === "asset" && tile.assetId) {
+    if (tile.selectable) {
+      menu.push({ label: selected ? "Stop using as reference" : "Use as reference", onSelect: onSelect });
+    }
+    if (viewable) {
+      menu.push({ label: "Animate this", onSelect: onAnimate, title: "Make a clip that starts from this picture" });
+      menu.push({ label: "Download", onSelect: onDownload, title: "Download the full-size file" });
+    }
+    menu.push({ label: "Delete", onSelect: onDelete, danger: true, title: "Delete this image from the cast" });
+  }
   return (
     <div
       className={clsx(
@@ -954,7 +1192,7 @@ function TileCard({
       )}
       {!tile.imageUrl && !tile.videoUrl && (
         <div className="w-full h-full flex flex-col items-center justify-center gap-1 text-ink-400 text-xs p-3 text-center">
-          <span>{tile.status || "preview unavailable"}</span>
+          <span title={tile.status}>{statusText || "Preview unavailable"}</span>
           {failed && job?.error && <span className="text-[10px] line-clamp-4">{job.error}</span>}
         </div>
       )}
@@ -1001,7 +1239,7 @@ function TileCard({
           aria-label={selected ? "Deselect reference" : "Use as reference"}
           aria-pressed={selected}
           className={clsx(
-            "absolute top-2 right-2 w-6 h-6 rounded-full border text-xs flex items-center justify-center",
+            "absolute top-2 left-2 w-7 h-7 pointer-coarse:w-9 pointer-coarse:h-9 rounded-full border text-xs flex items-center justify-center",
             selected
               ? "grad border-transparent text-ink-950"
               // Touch devices have no hover; show at 60% so it's discoverable,
@@ -1025,119 +1263,30 @@ function TileCard({
         />
       )}
 
-      {tile.kind === "job" && tile.jobId && !selectMode && (
-        // Desktop: shown on hover/focus so they don't cover the image, and
-        // clicks between the buttons reach the open button. Touch screens have
-        // no hover: a result with a picture or clip opens in the viewer (which
-        // has all these actions) so the tile stays clear; one without (failed,
-        // still running) keeps them visible here.
-        <div
-          className={clsx(
-            "pointer-events-none *:pointer-events-auto absolute top-2 right-2 flex flex-col items-end gap-1 transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-within:opacity-100",
-            viewable ? "pointer-coarse:hidden" : "pointer-coarse:opacity-100!"
-          )}
-        >
-          {failed && (
-            <button
-              onClick={onRetry}
-              className={actionCls}
-              title="Run this generation again with the same settings"
-              aria-label="Retry this generation"
-            >
-              Retry
-            </button>
-          )}
-          {finished && tile.imageUrl && (
-            <button
-              onClick={() => onAssign(tile.jobId!)}
-              className={actionCls}
-              title="Save this image to a character or scene, as its main picture or another slot"
-            >
-              Assign to…
-            </button>
-          )}
-          {tile.status === "completed" && tile.imageUrl && (
-            <button
-              onClick={() => onQuickSave(tile.jobId!)}
-              className={actionCls}
-              title={`Save to this job's ${
-                tile.ownerKind === "ingredient" ? "scene as a reference" : "character as a lifestyle shot"
-              }`}
-              aria-label="Quick save this generation to the cast"
-            >
-              Save
-            </button>
-          )}
-          {finished && (
-            <button
-              onClick={() => onUseInProject(tile.jobId!)}
-              className={actionCls}
-              title="Start a new project pre-loaded with this asset's owner"
-              aria-label="Start a new project pre-loaded with this asset's owner"
-            >
-              New Project →
-            </button>
-          )}
-          {finished && (
-            <button
-              onClick={() => onRemix(tile.jobId!)}
-              className={actionCls}
-              title="Load this result's prompt, avoid list, references, model and aspect into the prompt bar"
-              aria-label="Remix: load this result's settings into the prompt bar"
-            >
-              Remix
-            </button>
-          )}
-          {(finished || failed) && (
-            <button
-              onClick={onTryModel}
-              className={actionCls}
-              title="Make it again with a different model; the original stays"
-              aria-label="Try another model for this generation"
-            >
-              Try another model…
-            </button>
-          )}
-          {finished && tile.imageUrl && (
-            <a
-              href={`/ambient/new?studio_job=${tile.jobId}`}
-              className={actionCls}
-              title="Make an hour-long ambient scene from this image"
-            >
-              Ambient scene →
-            </a>
-          )}
-          <button
-            onClick={onDelete}
-            className={clsx(actionCls, "hover:text-accent")}
-            title="Delete this Studio result"
-            aria-label="Delete this Studio result"
-          >
-            Delete
-          </button>
+      {!selectMode && menu.length > 0 && (
+        // One "⋯" button: on hover / focus with a mouse on wide screens, always
+        // on touch screens and narrow windows.
+        <div className="absolute top-2 right-2">
+          <TileMenu
+            items={menu}
+            label={`Actions for ${tile.label}`}
+            className="transition md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100 pointer-coarse:opacity-100"
+          />
         </div>
-      )}
-
-      {tile.kind === "asset" && tile.assetId && (
-        <button
-          onClick={onDelete}
-          className={clsx(
-            actionCls,
-            "absolute top-2 left-2 hover:text-accent transition opacity-100 md:opacity-0 md:group-hover:opacity-100 md:focus-visible:opacity-100",
-            viewable && "pointer-coarse:hidden"
-          )}
-          title="Delete this image from the cast"
-          aria-label={`Delete ${tile.label} from the cast`}
-        >
-          Delete
-        </button>
       )}
 
       {tile.kind === "job" && (
         <div className="absolute top-2 left-2 flex flex-col items-start gap-1 max-w-[60%] pointer-events-none">
-          {tile.status === "saved" && <div className="chip text-[10px] py-0.5">saved</div>}
-          {tile.status && !FINISHED.includes(tile.status) && (
-            <div className="chip text-[10px] py-0.5">{tile.status}</div>
+          {tile.status && tile.status !== "completed" && (
+            <div
+              className={clsx(
+                "chip text-[10px] py-0.5 bg-ink-900/85",
+                failed && "text-red-200 border-red-500/40"
+              )}
+              title={`Status: ${tile.status}`}
+            >
+              {statusText}
+            </div>
           )}
           {job?.label && (
             <div className="chip text-[10px] py-0.5 bg-ink-900/85 truncate max-w-full" title={job.label}>
@@ -1162,18 +1311,22 @@ function PromptBar({
   onCreated,
   onSheetCreated,
   onAddRefs,
+  firstFrame,
+  onClearFirstFrame,
   onReload,
 }: {
   avatars: Avatar[];
   ingredients: Ingredient[];
   imageModels: ModelOption[];
-  videoModels: ModelOption[];
+  videoModels: VideoModelOption[];
   selectedRefs: number[];
   selectedAssets: Asset[];
   load: PromptLoad | null;
   onCreated: (j: StudioJob) => void;
   onSheetCreated: (res: { batch_ids: number[]; jobs: StudioJob[] }, avatarId: number) => void;
   onAddRefs: (assetIds: number[]) => void;
+  firstFrame: FirstFrame | null;
+  onClearFirstFrame: () => void;
   onReload: () => Promise<void> | void;
 }) {
   const [outputKind, setOutputKind] = useState<"image" | "video_clip">("image");
@@ -1218,15 +1371,21 @@ function PromptBar({
     if (next) setUploadOwner(next);
   }, [avatars, ingredients, selectedAssets, uploadOwner]);
 
-  const currentModels = outputKind === "image" ? imageModels : videoModels;
+  // A clip that starts from a picture: only models that can.
+  const startsFromPicture = outputKind === "video_clip" && firstFrame !== null;
+  const frameModels = useMemo(() => videoModels.filter((m) => m.first_frame), [videoModels]);
+  const currentModels: ModelOption[] =
+    outputKind === "image" ? imageModels : startsFromPicture ? frameModels : videoModels;
   useEffect(() => {
     // Reset to default when switching output kind so we don't carry a video
-    // model into an image generation request.
+    // model into an image generation request; a starting picture keeps the
+    // chosen model when it can start from one.
     const want = wantModel.current;
     if (want !== null && currentModels.length > 0) wantModel.current = null;
     if (want && currentModels.some((m) => m.id === want)) setModel(want);
+    else if (firstFrame && currentModels.some((m) => m.id === model)) return;
     else setModel(currentModels[0]?.id || "");
-  }, [outputKind, imageModels, videoModels]);
+  }, [outputKind, imageModels, videoModels, firstFrame?.kind, firstFrame?.id]);
 
   // Fill the bar from Remix or a preset.
   const apply = (p: Omit<PromptLoad, "nonce">) => {
@@ -1302,9 +1461,19 @@ function PromptBar({
       setError("Create a Character or Scene first (Cast → New).");
       return;
     }
+    if (startsFromPicture && frameModels.length === 0) {
+      setError("None of your video models can start from a picture. Remove the picture or add a model that can.");
+      return;
+    }
     setSubmitting(true);
     setError(null);
     try {
+      const frame =
+        startsFromPicture && firstFrame
+          ? firstFrame.kind === "job"
+            ? { first_frame_job_id: firstFrame.id }
+            : { first_frame_asset_id: firstFrame.id }
+          : {};
       const body = {
         owner_kind,
         owner_id,
@@ -1313,7 +1482,7 @@ function PromptBar({
         aspect_ratio: aspect || null,
         ...(avoid.trim() ? { negative_prompt: avoid.trim() } : {}),
         ...(model ? { model } : {}),
-        ...(outputKind === "video_clip" ? { duration_seconds: clipSeconds } : { variations }),
+        ...(outputKind === "video_clip" ? { duration_seconds: clipSeconds, ...frame } : { variations }),
       };
       const job =
         outputKind === "image"
@@ -1321,8 +1490,13 @@ function PromptBar({
           : await api.generateClip(body);
       onCreated(job);
       setPrompt("");
+      if (startsFromPicture) onClearFirstFrame();
     } catch (e: any) {
-      setError(e.message || "Generation failed");
+      // A refusal (e.g. the safety check, a model that can't start from a
+      // picture) comes back as the server's own sentence.
+      setError(errorText(e, "Generation failed"));
+      // Queue down (503): the jobs were stored as failed; show them.
+      if (e instanceof ApiError && e.status === 503) onReload();
     } finally {
       setSubmitting(false);
     }
@@ -1357,6 +1531,39 @@ function PromptBar({
                 {a.owner_kind === "avatar" ? "Char" : "Scene"} #{a.id} · {a.asset_type}
               </span>
             ))}
+          </div>
+        )}
+
+        {startsFromPicture && firstFrame && (
+          <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-ink-300">
+            <span className="chip py-0.5 pl-0.5 pr-1 text-[11px] flex items-center gap-1.5">
+              <img
+                src={firstFrame.thumbUrl}
+                alt=""
+                className="w-6 h-6 rounded-full object-cover"
+              />
+              <span>Starts from: {firstFrame.label}</span>
+              <button
+                type="button"
+                onClick={onClearFirstFrame}
+                className="w-6 h-6 rounded-full text-ink-300 hover:text-white hover:bg-white/10"
+                aria-label="Remove the starting picture"
+                title="Remove the starting picture"
+              >
+                ✕
+              </button>
+            </span>
+            {frameModels.length === 0 ? (
+              <span className="text-amber-200">
+                None of your video models can start from a picture. Pick one in{" "}
+                <a href="/settings#models" className="underline">
+                  Settings → Models
+                </a>
+                .
+              </span>
+            ) : (
+              <span className="text-ink-400">Only models that can start from a picture are listed.</span>
+            )}
           </div>
         )}
 
@@ -1412,7 +1619,11 @@ function PromptBar({
         {/* Phones: the prompt gets its own full-width row; the controls wrap under it. */}
         <div className="card flex flex-wrap items-center gap-2 p-2">
           <button
-            onClick={() => setOutputKind(outputKind === "image" ? "video_clip" : "image")}
+            onClick={() => {
+              // A picture to start from only applies to clips.
+              if (outputKind === "video_clip" && firstFrame) onClearFirstFrame();
+              setOutputKind(outputKind === "image" ? "video_clip" : "image");
+            }}
             className="chip text-xs"
             title="Toggle output kind"
           >
@@ -1543,7 +1754,7 @@ function PromptBar({
           />
           <button
             onClick={submit}
-            disabled={submitting || !prompt.trim()}
+            disabled={submitting || !prompt.trim() || (startsFromPicture && frameModels.length === 0)}
             className="btn-primary text-sm disabled:opacity-50 ml-auto sm:ml-0"
             title={
               isImage && variations > 1

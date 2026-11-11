@@ -3,16 +3,35 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api, Render } from "@/lib/api";
 import { StatusBadge } from "./StatusBadge";
+import { useEvents, useLiveConnected } from "./NotificationsProvider";
+import { usePoll } from "@/lib/usePoll";
+
+const DONE = ["completed", "failed", "cancelled"];
 
 export function RenderHistory({ projectId }: { projectId: number }) {
   const [renders, setRenders] = useState<Render[]>([]);
 
-  const reload = () => api.listRenders(projectId).then(setRenders);
+  const reload = () =>
+    api
+      .listRenders(projectId)
+      .then(setRenders)
+      .catch(() => {
+        /* keep what is shown */
+      });
   useEffect(() => {
     reload();
-    const t = setInterval(reload, 4000);
-    return () => clearInterval(t);
   }, [projectId]);
+  // While the live stream is connected, a render event for this project
+  // refetches and a slow fallback runs only while a render is in flight.
+  // Without the stream nothing would announce a new render, so a slow poll
+  // keeps running.
+  const connected = useLiveConnected();
+  const active = renders.some((r) => !DONE.includes(r.status));
+  const poke = usePoll(reload, { enabled: active || !connected, interval: 8000, liveInterval: 15_000 });
+  useEvents(
+    (ev) => ev.project_id === projectId && (ev.kind === "render" || ev.kind === "ambient_render"),
+    () => poke()
+  );
 
   if (renders.length === 0) {
     return null;

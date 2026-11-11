@@ -7,6 +7,7 @@ from . import (
     avatars,
     brand_kits,
     content,
+    events,
     generation,
     ingredients,
     inspector,
@@ -48,6 +49,7 @@ api_router.include_router(spend.router, prefix="/api/spend", tags=["spend"])
 api_router.include_router(settings_keys.router, prefix="/api/settings/keys", tags=["settings"])
 api_router.include_router(content.router, prefix="/api/settings/content", tags=["settings"])
 api_router.include_router(inspector.router, prefix="/api", tags=["clip-check"])
+api_router.include_router(events.router, prefix="/api", tags=["events"])
 api_router.include_router(webhooks.router, prefix="/api", tags=["webhooks"])
 api_router.include_router(ambient.public_router, prefix="/api", tags=["public"])
 

@@ -1,5 +1,7 @@
 "use client";
 import Link from "next/link";
+import { usePoll } from "@/lib/usePoll";
+import { useEvents } from "@/components/NotificationsProvider";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
@@ -77,11 +79,14 @@ export function PublishPanel({ projectId, renderId }: { projectId: number; rende
   }, [projectId, renderId, loadJobs]);
 
   const active = jobs.some((j) => j.status === "queued" || j.status === "uploading");
-  useEffect(() => {
-    if (!active) return;
-    const t = setInterval(loadJobs, 2500);
-    return () => clearInterval(t);
-  }, [active, loadJobs]);
+  // 2.5 s while an upload runs (10 s while the live stream is connected),
+  // paused while the tab is hidden; a publish event for one of these jobs
+  // refetches at once.
+  const poke = usePoll(loadJobs, { enabled: active, interval: 2500, liveInterval: 10_000 });
+  useEvents(
+    (ev) => ev.kind === "publish" && jobs.some((j) => j.id === ev.entity_id),
+    () => poke()
+  );
 
   // A render already on YouTube (or on its way) gets "open / upload again"
   // instead of a live "Publish…" button. Removed videos don't count.

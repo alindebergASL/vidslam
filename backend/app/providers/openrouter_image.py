@@ -93,6 +93,8 @@ class OpenRouterImageProvider(ImageProvider):
         from ..services.safety import check_prompt
 
         check_prompt(prompt)  # minors: refused here too, not only by the vendor
+        if negative_prompt:
+            check_prompt(negative_prompt)  # sent too, as "Avoid: …"
         url = f"{get_settings().openrouter_base_url.rstrip('/')}/images"
         body: dict = {
             "model": model or self.model,

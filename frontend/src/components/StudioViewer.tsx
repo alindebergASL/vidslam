@@ -2,8 +2,10 @@
 import { useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
 import clsx from "clsx";
-import type { StudioJob } from "@/lib/api";
-import { costText } from "@/components/StudioLibrary";
+import type { Asset, StudioJob } from "@/lib/api";
+import { costText, studioStatusLabel } from "@/components/StudioLibrary";
+import { downloadFile, extFromMime, extFromPath } from "@/lib/download";
+import { useToast } from "@/components/Toaster";
 
 /** One thing the viewer can show: a Studio result or a cast picture. */
 export type ViewerItem = {
@@ -18,6 +20,8 @@ export type ViewerItem = {
   assetId?: number;
   selectable?: boolean;
   ownerKind?: "avatar" | "ingredient";
+  /** Cast pictures: the asset (for its real file type). */
+  asset?: Asset;
 };
 
 export type ViewerActions = {
@@ -26,7 +30,12 @@ export type ViewerActions = {
   onAssign: (job: StudioJob) => void;
   onRemix: (job: StudioJob) => void;
   onTryModel: (job: StudioJob) => void;
+  /** Start a new project with this result's owner. */
+  onNewProject: (job: StudioJob) => void;
+  /** Finished clips: use it as a storyboard shot's clip. */
   onUseInProject: (job: StudioJob) => void;
+  /** Finished pictures (Studio or Cast): start a clip from it. */
+  onAnimate: (item: ViewerItem) => void;
   onDelete: (item: ViewerItem) => void;
   /** Cast pictures: add to / remove from the prompt bar's references. */
   onToggleRef?: (assetId: number) => void;
@@ -36,9 +45,30 @@ export type ViewerActions = {
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), video[controls], [tabindex]:not([tabindex="-1"])';
 
-function extOf(job?: StudioJob, video?: boolean): string {
-  const m = /\.([a-z0-9]{2,5})$/i.exec(job?.result_path || "");
-  return m ? m[1].toLowerCase() : video ? "mp4" : "png";
+/** The file name (without extension) and the extension a download gets;
+ *  "" = take it from the file's type once fetched. */
+export function downloadName(item: ViewerItem): { base: string; ext: string } {
+  if (item.job) return { base: `studio-${item.job.id}`, ext: extFromPath(item.job.result_path) };
+  const a = item.asset;
+  return {
+    base: `cast-${item.assetId ?? "picture"}`,
+    ext: extFromMime(a?.mime_type) || extFromPath(a?.original_filename),
+  };
+}
+
+/** "9:16" / "16:9" / "1:1" nearest to a real size. */
+export function nearestAspect(w: number, h: number): string {
+  const r = w / h;
+  const opts: [string, number][] = [
+    ["9:16", 9 / 16],
+    ["1:1", 1],
+    ["16:9", 16 / 9],
+  ];
+  return opts.reduce((a, b) => (Math.abs(b[1] - r) < Math.abs(a[1] - r) ? b : a))[0];
+}
+
+function secondsText(n: number): string {
+  return `${Number.isInteger(n) ? n : n.toFixed(1)} s`;
 }
 
 function when(iso?: string): string {
@@ -67,6 +97,7 @@ export function StudioViewer({
   actions: ViewerActions;
 }) {
   const titleId = useId();
+  const toast = useToast();
   const boxRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const swipe = useRef<{ x: number; y: number } | null>(null);
@@ -186,11 +217,29 @@ export function StudioViewer({
 
   const details: string[] = [];
   if (job) {
-    details.push(isVideo ? `Clip · ${Math.round(job.duration_seconds || 0)} s` : "Image");
+    // The real length and size once the clip landed; older jobs only know
+    // what was asked for.
+    if (isVideo) {
+      details.push(
+        job.result_duration_seconds
+          ? `Clip · ${secondsText(job.result_duration_seconds)}`
+          : `Clip · ${Math.round(job.duration_seconds || 0)} s (requested)`
+      );
+    } else {
+      details.push("Image");
+    }
     if (job.provider_model) details.push(job.provider_model);
-    details.push(job.aspect_ratio || (job.owner_kind === "avatar" ? "9:16 (default)" : "16:9 (default)"));
+    if (job.result_width && job.result_height) {
+      details.push(`${job.result_width}×${job.result_height} (${nearestAspect(job.result_width, job.result_height)})`);
+    } else if (job.aspect_ratio) {
+      details.push(isVideo ? `${job.aspect_ratio} (requested)` : job.aspect_ratio);
+    } else {
+      // Auto: a clip is made at the model's own default shape.
+      details.push(isVideo ? "Model default" : job.owner_kind === "avatar" ? "9:16 (default)" : "16:9 (default)");
+    }
     if (cost) details.push(cost);
     if (job.status === "saved") details.push("saved to the cast");
+    else if (!finished) details.push(studioStatusLabel(job));
     const made = when(job.created_at);
     if (made) details.push(made);
   } else {
@@ -216,7 +265,15 @@ export function StudioViewer({
         {url && (
           <a
             href={url}
-            download={job ? `studio-${job.id}.${extOf(job, isVideo)}` : `cast-${item.assetId ?? "picture"}.png`}
+            onClick={(e) => {
+              if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+              e.preventDefault();
+              const n = downloadName(item);
+              downloadFile(url, n.base, n.ext).then((ok) => {
+                if (!ok)
+                  toast.error("Couldn't download the file", { action: { label: "Open", href: url }, key: "download" });
+              });
+            }}
             className="chip text-xs py-1 shrink-0"
             title="Download the full-size file"
           >
@@ -358,9 +415,27 @@ export function StudioViewer({
               Ambient scene →
             </a>
           )}
+          {job && finished && isVideo && (
+            <button
+              onClick={closeThen(() => actions.onUseInProject(job))}
+              className={act}
+              title="Use this clip as a shot in a storyboard project (free)"
+            >
+              Use in project…
+            </button>
+          )}
+          {((job && finished && !isVideo) || (item.kind === "asset" && item.imageUrl)) && (
+            <button
+              onClick={closeThen(() => actions.onAnimate(item))}
+              className={act}
+              title="Make a clip that starts from this picture"
+            >
+              Animate this
+            </button>
+          )}
           {job && finished && (
-            <button onClick={closeThen(() => actions.onUseInProject(job))} className={act}>
-              New Project →
+            <button onClick={closeThen(() => actions.onNewProject(job))} className={act}>
+              New project →
             </button>
           )}
           {item.kind === "asset" && item.selectable && item.assetId && actions.onToggleRef && (

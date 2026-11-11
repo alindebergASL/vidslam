@@ -484,7 +484,15 @@ def start_sweeper(interval: float = 5.0) -> bool:
             except Exception:  # noqa: BLE001
                 log.exception("video job sweep failed")
             if ticks % max(int(60 / interval), 1) == 0:
-                # About once a minute: settle TTS costs OpenRouter reports late.
+                # About once a minute: Studio jobs and renders a dead worker
+                # left running, and event retention (once a day).
+                try:
+                    from . import sweepers
+
+                    sweepers.run_once()
+                except Exception:  # noqa: BLE001
+                    log.exception("studio/render sweep failed")
+                # Settle TTS costs OpenRouter reports late.
                 try:
                     from . import spend
 

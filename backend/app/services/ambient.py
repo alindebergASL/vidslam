@@ -45,7 +45,7 @@ from ..schemas.ambient import (
     SoundPresetOut,
 )
 from ..schemas.api import RenderOut, ShotOut
-from . import alerts, loop_health, render_files, storage
+from . import alerts, events, loop_health, render_files, storage
 from .image_settings import best_image_settings
 from .model_registry import active_model as _active_model
 from .model_registry import switched_off as _switched_off
@@ -740,7 +740,7 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
     (same_place_prompt). A Sogni edit gets the instruction; another model
     that applies the reference gets the full prompt plus _SAME_PLACE; the
     text-only last resort gets the full prompt."""
-    from .pipeline import _log_provider_call, _resolve_model
+    from .pipeline import _log_provider_call, _pname, _resolve_model
 
     last: Optional[Exception] = None
     attempts = reference_still_attempts(cfg) if references else [(m, False) for m in _live_chain(cfg)]
@@ -773,14 +773,14 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
             # Recorded (status=error) so the provider-error alerts see it.
             route = getattr(image, "last_route", None)
             _log_provider_call(db, project_id=project_id,
-                               provider=type(image).__name__ if image is not None else "image",
+                               provider=_pname(image) if image is not None else "image",
                                endpoint=endpoint,
                                request_summary={"model": model, "reference": with_refs, **(summary or {}),
                                                 **({"edit_model": route.model.selector} if route else {})},
                                response_summary={"error": str(e)[:500]}, status="error")
             continue
         route = getattr(image, "last_route", None)
-        _log_provider_call(db, project_id=project_id, provider=type(image).__name__, endpoint=endpoint,
+        _log_provider_call(db, project_id=project_id, provider=_pname(image), endpoint=endpoint,
                            request_summary={"model": model, "reference": with_refs, **(summary or {}),
                                             **({"edit_model": route.model.selector} if route else {})},
                            response_summary={"bytes": len(png)})
@@ -2010,6 +2010,7 @@ def _finalize_generation(
     # be finished from its clips instead of bought again.
     _set_state(project, _CHAIN_KEY, None)
     project.status = "planned"
+    events.ambient_loop_event(db, project, "completed")
     db.commit()
     if render_after:
         from ..workers.jobs import render_ambient_job
@@ -2032,6 +2033,7 @@ def _fail_generation(db: Session, project_id: int, e: Exception) -> None:
     if chain:
         _set_state(project, _CHAIN_KEY, {**chain, "failed": True, "error": str(e)[:300]})
     project.status = "failed"
+    events.ambient_loop_event(db, project, "failed", error=str(e))
     db.commit()
     alerts.render_failed("ambient loop", project_id, project.title, str(e))
 
@@ -2054,6 +2056,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
     project.status = "generating"
     _set_state(project, _CHAIN_KEY, None)  # supersede any in-flight (or kept) chain
     _set_state(project, _STARTED_KEY, datetime.utcnow().isoformat())
+    events.ambient_loop_event(db, project, "started")
     db.commit()
     try:
         cfg = _with_current_rewrite(db, project, _config_of(project))
@@ -2253,23 +2256,35 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         raise ValueError(f"ambient scene {project_id} not found")
     cfg = _config_of(project)
     shot = _loop_shot(project)
-    if shot is None or not shot.clip_path or not Path(shot.clip_path).exists():
-        raise ValueError("generate the loop clip before rendering")
     gen = _generated_of(project)
     closed = bool(gen.get("closed"))
     k = int(gen.get("variants") or 1)
     extra: list[Path] = []
-    if k > 1:
+    problem = None
+    if shot is None or not shot.clip_path or not Path(shot.clip_path).exists():
+        problem = "generate the loop clip before rendering"
+    elif k > 1:
         variants = _variant_shots(project)[:k - 1]
         if len(variants) < k - 1 or any(not v.clip_path or not Path(v.clip_path).exists() for v in variants):
-            raise ValueError("generate the loop clips before rendering")
-        extra = [Path(v.clip_path) for v in variants]
+            problem = "generate the loop clips before rendering"
+        else:
+            extra = [Path(v.clip_path) for v in variants]
+    if problem:
+        if project.status == "generating" and not db.query(models.Render.id).filter(
+                models.Render.project_id == project.id,
+                models.Render.status.notin_(("completed", "failed", "cancelled"))).first():
+            # Claimed by the render request: don't leave the scene spinning.
+            project.status = "failed"
+            db.commit()
+        raise ValueError(problem)
 
     # Tiling is local FFmpeg work: nothing is billed at render time. The
     # provider spend was incurred (and recorded) when the loop was generated.
     render = models.Render(project_id=project.id, status="rendering", estimated_cost=0.0)
     db.add(render)
     project.status = "generating"
+    db.flush()
+    events.render_event(db, render, project, "started")
     db.commit()
     db.refresh(render)
 
@@ -2327,6 +2342,7 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         render.actual_cost = 0.0
         render.status = "completed"
         project.status = "completed"
+        events.render_event(db, render, project, "completed")
         db.commit()
         render_files.prune(db, project.id)
         return render
@@ -2341,6 +2357,7 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         render.status = "failed"
         render.error = str(e)[:800]
         project.status = "failed"
+        events.render_event(db, render, project, "failed", error=str(e))
         db.commit()
         alerts.render_failed("ambient render", project.id, project.title, str(e))
         raise

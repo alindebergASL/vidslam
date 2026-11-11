@@ -1,6 +1,7 @@
 """Adult mode (Settings → Adult content), see services/content_mode.py.
 
-GET /api/settings/content   {"adult", "default", "explicit", "text_model", "planner"}
+GET /api/settings/content   {"adult", "default", "explicit", "text_model", "planner",
+                             "safety_check": {"model", "available"}}
 PUT /api/settings/content   {"adult": true | false | null} → same (null = back to ADULT_MODE)
 """
 from __future__ import annotations

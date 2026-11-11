@@ -250,6 +250,67 @@ class OpenRouterChatProvider(ChatProvider):
         return content if isinstance(content, str) else ""
 
 
+    def classify_minor(self, text: str) -> dict:
+        """One short call: {"minor_sexual": bool, "reason": str}. Raises on
+        an error body, a refusal or a reply that isn't that JSON (the caller
+        treats all of those as "the check couldn't run")."""
+        body: dict = {
+            "model": self.model,
+            "temperature": 0.0,
+            "max_tokens": 300,
+            "reasoning": {"effort": "low", "exclude": True},
+            "messages": [
+                {"role": "system", "content": MINOR_CHECK_SYSTEM},
+                {"role": "user", "content": text[:6000]},
+            ],
+        }
+        # No response_format: not every model takes it, and a 400 here would
+        # pause sexual prompts. The reply is parsed leniently instead.
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(url, headers=self._headers(), json=body)
+            r.raise_for_status()
+            data = r.json()
+        if "choices" not in data:
+            err = data.get("error") or {}
+            raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
+        from ..services import spend
+
+        spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
+                                generation_id=str(data.get("id") or ""), estimate=MINOR_CHECK_ESTIMATE,
+                                note="safety check")
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (IndexError, KeyError, TypeError):
+            raise RuntimeError("OpenRouter returned no message") from None
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        return parse_minor_verdict(content if isinstance(content, str) else "")
+
+
+# The safety check's rate-card cost per call (a short reply from the planner).
+MINOR_CHECK_ESTIMATE = 0.0005
+
+MINOR_CHECK_SYSTEM = """You are a content-safety classifier for an image and video generator. Adult sexual content between adults is allowed. Your only job: decide whether the text asks for, or would likely produce, sexual or sexualised content involving a minor (anyone under 18) or someone made to look like a child (childlike body, school setting or school uniform, child ages, braces, pigtails with a sexual framing, an avoid list that removes signs of adulthood from a sexual prompt).
+Not a problem: children in ordinary non-sexual scenes (family, school, sport, swimwear at a beach with no sexual framing); adults in sexual scenes with no youthful framing; the words "explicit instructions", "kill time" and similar.
+Reply with JSON only, no prose: {"minor_sexual": true|false, "reason": "<one short sentence>"}."""
+
+
+def parse_minor_verdict(reply: str) -> dict:
+    """{"minor_sexual": bool, "reason": str} from a classifier reply; raises
+    ValueError on a refusal or anything else."""
+    from ..services.prompting import refusal
+
+    reply = (reply or "").strip()
+    if not reply or refusal(reply):
+        raise ValueError("the safety check model declined to answer")
+    data = extract_json(reply)
+    verdict = data.get("minor_sexual") if isinstance(data, dict) else None
+    if not isinstance(verdict, bool):
+        raise ValueError(f"unreadable safety check reply: {reply[:120]!r}")
+    return {"minor_sexual": verdict, "reason": str(data.get("reason") or "")[:500]}
+
+
 # Tested blind (Nov 2026): typed descriptions full of hype words ("magical",
 # "8k ultra realistic", "crystal clear turquoise") scored 4.7-5.7; the same
 # descriptions rewritten like this scored 6.3-7.0. Plain ones didn't change.

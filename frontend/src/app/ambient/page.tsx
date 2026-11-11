@@ -1,5 +1,7 @@
 "use client";
 import Link from "next/link";
+import { usePoll } from "@/lib/usePoll";
+import { useEvents } from "@/components/NotificationsProvider";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import clsx from "clsx";
@@ -16,6 +18,7 @@ import {
 } from "@/components/ambient/shared";
 import {
   api,
+  errorText,
   AmbientPresets,
   AmbientScene,
   DEFAULT_AMBIENT_CONFIG,
@@ -55,12 +58,13 @@ function Inner() {
     api.ambientEstimate(DEFAULT_AMBIENT_CONFIG).then((e) => setQuickCost(e.total)).catch(() => {});
   }, []);
 
-  // Keep statuses live while anything is generating/rendering.
-  useEffect(() => {
-    if (!scenes.some((s) => s.status === "generating")) return;
-    const t = setInterval(reload, 3000);
-    return () => clearInterval(t);
-  }, [scenes]);
+  // Keep statuses live while anything is generating/rendering: every 3 s
+  // (12 s while the live stream is connected), paused while the tab is
+  // hidden; an ambient event reloads at once.
+  const poke = usePoll(reload, { enabled: scenes.some((s) => s.status === "generating"), interval: 3000 });
+  useEvents({ kind: ["ambient_loop", "ambient_render"] }, (ev) => {
+    if (ev === null || ev.entity_type !== "preset_preview") poke();
+  });
 
   const quickStart = async (preset: ScenePreset) => {
     setBusyPreset(preset.id);
@@ -76,7 +80,7 @@ function Inner() {
       });
       router.push(`/ambient/${scene.id}`);
     } catch (e: any) {
-      toast.error(e.message || "Could not create scene");
+      toast.error(errorText(e, "Could not create scene"));
       setBusyPreset(null);
     }
   };
@@ -88,7 +92,7 @@ function Inner() {
       toast.success(`Deleted “${s.title}”`);
       reload();
     } catch (e: any) {
-      toast.error(e.message || "Delete failed");
+      toast.error(errorText(e, "Delete failed"));
     }
   };
 
@@ -293,7 +297,7 @@ function BatchPanel({ presets, onDone }: { presets: AmbientPresets; onDone: (n: 
       });
       onDone(r.scene_ids.length);
     } catch (e: any) {
-      toast.error(e.message || "Batch failed");
+      toast.error(errorText(e, "Batch failed"));
     } finally {
       setBusy(false);
     }

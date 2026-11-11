@@ -15,13 +15,18 @@ import { ProjectSettingsCard } from "@/components/ProjectSettingsCard";
 import { AddShotDialog, DeleteShotDialog, DuplicateShotDialog, TakesDialog } from "@/components/ShotEditing";
 import { checkBlockedWhy, checkCostText, InspectionChip, useClipCheckSettings } from "@/components/InspectionChip";
 import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
-import { api, Asset, ClipCheckSettings, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render } from "@/lib/api";
+import { api, Asset, ClipCheckSettings, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render, ApiError, errorText } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
+import { usePoll } from "@/lib/usePoll";
+import { useEvents } from "@/components/NotificationsProvider";
 
 // Project states in which a render (or a re-plan) can be started.
 const CAN_GENERATE = ["planned", "failed", "completed", "cancelled"];
 const usd = (n: number) => `$${n.toFixed(2)}`;
 const IN_FLIGHT = ["submitted", "polling", "running"];
+// After this page starts work, how long an idle status may be read before
+// polling stops (the job may still be waiting for a worker).
+const KICK_GRACE_MS = 45_000;
 // After a clip lands with the automatic check on, keep polling this long for
 // its verdict (the check runs after the clip is stored, off the render's path).
 const AUTO_CHECK_WAIT_MS = 60_000;
@@ -63,7 +68,6 @@ function Inner() {
     { id: string; name: string; description: string }[]
   >([]);
   const router = useRouter();
-  const timer = useRef<NodeJS.Timeout | null>(null);
   // Clip check: cost per check and whether checks can run (fetched once).
   const clipCheck = useClipCheckSettings();
   // refresh() also runs from a setInterval set up earlier: read these via refs.
@@ -82,7 +86,27 @@ function Inner() {
     api.videoModels().then(setVideoModels).catch(() => setVideoModels([]));
   }, []);
 
+  // Bumped when this page starts work (generate video / plan, recompose,
+  // retry…): a refresh that began before that must not switch polling off
+  // with the status it read before the server claimed the project.
+  // Re-compose and re-roll only queue their job: the worker claims the
+  // project when it picks the job up, so until a refresh has seen the work
+  // running (or for KICK_GRACE_MS) an idle status doesn't stop polling.
+  const kickSeq = useRef(0);
+  const kickedAt = useRef(0);
+  const activeSinceKick = useRef(true);
+  const pokeRef = useRef<() => void>(() => {});
+  const startPolling = () => {
+    kickSeq.current += 1;
+    kickedAt.current = Date.now();
+    activeSinceKick.current = false;
+    setPolling(true);
+    // Show the claimed state ("generating" / "planning") right away.
+    pokeRef.current();
+  };
+
   const refresh = async () => {
+    const seq = kickSeq.current;
     try {
       const p = await api.getProject(projectId);
       setProject(p);
@@ -154,9 +178,15 @@ function Inner() {
         if (!s || `${s.id}:${s.clip_path}` !== key) awaitingCheck.current.delete(key);
       }
       setCheckPending(pending);
-      setPolling(renderActive || projectActive || shotsActive || pending.size > 0);
+      const active = renderActive || projectActive || shotsActive || pending.size > 0;
+      if (active) {
+        if (seq === kickSeq.current) activeSinceKick.current = true;
+        setPolling(true);
+      } else if (activeSinceKick.current || Date.now() - kickedAt.current > KICK_GRACE_MS) {
+        setPolling(false);
+      }
     } catch (e: any) {
-      setError(e.message);
+      setError(errorText(e));
     }
   };
 
@@ -164,13 +194,12 @@ function Inner() {
     refresh();
   }, [projectId]);
 
-  useEffect(() => {
-    if (!polling) return;
-    timer.current = setInterval(refresh, 2000);
-    return () => {
-      if (timer.current) clearInterval(timer.current);
-    };
-  }, [polling]);
+  // Every 2 s while something runs (10 s while the live stream is
+  // connected), never overlapping, paused while the tab is hidden; an event
+  // for this project refreshes at once.
+  const pokeRefresh = usePoll(refresh, { enabled: polling, interval: 2000, liveInterval: 10_000 });
+  pokeRef.current = pokeRefresh;
+  useEvents({ project_id: projectId }, () => pokeRefresh());
 
   // Auto-kick storyboard generation on first load if the project has no plan yet.
   const autoKicked = useRef(false);
@@ -178,7 +207,7 @@ function Inner() {
     if (!project || autoKicked.current) return;
     if (project.status === "draft" && !project.generated_plan_json) {
       autoKicked.current = true;
-      api.generatePlan(projectId).then(() => setPolling(true)).catch((e) => setError(e.message));
+      api.generatePlan(projectId).then(() => startPolling()).catch((e) => setError(errorText(e)));
     }
   }, [project, projectId]);
 
@@ -226,7 +255,7 @@ function Inner() {
         label: "Re-compose latest render",
         run: () => {
           if (project?.status !== "completed") return;
-          api.recompose(projectId).then(() => setPolling(true)).catch((e) => setError(e.message));
+          api.recompose(projectId).then(() => startPolling()).catch((e) => setError(errorText(e)));
         },
       },
       {
@@ -249,13 +278,25 @@ function Inner() {
     [project, projectId, showPreflight, showShortcuts, showReplan]
   );
 
+  // Claimed but no render yet (the job waits for a worker, or stopped
+  // before it began): Cancel gives the claim back.
+  const cancelWaiting = async () => {
+    try {
+      const r = await api.cancelRender(projectId);
+      toast.info(r.action === "released" ? "Cancelled before it started" : "Nothing to cancel");
+    } catch (e) {
+      setError(errorText(e));
+    }
+    pokeRef.current();
+  };
+
   const recompose = async () => {
     try {
       await api.recompose(projectId);
       toast.info("Re-composing the video…");
-      setPolling(true);
+      startPolling();
     } catch (e: any) {
-      toast.error(e.message || "Re-compose failed");
+      toast.error(errorText(e, "Re-compose failed"));
     }
   };
 
@@ -291,7 +332,7 @@ function Inner() {
       );
       applyShotEdit(r);
     } catch (e: any) {
-      toast.error(e.message || "Couldn't duplicate the shot");
+      toast.error(errorText(e, "Couldn't duplicate the shot"));
     }
   };
 
@@ -304,9 +345,9 @@ function Inner() {
           ? "Re-planning. Your spoken script, end card, captions and shot edits are kept"
           : "Re-planning from scratch. The script, captions and every shot are replaced"
       );
-      setPolling(true);
+      startPolling();
     } catch (err: any) {
-      toast.error(err.message || "Re-plan failed");
+      toast.error(errorText(err, "Re-plan failed"));
     }
   };
 
@@ -448,8 +489,18 @@ function Inner() {
             render={render}
             shots={project.shots}
             projectId={projectId}
-            onRetry={() => setPolling(true)}
+            onRetry={() => startPolling()}
           />
+        )}
+
+      {project.status === "generating" &&
+        (!render || ["completed", "failed", "cancelled"].includes(render.status)) && (
+          <div className="card p-3 mb-6 flex items-center gap-3 text-sm" role="status">
+            <span className="flex-1 text-ink-300">Waiting to start this video…</span>
+            <button className="btn-ghost text-xs" onClick={cancelWaiting}>
+              Cancel
+            </button>
+          </div>
         )}
 
       <section className="card p-4 mb-6">
@@ -484,7 +535,7 @@ function Inner() {
             setProject({ ...project, original_script: t });
             api
               .updateProject(projectId, { original_script: t })
-              .catch((e) => toast.error(e.message || "Couldn't save the script"));
+              .catch((e) => toast.error(errorText(e, "Couldn't save the script")));
           }}
         />
         <label className="label mt-4 block" htmlFor="proj-creative-direction">Creative direction</label>
@@ -641,10 +692,10 @@ function Inner() {
                       await api.regenerateShotsBulk(projectId, selected);
                       toast.info(`Re-rolling ${count} shot${count === 1 ? "" : "s"}…`);
                     } catch (e: any) {
-                      toast.error(e.message || "Bulk re-roll failed");
+                      toast.error(errorText(e, "Bulk re-roll failed"));
                     }
                     setSelected([]);
-                    setPolling(true);
+                    startPolling();
                   }}
                 >
                   Re-roll selected →
@@ -746,7 +797,7 @@ function Inner() {
                     await refresh();
                   } catch (err: any) {
                     setProject(before);
-                    toast.error(err.message || "Couldn't reorder the shots");
+                    toast.error(errorText(err, "Couldn't reorder the shots"));
                   }
                 }}
                 onDragEnd={() => setDragIndex(null)}
@@ -791,9 +842,15 @@ function Inner() {
             setShowPreflight(false);
             try {
               await api.generateVideo(projectId, force);
-              setPolling(true);
+              startPolling();
             } catch (e: any) {
-              setError(e.message);
+              if (e instanceof ApiError && e.status === 409) {
+                // Another tab or a double click already started it: follow that one.
+                toast.info(errorText(e));
+                startPolling();
+              } else {
+                setError(errorText(e));
+              }
             }
           }}
         />
@@ -1010,7 +1067,7 @@ function StoryboardScript({
       onChange(updated);
       toast.success(resync ? "Saved · captions resynced" : "Saved");
     } catch (e: any) {
-      toast.error(e.message || "Save failed");
+      toast.error(errorText(e, "Save failed"));
     } finally {
       setSaving(false);
     }
@@ -1159,7 +1216,7 @@ function ShotRow({
       else toast.info(`Shot ${shot.shot_order}: ${r.inspection.summary || "couldn't check this clip"}`);
       onChange();
     } catch (e: any) {
-      toast.error(e.message || "Couldn't check the clip");
+      toast.error(errorText(e, "Couldn't check the clip"));
     } finally {
       setCheckBusy(false);
     }
@@ -1176,7 +1233,7 @@ function ShotRow({
       );
       onChange();
     } catch (e: any) {
-      toast.error(e.message || "Regenerate failed");
+      toast.error(errorText(e, "Regenerate failed"));
     } finally {
       setRegenBusy(false);
     }
@@ -1187,7 +1244,13 @@ function ShotRow({
       ? refs.filter((x) => x !== assetId)
       : [...refs, assetId];
     setRefs(next);
-    await api.updateShot(projectId, shot.id, { reference_asset_ids_json: next });
+    try {
+      await api.updateShot(projectId, shot.id, { reference_asset_ids_json: next });
+    } catch (e) {
+      setRefs(refs);
+      toast.error(errorText(e, "Couldn't change the reference pictures"));
+      return;
+    }
     onChange(); // the clip may now be out of date
   };
 
@@ -1276,9 +1339,14 @@ function ShotRow({
             <textarea
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              onBlur={() =>
-                api.updateShot(projectId, shot.id, { prompt }).then(onChange)
-              }
+              onBlur={() => {
+                if (prompt === shot.prompt) return;
+                api
+                  .updateShot(projectId, shot.id, { prompt })
+                  .then(onChange)
+                  // e.g. the safety check refused it (422): say why, in its words.
+                  .catch((e) => toast.error(errorText(e, "Couldn't save the prompt")));
+              }}
               aria-label={`Shot ${shot.shot_order} prompt`}
               className="input min-h-[60px] flex-1 min-w-0"
             />
@@ -1294,7 +1362,7 @@ function ShotRow({
                   api
                     .updateShot(projectId, shot.id, { prompt: t })
                     .then(onChange)
-                    .catch((e) => toast.error(e.message || "Couldn't save the prompt"));
+                    .catch((e) => toast.error(errorText(e, "Couldn't save the prompt")));
                 }}
               />
               <div className="flex items-center gap-2">
@@ -1311,7 +1379,7 @@ function ShotRow({
                     api
                       .updateShot(projectId, shot.id, { negative_prompt: avoid })
                       .then(onChange)
-                      .catch((e) => toast.error(e.message || "Couldn't save the avoid list"));
+                      .catch((e) => toast.error(errorText(e, "Couldn't save the avoid list")));
                   }}
                   placeholder="e.g. crowds, text on screen"
                   title="Your defaults from Settings → Prompting are added automatically"
@@ -1472,7 +1540,7 @@ function ShotRow({
                     );
                     onChange();
                   } catch (err: any) {
-                    toast.error(err.message || "Failed to set model");
+                    toast.error(errorText(err, "Failed to set model"));
                   }
                 }}
               >

@@ -1,5 +1,7 @@
 "use client";
 import Link from "next/link";
+import { usePoll } from "@/lib/usePoll";
+import { useEvents } from "@/components/NotificationsProvider";
 import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
@@ -144,22 +146,31 @@ function Uploads({ connected }: { connected: boolean }) {
     .map((i) => i.id)
     .slice(0, 100);
   const uploadingKey = uploadingIds.join(",");
-  useEffect(() => {
-    if (!uploadingKey) return;
-    const ids = uploadingKey.split(",").map(Number);
+  const uploadingRef = useRef(uploadingKey);
+  uploadingRef.current = uploadingKey;
+  const refreshUploading = async () => {
+    const key = uploadingRef.current;
+    if (!key) return;
+    const ids = key.split(",").map(Number);
     const listSeq = seq.current;
-    const t = setInterval(async () => {
-      try {
-        const page = await api.publishingJobs({ ids, limit: 100 });
-        if (listSeq !== seq.current) return; // filter or search changed meanwhile
-        setItems((prev) => prev.map((p) => page.items.find((f) => f.id === p.id) ?? p));
-        setCounts(page.counts);
-      } catch {
-        // The next tick tries again.
-      }
-    }, 3000);
-    return () => clearInterval(t);
-  }, [uploadingKey]);
+    try {
+      const page = await api.publishingJobs({ ids, limit: 100 });
+      if (listSeq !== seq.current) return; // filter or search changed meanwhile
+      setItems((prev) => prev.map((p) => page.items.find((f) => f.id === p.id) ?? p));
+      setCounts(page.counts);
+    } catch {
+      // The next tick tries again.
+    }
+  };
+  // Every 3 s while something uploads (10 s while the live stream is
+  // connected), paused while the tab is hidden. A publish event for a row on
+  // screen refetches those rows; one for a job not on screen (a new upload)
+  // reloads the list.
+  const pokeUploading = usePoll(refreshUploading, { enabled: !!uploadingKey, interval: 3000, liveInterval: 10_000 });
+  useEvents({ kind: "publish" }, (ev) => {
+    if (ev === null || !items.some((i) => i.id === ev.entity_id)) load(Math.min(100, Math.max(PAGE, items.length)));
+    else pokeUploading();
+  });
 
   const loadMore = async () => {
     if (next == null) return;

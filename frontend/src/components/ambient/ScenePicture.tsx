@@ -4,7 +4,7 @@ import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
 import { IMAGE_ACCEPT } from "@/components/Dropzone";
 import { askBeforeDiscard } from "@/components/ambient/shared";
-import { api, AmbientScene } from "@/lib/api";
+import { api, AmbientScene, errorText } from "@/lib/api";
 
 export type PickedImage = { kind: "studio" | "asset"; id: number; url: string; label: string };
 
@@ -121,7 +121,7 @@ export function ScenePicture({
       onChange(next);
       toast.success(ok);
     } catch (e: any) {
-      toast.error(e.message || "Picture update failed");
+      toast.error(errorText(e, "Picture update failed"));
     } finally {
       setBusy(null);
     }

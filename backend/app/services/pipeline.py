@@ -20,11 +20,12 @@ from ..providers import (
 )
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
-from . import alerts, fingerprints, render_files, storage, takes
+from . import alerts, events, fingerprints, render_files, storage, takes
 from .captions import chunks_to_timed
 from .model_registry import active_model as _active_model
 from .prompting import effective_negative
 from .renderer import RenderInputs, compose
+from .safety import UnsafeScriptError
 
 log = logging.getLogger("avs.pipeline")
 settings = get_settings()
@@ -106,6 +107,13 @@ def _disclosure_for(
         or (plan.disclosure_text or "").strip()
         or "AI-generated virtual creator"
     )
+
+
+def _pname(provider) -> str:
+    """The adapter's class name for the provider-call log (not the safety wrapper's)."""
+    from ..providers.registry import unwrap
+
+    return type(unwrap(provider)).__name__
 
 
 def _log_provider_call(
@@ -224,15 +232,44 @@ def _check_plan(plan: StoryboardPlan) -> None:
         if steers_young(shot.visual_prompt or "", shot.negative_prompt or ""):
             raise UnsafePromptError(
                 "This plan was refused: a shot's avoid list removes signs of adulthood from a sexual prompt.")
+    # The AI safety check, once per distinct shot prompt (fills its cache,
+    # so the clip calls later are hits), and on the script when it's sexual.
+    from .minor_check import check_generation
+
+    seen: set[tuple[str, str]] = set()
+    for shot in plan.shots:
+        key = (shot.visual_prompt or "", effective_negative("video", shot.negative_prompt or ""))
+        if key[0].strip() and key not in seen:
+            seen.add(key)
+            check_generation(key[0], key[1], kind="video")
+    check_generation(plan.cleaned_voice_script or "", kind="script")
+
+
+def claim_held(db: Session, project_id: int, claim: str) -> bool:
+    """Whether the project is still in the state the API claimed it with
+    when it queued this job. Not when the claim was cancelled, or the
+    sweeper gave up on it while it waited in the queue: the job then does
+    nothing (and pays for nothing)."""
+    row = db.query(models.VideoProject.status).filter(models.VideoProject.id == project_id).first()
+    if row is None or row[0] != claim:
+        log.info("project %s is no longer %s (now %s); skipping its queued job",
+                 project_id, claim, row[0] if row else "gone")
+        return False
+    return True
 
 
 def generate_plan(
-    db: Session, project_id: int, *, preserve_edits: bool = False
-) -> StoryboardPlan:
+    db: Session, project_id: int, *, preserve_edits: bool = False, claim: Optional[str] = None,
+) -> Optional[StoryboardPlan]:
+    """`claim`: the status the API claimed the project with ("planning");
+    when it no longer holds, nothing is done and None is returned."""
+    if claim and not claim_held(db, project_id, claim):
+        return None
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise ValueError(f"project {project_id} not found")
     project.status = "planning"
+    events.plan_event(db, project, "started")
     db.commit()
 
     chat = None
@@ -243,6 +280,7 @@ def generate_plan(
         _check_plan(plan)
     except Exception as e:  # noqa: BLE001
         project.status = "failed"
+        events.plan_event(db, project, "failed", error=str(e))
         db.commit()
         _log_provider_call(
             db,
@@ -334,6 +372,7 @@ def generate_plan(
                     reference_asset_ids_json=[],
                 )
             )
+    events.plan_event(db, project, "completed")
     db.commit()
 
     _log_provider_call(
@@ -473,6 +512,7 @@ def on_shot_clip_ready(db: Session, job: models.VideoJob) -> None:
         shot = db.get(models.VideoShot, job.ref_id)
     if _remake_outdated(db, job, shot):
         return
+    _shot_progress(db, job)
     _after_shot(db, job)
     # The clip check runs after the render has moved on: advisory, never in its way.
     from . import inspector
@@ -555,6 +595,25 @@ def on_shot_clip_failed(db: Session, job: models.VideoJob) -> None:
     _after_shot(db, job)
 
 
+def _shot_progress(db: Session, job: models.VideoJob) -> None:
+    """One progress event per landed clip of a render that is making clips:
+    "Clips: 2 of 5 ready". Never in the render's way."""
+    try:
+        if not job.render_id:
+            return
+        render = db.get(models.Render, job.render_id)
+        if render is None or render.status != "generating_shots":
+            return
+        project = db.get(models.VideoProject, render.project_id)
+        body = _body_shots(project)
+        done = sum(1 for s in body if s.status == "completed")
+        events.render_event(db, render, project, "progress", detail=f"Clips: {done} of {len(body)} ready")
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        log.exception("render progress event failed")
+
+
 def _after_shot(db: Session, job: models.VideoJob) -> None:
     after = (job.context_json or {}).get("after", "compose")
     if after == "compose" and job.render_id:
@@ -601,7 +660,9 @@ def maybe_compose(db: Session, render_id: int) -> None:
         return
     res = db.execute(sa_update(models.Render)
                      .where(models.Render.id == render_id, models.Render.status == "generating_shots")
-                     .values(status="rendering"))
+                     .values(status="rendering", updated_at=datetime.utcnow()))
+    if res.rowcount == 1:
+        events.render_event(db, render, project, "progress", detail="Putting the video together")
     db.commit()
     if res.rowcount == 1:
         enqueue(compose_render_job, render_id)
@@ -629,6 +690,7 @@ def _fail_render(db: Session, render: models.Render, project: models.VideoProjec
     render.status = "failed"
     render.error = error[:800]
     project.status = "failed"
+    events.render_event(db, render, project, "failed", error=error)
     db.commit()
     alerts.render_failed("render", project.id, project.title, error)
 
@@ -685,7 +747,6 @@ def submit_talking_head(
         return False
     out_dir = storage.render_subdir(project.id)
     dur = float(shot.duration_seconds or 5.0)
-    body = [s for s in project.shots if s.shot_type != "end_card"]
     audio_url = None
     speech = dur
     if audio_path and Path(audio_path).exists():
@@ -698,8 +759,7 @@ def submit_talking_head(
         from .renderer import _probe_duration
 
         speech = min(dur, _probe_duration(seg) or dur)
-    script = (plan.cleaned_voice_script if len(body) == 1 else "") or shot.caption_text \
-        or plan.cleaned_voice_script or shot.prompt
+    script = _talking_head_script(project, shot, plan)
     takes.ensure_current_take(db, shot)  # the clip being replaced stays selectable
     shot.status = "submitted"
     shot.provider = "lipsync"
@@ -727,11 +787,64 @@ def submit_talking_head(
                                    "aspect": project.aspect_ratio or "",
                                    **({"fingerprint": fingerprint} if fingerprint else {})},
                           start=start_fn)
+    except UnsafeScriptError:
+        # A safety refusal is never worked around with the video model: the
+        # voiceover carries the refused script. The render fails.
+        db.rollback()
+        raise
     except Exception as e:  # noqa: BLE001 — submit failed: use the video model
         log.warning("talking-head submit failed for shot %s, falling back: %s", shot.id, e)
         db.rollback()
         return f"lip-sync failed, used video model instead: {str(e)[:300]}"
     return True
+
+
+def _talking_head_script(project: models.VideoProject, shot: models.VideoShot, plan: StoryboardPlan) -> str:
+    """The text a talking-head shot speaks (sent with its lip-sync job)."""
+    body = [s for s in project.shots if s.shot_type != "end_card"]
+    return (plan.cleaned_voice_script if len(body) == 1 else "") or shot.caption_text \
+        or plan.cleaned_voice_script or shot.prompt
+
+
+def precheck_render(db: Session, project: models.VideoProject, plan: StoryboardPlan) -> None:
+    """The safety checks every paid step of a render will meet, run before
+    anything is paid for (the voiceover first of all): each body shot's clip
+    prompt with its avoid list, the lip-sync text (motion + script) of
+    talking-head shots, and the spoken script. Raises UnsafeScriptError.
+    Verdicts are cached, so the checks at submit time are hits."""
+    from ..providers import get_avatar
+    from .minor_check import check_generation
+    from .safety import check_prompt
+
+    ambient = project.mode == "ambient_loop"
+    avatar = None
+    seen: set[tuple[str, str, str]] = set()
+
+    def once(text: str, negative: str, kind: str) -> None:
+        key = (text, negative, kind)
+        if text.strip() and key not in seen:
+            seen.add(key)
+            check_generation(text, negative, kind=kind)
+
+    for shot in _body_shots(project):
+        if shot.status == "completed" and shot.clip_path and Path(shot.clip_path).exists() \
+                and not fingerprints.shot_is_stale(shot):
+            continue  # reused, not submitted
+        negative = shot.negative_prompt or ""
+        if not ambient:
+            negative = effective_negative("video", negative)
+        once(shot.prompt or "", negative, "video")
+        if shot.shot_type == "talking_head":
+            if avatar is None:
+                avatar = get_avatar() or False
+            if avatar and _hero_portrait(db, project) is not None:
+                motion = shot.camera_direction or ""
+                if motion.strip():
+                    check_prompt(motion)
+                script = _talking_head_script(project, shot, plan)
+                once(" ".join(x for x in (motion, script) if x.strip()), "", "lipsync")
+    if (project.voiceover_source or "tts").lower() == "tts":
+        once(plan.cleaned_voice_script or "", "", "script")
 
 
 def generate_audio(
@@ -770,7 +883,7 @@ def generate_audio(
         _log_provider_call(
             db,
             project_id=project.id,
-            provider=type(tts).__name__,
+            provider=_pname(tts),
             endpoint="tts.synthesize",
             request_summary={"chars": len(plan.cleaned_voice_script), "voice_id": bool(voice_id)},
             response_summary={"bytes": len(audio_bytes)},
@@ -780,12 +893,14 @@ def generate_audio(
         _log_provider_call(
             db,
             project_id=project.id,
-            provider=type(tts).__name__,
+            provider=_pname(tts),
             endpoint="tts.synthesize",
             request_summary={"chars": len(plan.cleaned_voice_script)},
             response_summary={"error": str(e)[:500]},
             status="error",
         )
+        if isinstance(e, UnsafeScriptError):
+            raise VoiceoverFailed(f"Voiceover not made: {e}") from e
         raise VoiceoverFailed(
             "Voiceover failed, so no clips were made and nothing was spent on video. "
             f"The voice provider said: {str(e)[:400] or type(e).__name__}. "
@@ -857,9 +972,11 @@ def make_voiceover_preview(db: Session, project: models.VideoProject) -> dict:
     try:
         data = tts.synthesize(text=script, voice_id=voice_id)
     except Exception as e:  # noqa: BLE001
-        _log_provider_call(db, project_id=project.id, provider=type(tts).__name__, endpoint="tts.synthesize",
+        _log_provider_call(db, project_id=project.id, provider=_pname(tts), endpoint="tts.synthesize",
                            request_summary={"chars": len(script), "preview": True},
                            response_summary={"error": str(e)[:500]}, status="error")
+        if isinstance(e, UnsafeScriptError):
+            raise VoiceoverFailed(str(e)) from e
         raise VoiceoverFailed(f"The voice provider said: {str(e)[:400] or type(e).__name__}") from e
     # One file per fingerprint: a render that used an earlier preview keeps
     # pointing at the audio it was made with.
@@ -876,7 +993,7 @@ def make_voiceover_preview(db: Session, project: models.VideoProject) -> dict:
         "created_at": datetime.utcnow().isoformat(),
     }
     db.commit()
-    _log_provider_call(db, project_id=project.id, provider=type(tts).__name__, endpoint="tts.synthesize",
+    _log_provider_call(db, project_id=project.id, provider=_pname(tts), endpoint="tts.synthesize",
                        request_summary={"chars": len(script), "voice_id": bool(voice_id), "preview": True},
                        response_summary={"bytes": len(data)})
     return {"path": str(path), "fingerprint": fingerprint, "cost_estimate": cost, "reused": False}
@@ -1326,17 +1443,32 @@ def generate_music_for_project(
     return out_path
 
 
-def render_project(db: Session, project_id: int) -> models.Render:
+def render_project(db: Session, project_id: int, *, claim: Optional[str] = None) -> Optional[models.Render]:
+    """`claim`: the status the API claimed the project with ("generating");
+    when it no longer holds (cancelled, or failed by the sweeper while the
+    job waited in the queue) nothing is done and None is returned."""
+    if claim and not claim_held(db, project_id, claim):
+        return None
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise ValueError(f"project {project_id} not found")
-    if not project.generated_plan_json:
-        raise ValueError("project has no storyboard plan yet")
+    try:
+        if not project.generated_plan_json:
+            raise ValueError("project has no storyboard plan yet")
+        plan = StoryboardPlan.model_validate(project.generated_plan_json)
+        from .cost import estimate_for_project
 
-    plan = StoryboardPlan.model_validate(project.generated_plan_json)
-    from .cost import estimate_for_project
-
-    estimate = estimate_for_project(db, project, plan)
+        estimate = estimate_for_project(db, project, plan)
+    except Exception as e:
+        # Nothing was made: give up the claim so Generate works again.
+        db.rollback()
+        if project.status == "generating":
+            project.status = "failed"
+            events.emit(db, "render", "project", project.id, "failed",
+                        f"Render failed: {events.plain_error(str(e))}", detail=str(e)[:600],
+                        url=events.project_url(project), project_id=project.id)
+            db.commit()
+        raise
     render = models.Render(
         project_id=project.id,
         status="generating_audio",
@@ -1346,6 +1478,8 @@ def render_project(db: Session, project_id: int) -> models.Render:
     # Mark the project itself as generating so clients polling project_status keep
     # polling while a worker-backed render runs in the background.
     project.status = "generating"
+    db.flush()
+    events.render_event(db, render, project, "started", detail="Making the voiceover")
     db.commit()
     db.refresh(render)
     from . import spend
@@ -1354,6 +1488,9 @@ def render_project(db: Session, project_id: int) -> models.Render:
 
     try:
         _check_cancel(db, render)
+        # 0. Every safety check this render's paid steps will meet, before
+        #    the voiceover is paid for.
+        precheck_render(db, project, plan)
         # 1. audio. An unchanged voiceover is reused (not paid for again,
         #    and lip-synced clips cut from it stay in step); a failed
         #    synthesis stops here, before any clip is submitted.
@@ -1368,6 +1505,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
             render.audio_path = str(audio_path)
             render.voice_fingerprint = voice_fp
         render.status = "generating_shots"
+        events.render_event(db, render, project, "progress", detail="Making clips")
         db.commit()
         _check_cancel(db, render)
 
@@ -1434,6 +1572,7 @@ def render_project(db: Session, project_id: int) -> models.Render:
         render.status = "failed"
         render.error = str(e)[:800]
         project.status = "failed"
+        events.render_event(db, render, project, "failed", error=str(e))
         db.commit()
         alerts.render_failed("render", project.id, project.title, str(e))
         raise
@@ -1476,6 +1615,7 @@ def compose_render(db: Session, render_id: int) -> models.Render:
         render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
         render.status = "completed"
         project.status = "completed"
+        events.render_event(db, render, project, "completed")
         db.commit()
         _settle_render_cost(db, render)
         render_files.prune(db, project.id)
@@ -1641,10 +1781,13 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
             missing.append(shot.shot_order)
             continue
         clip_paths.append(Path(shot.clip_path))
-    if missing:
-        raise ValueError(f"shots not yet generated: {missing}")
-    if not clip_paths:
-        raise ValueError("no shot clips available to recompose")
+    if missing or not clip_paths:
+        error = f"shots not yet generated: {missing}" if missing else "no shot clips available to recompose"
+        if project.status == "generating":
+            # Claimed by Retry (or a re-roll's recompose): don't leave it spinning.
+            project.status = "failed"
+            db.commit()
+        raise ValueError(error)
 
     audio, audio_fp = _recompose_voiceover(db, project)
 
@@ -1655,6 +1798,8 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
         voice_fingerprint=audio_fp,
     )
     db.add(render)
+    db.flush()
+    events.render_event(db, render, project, "started", detail="Putting the video together")
     db.commit()
     db.refresh(render)
 
@@ -1691,6 +1836,7 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
         render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
         render.status = "completed"
         project.status = "completed"
+        events.render_event(db, render, project, "completed")
         db.commit()
         render_files.prune(db, project.id)
         return render
@@ -1705,11 +1851,42 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
         log.exception("recompose failed")
         render.status = "failed"
         render.error = str(e)[:800]
+        if project.status == "generating":
+            project.status = "failed"  # nothing else will move it on
+        events.render_event(db, render, project, "failed", error=str(e))
         db.commit()
         raise
 
 
 STUDIO_DELETED = "deleted"  # tombstone: the row stays so its id is never reused
+STUDIO_RUNNING = ("pending", "submitted", "polling")
+
+
+def studio_failed_alert(error: str) -> None:
+    """One ops alert per burst of Studio failures (a failed batch is one alert)."""
+    alerts.send("studio-failed", "Studio job failed", (error or "")[:600])
+
+
+def studio_first_frame(db: Session, job: models.AssetGenerationJob) -> Optional[ImageRef]:
+    """The picture an "Animate this" clip starts from, at a URL the provider
+    can fetch, or None when the job has none. Raises ValueError when the
+    picture is gone."""
+    if job.first_frame_job_id:
+        src = db.get(models.AssetGenerationJob, job.first_frame_job_id)
+        if (src is None or src.status == STUDIO_DELETED or src.output_kind != "image"
+                or not src.result_path or not Path(src.result_path).exists()):
+            raise ValueError("the picture this clip starts from was deleted")
+        from . import public_media
+
+        return ImageRef(url=public_media.publish(Path(src.result_path)), role="scene",
+                        name="first frame", frame_type="first_frame")
+    if job.first_frame_asset_id:
+        asset = db.get(models.Asset, job.first_frame_asset_id)
+        if asset is None or not (asset.mime_type or "").startswith("image/"):
+            raise ValueError("the picture this clip starts from was deleted")
+        return ImageRef(url=storage.public_url_for_token(asset.public_token), role="scene",
+                        name="first frame", frame_type="first_frame")
+    return None
 
 
 def _studio_job_deleted(db: Session, job_id: int) -> bool:
@@ -1722,8 +1899,20 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
     job = db.get(models.AssetGenerationJob, job_id)
     if job is None:
         raise ValueError(f"studio job {job_id} not found")
-    job.status = "submitted"
+    # The worker's claim already set "submitted"; this only moves a job
+    # started another way, and never undoes a Cancel that landed between
+    # the claim and here.
+    from sqlalchemy import update as _update
+
+    moved = db.execute(_update(models.AssetGenerationJob)
+                       .where(models.AssetGenerationJob.id == job_id,
+                              models.AssetGenerationJob.status.in_(("pending", "submitted")))
+                       .values(status="submitted")).rowcount
     db.commit()
+    db.refresh(job)
+    if moved != 1:
+        log.info("studio job %s is %s; not starting it", job_id, job.status)
+        return job
     try:
         # The user's order, each with its role and name (an ingredient was
         # always sent as a "scene" before, in database order).
@@ -1756,12 +1945,16 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
                 return job
             ext, _mime, _w, _h = storage.image_info(data)
             path = storage.save_generated_bytes(data, extension=ext, subdir_name="images")
+            # Only a job still running takes the result: a deleted or
+            # cancelled one keeps its state (the image was still billed).
             done = db.query(models.AssetGenerationJob).filter(
                 models.AssetGenerationJob.id == job.id,
-                models.AssetGenerationJob.status != STUDIO_DELETED,
+                models.AssetGenerationJob.status.in_(STUDIO_RUNNING),
             ).update({"result_path": str(path), "status": "completed",
                       "provider": job.provider, "provider_model": job.provider_model},
                      synchronize_session=False)
+            if done:
+                events.studio_event(db, job, "completed")
             db.commit()
             if not done:
                 Path(path).unlink(missing_ok=True)
@@ -1774,18 +1967,32 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             video = get_video(model) if routes_per_model("video", model) else get_video()
             job.provider = provider_label("video", model)
             job.provider_model = model
-            job.status = "polling"
+            moved = db.query(models.AssetGenerationJob).filter(
+                models.AssetGenerationJob.id == job.id,
+                models.AssetGenerationJob.status.in_(("pending", "submitted")),
+            ).update({"status": "polling", "provider": job.provider, "provider_model": model},
+                     synchronize_session=False)
             db.commit()
+            db.refresh(job)
+            if not moved:
+                return job  # cancelled or deleted before anything was sent
 
             negative = effective_negative("video", job.negative_prompt or "")
             settings_extra: dict = {}
             if job.aspect_ratio:  # unset: the model's own default, as before
                 settings_extra["aspect_ratio"] = job.aspect_ratio
+            strategy = "input_references"
+            first = studio_first_frame(db, job)
+            if first is not None:
+                # "Animate this": the clip starts on that picture. Frame
+                # images and input references don't mix, so it is the one
+                # picture sent (it already shows whoever is in it).
+                refs, strategy = [first], "frame_images"
 
             def start(callback):
                 return video.submit(
                     model=model, prompt=job.prompt, references=refs,
-                    negative_prompt=negative,
+                    negative_prompt=negative, reference_strategy=strategy,
                     duration_seconds=float(job.duration_seconds or 5.0),
                     settings={**settings_extra, **({"callback_url": callback} if callback else {})} or None,
                 )
@@ -1802,12 +2009,19 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
         return job
     except Exception as e:  # noqa: BLE001
         db.rollback()
-        # Only a job that still exists gets the failure; a deleted one stays deleted.
-        db.query(models.AssetGenerationJob).filter(
+        # Only a job still running gets the failure; a deleted (or
+        # cancelled) one keeps its state.
+        failed = db.query(models.AssetGenerationJob).filter(
             models.AssetGenerationJob.id == job_id,
-            models.AssetGenerationJob.status != STUDIO_DELETED,
+            models.AssetGenerationJob.status.in_(STUDIO_RUNNING),
         ).update({"status": "failed", "error": str(e)[:500]}, synchronize_session=False)
+        if failed:
+            row = db.get(models.AssetGenerationJob, job_id)
+            if row is not None:
+                events.studio_event(db, row, "failed", error=str(e))
         db.commit()
+        if failed:
+            studio_failed_alert(str(e))
         raise
 
 
@@ -1898,6 +2112,7 @@ def run_training_job(db: Session, job_id: int) -> None:
         raise ValueError(f"custom_model {job_id} not found")
 
     cm.status = "training"
+    events.training_event(db, cm, "started")
     db.commit()
 
     try:
@@ -1943,6 +2158,7 @@ def run_training_job(db: Session, job_id: int) -> None:
                     if av is not None:
                         av.elevenlabs_voice_id = st.provider_model_id
                         av.default_voice_provider = "elevenlabs"
+                events.training_event(db, cm, "completed")
                 db.commit()
                 if cm.cost_usd and not type(provider).__name__.startswith("Mock"):
                     from . import spend
@@ -1963,7 +2179,7 @@ def run_training_job(db: Session, job_id: int) -> None:
             if st.state == "failed":
                 cm.status = "failed"
                 cm.error = st.error or "training failed"
-                db.commit()
+                _training_failed(db, cm)
                 _log_provider_call(
                     db,
                     project_id=0,
@@ -1977,7 +2193,7 @@ def run_training_job(db: Session, job_id: int) -> None:
             if elapsed > deadline:
                 cm.status = "failed"
                 cm.error = f"polling timed out after {deadline}s"
-                db.commit()
+                _training_failed(db, cm)
                 return
             sleep(2)
             elapsed += 2
@@ -1985,8 +2201,15 @@ def run_training_job(db: Session, job_id: int) -> None:
     except Exception as e:  # noqa: BLE001
         cm.status = "failed"
         cm.error = str(e)[:500]
-        db.commit()
+        _training_failed(db, cm)
         raise
+
+
+def _training_failed(db: Session, cm: models.CustomModel) -> None:
+    """Commit a failed training run, with its event and an ops alert."""
+    events.training_event(db, cm, "failed", error=cm.error)
+    db.commit()
+    alerts.send(f"training-failed:{cm.id}", f"Training failed: {cm.name or cm.id}", (cm.error or "")[:600])
 
 
 def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
@@ -1997,18 +2220,52 @@ def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
         if vjob.result_path:
             Path(vjob.result_path).unlink(missing_ok=True)
         return
+    if job.status != "polling":
+        # Cancelled (or already finished): the clip was billed and its spend
+        # recorded, but nothing shows it.
+        if vjob.result_path:
+            Path(vjob.result_path).unlink(missing_ok=True)
+        return
+    from sqlalchemy import update as _update
+
+    from .renderer import _probe_duration, _probe_size
+
     data = Path(vjob.result_path).read_bytes()
     path = storage.save_generated_bytes(data, extension="mp4", subdir_name="clips")
-    Path(vjob.result_path).unlink(missing_ok=True)
-    job.result_path = str(path)
-    job.status = "completed"
-    db.commit()
+    try:
+        size = _probe_size(path)
+        duration = _probe_duration(path)
+        # Claimed atomically: two sweepers (or the handler and a sweeper)
+        # applying the same clip save it once and announce it once.
+        Job = models.AssetGenerationJob
+        won = db.execute(_update(Job).where(Job.id == job.id, Job.status == "polling").values(
+            result_path=str(path),
+            result_width=size[0] if size else None, result_height=size[1] if size else None,
+            result_duration_seconds=round(duration, 3) if duration > 0 else None,
+            status="completed", error="", updated_at=datetime.utcnow(),
+        )).rowcount
+        if won != 1:
+            db.rollback()
+            Path(path).unlink(missing_ok=True)
+            return
+        db.refresh(job)
+        events.studio_event(db, job, "completed")
+        db.commit()
+    except Exception:
+        # Nothing saved: drop the copy and keep the provider's file, so the
+        # sweeper's retry can still apply the clip.
+        db.rollback()
+        Path(path).unlink(missing_ok=True)
+        raise
+    Path(vjob.result_path).unlink(missing_ok=True)  # only once the clip is saved
 
 
 def on_studio_clip_failed(db: Session, vjob: models.VideoJob) -> None:
     job = db.get(models.AssetGenerationJob, vjob.ref_id)
-    if job is None or job.status == STUDIO_DELETED:
-        return
+    if job is None or job.status != "polling":
+        return  # deleted, cancelled or already finished
     job.status = "failed"
     job.error = vjob.error[:500]
+    events.studio_event(db, job, "failed", error=vjob.error)
     db.commit()
+    studio_failed_alert(vjob.error)

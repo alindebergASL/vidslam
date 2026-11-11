@@ -8,7 +8,7 @@ import { TrainPanel } from "@/components/TrainPanel";
 import { AssignDialog, ASSET_SLOTS, demoteOtherHeroes, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
-import { api, Asset, Avatar, Ingredient, Project, Voice } from "@/lib/api";
+import { api, Asset, Avatar, Ingredient, Project, Voice, errorText } from "@/lib/api";
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
 
@@ -304,6 +304,8 @@ function CreateModal({
   const [persona, setPersona] = useState("");
   const [visual, setVisual] = useState("");
   const [iKind, setIKind] = useState(ingredientKind);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
   return (
     <div className="fixed inset-0 z-30 bg-black/60 flex items-center justify-center p-4">
       <div className="card w-full max-w-md p-6 space-y-4">
@@ -374,24 +376,38 @@ function CreateModal({
           </button>
           <button
             className="btn-primary"
-            disabled={!name.trim()}
+            disabled={!name.trim() || creating}
             onClick={async () => {
-              if (kind === "avatar") {
-                const a = await api.createAvatar({ name, persona, visual_identity: visual });
-                onCreated("avatar", a.id);
-              } else {
-                const i = await api.createIngredient({
-                  name,
-                  kind: iKind,
-                  visual_identity: visual,
-                });
-                onCreated("ingredient", i.id);
+              setCreating(true);
+              setCreateError(null);
+              try {
+                if (kind === "avatar") {
+                  const a = await api.createAvatar({ name, persona, visual_identity: visual });
+                  onCreated("avatar", a.id);
+                } else {
+                  const i = await api.createIngredient({
+                    name,
+                    kind: iKind,
+                    visual_identity: visual,
+                  });
+                  onCreated("ingredient", i.id);
+                }
+              } catch (e) {
+                // e.g. the safety check refused the description (422).
+                setCreateError(errorText(e, "Couldn't create it"));
+              } finally {
+                setCreating(false);
               }
             }}
           >
-            Create
+            {creating ? "Creating…" : "Create"}
           </button>
         </div>
+        {createError && (
+          <p className="text-xs text-accent" role="alert">
+            {createError}
+          </p>
+        )}
       </div>
     </div>
   );
@@ -446,7 +462,7 @@ function DetailDrawer({
     try {
       await api.updateAsset(a.id, { asset_type: next });
     } catch (e: any) {
-      toast.error(e.message || "Couldn't change the slot");
+      toast.error(errorText(e, "Couldn't change the slot"));
       setBusyAsset(null);
       return;
     }
@@ -475,7 +491,7 @@ function DetailDrawer({
       await api.deleteAsset(a.id);
       toast.success("Image deleted");
     } catch (e: any) {
-      toast.error(e.message || "Delete failed");
+      toast.error(errorText(e, "Delete failed"));
     } finally {
       setBusyAsset(null);
     }
@@ -569,12 +585,16 @@ function DetailDrawer({
                 value={(entity as Avatar).elevenlabs_voice_id || ""}
                 onChange={async (e) => {
                   const next = e.target.value;
-                  const updated = await api.updateAvatar(id, {
-                    elevenlabs_voice_id: next,
-                    default_voice_provider: next ? "elevenlabs" : "mock",
-                  });
-                  setEntity(updated);
-                  onChange();
+                  try {
+                    const updated = await api.updateAvatar(id, {
+                      elevenlabs_voice_id: next,
+                      default_voice_provider: next ? "elevenlabs" : "mock",
+                    });
+                    setEntity(updated);
+                    onChange();
+                  } catch (err) {
+                    toast.error(errorText(err, "Couldn't change the voice"));
+                  }
                 }}
               >
                 <option value="">— No specific voice (use TTS default) —</option>

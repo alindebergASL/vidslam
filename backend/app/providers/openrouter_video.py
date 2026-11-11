@@ -142,6 +142,8 @@ class OpenRouterVideoProvider(VideoProvider):
         from ..services.safety import check_prompt
 
         check_prompt(prompt)  # minors: refused here too, not only by the vendor
+        if negative_prompt:
+            check_prompt(negative_prompt)  # sent too, as "Avoid: …"
         caps = self.capabilities(model)
         # Providers 400 on any duration outside supported_durations; snap
         # up to the nearest accepted length (or the model's max).

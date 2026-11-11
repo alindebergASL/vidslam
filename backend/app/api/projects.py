@@ -20,7 +20,15 @@ from ..schemas import (
     ShotOut,
     ShotUpdate,
 )
-from ..schemas.api import ShotCreate, ShotEditImpactOut, ShotEditOut, TakeOut, TakesOut
+from ..schemas.api import (
+    ShotCreate,
+    ShotEditImpactOut,
+    ShotEditOut,
+    TakeFromStudioIn,
+    TakeFromStudioOut,
+    TakeOut,
+    TakesOut,
+)
 from ..schemas.storyboard import StoryboardPlan
 from ..services import takes as takes_svc
 from ..services.captions import chunk_script
@@ -217,6 +225,14 @@ def update_shot(
     if s is None or s.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
     changes = body.model_dump(exclude_none=True)
+    if "prompt" in changes or "negative_prompt" in changes:
+        # The safety check now (a 422), not when the clip is sent.
+        from ..services.minor_check import check_or_422
+        from ..services.prompting import effective_negative
+
+        prompt = changes.get("prompt", s.prompt) or ""
+        negative = changes.get("negative_prompt", s.negative_prompt) or ""
+        check_or_422(prompt, effective_negative("video", negative), kind="video")
     if "duration_seconds" in changes and float(changes["duration_seconds"]) != float(s.duration_seconds or 0):
         # A new length moves every later shot's slice of the voiceover.
         refuse_while_busy(db, s.project, "Shot lengths")
@@ -242,6 +258,9 @@ def edit_plan(
 
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
     if body.cleaned_voice_script is not None and body.cleaned_voice_script != plan.cleaned_voice_script:
+        from ..services.minor_check import check_or_422
+
+        check_or_422(body.cleaned_voice_script, kind="script")  # it is voiced and lip-synced
         refuse_while_busy(db, project, "The spoken script")  # the voiceover is made from it
         _adopt_old_voiceover(db, project)
     if body.cleaned_voice_script is not None:
@@ -436,6 +455,13 @@ def add_shot(project_id: int, body: ShotCreate, db: Session = Depends(get_db)) -
     project = _project_with_plan(db, project_id)
     refuse_while_busy(db, project, "Shots")
     after = _shot_in(project, body.after_shot_id) if body.after_shot_id is not None else None
+    if (body.prompt or "").strip() and body.shot_type != "end_card":
+        from ..services.minor_check import check_or_422
+        from ..services.prompting import effective_negative
+
+        # The same early check as editing a shot: a refusal now, not after
+        # the voiceover and other clips of the next render are paid for.
+        check_or_422(body.prompt, effective_negative("video", ""), kind="video")
     shot = models.VideoShot(
         project_id=project.id, shot_type=body.shot_type, prompt=body.prompt,
         duration_seconds=float(body.duration_seconds), reference_asset_ids_json=[], status="pending",
@@ -556,6 +582,38 @@ def use_take(project_id: int, shot_id: int, take_id: int, db: Session = Depends(
     takes_svc.use(db, shot, take)
     db.refresh(shot)
     return shot
+
+
+@router.post("/projects/{project_id}/shots/{shot_id}/takes/from-studio", response_model=TakeFromStudioOut,
+             status_code=201)
+def take_from_studio(project_id: int, shot_id: int, body: TakeFromStudioIn,
+                     db: Session = Depends(get_db)) -> TakeFromStudioOut:
+    """Use a finished Studio clip as this shot's clip: copied into the
+    project as a new take (trimmed to the shot when longer) and made
+    current. Free; Re-compose puts it in the video."""
+    from ..services import inspector
+    from ..services.pipeline import STUDIO_DELETED, _active_job_for
+
+    shot = _shot_of(db, project_id, shot_id)
+    job = db.get(models.AssetGenerationJob, body.studio_job_id)
+    if job is None or job.status == STUDIO_DELETED:
+        raise HTTPException(404, "That Studio clip was deleted.")
+    if job.output_kind != "video_clip":
+        raise HTTPException(422, "Only a Studio clip can be used in a shot, not a picture.")
+    if job.status not in ("completed", "saved") or not job.result_path or not Path(job.result_path).is_file():
+        raise HTTPException(409, "That Studio clip isn't finished yet.")
+    if not takes_svc._is_storyboard_shot(shot):
+        raise HTTPException(409, "Only a storyboard shot can use a Studio clip (not the end card).")
+    if _active_job_for(db, shot.id) is not None:
+        raise HTTPException(409, "A new clip for this shot is still being made. Wait until it is back, "
+                                 "then use the Studio clip.")
+    try:
+        take, warning, seconds = takes_svc.import_studio_clip(db, shot, job)
+    except takes_svc.StudioImportError as e:
+        raise HTTPException(e.status, str(e)) from e
+    db.refresh(shot)
+    inspector.queue_auto_check(db, shot)
+    return TakeFromStudioOut(**takes_svc.out(project_id, shot, take), warning=warning, duration_seconds=seconds)
 
 
 @router.delete("/projects/{project_id}/shots/{shot_id}/takes/{take_id}", status_code=204)
