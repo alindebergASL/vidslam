@@ -46,19 +46,18 @@ def thumbnail_url(r: models.Render) -> Optional[str]:
 
 def render_versions(db: Session, project_ids: Iterable[int]) -> dict[int, int]:
     """render id → version number within its project (1 = first completed
-    render), the same numbering as the project's export zip."""
-    ids = list(set(project_ids))
-    if not ids:
-        return {}
-    rows = (db.query(models.Render.id, models.Render.project_id)
-            .filter(models.Render.project_id.in_(ids), models.Render.status == "completed")
-            .order_by(models.Render.project_id, models.Render.created_at, models.Render.id).all())
-    out: dict[int, int] = {}
-    seen: Counter = Counter()
-    for rid, pid in rows:
-        seen[pid] += 1
-        out[rid] = seen[pid]
-    return out
+    render; a hook-lab variant has its base render's number), the same
+    numbering as the render page and the export zip."""
+    from . import render_versions as rv
+
+    return rv.numbers(db, project_ids)
+
+
+def version_labels(db: Session, renders: Iterable[models.Render]) -> dict[int, str]:
+    """render id → "Version 3" / "Version 3 · opening B"."""
+    from . import render_versions as rv
+
+    return {rid: d["version_label"] for rid, d in rv.describe(db, list(renders)).items()}
 
 
 def render_url(p: models.VideoProject, render_id: int) -> str:
@@ -82,12 +81,13 @@ def uploaded_at(job: models.PublishJob) -> Optional[datetime]:
 
 
 def job_item(job: models.PublishJob, render: models.Render, project: models.VideoProject,
-             version: Optional[int]) -> dict:
+             version: Optional[int], version_label: str = "") -> dict:
     state, warning = publish_state.display_state(job)
     return {
         "id": job.id,
         "render_id": render.id,
         "render_version": version,
+        "render_version_label": version_label,
         "project_id": project.id,
         "project_title": project.title or "",
         "project_kind": project_kind(project),
@@ -153,7 +153,8 @@ def list_jobs(db: Session, *, status: str = "all", q: str = "", limit: int = 30,
     more = len(rows) > limit
     rows = rows[:limit]
     versions = render_versions(db, [p.id for _, _, p in rows])
-    items = [job_item(j, r, p, versions.get(r.id)) for j, r, p in rows]
+    labels = version_labels(db, [r for _, r, _ in rows])
+    items = [job_item(j, r, p, versions.get(r.id), labels.get(r.id, "")) for j, r, p in rows]
     return {"items": items, "next_before_id": items[-1]["id"] if more and items else None, "counts": counts}
 
 
@@ -173,12 +174,14 @@ def not_posted(db: Session, *, limit: int = 30, before_id: Optional[int] = None)
     more = len(rows) > limit
     rows = rows[:limit]
     versions = render_versions(db, [p.id for _, p in rows])
+    labels = version_labels(db, [r for r, _ in rows])
     failed = dict(db.query(J.render_id, func.count(J.id))
                   .filter(J.render_id.in_([r.id for r, _ in rows]), J.status == "failed")
                   .group_by(J.render_id).all()) if rows else {}
     items = [{
         "render_id": r.id,
         "render_version": versions.get(r.id),
+        "render_version_label": labels.get(r.id, ""),
         "project_id": p.id,
         "project_title": p.title or "",
         "project_kind": project_kind(p),
@@ -224,7 +227,14 @@ def _duration(p: models.VideoProject) -> Optional[float]:
             return float(cfg.get("total_seconds") or 3600)
         except (TypeError, ValueError):
             return None
-    total = sum(float(s.duration_seconds or 0) for s in p.shots)
+    # The body shots plus the end card compose draws (only with a CTA, and
+    # at its own length, not the end-card shot's planned one).
+    from .pipeline import END_CARD_SECONDS
+
+    total = sum(float(s.duration_seconds or 0) for s in p.shots
+                if s.shot_type not in ("end_card", "ambient_segment"))
+    if total and (p.cta_text or "").strip():
+        total += END_CARD_SECONDS
     return total or float(p.target_duration_seconds or 0) or None
 
 
@@ -278,6 +288,23 @@ def project_costs(db: Session, project_ids: Iterable[int]) -> dict[int, tuple[fl
     rows = (db.query(S.project_id, func.coalesce(func.sum(S.cost_usd), 0.0), func.max(est))
             .filter(S.project_id.in_(ids)).group_by(S.project_id).all())
     return {pid: (round(float(total or 0), 4), bool(e)) for pid, total, e in rows}
+
+
+def variant_render_costs(db: Session, project_ids: Iterable[int]) -> dict[int, tuple[int, float, bool]]:
+    """Hook-lab variant render id → (project id, its own ledger spend, any
+    part estimated): what making that opening cost."""
+    ids = list(set(project_ids))
+    if not ids:
+        return {}
+    S, R = models.SpendEntry, models.Render
+    est = case((or_(S.is_estimate.is_(True), S.source == "pending"), 1), else_=0)
+    variants = dict(db.query(R.id, R.project_id).filter(R.project_id.in_(ids), R.hook_variant_id.isnot(None)).all())
+    out = {rid: (pid, 0.0, False) for rid, pid in variants.items()}
+    if variants:
+        for rid, total, e in (db.query(S.render_id, func.coalesce(func.sum(S.cost_usd), 0.0), func.max(est))
+                              .filter(S.render_id.in_(list(variants))).group_by(S.render_id).all()):
+            out[rid] = (variants[rid], round(float(total or 0), 4), bool(e))
+    return out
 
 
 def per_1k(cost: Optional[float], views: Optional[int]) -> Optional[float]:
@@ -343,6 +370,90 @@ def _project_facts(db: Session, projects: list[models.VideoProject]) -> dict[int
     return facts
 
 
+_seconds_cache: dict[tuple[str, int], float] = {}
+
+
+def _file_seconds(path: Optional[str]) -> float:
+    """A video file's length (ffprobe once per file version; 0 when gone)."""
+    from .renderer import _probe_duration
+
+    if not path:
+        return 0.0
+    p = Path(path)
+    try:
+        key = (str(p), p.stat().st_mtime_ns)
+    except OSError:
+        return 0.0
+    if key not in _seconds_cache:
+        if len(_seconds_cache) > 5000:
+            _seconds_cache.clear()
+        _seconds_cache[key] = float(_probe_duration(p) or 0.0)
+    return _seconds_cache[key]
+
+
+def _render_facts(render: models.Render, base: dict, avatars: dict[int, str]) -> dict:
+    """The project's facts, overridden by what this render was actually
+    made from (its composition_json) when it was recorded: the real length,
+    the shots' video models, the aspect ratio and the main character."""
+    comp = render.composition_json or {}
+    if not comp:
+        # Made before compositions were recorded: its file's real length
+        # (cached per file), not the project's current planned shots.
+        dur = _file_seconds(render.final_video_path)
+        if not dur:
+            return base
+        return {**base, "duration_seconds": round(dur, 2), "length_bucket": length_bucket(dur)}
+    facts = dict(base)
+    dur = comp.get("duration_seconds")
+    if not dur and comp.get("body_seconds"):
+        dur = float(comp["body_seconds"]) + float(comp.get("end_card_seconds") or 0)
+    if dur:
+        facts["duration_seconds"] = round(float(dur), 2)
+        facts["length_bucket"] = length_bucket(float(dur))
+    used = Counter(str(sh.get("provider_model") or "") for sh in comp.get("shots") or []
+                   if sh.get("provider_model"))
+    if used:
+        facts["model"] = used.most_common(1)[0][0]
+    if comp.get("aspect_ratio"):
+        facts["aspect_ratio"] = comp["aspect_ratio"]
+    if comp.get("avatar_id") in avatars:
+        facts["character"] = avatars[comp["avatar_id"]]
+    return facts
+
+
+_NO_HOOK = {"hook_variant_id": None, "hook_base_render_id": None, "hook_label": "", "hook_style_key": "",
+            "hook_style": "No spoken opening", "hook_text": ""}
+
+
+def _hook_facts(db: Session, pairs: list[tuple[models.Render, models.VideoProject]]) -> dict[int, dict]:
+    """render id → its opening: a hook-lab variant's label, style and text
+    (grouped with its base render), or for a storyboard render its own
+    opening ("A", original)."""
+    from . import hook_lab
+
+    vids = {r.hook_variant_id for r, _ in pairs if r.hook_variant_id}
+    variants = {v.id: v for v in db.query(models.HookVariant).filter(models.HookVariant.id.in_(vids))} if vids else {}
+    out: dict[int, dict] = {}
+    for r, p in pairs:
+        if p.mode == AMBIENT_MODE:
+            continue
+        v = variants.get(r.hook_variant_id or 0)
+        if v is not None:
+            out[r.id] = {"hook_variant_id": v.id, "hook_base_render_id": v.base_render_id, "hook_label": v.label,
+                         "hook_style_key": v.style, "hook_style": hook_lab.STYLE_LABELS.get(v.style, v.style),
+                         "hook_text": v.hook_text}
+            continue
+        comp = r.composition_json or {}
+        text = "" if comp.get("spoken_unknown") else (
+            str(comp.get("hook") or "") or hook_lab.plan_hook(p.generated_plan_json))
+        if not text:
+            continue
+        out[r.id] = {"hook_variant_id": None, "hook_base_render_id": r.id, "hook_label": "A",
+                     "hook_style_key": "original", "hook_style": hook_lab.STYLE_LABELS["original"],
+                     "hook_text": text}
+    return out
+
+
 def result_rows(db: Session, now: Optional[datetime] = None) -> list[dict]:
     now = now or datetime.utcnow()
     J, R, P = models.PublishJob, models.Render, models.VideoProject
@@ -355,17 +466,31 @@ def result_rows(db: Session, now: Optional[datetime] = None) -> list[dict]:
     snaps = _snapshots(db, [j.id for j, _, _ in rows], now)
     costs = project_costs(db, [p.id for _, _, p in rows])
     versions = render_versions(db, [p.id for _, _, p in rows])
+    labels = version_labels(db, [r for _, r, _ in rows])
+    variant_costs = variant_render_costs(db, [p.id for _, _, p in rows])
+    hooks = _hook_facts(db, [(r, p) for _, r, p in rows])
     facts = _project_facts(db, list({p.id: p for _, _, p in rows}.values()))
+    comp_avatars = {(r.composition_json or {}).get("avatar_id") for _, r, _ in rows} - {None}
+    avatars = dict(db.query(models.Avatar.id, models.Avatar.name)
+                   .filter(models.Avatar.id.in_(comp_avatars)).all()) if comp_avatars else {}
     out = []
     for job, render, p in rows:
-        f = facts[p.id]
+        f = _render_facts(render, facts[p.id], avatars)
         published = job.yt_publish_at or job.publish_at or uploaded_at(job) or job.created_at
         if job.yt_publish_at and job.yt_publish_at > now:
             published = job.yt_publish_at
         age = max((now - published).total_seconds() / 86400, 0.0)
         js = snaps.get(job.id, [])
         last = js[-1] if js else None
-        cost, est = costs.get(p.id, (0.0, False))
+        if render.hook_variant_id:
+            # A hook-lab variant: what its own opening cost.
+            _, cost, est = variant_costs.get(render.id, (p.id, 0.0, False))
+            cost_scope = "render"
+        else:
+            # The project's spend, without what its other openings cost.
+            cost, est = costs.get(p.id, (0.0, False))
+            cost = round(max(cost - sum(c for pid, c, _ in variant_costs.values() if pid == p.id), 0.0), 4)
+            cost_scope = "project"
         views = last.views if last else None
         live_days = max(age, 1.0)
         state, warning = publish_state.display_state(job)
@@ -373,6 +498,7 @@ def result_rows(db: Session, now: Optional[datetime] = None) -> list[dict]:
             "publish_job_id": job.id,
             "render_id": render.id,
             "render_version": versions.get(render.id),
+            "render_version_label": labels.get(render.id, ""),
             "project_id": p.id,
             "project_title": p.title or "",
             "project_kind": project_kind(p),
@@ -391,6 +517,8 @@ def result_rows(db: Session, now: Optional[datetime] = None) -> list[dict]:
             "stats_fetched_at": last.fetched_at if last else None,
             "cost_usd": cost,
             "cost_is_estimate": est,
+            "cost_scope": cost_scope,
+            **hooks.get(render.id, _NO_HOOK),
             "cost_per_1k_views": per_1k(cost, views),
             **_trend(js),
             "sparkline": [s.views for s in js[-30:]],
@@ -407,8 +535,13 @@ GROUPS = {
     "character": ("character", "Main character"),
     "model": ("model", "Video model"),
     "aspect": ("aspect_ratio", "Aspect ratio"),
+    "hook": ("hook_style", "Opening (hook) style"),
 }
 TOO_FEW = 3
+
+
+def _cost_key(r: dict) -> str:
+    return f"r{r['render_id']}" if r.get("cost_scope") == "render" else f"p{r['project_id']}"
 
 
 def group_rows(rows: list[dict], by: str) -> list[dict]:
@@ -426,10 +559,11 @@ def group_rows(rows: list[dict], by: str) -> list[dict]:
         # they'd count as 0 views.
         counted = [r for r in items if r["views"] is not None]
         views = [r["views"] for r in counted]
-        # Whole-project spend: count each project once, even with several uploads.
-        per_project = {r["project_id"]: (r["cost_usd"], r["cost_is_estimate"]) for r in items}
+        # Whole-project spend: count each project once, even with several
+        # uploads; a hook-lab variant's own spend once per variant render.
+        per_project = {_cost_key(r): (r["cost_usd"], r["cost_is_estimate"]) for r in items}
         total_cost = round(sum(c for c, _ in per_project.values()), 4)
-        counted_cost = round(sum(per_project[pid][0] for pid in {r["project_id"] for r in counted}), 4)
+        counted_cost = round(sum(per_project[k][0] for k in {_cost_key(r) for r in counted}), 4)
         total_views = sum(views)
         out.append({
             "key": key,
@@ -443,4 +577,114 @@ def group_rows(rows: list[dict], by: str) -> list[dict]:
             "too_few": len(counted) < TOO_FEW,
         })
     out.sort(key=lambda g: (-g["total_views"], g["key"]))
+    return out
+
+
+# ---------- hook tests ----------
+
+HOOK_TEST_MIN_DAYS = 3
+
+
+def _all_snapshots(db: Session, job_ids: list[int]) -> dict[int, list[models.VideoStat]]:
+    S = models.VideoStat
+    out: dict[int, list[models.VideoStat]] = defaultdict(list)
+    if job_ids:
+        for st in db.query(S).filter(S.publish_job_id.in_(job_ids)).order_by(S.fetched_at, S.id):
+            out[st.publish_job_id].append(st)
+    return out
+
+
+def views_at_age(snaps: list[models.VideoStat], published: datetime, days: int) -> Optional[int]:
+    """Views `days` days after `published` from the daily snapshots: the
+    last one taken by then, when one was taken close to that age."""
+    if days < 1:
+        return None
+    cutoff = published + timedelta(days=days, hours=12)
+    by_then = [st for st in snaps if published <= st.fetched_at <= cutoff]
+    if not by_then or (by_then[-1].fetched_at - published) < timedelta(days=days, hours=-12):
+        return None
+    return int(by_then[-1].views)
+
+
+def _verdict(entries: list[dict], days: Optional[int]) -> tuple[str, Optional[str], bool]:
+    """(plain verdict, leader label, ready)."""
+    if len(entries) < 2:
+        return "Too early to tell: publish at least two openings to compare them.", None, False
+    if days is None or days < HOOK_TEST_MIN_DAYS or any(e["views_per_day_equal_age"] is None for e in entries):
+        return (f"Too early to tell: each needs at least {HOOK_TEST_MIN_DAYS} days of numbers.", None, False)
+    ranked = sorted(entries, key=lambda e: -e["views_per_day_equal_age"])
+    top, second = ranked[0], ranked[1]
+    if top["views_per_day_equal_age"] <= 0:
+        return "No views yet on any of them.", None, True
+    if second["views_per_day_equal_age"] <= 0:
+        return f"{top['hook_label']} is ahead: the others have no views yet.", top["hook_label"], True
+    ratio = top["views_per_day_equal_age"] / second["views_per_day_equal_age"]
+    if ratio < 1.1:
+        return "Too close to call: about the same views per day.", None, True
+    return (f"{top['hook_label']} is ahead: {ratio:.1f}× the views per day.", top["hook_label"], True)
+
+
+def hook_tests(db: Session, rows: list[dict], now: Optional[datetime] = None) -> list[dict]:
+    """Each base video with other openings that are on YouTube: views per
+    day at equal age (the same number of days since upload, from the daily
+    snapshots), likes per 1,000 views, cost (the base: the project's, once;
+    a variant: its own) and a plain verdict once each has 3 days of numbers."""
+    now = now or datetime.utcnow()
+    groups: dict[int, list[dict]] = defaultdict(list)
+    for r in rows:
+        if r.get("hook_base_render_id"):
+            groups[r["hook_base_render_id"]].append(r)
+    groups = {b: items for b, items in groups.items() if any(i.get("hook_variant_id") for i in items)}
+    if not groups:
+        return []
+    snaps = _all_snapshots(db, [r["publish_job_id"] for items in groups.values() for r in items])
+    bases = {r.id: r for r in db.query(models.Render).filter(models.Render.id.in_(list(groups)))}
+    base_labels = version_labels(db, list(bases.values()))
+    out: list[dict] = []
+    for base_id, items in groups.items():
+        # One entry per video: a render uploaded twice (a re-upload, or a
+        # public and an unlisted test) is one opening, never compared with
+        # itself; its most-viewed upload stands for it.
+        per_render: dict[int, dict] = {}
+        uploads: Counter = Counter()
+        for r in sorted(items, key=lambda r: r["publish_job_id"]):
+            uploads[r["render_id"]] += 1
+            cur = per_render.get(r["render_id"])
+            if cur is None or (r.get("views") or 0) > (cur.get("views") or 0):
+                per_render[r["render_id"]] = r
+        items = sorted(per_render.values(), key=lambda r: (r.get("hook_label") or "", r["publish_job_id"]))
+        with_numbers = [r for r in items if snaps.get(r["publish_job_id"])]
+        days = min((int((now - r["published_at"]).total_seconds() // 86400) for r in with_numbers),
+                   default=None) if len(with_numbers) == len(items) else None
+        entries = []
+        for r in items:
+            js = snaps.get(r["publish_job_id"], [])
+            at = views_at_age(js, r["published_at"], days) if days else None
+            last = js[-1] if js else None
+            entries.append({
+                "hook_label": r.get("hook_label") or "", "hook_style": r.get("hook_style") or "",
+                "hook_style_key": r.get("hook_style_key") or "", "hook_text": r.get("hook_text") or "",
+                "is_base": not r.get("hook_variant_id"), "hook_variant_id": r.get("hook_variant_id"),
+                "render_id": r["render_id"], "render_version_label": r.get("render_version_label") or "",
+                "publish_job_id": r["publish_job_id"], "title": r["title"], "external_url": r["external_url"],
+                "thumbnail_url": r["thumbnail_url"], "published_at": r["published_at"], "age_days": r["age_days"],
+                "views": r["views"], "likes": r["likes"],
+                "views_at_equal_age": at,
+                "views_per_day_equal_age": round(at / days, 2) if at is not None and days else None,
+                "likes_per_1k_views": (round(last.likes / last.views * 1000, 1)
+                                       if last is not None and last.views else None),
+                "cost_usd": r["cost_usd"], "cost_scope": r.get("cost_scope", "project"),
+                "cost_is_estimate": r["cost_is_estimate"],
+                "uploads": uploads[r["render_id"]],
+            })
+        verdict, leader, ready = _verdict(entries, days)
+        first = items[0]
+        out.append({
+            "base_render_id": base_id, "project_id": first["project_id"], "project_title": first["project_title"],
+            "project_url": first["project_url"],
+            "base_version_label": base_labels.get(base_id, ""),
+            "equal_age_days": days, "ready": ready, "verdict": verdict, "leader": leader,
+            "entries": entries,
+        })
+    out.sort(key=lambda g: -max(e["publish_job_id"] for e in g["entries"]))
     return out

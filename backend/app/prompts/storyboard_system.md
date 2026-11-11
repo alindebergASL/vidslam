@@ -30,6 +30,7 @@ Return **only** valid JSON matching the `StoryboardPlan` schema:
 {
   "title": "...",
   "cleaned_voice_script": "...",
+  "hook": "...",
   "estimated_duration_seconds": 25.0,
   "content_warning_notes": "",
   "disclosure_text": "AI-generated virtual creator",
@@ -90,4 +91,8 @@ No prose, no markdown, no preamble. JSON only.
    - `talking_head_beta`: one long `talking_head` shot + optional end card.
    - `static_motion`: one `hero` shot with `reference_strategy: "static_motion"` +
      optional end card.
-10. **Output is JSON only.** Do not include explanations.
+10. **Hook**: `hook` is the exact first sentence of `cleaned_voice_script`, written
+    to stop the scroll (a question, a bold claim, a surprising number or the start
+    of a story). Copy it character for character from the script; the script must
+    begin with it.
+11. **Output is JSON only.** Do not include explanations.

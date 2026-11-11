@@ -270,6 +270,10 @@ class PlanEditIn(BaseModel):
     edited) spoken script."""
 
     cleaned_voice_script: Optional[str] = None
+    # The opening line (first sentence of the spoken script). A changed hook
+    # replaces the script's first sentence (also when a script is sent);
+    # otherwise the hook follows the script's first sentence.
+    hook: Optional[str] = None
     end_card_text: Optional[str] = None
     disclosure_text: Optional[str] = None
     resync_captions: bool = False
@@ -397,6 +401,17 @@ class RenderOut(BaseModel):
     actual_cost: float
     created_at: datetime
     updated_at: datetime
+    # A hook-lab variant of another render (its opening differs).
+    hook_variant_id: Optional[int] = None
+    # A variant's base render (known while it is still being made, before
+    # its composition_json is written).
+    hook_base_render_id: Optional[int] = None
+    # What the render was put together from (None: composed before 0011).
+    composition_json: Optional[dict] = None
+    # The project's one version numbering (services/render_versions.py):
+    # completed base renders 1, 2, 3…; a variant has its base's number.
+    version: Optional[int] = None
+    version_label: str = ""
 
 
 class ProjectStatusOut(BaseModel):

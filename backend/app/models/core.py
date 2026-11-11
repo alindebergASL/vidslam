@@ -343,10 +343,59 @@ class Render(Base):
     actual_cost: Mapped[float] = mapped_column(Float, default=0.0)
     error: Mapped[str] = mapped_column(Text, default="")
     share_token: Mapped[str] = mapped_column(String(80), default=_token, unique=True, index=True)
+    # What this render was put together from (written at compose, migration
+    # 0011): clips + take ids per shot, audio, caption timings, hook window,
+    # variant id. None = composed before it was recorded.
+    composition_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Set on a hook-lab variant: a copy of a base render with another opening.
+    # use_alter: hook_variants also points back at renders.
+    hook_variant_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("hook_variants.id", ondelete="SET NULL", use_alter=True,
+                   name="fk_renders_hook_variant_id"),
+        nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     project: Mapped[VideoProject] = relationship(back_populates="renders")
+
+
+class HookVariant(Base):
+    """One alternative opening (first spoken line, optionally the first
+    shot) of a finished base render: the rest of the video is reused."""
+
+    __tablename__ = "hook_variants"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("video_projects.id", ondelete="CASCADE"), index=True)
+    base_render_id: Mapped[int] = mapped_column(ForeignKey("renders.id", ondelete="CASCADE"), index=True)
+    label: Mapped[str] = mapped_column(String(10), default="")  # "B", "C"...
+    # question|bold_claim|stat|story|contrarian|custom|original
+    style: Mapped[str] = mapped_column(String(30), default="custom")
+    hook_text: Mapped[str] = mapped_column(Text, default="")
+    # Where the original opening ends in the base render's voiceover.
+    window_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    shot1_source: Mapped[str] = mapped_column(String(10), default="keep")  # keep|take|new|lipsync
+    shot1_take_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    shot1_prompt: Mapped[str] = mapped_column(Text, default="", server_default="")
+    shot1_clip_path: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    audio_path: Mapped[str] = mapped_column(String(500), default="", server_default="")
+    audio_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The clips one make round needs and has: {"needed": [shot index...],
+    # "clips": {"<index>": path}} (shot 1 = index 0; later lip-synced shots
+    # that overlap the opening are redone too).
+    clips_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # draft|making|ready|composing|completed|failed
+    status: Mapped[str] = mapped_column(String(20), default="draft")
+    error: Mapped[str] = mapped_column(Text, default="")
+    # The variant's own Render (once composed).
+    render_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("renders.id", ondelete="SET NULL"), nullable=True)
+    cost_estimate: Mapped[float] = mapped_column(Float, default=0.0)
+    # Set while "Listen" makes its voice (paid TTS): Make waits until then,
+    # so the voice is never bought twice. Past it, the claim is stale.
+    voicing_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
 
 # --- Asset Studio (image/clip generation that produces reusable assets) ---

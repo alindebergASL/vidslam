@@ -40,6 +40,9 @@ ACTIVE = ("submitted", "running")
 # Providers with no completion callbacks: their jobs are always polled.
 NO_WEBHOOK_PROVIDERS = frozenset({"sogni", "runware"})
 TERMINAL = ("completed", "failed")
+# Hook-lab clips (services/hook_lab.py): an alternative opening's new shot 1
+# and its lip-synced shots. ref_id is the hook variant, never a VideoShot.
+HOOK_PURPOSES = ("hook_shot", "hook_avatar")
 # A job is "completing" only while one worker downloads its clip. If that
 # worker dies, nothing else moves the job on: past this age it is treated as
 # stuck, no longer counts as being made, and the sweeper fails it.
@@ -296,6 +299,10 @@ def _dispatch_completed(db: Session, job: models.VideoJob) -> None:
         from . import pipeline
 
         pipeline.on_studio_clip_ready(db, job)
+    elif job.purpose in HOOK_PURPOSES:
+        from . import hook_lab
+
+        hook_lab.on_clip_ready(db, job)
 
 
 def dispatch_failed(db: Session, job: models.VideoJob) -> None:
@@ -318,6 +325,10 @@ def _dispatch_failed(db: Session, job: models.VideoJob) -> None:
         from . import pipeline
 
         pipeline.on_studio_clip_failed(db, job)
+    elif job.purpose in HOOK_PURPOSES:
+        from . import hook_lab
+
+        hook_lab.on_clip_failed(db, job)
 
 
 def still_in_progress():
@@ -331,7 +342,12 @@ def still_in_progress():
                and_(models.VideoJob.status == "completing", models.VideoJob.updated_at >= cutoff))
 
 
-def pending_for(db: Session, *, project_id: int, purposes: tuple[str, ...] = ("shot", "avatar")) -> int:
+def pending_for(db: Session, *, project_id: int,
+                purposes: tuple[str, ...] = ("shot", "avatar")) -> int:
+    """Clips of the project still being made: storyboard shots by default.
+    Hook-lab clips (HOOK_PURPOSES) only when asked for: they never feed a
+    storyboard compose or recompose, so waiting on them there would leave
+    a re-roll's recompose waiting with nothing to wake it."""
     return (db.query(models.VideoJob)
             .filter(models.VideoJob.project_id == project_id,
                     models.VideoJob.purpose.in_(purposes),

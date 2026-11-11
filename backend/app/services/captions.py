@@ -76,25 +76,47 @@ class CaptionTiming:
     text: str
 
 
+def hints_usable(chunks: list[CaptionChunk]) -> bool:
+    """The chunks' start hints form a timeline: the first is 0, the rest are
+    > 0 and strictly increasing (two equal hints would show two captions
+    at once). (A single chunk at 0 is spread like the rest.)"""
+    if len(chunks) < 2 or float(chunks[0].start_hint or 0) != 0.0:
+        return False
+    prev = 0.0
+    for c in chunks[1:]:
+        h = float(c.start_hint or 0)
+        if h <= 0 or h <= prev:
+            return False
+        prev = h
+    return True
+
+
 def chunks_to_timed(
     chunks: list[CaptionChunk], total_duration: float
 ) -> list[CaptionTiming]:
-    """Distribute caption chunks across the timeline using start_hint when set,
-    otherwise spread evenly across `total_duration`."""
+    """Place caption chunks on the timeline by their start_hint when the
+    hints make a timeline (the first at 0, every later one after the
+    previous one) that starts its last caption before
+    `total_duration` (each clamped to it); otherwise spread
+    them evenly across `total_duration`."""
     if not chunks:
         return []
     n = len(chunks)
     timed: list[CaptionTiming] = []
-    hinted = [c for c in chunks if c.start_hint > 0]
-    if hinted and len(hinted) == n:
-        starts = [c.start_hint for c in chunks]
+    # Hints past the end (planned for a longer video) would pile the last
+    # captions up at the end: spread evenly instead.
+    if hints_usable(chunks) and float(chunks[-1].start_hint) < total_duration:
+        starts = [min(max(float(c.start_hint), 0.0), total_duration) for c in chunks]
     else:
         slice_len = total_duration / n
         starts = [i * slice_len for i in range(n)]
     for i, ch in enumerate(chunks):
         start = starts[i]
         end = starts[i + 1] if i + 1 < n else total_duration
-        timed.append(CaptionTiming(start=start, end=max(end, start + 0.5), text=ch.text))
+        end = max(end, start + 0.5)
+        if i + 1 < n and starts[i + 1] > start:
+            end = min(end, starts[i + 1])  # never on screen with the next one
+        timed.append(CaptionTiming(start=start, end=end, text=ch.text))
     return timed
 
 

@@ -63,7 +63,8 @@ def test_edited_script_drives_render_captions(auth_client):
     auth_client.post(f"/api/projects/{pid}/generate-video")
     st = auth_client.get(f"/api/projects/{pid}/status").json()
     assert st["project_status"] == "completed"
-    ass = Path(st["latest_render"]["final_video_path"]).parent / "captions.ass"
+    # Each compose keeps its own captions file (it used to be a shared captions.ass).
+    ass = Path(st["latest_render"]["final_video_path"]).parent / f"captions_{st['latest_render']['id']}.ass"
     text = ass.read_text()
     assert "Totally" in text or "different" in text
 

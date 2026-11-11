@@ -522,8 +522,20 @@ def test_takes_are_capped_and_the_current_one_is_kept(auth_client, monkeypatch):
     for _ in range(3):
         auth_client.post(f"/api/projects/{pid}/shots/{shot['id']}/regenerate?recompose=false")
     got = _takes(auth_client, pid, shot["id"])
-    assert got["keep"] == 2 and len(got["takes"]) == 2 and got["takes"][0]["current"]
-    assert not Path(first_clip).exists(), "the oldest take's file is deleted"
+    # The newest 2 are kept, plus the first take: the finished video was
+    # composed from it (its render's composition_json), so prune keeps it
+    # (the hook lab re-composes other openings from those clips).
+    assert got["keep"] == 2 and len(got["takes"]) == 3 and got["takes"][0]["current"]
+    assert Path(first_clip).exists() and got["takes"][-1]["file_exists"]
+    from app import models
+
+    db = _db()
+    try:
+        pruned = (db.query(models.VideoJob).filter_by(project_id=pid, purpose="shot", ref_id=shot["id"])
+                  .order_by(models.VideoJob.id).all())[1]  # the first re-roll: not kept, not in a video
+        assert not Path(pruned.result_path).exists(), "an old take nothing uses is deleted"
+    finally:
+        db.close()
 
 
 def test_old_clip_shows_up_as_take_one(auth_client):

@@ -7,7 +7,8 @@ table, which works across web processes, RQ workers and sweeper threads,
 with or without Redis.
 
 Kinds: render | plan | ambient_loop | ambient_render | studio_job |
-training | publish | budget. Statuses: started | progress | completed |
+training | publish | budget | hook_lab (one alternative opening of a
+video, entity "hook_variant"). Statuses: started | progress | completed |
 failed | cancelled. Severity: info | warning | error.
 """
 from __future__ import annotations
@@ -22,7 +23,8 @@ from .. import models
 
 log = logging.getLogger("avs.events")
 
-KINDS = ("render", "plan", "ambient_loop", "ambient_render", "studio_job", "training", "publish", "budget")
+KINDS = ("render", "plan", "ambient_loop", "ambient_render", "studio_job", "training", "publish", "budget",
+         "hook_lab")
 STATUSES = ("started", "progress", "completed", "failed", "cancelled")
 RETENTION_DAYS = 30
 
@@ -94,6 +96,31 @@ def render_event(db: Session, render: models.Render, project: Optional[models.Vi
         title = f"{name}: {detail}" if detail else name
     emit(db, kind, "render", render.id, status, title, detail=detail, url=project_url(project),
          project_id=project.id if project is not None else render.project_id)
+
+
+def hook_lab_url(project: Optional[models.VideoProject]) -> str:
+    return f"/projects/{project.id}/hooks" if project is not None else ""
+
+
+def hook_variant_event(db: Session, variant: models.HookVariant, project: Optional[models.VideoProject],
+                       status: str, *, detail: str = "", error: str = "") -> None:
+    """One alternative opening (hook lab): started | progress | completed |
+    failed | cancelled."""
+    name = _name(project)
+    what = f"Opening {variant.label}" if variant.label else "Opening"
+    if status == "completed":
+        title = f"{what} ready: {name}"
+    elif status == "failed":
+        title = f"{what} failed: {plain_error(error)}"
+        detail = detail or f"{name}: {str(error or '')[:600]}"
+    elif status == "cancelled":
+        title = f"{what} cancelled: {name}"
+    elif status == "started":
+        title = f"Making {what.lower()}: {name}"
+    else:
+        title = f"{what}: {detail}" if detail else f"{what}: {name}"
+    emit(db, "hook_lab", "hook_variant", variant.id, status, title, detail=detail,
+         url=hook_lab_url(project), project_id=variant.project_id)
 
 
 def plan_event(db: Session, project: models.VideoProject, status: str, *, error: str = "") -> None:

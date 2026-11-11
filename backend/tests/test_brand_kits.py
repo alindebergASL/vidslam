@@ -93,7 +93,8 @@ def test_brand_primary_color_drives_caption_color(auth_client):
     assert st["project_status"] == "completed"
     # The generated ASS caption file should carry the brand color (&H008A5CFF).
     out_dir = Path(st["latest_render"]["final_video_path"]).parent
-    ass = out_dir / "captions.ass"
+    # One captions file per render now (the shared captions.ass was overwritten).
+    ass = out_dir / f"captions_{st['latest_render']['id']}.ass"
     assert ass.exists()
     style_line = next(
         line for line in ass.read_text().splitlines() if line.startswith("Style:")

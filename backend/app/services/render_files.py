@@ -23,8 +23,10 @@ from . import s3
 log = logging.getLogger("avs.render_files")
 
 # Compose scratch that is regenerated on every render (never referenced by
-# a Render row). Kept: shot clips, voice, music, captions.ass (tiny, handy
-# for debugging caption timing), ambient loop clip + frames.
+# a Render row). Kept: shot clips, voice, music, captions_<id>.ass (tiny,
+# handy for debugging caption timing), ambient loop clip + frames. A
+# storyboard compose keeps its scratch in its own tmp_<render id>/ dir,
+# removed whole.
 _SCRATCH = (
     "norm_*.mp4", "silent.mp4", "endcard.mp4", "concat.txt",
     "ambient_norm.mp4", "ambient_unit.mp4", "ambient_head.mp4", "ambient_tail.mp4",
@@ -37,11 +39,32 @@ _SCRATCH = (
 )
 
 
+SCRATCH_PREFIX = "tmp_"
+
+
+def scratch_dir(project_dir: Path, render_id: int) -> Path:
+    """A compose's own scratch dir (`tmp_<render id>/` in the project's
+    render dir), so two composes of one project never share files."""
+    d = project_dir / f"{SCRATCH_PREFIX}{render_id}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def drop_scratch(project_dir: Path, render_id: int) -> None:
+    """Remove a compose's scratch dir (after a failed or cancelled compose)."""
+    shutil.rmtree(project_dir / f"{SCRATCH_PREFIX}{render_id}", ignore_errors=True)
+
+
 def finalize(db: Session, render: models.Render, final_path: Path, thumb_path: Optional[Path]) -> None:
     """Version the outputs for `render`, mirror to S3, clean scratch.
     Sets render.final_video_path / thumbnail_path. Call prune() after the
     render is marked completed so it counts toward the kept set."""
     out_dir = final_path.parent
+    # A storyboard compose works in its own scratch dir (scratch_dir()):
+    # the outputs go to the project's render dir and the scratch dir goes.
+    scratch = out_dir if out_dir.name.startswith(SCRATCH_PREFIX) else None
+    if scratch is not None:
+        out_dir = scratch.parent
     video = out_dir / f"render_{render.id}.mp4"
     shutil.move(str(final_path), video)
     render.final_video_path = str(video)
@@ -49,6 +72,11 @@ def finalize(db: Session, render: models.Render, final_path: Path, thumb_path: O
         thumb = out_dir / f"render_{render.id}.jpg"
         shutil.move(str(thumb_path), thumb)
         render.thumbnail_path = str(thumb)
+    if scratch is not None:
+        ass = scratch / "captions.ass"
+        if ass.exists():  # tiny, handy for checking caption timing
+            shutil.move(str(ass), out_dir / f"captions_{render.id}.ass")
+        shutil.rmtree(scratch, ignore_errors=True)
     for pattern in _SCRATCH:
         for p in out_dir.glob(pattern):
             try:
@@ -71,7 +99,10 @@ def prune(db: Session, project_id: int) -> int:
         return 0
     rows = (
         db.query(models.Render)
-        .filter(models.Render.project_id == project_id, models.Render.status == "completed")
+        # Hook-lab openings neither count toward nor expire under the
+        # limit: making openings must never expire the version they are of.
+        .filter(models.Render.project_id == project_id, models.Render.status == "completed",
+                models.Render.hook_variant_id.is_(None))
         .order_by(models.Render.created_at.desc(), models.Render.id.desc())
         .all()
     )
@@ -79,6 +110,9 @@ def prune(db: Session, project_id: int) -> int:
         rid for (rid,) in db.query(models.PublishJob.render_id)
         .filter(models.PublishJob.status.in_(("queued", "uploading"))).all()
     }
+    # A version with live openings is the base they are compared against.
+    busy |= {rid for (rid,) in db.query(models.HookVariant.base_render_id)
+             .filter(models.HookVariant.project_id == project_id, models.HookVariant.status != "archived")}
     expired = 0
     for r in rows[keep:]:
         if r.id in busy:

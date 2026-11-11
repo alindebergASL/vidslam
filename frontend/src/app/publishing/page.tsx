@@ -379,7 +379,9 @@ function UploadRow({
           <span className="text-ink-500">
             {" · "}
             {it.project_kind === "ambient" ? "Ambient" : "Storyboard"}
-            {it.render_version != null && ` · version ${it.render_version}`}
+            {it.render_version_label
+              ? ` · ${it.render_version_label}`
+              : it.render_version != null && ` · Version ${it.render_version}`}
           </span>
         </div>
       </div>
@@ -501,7 +503,9 @@ function NotPosted() {
               </Link>
               <div className="text-xs text-ink-400 mt-0.5">
                 {it.project_kind === "ambient" ? "Ambient" : "Storyboard"}
-                {it.render_version != null && ` · version ${it.render_version}`}
+                {it.render_version_label
+              ? ` · ${it.render_version_label}`
+              : it.render_version != null && ` · Version ${it.render_version}`}
                 {" · finished "}
                 {fmtLocal(it.created_at, false)}
               </div>

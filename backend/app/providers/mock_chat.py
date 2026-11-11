@@ -89,6 +89,23 @@ class MockChatProvider(ChatProvider):
         return ('{"verdict": "ok", "issues": [], '
                 '"summary": "The clip matches the shot description."}')
 
+    # Deterministic hook ideas: a one-word lead-in per style, then the
+    # opening's own words, as many words as the opening (so each "fits").
+    HOOK_LEADS = {"question": "Why", "bold_claim": "Honestly,", "stat": "Fact:", "story": "So",
+                  "contrarian": "Actually,"}
+
+    def hook_ideas(self, *, script: str, hook: str, n: int, styles: list[str]) -> str:
+        import json
+
+        words = re.sub(r"[.!?…]+$", "", hook.strip()).split() or ["this"]
+        hooks = []
+        for style in styles[:n]:
+            core = [words[0].lower(), *words[1:]][: max(len(words) - 1, 1)]
+            text = " ".join([self.HOOK_LEADS.get(style, "Listen:"), *core])
+            text += "?" if style == "question" else "."
+            hooks.append({"style": style, "text": text})
+        return json.dumps({"hooks": hooks})
+
     def rewrite_scene(self, text: str) -> dict:
         scene = re.sub(r"\s{2,}", " ", _HYPE.sub("", text)).strip(" ,.") or text.strip()
         return {"scene": f"{scene[0].upper()}{scene[1:]}.", "light": "Soft, ordinary daylight.",
