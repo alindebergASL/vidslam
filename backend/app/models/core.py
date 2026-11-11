@@ -6,10 +6,12 @@ from typing import Optional
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -481,8 +483,54 @@ class PublishJob(Base):
     external_id: Mapped[str] = mapped_column(String(100), default="")
     external_url: Mapped[str] = mapped_column(String(300), default="")
     error: Mapped[str] = mapped_column(Text, default="")
+    # When the last byte reached YouTube (None = not uploaded). Migration
+    # 0008 fills it from updated_at for videos uploaded before it existed.
+    uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # What YouTube said about the video the last time we asked
+    # (videos.list part=status,snippet). "" / None = never checked.
+    yt_privacy_status: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    yt_upload_status: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    yt_publish_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # UTC
+    yt_failure_reason: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    yt_title: Mapped[str] = mapped_column(String(200), default="", server_default="")
+    yt_removed: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    yt_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # The YouTube channel the video went to ("" = not known yet). videos.list
+    # leaves out private videos of other channels, so a video is only taken
+    # for removed when this matches the channel connected now.
+    channel_id: Mapped[str] = mapped_column(String(64), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+    @property
+    def state(self) -> str:
+        """What the creator should read: uploading | published | scheduled |
+        private | processing | removed | failed (services/publish_state.py)."""
+        from ..services.publish_state import display_state
+
+        return display_state(self)[0]
+
+    @property
+    def warning(self) -> str:
+        """Where YouTube's state differs from what was asked; "" when not."""
+        from ..services.publish_state import display_state
+
+        return display_state(self)[1]
+
+
+class VideoStat(Base):
+    """One day's YouTube numbers for an uploaded video. At most one row per
+    publish job per UTC day: a later fetch the same day updates it."""
+
+    __tablename__ = "video_stats"
+    __table_args__ = (Index("ix_video_stats_job_fetched", "publish_job_id", "fetched_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    publish_job_id: Mapped[int] = mapped_column(ForeignKey("publish_jobs.id", ondelete="CASCADE"))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    views: Mapped[int] = mapped_column(BigInteger, default=0)
+    likes: Mapped[int] = mapped_column(Integer, default=0)
+    comments: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class VideoJob(Base):

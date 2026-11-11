@@ -8,6 +8,22 @@ const API_BASE =
       "http://localhost:8000"
     : process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
+/** Error thrown for a non-2xx response; the message keeps the old
+ *  "<status>: <detail>" shape, and status / detail / headers are exposed
+ *  for callers that branch on them (e.g. the duplicate-upload 409). */
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+  headers: Headers;
+  constructor(message: string, status: number, detail: string, headers: Headers) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    this.headers = headers;
+  }
+}
+
 async function req<T>(
   path: string,
   init: RequestInit = {},
@@ -41,7 +57,7 @@ async function req<T>(
       /* not JSON; fall through with the raw text */
     }
     const suffix = rid ? ` (req ${rid.slice(0, 8)}…)` : "";
-    throw new Error(`${r.status}: ${detail}${suffix}`);
+    throw new ApiError(`${r.status}: ${detail}${suffix}`, r.status, detail, r.headers);
   }
   if (raw) return (await r.blob()) as unknown as T;
   if (r.status === 204) return undefined as unknown as T;
@@ -818,6 +834,158 @@ export type PublishJob = {
   error: string;
   created_at: string;
   updated_at: string;
+  uploaded_at: string | null;
+  /** What YouTube says now; read this instead of `status` for the label. */
+  state: PublishState;
+  /** "" or a plain-language mismatch warning (private lock, removed, processing). */
+  warning: string;
+  yt_privacy_status: string;
+  yt_upload_status: string;
+  yt_publish_at: string | null;
+  yt_title: string;
+  yt_removed: boolean;
+  yt_checked_at: string | null;
+};
+
+export type PublishState =
+  | "uploading" | "published" | "scheduled" | "private" | "processing" | "removed" | "failed";
+
+export type ProjectKind = "storyboard" | "ambient";
+
+export type PublishFilter = "all" | "scheduled" | "published" | "failed" | "uploading";
+
+export type PublishOverviewItem = {
+  id: number;
+  render_id: number;
+  render_version: number | null;
+  project_id: number;
+  project_title: string;
+  project_kind: ProjectKind;
+  project_url: string;
+  /** The page with the publish form for this job's render. */
+  render_url: string;
+  title: string;
+  youtube_title: string;
+  thumbnail_url: string | null;
+  status: PublishJob["status"];
+  state: PublishState;
+  warning: string;
+  error: string;
+  privacy: string;
+  youtube_privacy: string;
+  youtube_upload_status: string;
+  publish_at: string | null;
+  youtube_publish_at: string | null;
+  youtube_reason: string;
+  removed: boolean;
+  external_id: string;
+  external_url: string;
+  bytes_total: number;
+  bytes_sent: number;
+  uploaded_at: string | null;
+  checked_at: string | null;
+  created_at: string;
+};
+
+export type PublishOverviewPage = {
+  items: PublishOverviewItem[];
+  next_before_id: number | null;
+  counts: Record<PublishFilter, number>;
+};
+
+export type NotPostedItem = {
+  render_id: number;
+  render_version: number | null;
+  project_id: number;
+  project_title: string;
+  project_kind: ProjectKind;
+  project_url: string;
+  publish_url: string;
+  thumbnail_url: string | null;
+  file_available: boolean;
+  failed_attempts: number;
+  created_at: string;
+};
+
+export type NotPostedPage = { items: NotPostedItem[]; next_before_id: number | null };
+
+export type PublishRefreshResult = {
+  items: PublishOverviewItem[];
+  checked: number;
+  removed: number;
+  skipped: number;
+};
+
+export type ResultsGroupBy = "type" | "preset" | "time_weather" | "length" | "character" | "model" | "aspect";
+
+export type ResultRow = {
+  publish_job_id: number;
+  render_id: number;
+  render_version: number | null;
+  project_id: number;
+  project_title: string;
+  project_kind: ProjectKind;
+  project_url: string;
+  title: string;
+  external_url: string;
+  thumbnail_url: string | null;
+  state: PublishState;
+  warning: string;
+  published_at: string;
+  age_days: number;
+  views: number | null;
+  likes: number | null;
+  comments: number | null;
+  views_per_day: number | null;
+  stats_fetched_at: string | null;
+  /** Whole-project ledger total. */
+  cost_usd: number;
+  cost_is_estimate: boolean;
+  cost_per_1k_views: number | null;
+  views_before: number | null;
+  views_change: number | null;
+  trend_days: number | null;
+  /** Up to the last 30 daily view counts, oldest first. */
+  sparkline: number[];
+  duration_seconds: number | null;
+  length_bucket: string;
+  preset: string;
+  time_weather: string;
+  character: string;
+  model: string;
+  aspect_ratio: string;
+};
+
+export type ResultGroup = {
+  key: string;
+  videos: number;
+  /** Videos with YouTube numbers: views, median, cost per 1k and too_few use only these. */
+  videos_with_numbers: number;
+  total_views: number;
+  median_views: number | null;
+  total_cost_usd: number;
+  cost_is_estimate: boolean;
+  cost_per_1k_views: number | null;
+  too_few: boolean;
+};
+
+export type ResultsOut = {
+  configured: boolean;
+  connected: boolean;
+  last_refreshed_at: string | null;
+  has_numbers: boolean;
+  rows: ResultRow[];
+  group_by: ResultsGroupBy;
+  group_label: string;
+  groups: ResultGroup[];
+};
+
+export type StatsRefreshOut = {
+  videos: number;
+  snapshots: number;
+  removed: number;
+  skipped: string;
+  refreshed_at: string;
 };
 
 // --- Model catalog + runtime switching ---
@@ -1038,6 +1206,8 @@ export const api = {
       made_for_kids: boolean;
       contains_synthetic_media: boolean;
       set_thumbnail: boolean;
+      /** Required to upload a render that is already on (or uploading to) YouTube. */
+      confirm_duplicate?: boolean;
     }
   ) =>
     req<PublishJob>(`/api/renders/${renderId}/publish/youtube`, {
@@ -1045,8 +1215,45 @@ export const api = {
       body: JSON.stringify(body),
     }),
   renderPublishJobs: (renderId: number) => req<PublishJob[]>(`/api/renders/${renderId}/publish-jobs`),
-  retryPublishJob: (jobId: number) =>
-    req<PublishJob>(`/api/publish-jobs/${jobId}/retry`, { method: "POST" }),
+  /** Resume a failed upload. `confirmNewUpload` is needed when it would make
+   * a new YouTube video (YouTube rejected the old one, or the render is
+   * already on YouTube by another upload). */
+  retryPublishJob: (jobId: number, confirmNewUpload = false) =>
+    req<PublishJob>(`/api/publish-jobs/${jobId}/retry`, {
+      method: "POST",
+      body: JSON.stringify({ confirm_new_upload: confirmNewUpload }),
+    }),
+  publishingJobs: (
+    opts: { status?: PublishFilter; q?: string; limit?: number; before_id?: number | null; ids?: number[] } = {}
+  ) => {
+    const p = new URLSearchParams();
+    if (opts.status && opts.status !== "all") p.set("status", opts.status);
+    if (opts.q) p.set("q", opts.q);
+    if (opts.limit) p.set("limit", String(opts.limit));
+    if (opts.before_id != null) p.set("before_id", String(opts.before_id));
+    for (const id of opts.ids ?? []) p.append("ids", String(id));
+    const qs = p.toString();
+    return req<PublishOverviewPage>(`/api/publishing/jobs${qs ? `?${qs}` : ""}`);
+  },
+  publishingNotPosted: (opts: { limit?: number; before_id?: number | null } = {}) => {
+    const p = new URLSearchParams();
+    if (opts.limit) p.set("limit", String(opts.limit));
+    if (opts.before_id != null) p.set("before_id", String(opts.before_id));
+    const qs = p.toString();
+    return req<NotPostedPage>(`/api/publishing/not-posted${qs ? `?${qs}` : ""}`);
+  },
+  refreshPublishJob: (jobId: number) =>
+    req<PublishOverviewItem>(`/api/publish-jobs/${jobId}/refresh`, { method: "POST" }),
+  refreshPublishJobs: (ids: number[]) =>
+    req<PublishRefreshResult>("/api/publish-jobs/refresh", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    }),
+  results: (groupBy: ResultsGroupBy = "type") =>
+    req<ResultsOut>(`/api/results?group_by=${encodeURIComponent(groupBy)}`),
+  refreshResults: () => req<StatsRefreshOut>("/api/results/refresh", { method: "POST" }),
+  /** Backend-relative paths (e.g. thumbnail_url) → absolute URL. */
+  backendUrl: (path: string) => `${API_BASE}${path}`,
 
   renderAmbient: (id: number) =>
     req<{ scene_id: number; job_id: string; status: string }>(`/api/ambient/${id}/render`, {

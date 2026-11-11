@@ -13,6 +13,7 @@ Upload (…/guides/using_resumable_upload_protocol, …/docs/videos/insert):
   PUT session URI in chunks (multiples of 256 KiB), Content-Range
   → 308 Resume Incomplete (Range: bytes=0-N) … → 201 video resource
   Resume: PUT, Content-Range: bytes */TOTAL → 308 + Range, continue at N+1
+State: GET https://www.googleapis.com/youtube/v3/videos?part=status,snippet,statistics&id=a,b (≤50 ids)
 Thumbnail: POST https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=
 Scheduling: status.privacyStatus=private + status.publishAt (ISO 8601).
 AI disclosure: status.containsSyntheticMedia.
@@ -34,7 +35,7 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..config import get_settings
 from . import model_registry as store
-from . import secret_box
+from . import publish_state, secret_box
 
 log = logging.getLogger("avs.youtube")
 
@@ -242,6 +243,9 @@ def upload(db: Session, job: models.PublishJob, *, client: Optional[httpx.Client
             else:
                 offset = got
         if not job.upload_url:
+            # A new upload session makes a new video: drop the old one's id
+            # and everything YouTube said about it.
+            publish_state.reset_for_new_upload(job)
             init = client.post(
                 f"{UPLOAD_API}/videos",
                 params={"uploadType": "resumable", "part": "snippet,status"},
@@ -302,6 +306,7 @@ def _finish(db: Session, job: models.PublishJob, video: dict, client: httpx.Clie
     vid = video.get("id") or ""
     job.external_id = vid
     job.external_url = f"https://www.youtube.com/watch?v={vid}" if vid else ""
+    job.channel_id = (((video.get("snippet") or {}).get("channelId")) or connected_channel_id() or "")[:64]
     job.bytes_sent = job.bytes_total
     job.upload_url = ""
     if job.set_thumbnail and render.thumbnail_path and Path(render.thumbnail_path).exists() and vid:
@@ -313,8 +318,97 @@ def _finish(db: Session, job: models.PublishJob, video: dict, client: httpx.Clie
             job.error = f"uploaded, but thumbnail wasn't set ({t.status_code}): {t.text[:200]}"
     # Uploaded; YouTube processes it from here. "scheduled" goes live at publish_at.
     job.status = "scheduled" if job.publish_at else "published"
+    job.uploaded_at = datetime.utcnow()
+    if vid:
+        # Ask YouTube what it actually did: an unaudited Google project gets
+        # every API upload locked to private whatever was asked.
+        try:
+            found = list_videos(client, token, [vid], part="status,snippet")
+            if vid in found:
+                publish_state.apply_video(job, found[vid])
+        except Exception as e:  # noqa: BLE001 — the upload itself succeeded
+            log.warning("couldn't read YouTube's state for %s after upload: %s", vid, e)
     db.commit()
     return job
+
+
+MAX_IDS = 50  # videos.list takes at most 50 ids per call (1 quota unit each call)
+
+
+def list_videos(client: httpx.Client, token: str, ids: list[str], *,
+                part: str = "status,snippet") -> dict[str, dict]:
+    """videos.list for any number of ids, ≤50 per call. Returns {id: item}.
+    An id missing from the result is deleted, never existed, or is a private
+    or scheduled video of a channel other than the connected one."""
+    out: dict[str, dict] = {}
+    uniq = list(dict.fromkeys(i for i in ids if i))
+    for start in range(0, len(uniq), MAX_IDS):
+        batch = uniq[start:start + MAX_IDS]
+        params = {"part": part, "id": ",".join(batch), "maxResults": str(MAX_IDS)}
+        r = client.get(f"{API}/videos", params=params, headers={"Authorization": f"Bearer {token}"})
+        if r.status_code == 401:
+            _access.clear()
+            token = access_token(client)
+            r = client.get(f"{API}/videos", params=params, headers={"Authorization": f"Bearer {token}"})
+        if r.status_code >= 400:
+            raise YouTubeError(f"YouTube didn't answer ({r.status_code}): {r.text[:200]}")
+        for item in r.json().get("items") or []:
+            if item.get("id"):
+                out[item["id"]] = item
+    return out
+
+
+def connected_channel_id() -> str:
+    """Id of the channel connected now ("" if unknown or not connected)."""
+    st = status()
+    if not st["connected"]:
+        return ""
+    return ((st.get("channel") or {}).get("id")) or ""
+
+
+def can_read() -> bool:
+    """Credentials configured and a channel connected."""
+    st = status()
+    return bool(st["configured"] and st["connected"])
+
+
+def refresh_jobs(db: Session, jobs: list[models.PublishJob], *,
+                 client: Optional[httpx.Client] = None) -> dict:
+    """Read YouTube's current state (and numbers) for these jobs' videos and
+    store it. Jobs with no video yet are left alone. Also records today's
+    statistics snapshot for each video found."""
+    from . import video_stats
+
+    channel = connected_channel_id()
+    # A video on another channel than the one connected now can't be read
+    # (if private) and mustn't be taken for removed: leave it alone.
+    targets = [j for j in jobs if j.external_id
+               and not (channel and j.channel_id and j.channel_id != channel)]
+    summary = {"checked": 0, "removed": 0, "skipped": len(jobs) - len(targets)}
+    if not targets:
+        return summary
+    own = client is None
+    client = client or httpx.Client(timeout=30.0)
+    try:
+        token = access_token(client)
+        found = list_videos(client, token, [j.external_id for j in targets], part="status,snippet,statistics")
+    finally:
+        if own:
+            client.close()
+    now = datetime.utcnow()
+    for job in targets:
+        item = found.get(job.external_id)
+        summary["checked"] += 1
+        if item is None:
+            if publish_state.can_mark_removed(job, channel):
+                publish_state.mark_removed(job, now)
+                summary["removed"] += 1
+            continue
+        publish_state.apply_video(job, item, now)
+        if item.get("statistics") is not None:
+            video_stats.store(db, job, item["statistics"], now)
+    db.commit()
+    return summary
 
 
 def validate_publish_at(when: Optional[datetime]) -> Optional[datetime]:

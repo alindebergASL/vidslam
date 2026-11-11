@@ -220,7 +220,7 @@ function Inner() {
             </button>
           </div>
           <div className="mt-6">
-            <PublishPanel projectId={projectId} renderId={render.id} />
+            <PublishPanel key={render.id} projectId={projectId} renderId={render.id} />
           </div>
         </>
       )}

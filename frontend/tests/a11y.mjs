@@ -37,6 +37,8 @@ try {
 const ROUTES = [
   '/',
   '/cast',
+  '/publishing',
+  '/results',
   '/studio',
   '/projects',
   `/projects/${PID}`,

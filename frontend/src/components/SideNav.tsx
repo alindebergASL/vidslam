@@ -10,6 +10,8 @@ const items = [
   { href: "/studio", label: "Studio", icon: "✦" },
   { href: "/projects", label: "Projects", icon: "▷" },
   { href: "/ambient", label: "Ambient", icon: "∿" },
+  { href: "/publishing", label: "Publishing", icon: "⇪" },
+  { href: "/results", label: "Results", icon: "↗" },
   { href: "/cast", label: "Cast", icon: "☺" },
   { href: "/brand", label: "Brand", icon: "◆" },
   { href: "/settings", label: "Settings", icon: "⚙" },
