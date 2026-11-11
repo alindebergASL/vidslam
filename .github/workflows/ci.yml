@@ -15,18 +15,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ffmpeg
-        # The Ubuntu mirrors sometimes stop resolving for a while: short
-        # timeouts, apt's own retries, and the whole step tried again.
-        timeout-minutes: 15
-        run: |
-          APT="-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
-          for attempt in 1 2 3; do
-            if sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends ffmpeg fonts-dejavu-core; then
-              exit 0
-            fi
-            echo "apt attempt $attempt failed; retrying in 20 s"; sleep 20
-          done
-          exit 1
+        # apt first, bounded; prebuilt ffmpeg/ffprobe and DejaVu fonts from
+        # GitHub releases when the Ubuntu mirrors are unreachable.
+        timeout-minutes: 20
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/install-ffmpeg.sh"
 
       - uses: actions/setup-python@v5
         with:
@@ -72,18 +64,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ffmpeg
-        # The Ubuntu mirrors sometimes stop resolving for a while: short
-        # timeouts, apt's own retries, and the whole step tried again.
-        timeout-minutes: 15
-        run: |
-          APT="-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
-          for attempt in 1 2 3; do
-            if sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends ffmpeg fonts-dejavu-core; then
-              exit 0
-            fi
-            echo "apt attempt $attempt failed; retrying in 20 s"; sleep 20
-          done
-          exit 1
+        # apt first, bounded; prebuilt ffmpeg/ffprobe and DejaVu fonts from
+        # GitHub releases when the Ubuntu mirrors are unreachable.
+        timeout-minutes: 20
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/install-ffmpeg.sh"
 
       - uses: actions/setup-python@v5
         with:
@@ -147,18 +131,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ffmpeg
-        # The Ubuntu mirrors sometimes stop resolving for a while: short
-        # timeouts, apt's own retries, and the whole step tried again.
-        timeout-minutes: 15
-        run: |
-          APT="-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
-          for attempt in 1 2 3; do
-            if sudo apt-get $APT update && sudo apt-get $APT install -y --no-install-recommends ffmpeg fonts-dejavu-core; then
-              exit 0
-            fi
-            echo "apt attempt $attempt failed; retrying in 20 s"; sleep 20
-          done
-          exit 1
+        # apt first, bounded; prebuilt ffmpeg/ffprobe and DejaVu fonts from
+        # GitHub releases when the Ubuntu mirrors are unreachable.
+        timeout-minutes: 20
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/install-ffmpeg.sh"
 
       - uses: actions/setup-python@v5
         with:
