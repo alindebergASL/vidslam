@@ -499,7 +499,49 @@ export type StudioJob = {
   result_duration_seconds?: number | null;
   /** Ids in reference_asset_ids whose picture was deleted since. */
   missing_reference_ids?: number[];
+  /** "" = made from a prompt; else the picture operation that made it. */
+  operation?: "" | ImageOp;
+  /** The Studio picture an operation ran on ("from #12"). */
+  source_job_id?: number | null;
+  /** The Cast/ingredient picture an operation ran on. */
+  source_asset_id?: number | null;
+  /** Operation options: {} for removal, {factor: 2|4} for upscale. */
+  options?: { factor?: number } & Record<string, unknown>;
 };
+
+export type ImageOp = "remove_background" | "upscale";
+
+/** GET /api/studio/operations/estimate: cost and output size before running. */
+export type ImageOpEstimate = {
+  op: ImageOp;
+  model: string;
+  model_name: string;
+  provider: string;
+  cost_usd: number;
+  is_estimate: boolean;
+  free: boolean;
+  factor: number | null;
+  output_width: number | null;
+  output_height: number | null;
+  too_large: boolean;
+  message: string;
+};
+
+/** One model offered for a picture operation. */
+export type ImageOpModel = {
+  id: string;
+  name: string;
+  description: string;
+  provider: string;
+  price_text: string;
+  free: boolean;
+  usable: boolean;
+  factors: number[];
+  active: boolean;
+};
+
+/** Which picture an operation runs on: a Studio job or a Cast picture. */
+export type ImageOpSource = { jobId: number } | { assetId: number };
 
 /** Filters for the Studio library list. All optional and combinable; newest first. */
 export type StudioJobsQuery = {
@@ -577,6 +619,8 @@ export type VideoModelOption = {
   description: string;
   /** The model can start a clip from a picture ("Animate this"). */
   first_frame?: boolean;
+  /** Rough price in plain words ("about $0.30 per 5 s"); "" = unknown. */
+  price_text?: string;
 };
 
 export type PromptDefaults = { image: string; video: string };
@@ -1040,7 +1084,8 @@ export type StatsRefreshOut = {
 
 // --- Model catalog + runtime switching ---
 
-export type ModelKind = "chat" | "image" | "video" | "tts" | "music" | "lipsync";
+export type ModelKind =
+  | "chat" | "image" | "video" | "tts" | "music" | "lipsync" | "bg_removal" | "upscale";
 
 export type CatalogEntry = {
   id: string;
@@ -1067,6 +1112,11 @@ export type CatalogEntry = {
   also_via?: string;
   /** Short catalog note (e.g. Sogni: "Premium Spark", "first frame"). */
   notes?: string;
+  /** Rough price in plain words, when the catalog knows it. */
+  price_text?: string;
+  /** Upscale models: the factors they take (e.g. [2, 4]). */
+  factors?: number[];
+  suggested?: boolean;
 };
 
 export type ActiveModel = {
@@ -1414,7 +1464,7 @@ export const api = {
   videoModels: () => req<VideoModelOption[]>(
     "/api/providers/openrouter/video-models"
   ),
-  imageModels: () => req<{ id: string; name: string; description: string }[]>(
+  imageModels: () => req<{ id: string; name: string; description: string; price_text?: string }[]>(
     "/api/providers/openrouter/image-models"
   ),
   voices: () => req<Voice[]>("/api/providers/elevenlabs/voices"),
@@ -1915,6 +1965,27 @@ export const api = {
   },
   deleteStudioJob: (id: number) =>
     req<void>(`/api/studio/jobs/${id}`, { method: "DELETE" }),
+  /** A new Studio job: the picture with its background removed, or ×2/×4 larger. */
+  runImageOp: (
+    op: ImageOp,
+    source: ImageOpSource,
+    body: { model?: string; factor?: number } = {}
+  ) => {
+    const base = "jobId" in source ? `/api/studio/jobs/${source.jobId}` : `/api/studio/assets/${source.assetId}`;
+    const path = op === "remove_background" ? "remove-background" : "upscale";
+    const payload = op === "upscale" ? body : { model: body.model };
+    return req<StudioJob>(`${base}/${path}`, { method: "POST", body: JSON.stringify(payload) });
+  },
+  /** What an operation would cost and make (nothing is queued or billed). */
+  imageOpEstimate: (op: ImageOp, opts: { model?: string; factor?: number; source?: ImageOpSource } = {}) => {
+    const q = new URLSearchParams({ op });
+    if (opts.model) q.set("model", opts.model);
+    if (op === "upscale" && opts.factor) q.set("factor", String(opts.factor));
+    if (opts.source && "jobId" in opts.source) q.set("source_job_id", String(opts.source.jobId));
+    if (opts.source && "assetId" in opts.source) q.set("source_asset_id", String(opts.source.assetId));
+    return req<ImageOpEstimate>(`/api/studio/operations/estimate?${q}`);
+  },
+  imageOpModels: (op: ImageOp) => req<ImageOpModel[]>(`/api/studio/operations/models?op=${op}`),
 
   // cast assets (images on a character / scene)
   updateAsset: (id: number, body: { asset_type: string }) =>

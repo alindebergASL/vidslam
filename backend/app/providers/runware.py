@@ -40,6 +40,8 @@ import httpx
 
 from ..config import get_settings
 from .base import (
+    ImageOp,
+    ImageOpProvider,
     ImageProvider,
     ImageRef,
     JobStatus,
@@ -205,6 +207,12 @@ def kind_of(caps) -> Optional[str]:
         return "video"
     if c & IMAGE_CAPS:
         return "image"
+    # Picture operations (image-to-image only): Studio's "Remove background"
+    # and "Upscale".
+    if "image-to-image" in c and "remove-background" in c:
+        return "bg_removal"
+    if "image-to-image" in c and "upscale" in c:
+        return "upscale"
     return None
 
 
@@ -384,6 +392,103 @@ def image_cost_usd(model: str, megapixels: float = 2.1) -> float:
         base = _mp(str(m.get("configuration") or "")) or 1.05
         return round(float(m["price"]) * max(1.0, megapixels / base), 4)
     return get_settings().cost_image_per_item
+
+
+OP_TASKS = {"remove_background": "removeBackground", "upscale": "upscale"}
+OP_KIND_OF = {"remove_background": "bg_removal", "upscale": "upscale"}
+
+
+def _label_mp(label: Any) -> Optional[float]:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*MP", str(label or ""))
+    return float(m.group(1)) if m else None
+
+
+# Runware's size tiers ("16 MP output") and its measured prices (a 1024 x
+# 1024 input) count megapixels in powers of two: 1 MP = 1024 x 1024 pixels.
+_MP_PIXELS = 1024 * 1024
+# A size this close to a tier still counts as that tier (rounding, a few
+# pixels of padding), so a 4096 x 4096 result is the 16 MP tier, not 24.
+_TIER_SLACK = 1.02
+
+
+def op_cost_usd(model: str, op: str, *, factor: int = 2, out_megapixels: Optional[float] = None) -> float:
+    """Pre-flight estimate of one picture operation. Prices from the model's
+    schema: a flat or output-size-tiered rate per picture, a rate per output
+    megapixel, or Runware's measured price for the same upscale factor (made
+    on a ~1 MP input, so scaled up for larger pictures). `out_megapixels` is
+    width x height / 1e6 of the result."""
+    sch = schema(model, fetch=False)
+    out = _rates(sch, "output")
+    if out:
+        tiers = [(mp, float(r["amount"])) for r in out if (mp := _label_mp(r.get("label"))) is not None]
+        if tiers:
+            if out_megapixels:
+                want = out_megapixels * 1e6 / _MP_PIXELS
+                fit = sorted(t for t in tiers if t[0] * _TIER_SLACK >= want)
+                return round(fit[0][1] if fit else max(a for _, a in tiers), 4)
+            return round(min(a for _, a in tiers), 4)
+        return round(float(out[0]["amount"]), 4)
+    per_mp = _rates(sch, "outputMegapixel")
+    if per_mp:
+        mp = out_megapixels or (1.05 * factor * factor if op == "upscale" else 1.05)
+        return round(float(per_mp[0]["amount"]) * mp, 4)
+    measured = [m for m in ((sch or {}).get("pricing") or {}).get("measured") or []
+                if isinstance(m.get("price"), (int, float))]
+    if measured:
+        if op != "upscale":
+            return round(float(measured[0]["price"]), 4)
+        # How many ~1 MP inputs this picture is (never less than one).
+        size = 1.0
+        if out_megapixels:
+            size = out_megapixels * 1e6 / _MP_PIXELS / (factor * factor)
+            size = 1.0 if size <= _TIER_SLACK else size
+
+        def fac(m: dict) -> Optional[int]:
+            hit = re.search(r"upscaleFactor\s*(\d+)", str(m.get("configuration") or ""))
+            return int(hit.group(1)) if hit else None
+        same = [m for m in measured if fac(m) == factor]
+        if same:
+            return round(float(same[0]["price"]) * size, 4)
+        base = measured[0]
+        bf = fac(base) or 2
+        return round(float(base["price"]) * (factor / bf) ** 2 * size, 4)
+    return get_settings().cost_image_per_item
+
+
+def upscale_factors(model: str) -> list[int]:
+    """Which of ×2 and ×4 the model takes (both when its schema isn't known
+    yet, or when it has no factor setting)."""
+    sch = schema(model, fetch=False)
+    spec = _props(sch).get("upscaleFactor") if sch else None
+    if not isinstance(spec, dict):
+        return [2, 4]
+    return [f for f in (2, 4) if _allowed(spec, f)]
+
+
+def input_limits(model: str) -> dict:
+    """The most the model takes as its input picture: {"area", "width",
+    "height"} in pixels (missing = no limit), from its schema."""
+    sch = schema(model, fetch=False)
+    out: dict = {}
+    for c in ((sch or {}).get("request") or {}).get("x-constraints") or []:
+        if "inputs.image" in (c.get("parameters") or []) and isinstance(c.get("maximum"), (int, float)):
+            if c.get("operation") in ("area", "width", "height"):
+                out[c["operation"]] = int(c["maximum"])
+    return out
+
+
+def fit_to_limits(width: int, height: int, limits: dict) -> tuple[int, int]:
+    """(w, h) scaled down (aspect kept) to fit the model's input limits."""
+    scale = 1.0
+    if limits.get("area") and width * height > limits["area"]:
+        scale = min(scale, math.sqrt(limits["area"] / (width * height)))
+    if limits.get("width") and width > limits["width"]:
+        scale = min(scale, limits["width"] / width)
+    if limits.get("height") and height > limits["height"]:
+        scale = min(scale, limits["height"] / height)
+    if scale >= 1.0:
+        return width, height
+    return max(1, int(width * scale)), max(1, int(height * scale))
 
 
 def video_resolution() -> str:
@@ -728,6 +833,47 @@ def build_image_task(model: str, prompt: str, references: list[ImageRef], *, neg
     return _choose(sch, bases, variants, display_name(model))
 
 
+_DATA_URI_PLACEHOLDER = "data:image/png;base64,iVBORw0KGgo="
+
+
+def build_operation_task(model: str, op: ImageOp, image_bytes: bytes, mime: str, options: Optional[dict] = None,
+                         *, keep_alpha: bool = False) -> dict:
+    """The removeBackground / upscale task for one picture (validated). The
+    picture goes inline as a data URI, so it needs no public URL. Removal
+    always comes back as PNG (keeps the transparency); an upscale as PNG
+    when the picture has transparency (`keep_alpha`), else JPG."""
+    import base64
+
+    if op not in OP_TASKS:
+        raise RunwareError(f"unknown picture operation {op!r}")
+    a = air(model)
+    sch = schema(model)
+    if sch is None:
+        raise RunwareError(f"{a} isn't in Runware's model list")
+    if kind_of(sch.get("capabilities")) != OP_KIND_OF[op]:
+        raise RunwareError(f"{display_name(model)} can't {'remove backgrounds' if op == 'remove_background' else 'upscale'}")
+    props = _props(sch)
+    task: dict = {"taskType": OP_TASKS[op], "taskUUID": str(uuid.uuid4()), "model": a,
+                  "inputs": {"image": _DATA_URI_PLACEHOLDER}}
+    for key, value in (("includeCost", True), ("outputType", "URL"), ("deliveryMethod", "sync")):
+        if key in props:
+            _put(task, props, (key,), value)
+    fmt = "PNG" if op == "remove_background" or keep_alpha else "JPG"
+    if "outputFormat" in props and not _put(task, props, ("outputFormat",), fmt) and fmt == "PNG":
+        raise RunwareError(f"{display_name(model)} can't return a PNG, so the transparency would be lost")
+    if fmt == "JPG" and "outputQuality" in props:
+        _put(task, props, ("outputQuality",), 95)
+    if op == "upscale":
+        factor = int((options or {}).get("factor") or 2)
+        if "upscaleFactor" in props and not _put(task, props, ("upscaleFactor",), factor):
+            raise RunwareError(f"{display_name(model)} can't upscale ×{factor}; pick another factor or model")
+    err = schema_error(sch, task)
+    if err:
+        raise RunwareError(f"Couldn't build a valid request for {display_name(model)}: {err}")
+    task["inputs"]["image"] = f"data:{mime or 'image/png'};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+    return task
+
+
 def _frames(refs: list[ImageRef], strategy: str) -> tuple[Optional[ImageRef], Optional[ImageRef]]:
     first = last = None
     if strategy == "frame_images":
@@ -1060,6 +1206,11 @@ def _guard(prompt: str) -> None:
     """Before any paid request: stop once the monthly budget's hard cap is
     reached (a batch of jobs would otherwise keep spending past it). The
     minors check runs on the exact text sent (_content_check)."""
+    _budget_guard()
+
+
+def _budget_guard() -> None:
+    """The monthly budget's hard cap, before any paid request."""
     from ..db import SessionLocal
     from ..services import spend
 
@@ -1131,6 +1282,9 @@ def catalog_entries(usable: bool) -> list[dict]:
                    "description": ("Runware-hosted open weights: no vendor moderation." if open_ else
                                    "Runs on the vendor's API through Runware (the vendor moderates it)."),
                    "uncensored": open_, "suggested": a in curated, "usable": usable}
+        if kind in OP_KIND_OF.values():
+            out.append(_op_entry(a, model, kind, name, sch, a in curated, usable))
+            continue
         if kind == "image":
             usd = image_cost_usd(model) if sch else None
             e["notes"] = " · ".join(x for x in (tag, f"~${usd:.3f} per image" if usd else "") if x)
@@ -1154,6 +1308,47 @@ def catalog_entries(usable: bool) -> list[dict]:
                       "pricing_skus": {}, "price_per_second": rate})
         out.append(e)
     return out
+
+
+# Plain-language notes for the curated picture-operation models.
+_OP_NOTES = {
+    "runware:112@5": "Cheap and good for most pictures.",
+    "runware:109@1": "Cheap; an older remover.",
+    "bria:2@1": "Cleanest edges (hair, fur); costs more.",
+    "runware:504@1": "Cheap and sharp, ×2 or ×4.",
+    "runware:500@1": "Adds fine detail by redrawing; slower.",
+    "topazlabs:wonder@4": "Top quality; priced by output size.",
+}
+
+
+def _op_entry(a: str, model: str, kind: str, name: str, sch: Optional[dict], suggested: bool,
+              usable: bool) -> dict:
+    """A picture-operation model for Settings → Models and Studio's picker,
+    priced for a 1 MP (1024 × 1024) picture."""
+    from ..services.prices import money
+
+    e: dict = {"id": model, "kind": kind, "name": name, "provider": "runware",
+               "description": _OP_NOTES.get(a) or ("Removes the background, keeping transparency."
+                                                   if kind == "bg_removal" else "Makes the picture larger."),
+               "uncensored": False, "suggested": suggested, "usable": usable}
+    if kind == "bg_removal":
+        usd = op_cost_usd(model, "remove_background", out_megapixels=1.05) if sch else None
+        e["pricing"] = {"image": usd} if usd else {}
+        e["price_text"] = f"about {money(usd)} per picture" if usd else ""
+        e["notes"] = f"~{money(usd)} per picture" if usd else ""
+        return e
+    factors = upscale_factors(model)
+    e["factors"] = factors
+    prices = {f"x{f}": op_cost_usd(model, "upscale", factor=f, out_megapixels=1.05 * f * f)
+              for f in factors} if sch else {}
+    e["pricing"] = prices
+    if prices:
+        bits = [f"~{money(v)} ×{k[1:]}" for k, v in prices.items()]
+        e["notes"] = " · ".join(bits) + " (1 MP picture)"
+        e["price_text"] = "about " + ", ".join(f"{money(v)} for ×{k[1:]}" for k, v in prices.items())
+    else:
+        e["notes"], e["price_text"] = "", ""
+    return e
 
 
 def _model_infos(kind: str) -> list[ModelInfo]:
@@ -1208,6 +1403,114 @@ class RunwareImageProvider(ImageProvider):
         if row.get("NSFWContent") is not None:
             log.info("runware %s: NSFWContent=%s", air(model), row.get("NSFWContent"))
         return RunwareClient.download(url)
+
+
+def _prepared_input(model: str, image_bytes: bytes, mime: str) -> tuple[bytes, str, int, int, bool]:
+    """The picture as it will be sent: scaled down to the model's input
+    limits, and a large opaque PNG re-encoded as JPEG (a smaller request).
+    Returns (bytes, mime, width, height, has_alpha)."""
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(image_bytes)) as img:
+        img.load()
+        alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+        w, h = img.size
+        tw, th = fit_to_limits(w, h, input_limits(model))
+        big_png = not alpha and (mime or "").lower() == "image/png" and len(image_bytes) > 4_000_000
+        if (tw, th) == (w, h) and not big_png:
+            return image_bytes, mime or "image/png", w, h, alpha
+        out = img.convert("RGBA" if alpha else "RGB")
+        if (tw, th) != (w, h):
+            out = out.resize((tw, th), Image.LANCZOS)
+    buf = io.BytesIO()
+    if alpha:
+        out.save(buf, format="PNG")
+        return buf.getvalue(), "image/png", tw, th, True
+    out.save(buf, format="JPEG", quality=95)
+    return buf.getvalue(), "image/jpeg", tw, th, False
+
+
+def keeps_transparency(model: str) -> bool:
+    """Whether the model says it returns transparent pictures (Runware's
+    'transparency' capability: the background removers do, upscalers don't)."""
+    sch = schema(model, fetch=False)
+    return "transparency" in ((sch or {}).get("capabilities") or [])
+
+
+def restore_alpha(source: bytes, result: bytes) -> bytes:
+    """`result` (an upscale of `source`) with `source`'s transparency put
+    back: an upscaler that ignores the alpha channel fills the cut-out
+    background in, so the alpha is enlarged here (Lanczos) to the result's
+    size and applied. A result that already has transparency is kept."""
+    import io
+
+    from PIL import Image
+
+    with Image.open(io.BytesIO(source)) as src:
+        src.load()
+        alpha = src.convert("RGBA").getchannel("A")
+    with Image.open(io.BytesIO(result)) as res:
+        res.load()
+        if res.mode in ("RGBA", "LA", "P") and "A" in res.convert("RGBA").getbands():
+            lo, _hi = res.convert("RGBA").getchannel("A").getextrema()
+            if lo < 255:
+                return result
+        out = res.convert("RGBA")
+    out.putalpha(alpha.resize(out.size, Image.LANCZOS))
+    buf = io.BytesIO()
+    out.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class RunwareImageOpProvider(ImageOpProvider):
+    """removeBackground / upscale on one picture, synchronous (polls if
+    Runware is still working).
+
+    Cast pictures are allowed here without Runware's content check (these
+    models have none): the operation makes nothing new from a prompt, it
+    only cuts out or enlarges the user's own picture, so the rule that a
+    Cast likeness is only sent with the check on (_bases) doesn't apply."""
+
+    def __init__(self, *, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
+        self.client = RunwareClient(api_key)
+        self.model = model or ""
+
+    def run(self, op: ImageOp, model: str, image_bytes: bytes, mime: str, options: dict) -> bytes:
+        model = model or self.model
+        _budget_guard()
+        data, mime, w, h, alpha = _prepared_input(model, image_bytes, mime)
+        factor = int((options or {}).get("factor") or 2) if op == "upscale" else 1
+        task = build_operation_task(model, op, data, mime, options, keep_alpha=alpha)
+        estimate = op_cost_usd(model, op, factor=factor, out_megapixels=w * h * factor * factor / 1e6)
+        label = "remove background" if op == "remove_background" else "upscale"
+        from ..services import spend
+
+        try:
+            row = self.client.run(task, timeout=get_settings().runware_image_timeout_seconds)
+        except RunwareError as e:
+            if e.pending:
+                spend.record(provider="runware", kind="image", model=model, cost=estimate, is_estimate=True,
+                             source="rate_card", generation_id=task["taskUUID"],
+                             note=f"{label}; didn't finish in time, Runware may still bill it")
+            raise
+        cost = row.get("cost")
+        if isinstance(cost, (int, float)):
+            spend.record(provider="runware", kind="image", model=model, cost=float(cost),
+                         generation_id=task["taskUUID"], note=label)
+        else:
+            spend.record(provider="runware", kind="image", model=model, cost=estimate, is_estimate=True,
+                         source="rate_card", generation_id=task["taskUUID"],
+                         note=f"{label}; Runware reported no cost")
+        url = row.get("imageURL")
+        if not url:
+            raise RunwareError(f"Runware returned no picture for {air(model)}")
+        result = RunwareClient.download(url)
+        if alpha and op == "upscale" and not keeps_transparency(model):
+            # Upscalers don't list 'transparency': keep a cut-out a cut-out.
+            result = restore_alpha(data, result)
+        return result
 
 
 class RunwareVideoProvider(VideoProvider):
@@ -1333,6 +1636,16 @@ def smoke_build(model: str) -> Optional[str]:
         tries.append(lambda: build_video_task(model, "rain falls on a quiet street", [pic],
                                               reference_strategy="frame_images", duration_seconds=5,
                                               check_content=False))
+    elif kind in OP_KIND_OF.values():
+        import io
+
+        from PIL import Image
+
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 64), (90, 120, 150)).save(buf, format="PNG")
+        op = "remove_background" if kind == "bg_removal" else "upscale"
+        tries.append(lambda: build_operation_task(model, op, buf.getvalue(), "image/png",
+                                                  {"factor": (upscale_factors(model) or [2])[0]}))
     else:
         return "not an image or video model"
     err = None

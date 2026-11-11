@@ -1,11 +1,12 @@
 "use client";
-import { useEffect, useId, useRef } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import clsx from "clsx";
 import type { Asset, StudioJob } from "@/lib/api";
 import { costText, studioStatusLabel } from "@/components/StudioLibrary";
 import { downloadFile, extFromMime, extFromPath } from "@/lib/download";
 import { useToast } from "@/components/Toaster";
+import { sourceChipText } from "@/components/ImageOps";
 
 /** One thing the viewer can show: a Studio result or a cast picture. */
 export type ViewerItem = {
@@ -40,7 +41,22 @@ export type ViewerActions = {
   /** Cast pictures: add to / remove from the prompt bar's references. */
   onToggleRef?: (assetId: number) => void;
   isRef?: (assetId: number) => boolean;
+  /** Finished pictures (Studio or Cast): remove the background now. */
+  onRemoveBackground?: (item: ViewerItem) => void;
+  /** "Remove background · about $X". */
+  removeBackgroundLabel?: string;
+  /** Finished pictures: open the Upscale dialog. */
+  onUpscale?: (item: ViewerItem) => void;
+  /** Operation results: the picture it was made from (null = gone or unknown). */
+  sourceUrl?: (job: StudioJob) => string | null;
+  /** Operation results: show the picture it was made from. */
+  onOpenSource?: (job: StudioJob) => void;
 };
+
+/** Transparent pictures (cutouts) get a checkerboard behind them. */
+export function mayBeTransparent(item: { job?: StudioJob; asset?: Asset }): boolean {
+  return item.job?.operation === "remove_background" || item.asset?.mime_type === "image/png";
+}
 
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), video[controls], [tabindex]:not([tabindex="-1"])';
@@ -102,6 +118,9 @@ export function StudioViewer({
   const closeRef = useRef<HTMLButtonElement>(null);
   const swipe = useRef<{ x: number; y: number } | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [compare, setCompare] = useState(false);
+  // An original that wouldn't load (deleted since): no Compare for it.
+  const [brokenOriginal, setBrokenOriginal] = useState<string | null>(null);
   // The key shown now, for returning focus to its tile on close.
   const keyRef = useRef(openKey);
   keyRef.current = openKey;
@@ -190,6 +209,9 @@ export function StudioViewer({
     });
   }, [openKey]);
 
+  // Each result opens on its own; Compare is per result.
+  useEffect(() => setCompare(false), [openKey]);
+
   // Warm the neighbours so stepping through pictures is instant.
   useEffect(() => {
     for (const n of [prev, next]) {
@@ -208,6 +230,12 @@ export function StudioViewer({
   const finished = item.status === "completed" || item.status === "saved";
   const cost = job ? costText(job) : null;
   const act = "chip text-xs py-1.5";
+  const checker = mayBeTransparent(item);
+  const fromText = job ? sourceChipText(job) : null;
+  const sourceOf = job?.operation && finished && actions.sourceUrl ? actions.sourceUrl(job) : null;
+  const originalUrl = sourceOf && sourceOf !== brokenOriginal ? sourceOf : null;
+  const showCompare = compare && Boolean(originalUrl) && Boolean(item.imageUrl);
+  const isPicture = !isVideo && Boolean(item.imageUrl) && (item.kind === "asset" || finished);
   // Closing first keeps a dialog the action opens on top, and Remix shows
   // the prompt bar it filled.
   const closeThen = (fn: () => void) => () => {
@@ -325,12 +353,40 @@ export function StudioViewer({
             playsInline
             aria-label={item.label}
           />
+        ) : showCompare ? (
+          <div className="w-full h-full flex flex-col sm:flex-row gap-2 min-h-0">
+            {[
+              { src: originalUrl!, cap: "Original", tr: false },
+              { src: item.imageUrl!, cap: "Result", tr: checker },
+            ].map((p) => (
+              <figure key={p.cap} className="flex-1 min-h-0 min-w-0 flex flex-col items-center gap-1">
+                <div className="flex-1 min-h-0 w-full flex items-center justify-center">
+                  <img
+                    src={p.src}
+                    alt={`${p.cap}: ${item.label}`}
+                    className={clsx("max-w-full max-h-full object-contain select-none", p.tr && "checker")}
+                    draggable={false}
+                    onError={
+                      p.cap === "Original"
+                        ? () => {
+                            setBrokenOriginal(p.src);
+                            setCompare(false);
+                            toast.info("The original was deleted", { key: "original-gone" });
+                          }
+                        : undefined
+                    }
+                  />
+                </div>
+                <figcaption className="text-[11px] text-ink-300">{p.cap}</figcaption>
+              </figure>
+            ))}
+          </div>
         ) : item.imageUrl ? (
           <img
             key={item.key}
             src={item.imageUrl}
             alt={item.label}
-            className="max-w-full max-h-full object-contain select-none"
+            className={clsx("max-w-full max-h-full object-contain select-none", checker && "checker")}
             draggable={false}
           />
         ) : (
@@ -365,6 +421,20 @@ export function StudioViewer({
               {d}
             </span>
           ))}
+          {job && fromText && (
+            actions.onOpenSource && (job.source_job_id || job.source_asset_id) ? (
+              <button
+                type="button"
+                onClick={() => actions.onOpenSource!(job)}
+                className="underline underline-offset-2 hover:text-ink-100"
+                title="Show the picture this was made from"
+              >
+                {fromText}
+              </button>
+            ) : (
+              <span>{fromText}</span>
+            )
+          )}
         </div>
         {job?.prompt && <p className="text-sm whitespace-pre-wrap break-words">{job.prompt}</p>}
         {job?.negative_prompt && (
@@ -396,7 +466,35 @@ export function StudioViewer({
               Assign to…
             </button>
           )}
-          {job && finished && (
+          {originalUrl && item.imageUrl && (
+            <button
+              onClick={() => setCompare((v) => !v)}
+              aria-pressed={compare}
+              className={clsx(act, compare && "chip-active")}
+              title="Show the original next to this result"
+            >
+              Compare with original
+            </button>
+          )}
+          {isPicture && actions.onRemoveBackground && (
+            <button
+              onClick={closeThen(() => actions.onRemoveBackground!(item))}
+              className={act}
+              title="Make a copy with the background cut out (transparent PNG); the original stays"
+            >
+              {actions.removeBackgroundLabel || "Remove background"}
+            </button>
+          )}
+          {isPicture && actions.onUpscale && (
+            <button
+              onClick={closeThen(() => actions.onUpscale!(item))}
+              className={act}
+              title="Make a larger copy (×2 or ×4); the price shows before it runs"
+            >
+              Upscale…
+            </button>
+          )}
+          {job && finished && !job.operation && (
             <button
               onClick={closeThen(() => actions.onRemix(job))}
               className={act}

@@ -197,6 +197,9 @@ def delete_asset(asset_id: int, db: Session = Depends(get_db)) -> None:
     db.delete(a)
     db.commit()
     if path and not shared:
+        from ..services.storage import drop_reference_copy
+
+        drop_reference_copy(Path(path))
         try:
             Path(path).unlink(missing_ok=True)
         except OSError:
@@ -212,7 +215,7 @@ def asset_preview(asset_id: int, db: Session = Depends(get_db)) -> FileResponse:
 
 
 @router.get("/public-assets/{token}")
-def public_asset(token: str, db: Session = Depends(get_db)):
+def public_asset(token: str, ref: bool = False, db: Session = Depends(get_db)):
     """Tokenized, unauthenticated public asset URL exposed to providers as
     reference images.
 
@@ -228,6 +231,16 @@ def public_asset(token: str, db: Session = Depends(get_db)):
     from fastapi.responses import RedirectResponse
 
     from ..services.s3 import presigned_url_for
+    from ..services.storage import reference_copy
+
+    # `?ref=1` is the URL handed to providers (storage.public_url_for_token):
+    # a big picture (e.g. a 4× upscale saved to the Cast) goes to them as a
+    # scaled-down copy. The app's own views and downloads (no flag) get the
+    # stored picture at full size.
+    if ref and (a.mime_type or "").startswith("image/") and Path(a.file_path).exists():
+        small = reference_copy(Path(a.file_path))
+        if small != Path(a.file_path):
+            return FileResponse(small, media_type=a.mime_type)
 
     presigned = presigned_url_for(Path(a.file_path), content_type=a.mime_type)
     if presigned is not None:

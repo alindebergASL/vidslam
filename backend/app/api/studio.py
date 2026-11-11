@@ -17,6 +17,8 @@ from ..schemas.api import (
     CharacterSheetOut,
     CharacterSheetRequest,
     CharacterSheetView,
+    ImageOpEstimateOut,
+    ImageOpModelOut,
     StudioBulkDeleteOut,
     StudioBulkFavorite,
     StudioBulkFavoriteOut,
@@ -24,14 +26,18 @@ from ..schemas.api import (
     StudioBulkSave,
     StudioBulkSaveOut,
     StudioJobUpdate,
+    StudioRemoveBackgroundRequest,
     StudioRetryRequest,
     StudioSaveRequest,
     StudioSkipped,
+    StudioUpscaleRequest,
 )
 from ..services import provider_gate
+from ..services.model_registry import LOCAL_PREFIX
 from ..services.pipeline import STUDIO_DELETED, save_studio_result_as_asset
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
+from ..services.storage import drop_reference_copy
 from ..workers.jobs import generate_asset_job
 from ..workers.queue import enqueue
 from .auth import require_auth
@@ -440,6 +446,7 @@ def _remove_files(db: Session, paths: list[str]) -> None:
     for p in paths:
         if db.query(models.Asset).filter(models.Asset.file_path == p).first():
             continue
+        drop_reference_copy(Path(p))
         try:
             Path(p).unlink(missing_ok=True)
         except OSError:
@@ -513,7 +520,7 @@ def bulk_favorite(body: StudioBulkFavorite, db: Session = Depends(get_db)) -> St
 
 
 @router.post("/jobs/{job_id}/retry", response_model=StudioJobOut, status_code=202,
-             dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
+             dependencies=[Depends(rate_limit("generation"))])
 def retry_job(job_id: int, body: Optional[StudioRetryRequest] = Body(None),
               db: Session = Depends(get_db)) -> StudioJobOut:
     """Run a job again as a new job (failed or completed alike), with any
@@ -524,6 +531,17 @@ def retry_job(job_id: int, body: Optional[StudioRetryRequest] = Body(None),
     body = body or StudioRetryRequest()
     if not _owner_exists(db, src.owner_kind, src.owner_id):
         raise HTTPException(404, "owner not found")
+    if src.operation:
+        # Runs the same operation again on the same picture (the prompt,
+        # avoid text and aspect don't apply); a model given replaces it.
+        from ..services import image_ops
+
+        if src.source_job_id is None and src.source_asset_id is None:
+            raise HTTPException(404, "The original picture was deleted")
+        return _queue_operation(db, src.operation, body.model or src.provider_model or None,
+                                image_ops.factor_of(src), source_job_id=src.source_job_id,
+                                source_asset_id=src.source_asset_id, label=src.label or None)
+    budget_guard()
     model = body.model or src.provider_model or ""
     provider_gate.require_model("image" if src.output_kind == "image" else "video", model or None, db)
     _check_first_frame(db, src.output_kind, model or None, src.first_frame_job_id, src.first_frame_asset_id)
@@ -644,3 +662,99 @@ def character_sheet(body: CharacterSheetRequest, db: Session = Depends(get_db)) 
         for view in body.views
     ])
     return CharacterSheetOut(batch_ids=[j.id for j in jobs], jobs=_with_costs(db, jobs))
+
+
+# ---------- picture operations: remove background, upscale ----------
+
+
+def _queue_operation(db: Session, op: str, model: Optional[str], factor: int, *,
+                     source_job_id: Optional[int] = None, source_asset_id: Optional[int] = None,
+                     label: Optional[str] = None) -> StudioJobOut:
+    """Check and queue one operation job; it lands in Studio as a new
+    pending tile owned by the source's owner."""
+    from ..services import image_ops
+
+    try:
+        job = image_ops.new_job(db, op, model, factor, source_job_id=source_job_id,
+                                source_asset_id=source_asset_id, label=label)
+    except image_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+    if not _owner_exists(db, job.owner_kind, job.owner_id):
+        raise HTTPException(404, "owner not found")
+    # The free upscale costs nothing, so the monthly cap doesn't stop it (the
+    # rate limit still applies: it uses this machine's CPU).
+    if not (job.provider_model or "").startswith(LOCAL_PREFIX):
+        budget_guard()
+    _enqueue_jobs(db, [job])
+    out = _with_costs(db, [job])[0]
+    out.batch_ids = [job.id]
+    return out
+
+
+@router.post("/jobs/{job_id}/remove-background", response_model=StudioJobOut, status_code=202,
+             dependencies=[Depends(rate_limit("generation"))])
+def remove_background_job(job_id: int, body: Optional[StudioRemoveBackgroundRequest] = Body(None),
+                          db: Session = Depends(get_db)) -> StudioJobOut:
+    """A new job: this finished Studio picture with its background removed
+    (transparent PNG)."""
+    body = body or StudioRemoveBackgroundRequest()
+    return _queue_operation(db, "remove_background", body.model or None, 1, source_job_id=job_id)
+
+
+@router.post("/jobs/{job_id}/upscale", response_model=StudioJobOut, status_code=202,
+             dependencies=[Depends(rate_limit("generation"))])
+def upscale_job(job_id: int, body: Optional[StudioUpscaleRequest] = Body(None),
+                db: Session = Depends(get_db)) -> StudioJobOut:
+    """A new job: this finished Studio picture ×2 or ×4 larger."""
+    body = body or StudioUpscaleRequest()
+    return _queue_operation(db, "upscale", body.model or None, body.factor, source_job_id=job_id)
+
+
+@router.post("/assets/{asset_id}/remove-background", response_model=StudioJobOut, status_code=202,
+             dependencies=[Depends(rate_limit("generation"))])
+def remove_background_asset(asset_id: int, body: Optional[StudioRemoveBackgroundRequest] = Body(None),
+                            db: Session = Depends(get_db)) -> StudioJobOut:
+    """A Cast (or ingredient) picture with its background removed; the
+    result is a Studio job owned by that cast member."""
+    body = body or StudioRemoveBackgroundRequest()
+    return _queue_operation(db, "remove_background", body.model or None, 1, source_asset_id=asset_id)
+
+
+@router.post("/assets/{asset_id}/upscale", response_model=StudioJobOut, status_code=202,
+             dependencies=[Depends(rate_limit("generation"))])
+def upscale_asset(asset_id: int, body: Optional[StudioUpscaleRequest] = Body(None),
+                  db: Session = Depends(get_db)) -> StudioJobOut:
+    """A Cast (or ingredient) picture ×2 or ×4 larger, as a Studio job."""
+    body = body or StudioUpscaleRequest()
+    return _queue_operation(db, "upscale", body.model or None, body.factor, source_asset_id=asset_id)
+
+
+@router.get("/operations/estimate", response_model=ImageOpEstimateOut)
+def operation_estimate(
+    op: Literal["remove_background", "upscale"],
+    model: Optional[str] = Query(None, max_length=300),
+    factor: int = Query(2, description="2 or 4 (upscale only)"),
+    source_job_id: Optional[int] = None,
+    source_asset_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+) -> ImageOpEstimateOut:
+    """Rough cost and output size of a run, before it runs (nothing is
+    queued or billed). Without a source the price is for a 1 MP picture."""
+    from ..services import image_ops
+
+    if source_job_id is not None and source_asset_id is not None:
+        raise HTTPException(422, "Pick one picture, not two")
+    try:
+        return ImageOpEstimateOut(**image_ops.estimate(
+            db, op, model or None, int(factor), source_job_id=source_job_id, source_asset_id=source_asset_id))
+    except image_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+
+
+@router.get("/operations/models", response_model=list[ImageOpModelOut])
+def operation_models(op: Literal["remove_background", "upscale"]) -> list[ImageOpModelOut]:
+    """The models offered for an operation, each with its price in plain
+    words (Try another model, the Upscale dialog)."""
+    from ..services import image_ops
+
+    return [ImageOpModelOut(**m) for m in image_ops.models_for(op)]

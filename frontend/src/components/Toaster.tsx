@@ -14,7 +14,8 @@ export type Toast = {
   key?: string;
 };
 
-export type ToastAction = { label: string; href: string };
+/** A link, or (without href) a button that runs onClick. */
+export type ToastAction = { label: string; href?: string; onClick?: () => void };
 
 export type ToastOpts = {
   duration?: number;
@@ -117,7 +118,7 @@ function Toaster({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: numbe
             {t.kind === "success" ? "✓" : t.kind === "error" ? "✕" : "•"}
           </span>
           <span className="flex-1 min-w-0 wrap-break-word">{t.message}</span>
-          {t.action && (
+          {t.action && t.action.href && (
             <Link
               href={t.action.href}
               aria-label={`${t.action.label}: ${t.message}`}
@@ -126,6 +127,19 @@ function Toaster({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: numbe
             >
               {t.action.label}
             </Link>
+          )}
+          {t.action && !t.action.href && t.action.onClick && (
+            <button
+              type="button"
+              aria-label={`${t.action.label}: ${t.message}`}
+              className="shrink-0 text-xs font-medium underline underline-offset-2 hover:text-white"
+              onClick={() => {
+                onDismiss(t.id);
+                t.action?.onClick?.();
+              }}
+            >
+              {t.action.label}
+            </button>
           )}
           <button
             className="text-ink-300 hover:text-white text-xs leading-none mt-0.5"

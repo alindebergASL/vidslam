@@ -11,6 +11,7 @@ import { useContentMode } from "@/components/AdultModePanel";
 // Model kinds (as the API names them) in the words the Models panel uses.
 const KIND_LABEL: Record<string, string> = {
   chat: "planner", image: "image", video: "video", tts: "voice", music: "music", lipsync: "lip-sync",
+  bg_removal: "remove background", upscale: "upscale",
 };
 
 const SOURCE_CHIP: Record<ApiKeyStatus["source"], { text: string; cls: string }> = {

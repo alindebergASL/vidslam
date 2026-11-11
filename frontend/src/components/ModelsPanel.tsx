@@ -12,6 +12,8 @@ const KINDS: { id: ModelKind; label: string; hint: string }[] = [
   { id: "tts", label: "Voice", hint: "Voiceovers. ElevenLabs, or an OpenRouter speech / gpt-audio model." },
   { id: "music", label: "Music", hint: "Music beds. ElevenLabs, or Google Lyria — Lyria 3 Pro / Clip through OpenRouter (same key), Lyria 3.5 through Google (GEMINI_API_KEY)." },
   { id: "lipsync", label: "Lip-sync", hint: "Talking-head shots from the avatar's photo + voiceover. Off = regular video model." },
+  { id: "bg_removal", label: "Remove background", hint: "Cuts the subject out of a Studio or Cast picture (transparent PNG). Runware models need a Runware key." },
+  { id: "upscale", label: "Upscale", hint: "Makes a Studio or Cast picture ×2 or ×4 larger. Runware models need a Runware key; Basic upscale is free and runs here (no AI)." },
 ];
 
 const PROVIDER_LABEL: Record<string, string> = {
@@ -23,6 +25,7 @@ const PROVIDER_LABEL: Record<string, string> = {
   unavailable: "nobody: its provider is switched off",
   replicate: "Replicate",
   mock: "mock",
+  local: "this server (free)",
   off: "off",
 };
 
@@ -36,6 +39,7 @@ function ago(iso: string | null): string {
 }
 
 function priceChip(e: CatalogEntry): string | null {
+  if (e.price_text) return e.price_text;
   const p = e.pricing || {};
   if (p.prompt || p.completion) {
     const m = (x?: number) => (x ? `$${(x * 1e6).toFixed(x * 1e6 < 1 ? 2 : 1)}` : "—");
@@ -64,6 +68,7 @@ function chips(e: CatalogEntry): string[] {
     out.push(e.supported_parameters.includes("response_format") ? "JSON mode" : "plain JSON");
   if (e.supported_voices?.length) out.push(`${e.supported_voices.length} voices`);
   if (e.also_via === "gemini") out.push("also via Google");
+  if (e.factors?.length) out.push(e.factors.map((f) => `×${f}`).join(" / "));
   if (e.kind === "tts" && e.output_modalities?.includes("audio") && !e.output_modalities.includes("speech"))
     out.push("chat audio");
   const price = priceChip(e);

@@ -1921,7 +1921,7 @@ def studio_first_frame(db: Session, job: models.AssetGenerationJob) -> Optional[
             raise ValueError("the picture this clip starts from was deleted")
         from . import public_media
 
-        return ImageRef(url=public_media.publish(Path(src.result_path)), role="scene",
+        return ImageRef(url=public_media.publish(storage.reference_copy(Path(src.result_path))), role="scene",
                         name="first frame", frame_type="first_frame")
     if job.first_frame_asset_id:
         asset = db.get(models.Asset, job.first_frame_asset_id)
@@ -1936,6 +1936,54 @@ def _studio_job_deleted(db: Session, job_id: int) -> bool:
     status = db.query(models.AssetGenerationJob.status).filter(
         models.AssetGenerationJob.id == job_id).scalar()
     return status is None or status == STUDIO_DELETED
+
+
+def _finish_studio_image(db: Session, job: models.AssetGenerationJob, data: bytes, *,
+                         sized: bool = False) -> models.AssetGenerationJob:
+    """Store a finished picture for a Studio job and complete it. Deleted
+    in Studio while the provider worked: the picture is dropped (it was
+    still billed). The write is conditional too, so a delete or cancel in
+    between can't be undone by this result. `sized` also records the
+    picture's real size (operation results: cutouts and upscales)."""
+    if _studio_job_deleted(db, job.id):
+        db.rollback()
+        return job
+    ext, _mime, w, h = storage.image_info(data)
+    path = storage.save_generated_bytes(data, extension=ext, subdir_name="images")
+    values = {"result_path": str(path), "status": "completed",
+              "provider": job.provider, "provider_model": job.provider_model}
+    if sized and w and h:
+        values.update(result_width=w, result_height=h)
+    done = db.query(models.AssetGenerationJob).filter(
+        models.AssetGenerationJob.id == job.id,
+        models.AssetGenerationJob.status.in_(STUDIO_RUNNING),
+    ).update(values, synchronize_session=False)
+    if done:
+        events.studio_event(db, job, "completed")
+    db.commit()
+    if not done:
+        Path(path).unlink(missing_ok=True)
+    db.refresh(job)
+    return job
+
+
+def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerationJob:
+    """Remove the background of, or upscale, the job's source picture (a
+    Studio result or a Cast picture). No prompt, so no safety check: the
+    operation makes nothing new, it only cuts out or enlarges."""
+    from ..providers import get_image_op
+    from . import image_ops
+    from . import model_registry as reg
+
+    kind = image_ops.kind_for(job.operation)
+    model = job.provider_model or reg.active_model(kind)
+    provider = get_image_op(kind, model)
+    job.provider = reg.provider_for(kind, model)
+    job.provider_model = model
+    db.commit()
+    raw, mime = image_ops.load_source(db, job)
+    data = provider.run(job.operation, model, raw, mime, dict(job.options_json or {}))  # type: ignore[arg-type]
+    return _finish_studio_image(db, job, data, sized=True)
 
 
 def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
@@ -1957,6 +2005,8 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
         log.info("studio job %s is %s; not starting it", job_id, job.status)
         return job
     try:
+        if job.operation:
+            return _run_studio_operation(db, job)
         # The user's order, each with its role and name (an ingredient was
         # always sent as a "scene" before, in database order).
         refs = _asset_refs(db, list(job.reference_asset_ids_json or []))
@@ -1983,26 +2033,7 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             # Deleted in Studio while the provider worked: drop the image
             # (it was still billed). The write below is conditional too, so
             # a delete in between can't be undone by this result.
-            if _studio_job_deleted(db, job.id):
-                db.rollback()
-                return job
-            ext, _mime, _w, _h = storage.image_info(data)
-            path = storage.save_generated_bytes(data, extension=ext, subdir_name="images")
-            # Only a job still running takes the result: a deleted or
-            # cancelled one keeps its state (the image was still billed).
-            done = db.query(models.AssetGenerationJob).filter(
-                models.AssetGenerationJob.id == job.id,
-                models.AssetGenerationJob.status.in_(STUDIO_RUNNING),
-            ).update({"result_path": str(path), "status": "completed",
-                      "provider": job.provider, "provider_model": job.provider_model},
-                     synchronize_session=False)
-            if done:
-                events.studio_event(db, job, "completed")
-            db.commit()
-            if not done:
-                Path(path).unlink(missing_ok=True)
-            db.refresh(job)
-            return job
+            return _finish_studio_image(db, job, data)
         else:  # video_clip — async: completes via webhook / sweeper
             from . import video_jobs
 

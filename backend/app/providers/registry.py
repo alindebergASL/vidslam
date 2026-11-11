@@ -14,7 +14,7 @@ from .base import (
 )
 
 if TYPE_CHECKING:
-    from .base import VideoCapabilities
+    from .base import ImageOpProvider, VideoCapabilities
 
 
 
@@ -217,6 +217,32 @@ def _video(model: str | None) -> VideoProvider:
     return OpenRouterVideoProvider(model=model)
 
 
+def get_image_op(kind: str, model: str | None = None) -> "ImageOpProvider":
+    """Provider for a picture operation (`kind` "bg_removal" | "upscale")
+    with `model` (else the active one): Runware, the free local upscale or
+    the mock. Never OpenRouter; raises ProviderUnavailable (before any
+    provider call) when it can't be served."""
+    from ..services import model_registry as reg
+
+    if kind not in reg.OP_KINDS:
+        raise ValueError(f"not a picture operation: {kind!r}")
+    model = model or reg.active_model(kind)
+    provider = _checked(kind, model)
+    if provider == "mock":
+        from .mock_image_ops import MockImageOpProvider
+
+        return MockImageOpProvider()
+    if provider == "local":
+        from .local_upscale import LocalUpscaleProvider
+
+        return LocalUpscaleProvider()
+    if provider == "runware":
+        from .runware import RunwareImageOpProvider
+
+        return RunwareImageOpProvider(model=model)
+    raise reg.unavailable(kind, model, None)
+
+
 def uses_webhooks(model: str | None) -> bool:
     """Whether a video job for `model` can be told to call back (OpenRouter
     only; Sogni has no callbacks and Runware's aren't signed: both are polled)."""
@@ -410,6 +436,8 @@ def provider_status() -> dict:
         "tts": snap["tts"]["provider"],
         "music": snap["music"]["provider"],
         "lipsync": snap["lipsync"]["provider"],
+        "bg_removal": snap["bg_removal"]["provider"],
+        "upscale": snap["upscale"]["provider"],
         "training_lora": training_lora,
         "training_voice": training_voice,
         "models": {k: v["model"] for k, v in snap.items()},

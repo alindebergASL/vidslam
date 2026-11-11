@@ -250,6 +250,9 @@ def run_once(*, now: Optional[datetime] = None) -> dict:
             try:
                 result["pruned_events"] = events.prune(db)
                 _last_prune = time.monotonic()
+                from . import storage
+
+                result["pruned_reference_copies"] = storage.prune_reference_cache()
             except Exception:  # noqa: BLE001
                 db.rollback()
                 log.exception("event retention failed")

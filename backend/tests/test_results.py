@@ -328,7 +328,7 @@ def test_migration_0008(tmp_path, monkeypatch):
     fk = insp.get_foreign_keys("video_stats")[0]
     assert fk["referred_table"] == "publish_jobs" and fk["options"].get("ondelete") == "CASCADE"
     with dbmod.engine.connect() as conn:
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0009"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0010"
         diff = compare_metadata(MigrationContext.configure(conn), dbmod.Base.metadata)
     assert diff == [], diff  # same as `alembic check`
     command.downgrade(dbmod._alembic_config(), "0007")
