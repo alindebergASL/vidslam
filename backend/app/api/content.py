@@ -41,12 +41,16 @@ async def put_avatar_adult_ok(avatar_id: int, request: Request) -> dict:
         body = json.loads((await request.body()) or b"null")
     except (ValueError, UnicodeDecodeError):
         body = None
-    if not isinstance(body, dict) or body.get("adult_ok") not in (True, False):
+    if not isinstance(body, dict) or body.get("adult_ok") is not True and body.get("adult_ok") is not False:
         raise HTTPException(422, 'body must be JSON: {"adult_ok": true | false}')
-    db = SessionLocal()
-    try:
-        if db.get(models.Avatar, avatar_id) is None:
-            raise HTTPException(404, "cast character not found")
-    finally:
-        db.close()
-    return content_mode.set_avatar_adult_ok(avatar_id, body["adult_ok"])
+    if body["adult_ok"]:
+        db = SessionLocal()
+        try:
+            avatar = db.get(models.Avatar, avatar_id)
+            if avatar is None:
+                raise HTTPException(404, "cast character not found")
+            if content_mode.describes_minor(avatar):
+                raise HTTPException(422, "This character is described as a minor, so adult content can't be allowed.")
+        finally:
+            db.close()
+    return content_mode.set_avatar_adult_ok(avatar_id, body["adult_ok"])  # clearing always works

@@ -131,9 +131,9 @@ export function AdultModePanel() {
             </>
           )}
           <li>
-            Always: prompts that sexualise minors are refused. Pictures of your Cast are checked, except characters you
-            mark &ldquo;Adult content allowed&rdquo; in Cast (fictional, or the person consented), and only while
-            Adult mode is on.
+            Always: prompts that sexualise minors are refused. Pictures of your Cast are checked, except adult
+            characters you mark &ldquo;Adult content allowed&rdquo; in Cast, while Adult mode is on and only when
+            every picture in the request is of a marked character.
           </li>
         </ul>
       )}
@@ -161,15 +161,29 @@ export function AdultModePanel() {
   );
 }
 
-/** The current Adult mode setting (null while loading or unavailable), kept
- * current when the switch is flipped on this page. */
-export function useContentMode(): ContentMode | null {
+/** The Adult mode setting, kept current when the switch (or a Cast mark) is
+ * changed on the page. A failed refetch keeps the last good value. */
+export function useContentModeState(): { mode: ContentMode | null; failed: boolean; reload: () => void } {
   const [mode, setMode] = useState<ContentMode | null>(null);
+  const [failed, setFailed] = useState(false);
+  const reload = () => {
+    api
+      .getContentMode()
+      .then((m) => {
+        setMode(m);
+        setFailed(false);
+      })
+      .catch(() => setFailed(true));
+  };
   useEffect(() => {
-    const load = () => api.getContentMode().then(setMode).catch(() => setMode(null));
-    load();
-    window.addEventListener("content-mode-changed", load);
-    return () => window.removeEventListener("content-mode-changed", load);
+    reload();
+    window.addEventListener("content-mode-changed", reload);
+    return () => window.removeEventListener("content-mode-changed", reload);
   }, []);
-  return mode;
+  return { mode, failed, reload };
+}
+
+/** The current Adult mode setting (null while loading or unavailable). */
+export function useContentMode(): ContentMode | null {
+  return useContentModeState().mode;
 }

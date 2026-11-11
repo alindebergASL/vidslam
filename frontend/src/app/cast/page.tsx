@@ -8,7 +8,7 @@ import { TrainPanel } from "@/components/TrainPanel";
 import { AssignDialog, ASSET_SLOTS, demoteOtherHeroes, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
-import { useContentMode } from "@/components/AdultModePanel";
+import { useContentModeState } from "@/components/AdultModePanel";
 import { api, Asset, Avatar, Ingredient, Project, Voice, errorText } from "@/lib/api";
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
@@ -705,22 +705,32 @@ function DetailDrawer({
 
 
 /**
- * "Adult content allowed" for one Cast character: fictional, or the person
- * consented. In Adult mode their pictures skip the forced content filter
+ * "Adult content allowed" for one Cast character: an adult (18+), fictional
+ * or a real adult who consented. While Adult mode is on, requests whose
+ * pictures are all of marked characters skip the forced content filter
  * (Sogni's safe filter, Runware's content check). Minors are always refused.
  */
 function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   const toast = useToast();
-  const mode = useContentMode();
+  const { mode, failed, reload } = useContentModeState();
   const [busy, setBusy] = useState(false);
-  if (!mode) return null;
+  if (!mode) {
+    return failed ? (
+      <div className="card p-4 mb-4 text-xs text-ink-400">
+        Couldn&rsquo;t load the adult content setting.{" "}
+        <button type="button" className="underline" onClick={reload}>
+          Retry
+        </button>
+      </div>
+    ) : null;
+  }
   const allowed = (mode.adult_ok_avatars ?? []).includes(avatarId);
 
   const toggle = async (next: boolean) => {
     if (
       next &&
       !window.confirm(
-        `Allow adult content with ${name}'s pictures? Confirm that ${name} is fictional (not a real person), or that the person has consented. In Adult mode their pictures then skip Sogni's safe filter and Runware's content check. Prompts involving minors are always refused.`
+        `Allow adult content with ${name}'s pictures?\n\nConfirm that ${name} is an adult (18 or older), either fictional or a real adult who has consented, and that the pictures you put on ${name}'s card show ${name}.\n\nWhile Adult mode is on, requests whose pictures are all of marked characters then skip Sogni's safe filter and Runware's content check. Any other picture in the request keeps them on, and a picture made in Studio from someone else's picture doesn't count. Prompts involving minors are always refused.`
       )
     )
       return;
@@ -749,8 +759,8 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
         <span>
           <span className="font-medium">Adult content allowed</span>
           <span className="block text-xs text-ink-400">
-            {name} is fictional, or the person consented. While Adult mode is on, their pictures skip Sogni&rsquo;s
-            safe filter and Runware&rsquo;s content check.
+            {name} is an adult (18+), fictional or a real adult who consented. While Adult mode is on, requests whose
+            pictures are all of marked characters skip Sogni&rsquo;s safe filter and Runware&rsquo;s content check.
             {mode.adult ? "" : " Adult mode is off, so this has no effect right now."} Prompts involving minors are
             always refused.
           </span>

@@ -200,7 +200,7 @@ def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
     rows = {r.id: r for r in db.query(models.Asset).filter(models.Asset.id.in_(ids)).all()}
     from .content_mode import adult_ok_avatars
 
-    adult_ok = adult_ok_avatars()
+    marked = adult_ok_avatars()
     refs: list[ImageRef] = []
     for aid in dict.fromkeys(ids):
         row = rows.get(aid)
@@ -217,8 +217,35 @@ def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
             name = row.ingredient.name
         refs.append(ImageRef(url=storage.public_url_for_token(row.public_token),
                              role=role, name=name,  # type: ignore[arg-type]
-                             adult_ok=role == "character" and row.avatar_id in adult_ok))
+                             adult_ok=role == "character" and _exempt_asset(db, row, marked)))
     return refs
+
+
+def _exempt_asset(db: Session, asset: Optional[models.Asset], marked: set[int], depth: int = 0) -> bool:
+    """Whether a Cast picture counts as its marked character ("adult content
+    allowed"): a non-logo picture on a marked character's card whose own
+    text names no minor, either filed there (uploaded) or generated only
+    from that same character's counted pictures (so a picture made from
+    someone else's photo and saved to the card never counts)."""
+    if asset is None or asset.owner_kind != "avatar" or asset.asset_type == "logo" or asset.avatar_id not in marked:
+        return False
+    if depth == 0:
+        from .content_mode import describes_minor
+
+        if asset.avatar is None or describes_minor(asset.avatar):
+            return False
+    if asset.source == "generated" and asset.generation_job_id:
+        if depth >= 8:
+            return False
+        job = db.get(models.AssetGenerationJob, asset.generation_job_id)
+        if job is None or job.first_frame_job_id:
+            return False  # unknown, or made from a Studio result
+        inputs = _asset_ids(job.reference_asset_ids_json) + ([job.first_frame_asset_id] if job.first_frame_asset_id else [])
+        for aid in inputs:
+            src = db.get(models.Asset, aid)
+            if src is None or src.avatar_id != asset.avatar_id or not _exempt_asset(db, src, marked, depth + 1):
+                return False
+    return True
 
 
 # ---------- public entry points ----------
@@ -1931,8 +1958,11 @@ def studio_first_frame(db: Session, job: models.AssetGenerationJob) -> Optional[
         asset = db.get(models.Asset, job.first_frame_asset_id)
         if asset is None or not (asset.mime_type or "").startswith("image/"):
             raise ValueError("the picture this clip starts from was deleted")
+        from .content_mode import adult_ok_avatars
+
         return ImageRef(url=storage.public_url_for_token(asset.public_token), role="scene",
-                        name="first frame", frame_type="first_frame")
+                        name="first frame", frame_type="first_frame",
+                        adult_ok=_exempt_asset(db, asset, adult_ok_avatars()))
     return None
 
 

@@ -59,6 +59,10 @@ def update_avatar(
         setattr(a, k, v)
     db.commit()
     db.refresh(a)
+    from ..services import content_mode
+
+    if avatar_id in content_mode.adult_ok_avatars() and content_mode.describes_minor(a):
+        content_mode.set_avatar_adult_ok(avatar_id, False)  # now described as a minor: never marked
     return a
 
 
@@ -78,3 +82,6 @@ def delete_avatar(avatar_id: int, db: Session = Depends(get_db)) -> None:
     ).update({models.VideoProject.primary_avatar_id: None}, synchronize_session=False)
     db.delete(a)
     db.commit()
+    from ..services import content_mode
+
+    content_mode.set_avatar_adult_ok(avatar_id, False)  # a reused id must not inherit the mark

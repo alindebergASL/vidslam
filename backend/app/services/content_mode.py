@@ -69,28 +69,49 @@ def text_model() -> str:
     return (get_settings().adult_text_model or "") if adult_mode() else ""
 
 
-# Cast characters marked "adult content allowed": fictional, or the person
-# consented. Their pictures skip the forced content filter in adult mode.
-ADULT_OK_KEY = "content.adult_ok_avatars"  # {"ids": [avatar id, ...]}
+# Cast characters marked "adult content allowed": an adult (18+), fictional
+# or a real adult who consented. Their pictures skip the forced content
+# filter in adult mode (pipeline._exempt_asset decides which pictures count).
+# One row per character, so marking two at once can't overwrite each other.
+ADULT_OK_PREFIX = "content.adult_ok.avatar."  # + id → {"enabled": true, "at": iso}
 
 
 def adult_ok_avatars() -> set[int]:
-    try:
-        from .model_registry import get_setting
+    """Marked character ids. A failed read marks nobody (filters stay on)."""
+    from .. import models
+    from ..db import SessionLocal
 
-        rec = get_setting(ADULT_OK_KEY)
+    try:
+        db = SessionLocal()
+    except Exception:  # noqa: BLE001
+        return set()
+    try:
+        rows = db.query(models.AppSetting).filter(models.AppSetting.key.like(f"{ADULT_OK_PREFIX}%")).all()
     except Exception:  # noqa: BLE001 — unreadable: nobody is exempt
         return set()
-    ids = rec.get("ids") if isinstance(rec, dict) else None
-    return {int(i) for i in ids or [] if isinstance(i, int) or str(i).isdigit()}
+    finally:
+        db.close()
+    out = set()
+    for r in rows:
+        tail = r.key[len(ADULT_OK_PREFIX):]
+        if tail.isdigit() and isinstance(r.value, dict) and r.value.get("enabled") is True:
+            out.add(int(tail))
+    return out
+
+
+def describes_minor(avatar) -> bool:  # noqa: ANN001 — models.Avatar
+    """The character's own text names a child or a minor's age: never marked."""
+    from .safety import mentions_minor
+
+    text = " ".join(str(getattr(avatar, f, "") or "") for f in ("name", "description", "persona", "visual_identity"))
+    return mentions_minor(text)
 
 
 def set_avatar_adult_ok(avatar_id: int, value: bool) -> dict:
     from .model_registry import put_setting
 
-    ids = adult_ok_avatars()
-    (ids.add if value else ids.discard)(int(avatar_id))
-    put_setting(ADULT_OK_KEY, {"ids": sorted(ids)} if ids else None)
+    put_setting(f"{ADULT_OK_PREFIX}{int(avatar_id)}", {
+        "enabled": True, "at": datetime.now(timezone.utc).isoformat()} if value else None)
     log.info("cast character %s: adult content %s", avatar_id, "allowed" if value else "not allowed")
     return status()
 
