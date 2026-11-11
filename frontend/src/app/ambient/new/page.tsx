@@ -1,5 +1,7 @@
 "use client";
 import Link from "next/link";
+import { usePoll } from "@/lib/usePoll";
+import { useEvents } from "@/components/NotificationsProvider";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
@@ -26,12 +28,37 @@ import {
 } from "@/components/ambient/shared";
 import {
   api,
+  errorText,
   AmbientConfig,
   AmbientPresets,
   AmbientSource,
   CostEstimate,
   DEFAULT_AMBIENT_CONFIG,
 } from "@/lib/api";
+
+const PREVIEW_RUN_KEY = "avs:preset-previews";
+// Stop waiting after this long (about 2 minutes per preview on the best model).
+const PREVIEW_RUN_MAX_MS = 45 * 60_000;
+
+function readPreviewRun(): { ids: string[]; started: number } | null {
+  try {
+    const raw = window.localStorage.getItem(PREVIEW_RUN_KEY);
+    const v = raw ? JSON.parse(raw) : null;
+    if (v && Array.isArray(v.ids) && typeof v.started === "number" && v.ids.length > 0) return v;
+  } catch {
+    /* unreadable: start fresh */
+  }
+  return null;
+}
+
+function savePreviewRun(run: { ids: string[]; started: number } | null) {
+  try {
+    if (run) window.localStorage.setItem(PREVIEW_RUN_KEY, JSON.stringify(run));
+    else window.localStorage.removeItem(PREVIEW_RUN_KEY);
+  } catch {
+    /* private mode: progress just isn't kept across visits */
+  }
+}
 
 export default function NewAmbientPage() {
   return (
@@ -66,8 +93,12 @@ function Inner() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [genPreviews, setGenPreviews] = useState(false);
+  // Preset previews being made: which ones and since when. Kept in this
+  // browser so leaving the page and coming back picks the progress up again
+  // (the presets endpoint only says which previews exist).
+  const [previewRun, setPreviewRun] = useState<{ ids: string[]; started: number } | null>(null);
   const [previewProgress, setPreviewProgress] = useState<{ done: number; total: number } | null>(null);
+  const genPreviews = previewRun !== null;
   // Optional picture to build the scene from: a file to upload, or a
   // Studio/Cast image. Attached right after the scene is created.
   const [picture, setPicture] = useState<{ file?: File; picked?: PickedImage; url: string } | null>(null);
@@ -87,8 +118,57 @@ function Inner() {
   }, [picture]);
 
   useEffect(() => {
-    api.ambientPresets().then(setPresets).catch((e) => setError(e.message));
+    api.ambientPresets().then(setPresets).catch((e) => setError(errorText(e)));
+    const saved = readPreviewRun();
+    if (saved && Date.now() - saved.started < PREVIEW_RUN_MAX_MS) setPreviewRun(saved);
+    else savePreviewRun(null);
   }, []);
+
+  const startPreviewRun = (run: { ids: string[]; started: number } | null) => {
+    setPreviewRun(run);
+    savePreviewRun(run);
+    if (!run) setPreviewProgress(null);
+  };
+  // Check the presets while previews are being made: every 5 s (15 s while
+  // the live stream is connected), paused while the tab is hidden, and at
+  // once when a preview event arrives.
+  const checkPreviews = async () => {
+    const run = previewRunRef.current;
+    if (!run) return;
+    const p = await api.ambientPresets();
+    setPresets(p);
+    const want = new Set(run.ids);
+    const done = p.scenes.filter((x) => want.has(x.id) && x.preview_url).length;
+    setPreviewProgress({ done, total: want.size });
+    if (done >= want.size) {
+      toast.success(`Generated ${done} preview image${done === 1 ? "" : "s"}`);
+      startPreviewRun(null);
+    } else if (Date.now() - run.started > PREVIEW_RUN_MAX_MS) {
+      toast.info(`${done} of ${want.size} previews ready; the rest are still being made`);
+      startPreviewRun(null);
+    }
+  };
+  const previewRunRef = useRef(previewRun);
+  previewRunRef.current = previewRun;
+  const pokePreviews = usePoll(checkPreviews, { enabled: previewRun !== null, interval: 5000, liveInterval: 15_000 });
+  useEffect(() => {
+    if (previewRun) pokePreviews();
+  }, [previewRun, pokePreviews]);
+  useEvents({ kind: "ambient_loop", entity_type: "preset_preview" }, (ev) => {
+    const run = previewRunRef.current;
+    if (!run) return;
+    if (ev && ev.status === "failed") {
+      // detail is "<preset id>: <error>"; that one won't come: stop waiting for it.
+      const pid = ev.detail.split(":", 1)[0];
+      if (run.ids.includes(pid)) {
+        toast.error(ev.title);
+        const ids = run.ids.filter((x) => x !== pid);
+        startPreviewRun(ids.length > 0 ? { ...run, ids } : null);
+        return;
+      }
+    }
+    pokePreviews();
+  });
 
   // Every image and video model, after the suggested ones (see ModelControls).
   useEffect(() => {
@@ -177,7 +257,7 @@ function Inner() {
               picture.picked!.kind === "studio" ? { studio_job_id: picture.picked!.id } : { asset_id: picture.picked!.id }
             );
         } catch (e: any) {
-          toast.error(`Scene created, but the picture failed: ${e.message || e}`);
+          toast.error(`Scene created, but the picture failed: ${errorText(e)}`);
           router.push(`/ambient/${scene.id}`);
           return;
         }
@@ -190,7 +270,7 @@ function Inner() {
           await api.generateAmbientPicture(scene.id);
           toast.success("Picture ready. Check it, then make the loop.");
         } catch (e: any) {
-          toast.error(`Scene created, but the picture failed: ${e.message || e}. Try again on the scene page.`);
+          toast.error(`Scene created, but the picture failed: ${errorText(e)}. Try again on the scene page.`);
         }
         router.push(`/ambient/${scene.id}`);
         return;
@@ -198,7 +278,7 @@ function Inner() {
       toast.success(generateNow ? "Scene created — generating the loop" : "Scene created");
       router.push(`/ambient/${scene.id}`);
     } catch (e: any) {
-      setError(e.message || "Could not create scene");
+      setError(errorText(e, "Could not create scene"));
       setSubmitting(false);
       setPhase("");
     }
@@ -238,33 +318,20 @@ function Inner() {
                   className="btn-ghost text-xs shrink-0"
                   disabled={genPreviews}
                   onClick={async () => {
-                    setGenPreviews(true);
                     try {
                       const r = await api.generatePresetPreviews();
-                      const want = new Set(r.presets);
                       // Inline in dev; with a worker it runs in the background, one
-                      // image at a time (about 2 minutes each on the best model), so
+                      // image at a time (about 2 minutes each on the best model):
                       // keep checking until every requested preview is there.
-                      let done = 0;
-                      setPreviewProgress({ done: 0, total: want.size });
-                      for (let i = 0; i < 360 && want.size > 0; i++) {
-                        const p = await api.ambientPresets();
-                        setPresets(p);
-                        done = p.scenes.filter((x) => want.has(x.id) && x.preview_url).length;
-                        setPreviewProgress({ done, total: want.size });
-                        if (done === want.size) break;
-                        await new Promise((res) => setTimeout(res, 5000));
+                      if (r.presets.length === 0) {
+                        toast.info("Every preview is already there");
+                        api.ambientPresets().then(setPresets).catch(() => {});
+                        return;
                       }
-                      if (done === want.size) {
-                        toast.success(`Generated ${done} preview image${done === 1 ? "" : "s"}`);
-                      } else {
-                        toast.success(`${done} of ${want.size} previews ready; the rest are still being made`);
-                      }
+                      setPreviewProgress({ done: 0, total: r.presets.length });
+                      startPreviewRun({ ids: r.presets, started: Date.now() });
                     } catch (e: any) {
-                      toast.error(e.message || "Preview generation failed");
-                    } finally {
-                      setGenPreviews(false);
-                      setPreviewProgress(null);
+                      toast.error(errorText(e, "Preview generation failed"));
                     }
                   }}
                   title="One image-model call per preset; cached afterwards"

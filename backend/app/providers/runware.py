@@ -646,7 +646,7 @@ def _fit_text(text: str, spec: Optional[dict], *, terms: bool = False) -> str:
 
 
 def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str,
-           check_content: bool, cast: bool) -> list[dict]:
+           check_content: bool, cast: bool, *, pictures: bool = False) -> list[dict]:
     """The request without its size/frames, with our defaults (quiet: no
     audio or prompt rewriting; permissive: vendor safety knobs at their
     loosest), then without the permissive knobs, then without either."""
@@ -662,9 +662,13 @@ def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str
     neg = _fit_text(negative, props.get("negativePrompt"), terms=True)
     if neg and "negativePrompt" in props and _allowed(props["negativePrompt"], neg) and len(neg) >= 2:
         task["negativePrompt"] = neg
-    if not _put(task, props, ("safety", "checkContent"), bool(check_content)) and cast:
-        # Rule: a Cast member's picture never goes out without the check.
-        raise RunwareError(f"{model_air} has no content check, so it can't be sent pictures of your Cast")
+    if not _put(task, props, ("safety", "checkContent"), bool(check_content)) and (cast or pictures):
+        # Rule: a Cast member's picture, or any picture with a sexual
+        # prompt, never goes out without the check.
+        if cast:
+            raise RunwareError(f"{model_air} has no content check, so it can't be sent pictures of your Cast")
+        raise RunwareError(f"{model_air} has no content check, so it can't be sent a picture with a "
+                           "sexual prompt; remove the picture or pick another model")
     quiet = copy.deepcopy(task)
     for path, value in _QUIET:
         _put(quiet, props, path, value)
@@ -711,8 +715,9 @@ def build_image_task(model: str, prompt: str, references: list[ImageRef], *, neg
     # through Runware's content check.
     cast = any(r.role == "character" for r in used)
     sent = _name_refs(prompt, used)
-    checked = _content_check(check_content, cast, sent, negative_prompt)
-    bases = _bases(sch, "imageInference", a, sent, negative_prompt, checked, cast)
+    pictures = _pictures_need_check(used, sent)
+    checked = _content_check(check_content, cast, sent, negative_prompt) or pictures
+    bases = _bases(sch, "imageInference", a, sent, negative_prompt, checked, cast, pictures=pictures)
     for base in bases:
         for key, value in (("deliveryMethod", "sync"), ("outputFormat", "JPG"), ("outputQuality", 95)):
             if key in props:
@@ -772,8 +777,9 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
                     len(refs) - len(used), "fewer" if used else "only pinned frames")
     cast = any(r.role == "character" for r in used)
     sent = _name_refs(prompt, used if not first else [])
-    checked = _content_check(check_content, cast, sent, negative_prompt)
-    bases = _bases(sch, "videoInference", a, sent, negative_prompt, checked, cast)
+    pictures = _pictures_need_check(used, sent)
+    checked = _content_check(check_content, cast, sent, negative_prompt) or pictures
+    bases = _bases(sch, "videoInference", a, sent, negative_prompt, checked, cast, pictures=pictures)
     loop = first is not None and last is not None and first.url == last.url
     for base in bases:
         _put(base, props, ("deliveryMethod",), "async")
@@ -1041,13 +1047,19 @@ def _content_check(explicit: Optional[bool], cast: bool, sent: str, negative: st
     return bool(default or cast or mentions_minor(sent) or steers_young(sent, negative))
 
 
-def _guard(prompt: str) -> None:
-    """Before any paid request: refuse prompts involving minors, and stop
-    once the monthly budget's hard cap is reached (a batch of jobs would
-    otherwise keep spending past it)."""
-    from ..services.safety import check_prompt
+def _pictures_need_check(used: list[ImageRef], sent: str) -> bool:
+    """A sexual prompt sent with any reference picture (not only a Cast
+    member's) always goes through Runware's content check: nobody has
+    checked who is in the picture."""
+    from ..services.safety import is_sexual
 
-    check_prompt(prompt)
+    return bool(used) and is_sexual(sent)
+
+
+def _guard(prompt: str) -> None:
+    """Before any paid request: stop once the monthly budget's hard cap is
+    reached (a batch of jobs would otherwise keep spending past it). The
+    minors check runs on the exact text sent (_content_check)."""
     from ..db import SessionLocal
     from ..services import spend
 

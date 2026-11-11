@@ -77,6 +77,32 @@ def enqueue(func: Callable, *args, **kwargs) -> str:
     return job.id
 
 
+def queue_entry_state(job_id: str) -> str:
+    """Whether a job's queue entry can still run it: "alive" (queued,
+    started, deferred or scheduled in RQ), "gone" (no RQ id, ran inline,
+    finished, failed or expired) or "unknown" (Redis didn't answer)."""
+    job_id = (job_id or "").strip()
+    if not job_id or ":" in job_id:  # "", "inline:...", "background:..."
+        return "gone"
+    if (get_settings().queue_mode or "auto").lower() == "inline":
+        return "gone"
+    if _try_redis_queue() is None:
+        return "unknown"
+    try:
+        from rq.exceptions import NoSuchJobError
+        from rq.job import Job
+
+        try:
+            job = Job.fetch(job_id, connection=_redis_singleton)
+        except NoSuchJobError:
+            return "gone"
+        status = job.get_status(refresh=False)
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    status = getattr(status, "value", status)
+    return "alive" if status in ("queued", "started", "deferred", "scheduled") else "gone"
+
+
 # ---------- low-priority side jobs (advisory work off the render's path) ----------
 
 LOW_QUEUE = "inspect"  # workers list it after "default", so they drain it last

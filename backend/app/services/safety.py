@@ -5,14 +5,50 @@ import re
 # Adult content between adults is allowed (no NSFW gate). What stays
 # blocked is sexual content involving minors, and threats against a named
 # person.
+# A minor word and a sexual word in the same sentence ("Our kids love it.
+# Explicit instructions inside." is two sentences, and "explicit
+# instructions" isn't sexual anyway: the same exclusions as _SEXUAL_TERMS).
+_OLD_MINOR = r"\b(child|children|kid|kids|minor|minors|underage|teen|teens|preteen)\b"
+_OLD_SEXUAL = (r"\b(sex|sexual|nude|naked|porn|nsfw|"
+               r"explicit(?!\s+(?:lyrics|language|instructions|permission|consent)))\b")
 _BLOCKED_PATTERNS = [
-    re.compile(r"\b(child|children|kid|kids|minor|minors|underage|teen|teens|preteen)\b.*"
-               r"\b(sex|sexual|nude|naked|porn|nsfw|explicit)\b", re.I),
-    re.compile(r"\b(sex|sexual|nude|naked|porn|nsfw|explicit)\b.*"
-               r"\b(child|children|kid|kids|minor|minors|underage|teen|teens|preteen)\b", re.I),
-    re.compile(r"\b(kill|murder|assassinate)\b\s+(?:the\s+)?[A-Z][a-z]+", re.I),
+    re.compile(_OLD_MINOR + r"[^.!?\n]*" + _OLD_SEXUAL, re.I),
+    re.compile(_OLD_SEXUAL + r"[^.!?\n]*" + _OLD_MINOR, re.I),
     re.compile(r"\b(cp|loli|shota)\b", re.I),
 ]
+# A threat against a named person: only the verb ignores case; the name
+# must be Capitalised in the text itself ("kill time", "murder mystery
+# night" and "kill the lights" pass; "kill John" doesn't). See _threat for
+# the Title Case copy it lets through ("Murder Mystery Night", "Kill Time").
+_THREAT_RE = re.compile(
+    r"(?i:\b(?P<verb>kill|murder|assassinate)\b)\s+(?:(?i:the)\s+)?(?P<name>[A-Z][a-z]+)"
+    r"(?P<after>\s+[A-Z][a-z]+)?")
+# Capitalised words after the verb that are ordinary nouns in ad copy and
+# titles, not names.
+_THREAT_NOUNS = frozenset((
+    "time", "mystery", "mysteries", "night", "nights", "lights", "light", "switch", "game", "games",
+    "party", "parties", "dinner", "weekend", "show", "fest", "festival", "room", "house", "hotel",
+    "train", "tour", "trail", "walk", "club", "podcast", "bill", "joy", "boredom", "germs", "bacteria",
+    "weeds", "bugs", "pests", "stains", "odors", "odours", "thirst", "hunger", "pain", "stress",
+    "it", "them", "all", "everything", "nothing", "one", "two", "your", "our", "my", "this", "that",
+    "zone", "box", "count", "shot", "shots", "streak", "deal", "deals", "price", "prices", "season",
+    "list", "spree", "machine", "mode", "screen", "button", "music", "noise", "engine", "power",
+))
+
+
+def _threat(script: str) -> bool:
+    for m in _THREAT_RE.finditer(script):
+        if m.group("name").lower() in _THREAT_NOUNS:
+            continue
+        verb = m.group("verb")
+        before = script[:m.start()].rstrip()
+        sentence_start = not before or before[-1] in ".!?:\n\"'(“"
+        # Title Case copy: a capitalised verb mid-sentence followed by a run
+        # of Capitalised words ("Join our Murder Weekend Special").
+        if verb[0].isupper() and not sentence_start and m.group("after"):
+            continue
+        return True
+    return False
 
 
 class UnsafeScriptError(ValueError):
@@ -28,7 +64,7 @@ def validate_script(script: str) -> None:
     if not script or not script.strip():
         raise UnsafeScriptError("Script is empty.")
     for pat in _BLOCKED_PATTERNS:
-        if pat.search(script):
+        if pat.search(script) or _threat(script):
             raise UnsafeScriptError(
                 "Script appears to contain disallowed content "
                 "(sexual content involving minors, or threats against a specific person)."
@@ -182,6 +218,11 @@ def mentions_minor(text: str) -> bool:
 def is_sexual(text: str) -> bool:
     forms = _forms(text)
     return _any(_SEXUAL_RE, forms) or _any(_SOFT_RE, forms)
+
+
+def is_hard_sexual(text: str) -> bool:
+    """is_sexual without the everyday words ("breast", "swimsuit", "bra")."""
+    return _any(_SEXUAL_RE, _forms(text))
 
 
 def check_prompt(text: str) -> None:

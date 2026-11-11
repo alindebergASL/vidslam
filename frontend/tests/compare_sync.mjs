@@ -50,10 +50,13 @@ const ctx = await browser.newContext({ viewport: { width: 1400, height: 1000 } }
 const page = await ctx.newPage();
 
 // Login
-await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+await page.goto(`${BASE}/`, { waitUntil: 'load' });
 await page.fill('#avs-password', PW);
 await page.click('button[type=submit]');
-await page.waitForLoadState('networkidle');
+// Signed in, the app keeps a live-event stream (SSE) open, so the network
+// is never idle: wait for 'load' and a moment instead of 'networkidle'.
+await page.waitForLoadState('load');
+await page.waitForTimeout(1000);
 
 // Resolve a pair of completed render ids by going through the same API the
 // frontend uses — login already issued an HttpOnly cookie on the backend
@@ -84,7 +87,7 @@ ok(`comparing v(latest)=${latestId} vs v(other)=${otherId}`);
 
 // Comparison view
 await page.goto(`${BASE}/projects/${PROJECT_ID}/render?id=${latestId}&compare=${otherId}`, {
-  waitUntil: 'networkidle',
+  waitUntil: 'load',
 });
 await page.waitForTimeout(800);
 

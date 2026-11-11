@@ -1,5 +1,7 @@
 "use client";
 import Link from "next/link";
+import { usePoll } from "@/lib/usePoll";
+import { useEvents } from "@/components/NotificationsProvider";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import clsx from "clsx";
@@ -34,7 +36,7 @@ import {
   VarietyControls,
   statusTone,
 } from "@/components/ambient/shared";
-import { api, AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, PhotoRewrite, Render } from "@/lib/api";
+import { api, AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, PhotoRewrite, Render, errorText } from "@/lib/api";
 
 export default function AmbientScenePage() {
   return (
@@ -88,7 +90,7 @@ function Inner() {
         return s;
       });
     } catch (e: any) {
-      if (String(e.message || "").startsWith("404")) setNotFound(true);
+      if (String(errorText(e, "")).startsWith("404")) setNotFound(true);
     }
   }, [id]);
 
@@ -102,11 +104,11 @@ function Inner() {
     scene?.status === "generating" ||
     scene?.loop_status === "submitted" ||
     scene?.loop_status === "polling";
-  useEffect(() => {
-    if (!inFlight) return;
-    const t = setInterval(reload, 2500);
-    return () => clearInterval(t);
-  }, [inFlight, reload]);
+  // Every 2.5 s while the scene is being made (12 s while the live stream is
+  // connected), paused while the tab is hidden; an event for this scene
+  // reloads at once.
+  const poke = usePoll(reload, { enabled: inFlight, interval: 2500 });
+  useEvents({ project_id: id }, () => poke());
 
   const run = async (key: string, fn: () => Promise<unknown>, okMsg?: string) => {
     setBusy(key);
@@ -122,7 +124,7 @@ function Inner() {
       if (key === "music" || key === "sound") setCacheBust(Date.now());
       await reload();
     } catch (e: any) {
-      toast.error(e.message || "Request failed");
+      toast.error(errorText(e, "Request failed"));
     } finally {
       setBusy(null);
     }
@@ -240,7 +242,7 @@ function Inner() {
                 toast.success("Scene deleted");
                 router.push("/ambient");
               } catch (e: any) {
-                toast.error(e.message || "Delete failed");
+                toast.error(errorText(e, "Delete failed"));
               }
             }}
           >

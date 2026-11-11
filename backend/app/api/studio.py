@@ -48,14 +48,78 @@ def _owner_exists(db: Session, kind: str, owner_id: int) -> bool:
 
 
 def _enqueue_jobs(db: Session, jobs: list[models.AssetGenerationJob]) -> list[models.AssetGenerationJob]:
-    """Store new jobs (one commit) and enqueue each on its own."""
+    """Store new jobs (one commit) and enqueue each on its own. When the
+    queue refuses one, it and the rest are marked failed (nothing would
+    ever run them) before the error goes back to the caller."""
     db.add_all(jobs)
     db.commit()
     for job in jobs:
         db.refresh(job)
-    for job in jobs:
-        enqueue(generate_asset_job, job.id)
+    for i, job in enumerate(jobs):
+        try:
+            qid = enqueue(generate_asset_job, job.id)
+            # The sweeper leaves a pending job alone while this entry waits.
+            db.query(models.AssetGenerationJob).filter(
+                models.AssetGenerationJob.id == job.id, models.AssetGenerationJob.status == "pending",
+            ).update({"queue_job_id": str(qid)[:80]}, synchronize_session=False)
+            db.commit()
+        except Exception:
+            db.rollback()
+            left = [j.id for j in jobs[i:]]
+            db.query(models.AssetGenerationJob).filter(
+                models.AssetGenerationJob.id.in_(left),
+                models.AssetGenerationJob.status == "pending",
+            ).update({"status": "failed", "error": "Couldn't queue this job"}, synchronize_session=False)
+            db.commit()
+            raise
     return jobs
+
+
+def _video_model(db: Session, model: Optional[str]) -> str:
+    from ..services.model_registry import active_model
+    from ..services.pipeline import _resolve_model
+
+    return _resolve_model(db, model or active_model("video"))
+
+
+def _check_first_frame(db: Session, output_kind: str, model: Optional[str],
+                       job_id: Optional[int], asset_id: Optional[int]) -> None:
+    """A clip that starts from a picture: the picture is usable and the
+    video model can start from one (422 before anything is queued)."""
+    if job_id is None and asset_id is None:
+        return
+    if output_kind != "video_clip":
+        raise HTTPException(422, "Only clips can start from a picture")
+    if job_id is not None and asset_id is not None:
+        raise HTTPException(422, "Pick one picture to start from, not two")
+    if job_id is not None:
+        src = _live_job(db, job_id)
+        if src is None:
+            raise HTTPException(404, "The picture to start from was deleted")
+        if (src.output_kind != "image" or src.status not in ("completed", "saved")
+                or not src.result_path or not Path(src.result_path).exists()):
+            raise HTTPException(422, "Only a finished Studio picture can start a clip")
+    else:
+        asset = db.get(models.Asset, asset_id)
+        if asset is None:
+            raise HTTPException(404, "The picture to start from was deleted")
+        if not (asset.mime_type or "").startswith("image/"):
+            raise HTTPException(422, "Only a picture can start a clip")
+    from ..providers import video_capabilities
+
+    resolved = _video_model(db, model)
+    if not video_capabilities(resolved).first_frame:
+        raise HTTPException(422, f"{resolved or 'This model'} can't start from a picture; pick another model")
+
+
+def _check_safety(prompt: str, negative: str, output_kind: str) -> None:
+    """The safety check now, as the worker will run it (same avoid list,
+    so the worker's check is a cache hit): a refusal is a 422."""
+    from ..services.minor_check import check_or_422
+    from ..services.prompting import effective_negative
+
+    kind = "image" if output_kind == "image" else "video"
+    check_or_422(prompt or "", effective_negative(kind, negative or ""), kind=kind)
 
 
 def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int) -> StudioJobOut:
@@ -66,6 +130,8 @@ def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int)
         raise HTTPException(404, "owner not found")
     # The model's provider switched off in Settings: 409 before anything is queued.
     provider_gate.require_model("image" if output_kind == "image" else "video", body.model or None, db)
+    _check_first_frame(db, output_kind, body.model or None, body.first_frame_job_id, body.first_frame_asset_id)
+    _check_safety(body.prompt, body.negative_prompt, output_kind)
     jobs = _enqueue_jobs(db, [
         models.AssetGenerationJob(
             owner_kind=body.owner_kind,
@@ -77,6 +143,8 @@ def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int)
             reference_asset_ids_json=list(body.reference_asset_ids),
             aspect_ratio=body.aspect_ratio or "",
             provider_model=body.model or "",
+            first_frame_job_id=body.first_frame_job_id,
+            first_frame_asset_id=body.first_frame_asset_id,
             status="pending",
         )
         for _ in range(count)
@@ -119,12 +187,26 @@ def _with_costs(db: Session, jobs: list[models.AssetGenerationJob]) -> list[Stud
             for ref, total, est in rows:
                 prev_total, prev_est = costs.get(owner[ref], (0.0, False))
                 costs[owner[ref]] = (prev_total + float(total or 0.0), prev_est or bool(est))
+    # Reference pictures deleted since the job was made (Remix drops them).
+    wanted = {i for j in jobs for i in _ref_ids(j)}
+    existing = ({a for (a,) in db.query(models.Asset.id).filter(models.Asset.id.in_(wanted))}
+                if wanted else set())
     out = []
     for j in jobs:
         o = StudioJobOut.model_validate(j)
         if j.id in costs:
             o.cost_usd, o.cost_is_estimate = costs[j.id]
+        o.missing_reference_ids = [i for i in _ref_ids(j) if i not in existing]
         out.append(o)
+    return out
+
+
+def _ref_ids(j: models.AssetGenerationJob) -> list[int]:
+    out = []
+    for x in j.reference_asset_ids_json or []:
+        text = str(x).strip()
+        if text.isascii() and text.isdecimal():
+            out.append(int(text))
     return out
 
 
@@ -161,13 +243,32 @@ def list_jobs(
     status: Optional[Literal["completed", "failed", "active"]] = None,
     limit: int = Query(50, ge=1, le=200),
     before_id: Optional[int] = None,
+    ids: Optional[str] = Query(None, description="comma-separated job ids (max 200); ignores other filters"),
     db: Session = Depends(get_db),
 ) -> list[StudioJobOut]:
     """Newest first (by id). Every filter is optional and they combine;
-    `before_id` pages back from the last id the caller has."""
+    `before_id` pages back from the last id the caller has. `ids` fetches
+    just those jobs (the page's batched poll), whatever the other filters."""
+    Job = models.AssetGenerationJob
+    if ids is not None:
+        wanted: list[int] = []
+        for part in ids.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not (part.isascii() and part.isdecimal()):
+                raise HTTPException(422, "ids must be comma-separated numbers")
+            wanted.append(int(part))
+        wanted = list(dict.fromkeys(wanted))
+        if len(wanted) > 200:
+            raise HTTPException(422, "at most 200 ids")
+        if not wanted:
+            return []
+        rows = (db.query(Job).filter(Job.id.in_(wanted), Job.status != STUDIO_DELETED)
+                .order_by(Job.id.desc()).all())
+        return _with_costs(db, rows)
     if (owner_kind is None) != (owner_id is None):
         raise HTTPException(422, "owner_kind and owner_id go together")
-    Job = models.AssetGenerationJob
     query = db.query(Job).filter(Job.status != STUDIO_DELETED)
     text = (q or "").strip()
     if text:
@@ -217,8 +318,16 @@ def preview_job(job_id: int, db: Session = Depends(get_db)) -> FileResponse:
     j = _live_job(db, job_id)
     if j is None or not j.result_path or not Path(j.result_path).exists():
         raise HTTPException(404, "result not ready")
-    media = "image/png" if j.output_kind == "image" else "video/mp4"
-    return FileResponse(j.result_path, media_type=media)
+    return FileResponse(j.result_path, media_type=media_type_of(j.result_path, j.output_kind))
+
+
+_MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+                ".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}
+
+
+def media_type_of(path: str, output_kind: str = "image") -> str:
+    """From the file's real suffix (providers return PNG, JPEG or WebP)."""
+    return _MEDIA_TYPES.get(Path(path).suffix.lower(), "image/png" if output_kind == "image" else "video/mp4")
 
 
 def _check_asset_type(kind: str, asset_type: Optional[str]) -> None:
@@ -347,6 +456,30 @@ def delete_job(job_id: int, db: Session = Depends(get_db)) -> None:
     _remove_files(db, files)
 
 
+@router.post("/jobs/{job_id}/cancel", response_model=StudioJobOut)
+def cancel_job(job_id: int, db: Session = Depends(get_db)) -> StudioJobOut:
+    """Stop waiting for a running job: it is marked failed ("Cancelled").
+    There is no provider cancel, so a clip already sent may still finish
+    and be billed; its video job stays tracked so that spend is recorded.
+    A job that already finished is answered unchanged."""
+    from ..services import events
+    from ..services.pipeline import STUDIO_RUNNING
+
+    j = _live_job(db, job_id)
+    if j is None:
+        raise HTTPException(404, "job not found")
+    done = db.query(models.AssetGenerationJob).filter(
+        models.AssetGenerationJob.id == job_id,
+        models.AssetGenerationJob.status.in_(STUDIO_RUNNING),
+    ).update({"status": "failed", "error": "Cancelled"}, synchronize_session=False)
+    if done:
+        db.refresh(j)
+        events.studio_event(db, j, "cancelled")
+    db.commit()
+    db.refresh(j)
+    return _with_costs(db, [j])[0]
+
+
 @router.post("/jobs/bulk-delete", response_model=StudioBulkDeleteOut)
 def bulk_delete(body: StudioBulkIds, db: Session = Depends(get_db)) -> StudioBulkDeleteOut:
     deleted: list[int] = []
@@ -393,6 +526,7 @@ def retry_job(job_id: int, body: Optional[StudioRetryRequest] = Body(None),
         raise HTTPException(404, "owner not found")
     model = body.model or src.provider_model or ""
     provider_gate.require_model("image" if src.output_kind == "image" else "video", model or None, db)
+    _check_first_frame(db, src.output_kind, model or None, src.first_frame_job_id, src.first_frame_asset_id)
     job = models.AssetGenerationJob(
         owner_kind=src.owner_kind,
         owner_id=src.owner_id,
@@ -404,8 +538,11 @@ def retry_job(job_id: int, body: Optional[StudioRetryRequest] = Body(None),
         aspect_ratio=body.aspect_ratio or src.aspect_ratio or "",
         label=src.label or "",
         provider_model=model,
+        first_frame_job_id=src.first_frame_job_id,
+        first_frame_asset_id=src.first_frame_asset_id,
         status="pending",
     )
+    _check_safety(job.prompt, job.negative_prompt, job.output_kind)
     _enqueue_jobs(db, [job])
     out = _with_costs(db, [job])[0]
     out.batch_ids = [job.id]
@@ -489,6 +626,8 @@ def character_sheet(body: CharacterSheetRequest, db: Session = Depends(get_db)) 
     if not refs:
         raise HTTPException(422, f"add a picture of {avatar.name} first")
     provider_gate.require_model("image", body.model or None, db)
+    for view in body.views:
+        _check_safety(_sheet_prompt(avatar, view, body.style), body.negative_prompt, "image")
     jobs = _enqueue_jobs(db, [
         models.AssetGenerationJob(
             owner_kind="avatar",

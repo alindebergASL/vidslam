@@ -124,6 +124,13 @@ class ChatProvider(Protocol):
         rate-card cost when the provider reports none."""
         ...
 
+    def classify_minor(self, text: str) -> dict:
+        """The safety check (services/minor_check.py): does `text` put a
+        minor, or someone made to look like one, in a sexual context?
+        Returns {"minor_sexual": bool, "reason": str}; raises when no
+        verdict came back (refusal, error, unreadable reply)."""
+        ...
+
 
 class ImageProvider(Protocol):
     def list_models(self) -> list[ModelInfo]: ...

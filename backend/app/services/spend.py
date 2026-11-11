@@ -348,6 +348,16 @@ def _check_alerts(db: Session) -> None:
            if top >= 100 and b["hard_stop"] else ""),
         severity="error" if top >= 100 else "warning",
     )
+    from . import events
+
+    reached = top >= 100
+    events.emit(
+        db, "budget", "budget", 0, "failed" if reached else "progress",
+        f"Monthly budget {'reached' if reached else f'at {pct:.0f}%'}: ${spent:.2f} of ${b['monthly_usd']:.2f}",
+        detail=("New paid generations are blocked until the budget is raised."
+                if reached and b["hard_stop"] else ""),
+        url="/settings", severity="error" if reached else "warning",
+    )
     value = {"month": month, "sent": sorted(sent | set(new))}
     if row:
         row.value = value

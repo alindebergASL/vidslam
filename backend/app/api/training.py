@@ -165,6 +165,9 @@ def cancel_training(job_id: int, db: Session = Depends(get_db)) -> models.Custom
         # Provider-side cancel is best-effort; the local row still flips.
         pass
     cm.status = "cancelled"
+    from ..services import events
+
+    events.training_event(db, cm, "cancelled")
     db.commit()
     db.refresh(cm)
     return cm

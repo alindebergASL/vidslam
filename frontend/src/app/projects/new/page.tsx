@@ -4,7 +4,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { EnhanceButton } from "@/components/EnhanceButton";
-import { api, Avatar, BrandKit, CastMember, Ingredient } from "@/lib/api";
+import { api, Avatar, BrandKit, CastMember, Ingredient, errorText } from "@/lib/api";
 
 const MODES = [
   { id: "reel_montage", label: "Reel Montage", desc: "2–5 short cuts (most reliable)" },
@@ -206,7 +206,7 @@ function Inner() {
       });
       router.push(`/projects/${project.id}`);
     } catch (e: any) {
-      setError(e.message);
+      setError(errorText(e));
       setSubmitting(false);
     }
   };

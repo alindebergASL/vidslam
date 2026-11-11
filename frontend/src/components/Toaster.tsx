@@ -1,5 +1,6 @@
 "use client";
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 
 type ToastKind = "success" | "error" | "info";
 
@@ -9,13 +10,25 @@ export type Toast = {
   message: string;
   // ms until auto-dismiss; 0 = sticky.
   duration: number;
+  action?: ToastAction;
+  key?: string;
+};
+
+export type ToastAction = { label: string; href: string };
+
+export type ToastOpts = {
+  duration?: number;
+  /** A link button on the toast (e.g. "Open" → /projects/12). */
+  action?: ToastAction;
+  /** De-dup key: a toast with the same key still on screen is replaced, not stacked. */
+  key?: string;
 };
 
 type ToastApi = {
-  toast: (msg: string, kind?: ToastKind, opts?: { duration?: number }) => void;
-  success: (msg: string, opts?: { duration?: number }) => void;
-  error: (msg: string, opts?: { duration?: number }) => void;
-  info: (msg: string, opts?: { duration?: number }) => void;
+  toast: (msg: string, kind?: ToastKind, opts?: ToastOpts) => void;
+  success: (msg: string, opts?: ToastOpts) => void;
+  error: (msg: string, opts?: ToastOpts) => void;
+  info: (msg: string, opts?: ToastOpts) => void;
 };
 
 const ToastCtx = createContext<ToastApi | null>(null);
@@ -29,30 +42,49 @@ export function useToast(): ToastApi {
 export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const nextId = useRef(1);
+  const timers = useRef(new Map<number, ReturnType<typeof setTimeout>>());
 
   const dismiss = useCallback((id: number) => {
-    setToasts((cur) => cur.filter((t) => t.id !== id));
+    const t = timers.current.get(id);
+    if (t) clearTimeout(t);
+    timers.current.delete(id);
+    setToasts((cur) => cur.filter((x) => x.id !== id));
   }, []);
 
   const toast = useCallback<ToastApi["toast"]>(
     (message, kind = "info", opts) => {
       const id = nextId.current++;
-      const duration = opts?.duration ?? (kind === "error" ? 6000 : 3000);
-      setToasts((cur) => [...cur, { id, kind, message, duration }]);
+      const duration = opts?.duration ?? (opts?.action ? 8000 : kind === "error" ? 6000 : 3000);
+      const item: Toast = { id, kind, message, duration, action: opts?.action, key: opts?.key };
+      setToasts((cur) => {
+        if (!item.key) return [...cur, item];
+        // Same key on screen: replace it in place (a burst of the same news
+        // is one toast, not a stack).
+        const old = cur.find((x) => x.key === item.key);
+        if (!old) return [...cur, item];
+        const t = timers.current.get(old.id);
+        if (t) clearTimeout(t);
+        timers.current.delete(old.id);
+        return cur.map((x) => (x.id === old.id ? item : x));
+      });
       if (duration > 0) {
         // Auto-dismiss. We don't pause on hover to keep this small; errors get longer.
-        setTimeout(() => dismiss(id), duration);
+        timers.current.set(id, setTimeout(() => dismiss(id), duration));
       }
     },
     [dismiss]
   );
 
-  const api: ToastApi = {
-    toast,
-    success: (m, o) => toast(m, "success", o),
-    error: (m, o) => toast(m, "error", o),
-    info: (m, o) => toast(m, "info", o),
-  };
+  // Stable across renders, so consumers can put it in effect deps.
+  const api = useMemo<ToastApi>(
+    () => ({
+      toast,
+      success: (m, o) => toast(m, "success", o),
+      error: (m, o) => toast(m, "error", o),
+      info: (m, o) => toast(m, "info", o),
+    }),
+    [toast]
+  );
 
   return (
     <ToastCtx.Provider value={api}>
@@ -85,6 +117,16 @@ function Toaster({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: numbe
             {t.kind === "success" ? "✓" : t.kind === "error" ? "✕" : "•"}
           </span>
           <span className="flex-1 min-w-0 wrap-break-word">{t.message}</span>
+          {t.action && (
+            <Link
+              href={t.action.href}
+              aria-label={`${t.action.label}: ${t.message}`}
+              className="shrink-0 text-xs font-medium underline underline-offset-2 hover:text-white"
+              onClick={() => onDismiss(t.id)}
+            >
+              {t.action.label}
+            </Link>
+          )}
           <button
             className="text-ink-300 hover:text-white text-xs leading-none mt-0.5"
             onClick={() => onDismiss(t.id)}

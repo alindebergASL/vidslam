@@ -41,10 +41,13 @@ const browser = await chromium.launch({
 });
 
 async function login(page) {
-  await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await page.goto(`${BASE}/`, { waitUntil: 'load' });
   await page.fill('#avs-password', PW);
   await page.click('button[type=submit]');
-  await page.waitForLoadState('networkidle');
+  // Signed in, the app keeps a live-event stream (SSE) open, so the network
+  // is never idle: wait for 'load' and a moment instead of 'networkidle'.
+  await page.waitForLoadState('load');
+  await page.waitForTimeout(1000);
   await page.waitForTimeout(400);
 }
 
@@ -57,7 +60,7 @@ async function shot(page, file) {
 {
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const page = await ctx.newPage();
-  await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await page.goto(`${BASE}/`, { waitUntil: 'load' });
   await page.waitForTimeout(400);
   await shot(page, '01-login.png');
   await ctx.close();
@@ -80,7 +83,7 @@ const desktop = [
 ];
 for (const [path, file, h] of desktop) {
   await page.setViewportSize({ width: 1280, height: h });
-  await page.goto(`${BASE}${path}`, { waitUntil: 'networkidle' });
+  await page.goto(`${BASE}${path}`, { waitUntil: 'load' });
   await page.waitForTimeout(700);
   await shot(page, file);
 }
@@ -94,7 +97,7 @@ for (const [path, file, h] of desktop) {
     storageState: await ctx.storageState(),
   });
   const mpage = await mctx.newPage();
-  await mpage.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+  await mpage.goto(`${BASE}/`, { waitUntil: 'load' });
   await mpage.waitForTimeout(500);
   await shot(mpage, '10-mobile-dashboard.png');
 
@@ -118,7 +121,7 @@ for (const [path, file, h] of desktop) {
     if (share_token) {
       const sctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
       const spage = await sctx.newPage();
-      await spage.goto(`${BASE}/share/${share_token}`, { waitUntil: 'networkidle' });
+      await spage.goto(`${BASE}/share/${share_token}`, { waitUntil: 'load' });
       await spage.waitForTimeout(500);
       await shot(spage, '11-share.png');
       await sctx.close();

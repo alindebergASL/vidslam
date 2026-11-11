@@ -42,6 +42,13 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     from app.services import alerts as _al
 
     _al.reset()
+    # The safety check's in-process verdicts and the mock classifier's hooks.
+    from app.providers import mock_chat as _mc
+    from app.services import minor_check as _mcheck
+
+    _mcheck.reset_cache()
+    _mc.MINOR_REPLY = None
+    _mc.MINOR_CALLS.clear()
 
     # Rebind the engine + SessionLocal to this test's own SQLite file so tests are
     # truly isolated (the engine is module-bound at import; without this every test

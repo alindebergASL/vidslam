@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import uuid
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -29,6 +31,61 @@ from ..workers.queue import enqueue
 from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
+
+# Project states a plan or render may start from (anything else: a plan,
+# render or re-roll is running).
+_IDLE = ("draft", "planned", "completed", "failed", "cancelled")
+_DONE_RENDER = ("completed", "failed", "cancelled")
+
+
+def claim_project(db: Session, project: models.VideoProject, to: str, busy: str) -> tuple[str, str]:
+    """Move the project to `to` ("generating" / "planning") before its job is
+    queued, atomically and only from an idle state with no render running,
+    so a double-click or a second tab can't queue a second paid run (409
+    `busy`), and the editor keeps polling while the job waits for a worker.
+    Returns the previous status (for release_project) and the claim's
+    unique token, which the queued job must consume before it does anything."""
+    latest = (db.query(models.Render.status).filter(models.Render.project_id == project.id)
+              .order_by(models.Render.id.desc()).first())
+    if latest is not None and latest[0] not in _DONE_RENDER:
+        raise HTTPException(409, busy)
+    previous = project.status or "draft"
+    token = uuid.uuid4().hex
+    claimed = (db.query(models.VideoProject)
+               .filter(models.VideoProject.id == project.id, models.VideoProject.status.in_(_IDLE))
+               .update({"status": to, "claim_token": token, "updated_at": datetime.utcnow()},
+                       synchronize_session=False))
+    db.commit()
+    if not claimed:
+        raise HTTPException(409, busy)
+    db.refresh(project)
+    return (previous if previous in _IDLE else "draft"), token
+
+
+def release_project(db: Session, project_id: int, claimed: str, previous: str, token: str) -> None:
+    """The job could not be queued: give the claim back."""
+    db.rollback()
+    db.query(models.VideoProject).filter(
+        models.VideoProject.id == project_id, models.VideoProject.status == claimed,
+        models.VideoProject.claim_token == token,
+    ).update({"status": previous, "claim_token": ""}, synchronize_session=False)
+    db.commit()
+
+
+def _enqueue_claimed(db: Session, project: models.VideoProject, to: str, busy: str, func, *args, **kwargs) -> str:  # noqa: ANN001
+    previous, token = claim_project(db, project, to, busy)
+    try:
+        job_id = enqueue(func, *args, claim=to, claim_token=token, **kwargs)
+    except Exception:
+        release_project(db, project.id, to, previous, token)
+        raise
+    # Kept while the claim holds, so the sweeper can tell a job waiting in a
+    # busy queue from one whose queue entry is gone.
+    db.query(models.VideoProject).filter(
+        models.VideoProject.id == project.id, models.VideoProject.status == to,
+    ).update({"queue_job_id": str(job_id)[:80]}, synchronize_session=False)
+    db.commit()
+    return job_id
 
 # Public, token-gated router (no auth) for sharing finished renders.
 public_router = APIRouter()
@@ -91,7 +148,8 @@ def generate_plan(
     except UnsafeScriptError as e:
         raise HTTPException(422, str(e)) from e
     provider_gate.require_model("chat", content_mode.chat_model())
-    job_id = enqueue(generate_plan_job, project_id, preserve_edits=preserve_edits)
+    job_id = _enqueue_claimed(db, project, "planning", "Already planning this storyboard",
+                              generate_plan_job, project_id, preserve_edits=preserve_edits)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
 
@@ -150,7 +208,8 @@ def generate_video(
         result = run_preflight(db, project)
         if not result["ok"]:
             raise HTTPException(422, detail={"preflight": result})
-    job_id = enqueue(generate_video_job, project_id)
+    job_id = _enqueue_claimed(db, project, "generating", "Already making this video",
+                              generate_video_job, project_id)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
 
 
@@ -190,12 +249,21 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
         .order_by(models.Render.created_at.desc())
         .first()
     )
-    if latest is None:
-        raise HTTPException(409, "no render in flight")
     from ..services import video_jobs
 
+    if latest is None or latest.status in _DONE_RENDER:
+        # Claimed (Generate / Retry / plan) but its job hasn't made a render
+        # yet: still queued, or it stopped before it could. Give the claim
+        # back, so the editor stops waiting and Generate works again; the
+        # queued job sees the claim is gone and does nothing.
+        released = _release_waiting_claim(db, project)
+        if released:
+            return {"render_id": latest.id if latest is not None else None, "status": "cancelled",
+                    "action": "released", "clips_in_flight": video_jobs.pending_for(db, project_id=project_id)}
+    if latest is None:
+        raise HTTPException(409, "no render in flight")
     in_flight = video_jobs.pending_for(db, project_id=project_id)
-    if latest.status in ("completed", "failed", "cancelled"):
+    if latest.status in _DONE_RENDER:
         return {"render_id": latest.id, "status": latest.status, "action": "noop",
                 "clips_in_flight": in_flight}
     latest.status = "cancelled"
@@ -203,9 +271,40 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     # render_project to mirror this; in-flight clips that land later see a
     # cancelled render and don't compose.
     project.status = "cancelled"
+    from ..services import events
+
+    events.render_event(db, latest, project, "cancelled")
     db.commit()
     return {"render_id": latest.id, "status": "cancelled", "action": "signalled",
             "clips_in_flight": in_flight}
+
+
+def _release_waiting_claim(db: Session, project: models.VideoProject) -> bool:
+    """generating / planning with no render running → cancelled (atomic)."""
+    was = project.status
+    if was not in ("generating", "planning"):
+        return False
+    from ..services import events
+
+    # Only while no worker has taken the claim over (its token is still
+    # set): after that the job owns it and cancel goes through its render.
+    done = (db.query(models.VideoProject)
+            .filter(models.VideoProject.id == project.id, models.VideoProject.status == was,
+                    models.VideoProject.claim_token != "")
+            .update({"status": "cancelled", "claim_token": "", "updated_at": datetime.utcnow()},
+                    synchronize_session=False))
+    if done != 1:
+        db.rollback()
+        return False
+    db.refresh(project)
+    if was == "planning":
+        events.plan_event(db, project, "cancelled")
+    else:
+        kind = "ambient_loop" if project.mode == "ambient_loop" else "render"
+        events.emit(db, kind, "project", project.id, "cancelled", f"Cancelled: {events._name(project)}",
+                    url=events.project_url(project), project_id=project.id)
+    db.commit()
+    return True
 
 
 @router.post("/projects/{project_id}/retry", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
@@ -230,6 +329,11 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     body_shots = [s for s in project.shots if s.shot_type != "end_card"]
     if not body_shots:
         raise HTTPException(409, "no body shots to render — re-plan the storyboard first")
+    # Before anything is reset: a render already running refuses a second one.
+    running = (db.query(models.Render.status).filter(models.Render.project_id == project.id)
+               .order_by(models.Render.id.desc()).first())
+    if (project.status or "draft") not in _IDLE or (running is not None and running[0] not in _DONE_RENDER):
+        raise HTTPException(409, "Already making this video")
 
     # Reset any failed shots so the pipeline's idempotent check doesn't skip them.
     for s in body_shots:
@@ -260,14 +364,15 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     )
     have_audio = bool(latest and latest.audio_path and Path(latest.audio_path).exists())
 
+    busy = "Already making this video"
     if all_clips and have_audio:
-        job_id = enqueue(recompose_project_job, project_id)
+        job_id = _enqueue_claimed(db, project, "generating", busy, recompose_project_job, project_id)
         action = "recompose"
         voiceover, voiceover_cost = "reuse", 0.0
     else:
         voiceover, voiceover_cost = plan["voiceover"], plan["voiceover_cost"]
         provider_gate.require_project(db, project)  # only the shots it resubmits
-        job_id = enqueue(generate_video_job, project_id)
+        job_id = _enqueue_claimed(db, project, "generating", busy, generate_video_job, project_id)
         action = "resume"
     return {
         "project_id": project_id,

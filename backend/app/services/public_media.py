@@ -14,9 +14,9 @@ from typing import Optional
 
 from ..config import get_settings
 
-_NAME_RE = re.compile(r"([A-Za-z0-9_-]{32,64})\.(png|jpg|mp3|m4a|wav|mp4)")
-MIME = {"png": "image/png", "jpg": "image/jpeg", "mp3": "audio/mpeg",
-        "m4a": "audio/mp4", "wav": "audio/wav", "mp4": "video/mp4"}
+_NAME_RE = re.compile(r"([A-Za-z0-9_-]{32,64})\.(png|jpg|jpeg|webp|gif|mp3|m4a|wav|mp4)")
+MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp",
+        "gif": "image/gif", "mp3": "audio/mpeg", "m4a": "audio/mp4", "wav": "audio/wav", "mp4": "video/mp4"}
 
 
 def _dir() -> Path:

@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
-import { api, Asset, Avatar, Ingredient, StudioJob } from "@/lib/api";
+import { api, Asset, Avatar, Ingredient, StudioJob, errorText } from "@/lib/api";
 
 export type OwnerKind = "avatar" | "ingredient";
 
@@ -123,7 +123,7 @@ export function AssignDialog({
         asset_type: slot,
       });
     } catch (e: any) {
-      toast.error(e.message || "Couldn't save the picture");
+      toast.error(errorText(e, "Couldn't save the picture"));
       setBusy(false);
       return;
     }

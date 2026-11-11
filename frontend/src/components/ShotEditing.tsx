@@ -5,7 +5,7 @@ import { Dialog } from "@/components/Dialog";
 import { useToast } from "@/components/Toaster";
 import { checkBlockedWhy, checkCostText, InspectionChip, useClipCheckSettings } from "@/components/InspectionChip";
 import { shotTypeLabel } from "@/lib/labels";
-import { AddShotType, api, Project, Shot, ShotEdit, ShotEditImpact, Take } from "@/lib/api";
+import { AddShotType, api, Project, Shot, ShotEdit, ShotEditImpact, Take, errorText } from "@/lib/api";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 const ADD_TYPES: AddShotType[] = ["b_roll", "hero", "talking_head", "transition"];
@@ -97,7 +97,7 @@ export function AddShotDialog({
       );
       onDone(r);
     } catch (e: any) {
-      toast.error(e.message || "Couldn't add the shot");
+      toast.error(errorText(e, "Couldn't add the shot"));
       setBusy(false);
     }
   };
@@ -207,7 +207,7 @@ export function DeleteShotDialog({
       );
       onDone(r);
     } catch (e: any) {
-      toast.error(e.message || "Couldn't delete the shot");
+      toast.error(errorText(e, "Couldn't delete the shot"));
       setBusy(false);
     }
   };
@@ -323,7 +323,7 @@ export function TakesDialog({
       setTakes(r.takes);
       setKeep(r.keep);
     } catch (e: any) {
-      toast.error(e.message || "Couldn't load the takes");
+      toast.error(errorText(e, "Couldn't load the takes"));
       setTakes([]);
     }
   };
@@ -345,7 +345,7 @@ export function TakesDialog({
       await load();
       onChanged();
     } catch (e: any) {
-      toast.error(e.message || "Couldn't switch to this take");
+      toast.error(errorText(e, "Couldn't switch to this take"));
     } finally {
       setBusy(null);
     }
@@ -364,7 +364,7 @@ export function TakesDialog({
       await load();
       if (t.current) onChanged();
     } catch (e: any) {
-      toast.error(e.message || "Couldn't check this take");
+      toast.error(errorText(e, "Couldn't check this take"));
     } finally {
       setChecking(null);
     }
@@ -379,7 +379,7 @@ export function TakesDialog({
       await load();
       onChanged();
     } catch (e: any) {
-      toast.error(e.message || "Couldn't delete the take");
+      toast.error(errorText(e, "Couldn't delete the take"));
     } finally {
       setBusy(null);
     }

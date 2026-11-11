@@ -58,15 +58,18 @@ page.on('console', (msg) => {
   if (msg.type() === 'error') errors.push(`console.error: ${msg.text()}`);
 });
 
-await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+await page.goto(`${BASE}/`, { waitUntil: 'load' });
 await page.fill('#avs-password', PW);
 await page.click('button[type=submit]');
-await page.waitForLoadState('networkidle');
+// Signed in, the app keeps a live-event stream (SSE) open, so the network
+// is never idle: wait for 'load' and a moment instead of 'networkidle'.
+await page.waitForLoadState('load');
+await page.waitForTimeout(1000);
 
 for (const { path, expect } of ROUTES) {
   errors.length = 0;
   const start = Date.now();
-  const resp = await page.goto(`${BASE}${path}`, { waitUntil: 'networkidle' });
+  const resp = await page.goto(`${BASE}${path}`, { waitUntil: 'load' });
   if (!resp || !resp.ok()) {
     failures.push(`${path}: HTTP ${resp ? resp.status() : 'no response'}`);
     continue;

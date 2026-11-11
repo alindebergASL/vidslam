@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
-import { api, Avatar, BrandKit, CastMember, Ingredient, Project, RenderPlan } from "@/lib/api";
+import { api, Avatar, BrandKit, CastMember, Ingredient, Project, RenderPlan, errorText } from "@/lib/api";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
@@ -238,7 +238,7 @@ export function ProjectSettingsCard({
       setOutcome(result);
       toast.success("Project settings saved");
     } catch (e: any) {
-      toast.error(e.message || "Couldn't save the settings");
+      toast.error(errorText(e, "Couldn't save the settings"));
     } finally {
       setSaving(false);
     }

@@ -350,6 +350,16 @@ class TakeOut(BaseModel):
     created_at: Optional[str] = None
 
 
+class TakeFromStudioIn(BaseModel):
+    studio_job_id: int
+
+
+class TakeFromStudioOut(TakeOut):
+    # A plain note when the clip doesn't fit the shot or project ("" = fits).
+    warning: str = ""
+    duration_seconds: Optional[float] = None
+
+
 class TakesOut(BaseModel):
     takes: list[TakeOut]
     keep: int  # takes kept per shot; older ones are deleted (never the current one)
@@ -418,6 +428,10 @@ class StudioRequest(BaseModel):
     # Images only: this many separate jobs from one request. A clip
     # request with more than 1 is refused (422) rather than billed N times.
     variations: int = Field(1, ge=1, le=4)
+    # Clips only ("Animate this"): start from a finished Studio image or a
+    # Cast picture (at most one). 422 when the video model can't.
+    first_frame_job_id: Optional[int] = None
+    first_frame_asset_id: Optional[int] = None
 
 
 class StudioSaveRequest(BaseModel):
@@ -458,6 +472,16 @@ class StudioJobOut(BaseModel):
     # video jobs), summed; None until something is recorded.
     cost_usd: Optional[float] = None
     cost_is_estimate: bool = False
+    # "Animate this": the picture the clip starts from (null = none).
+    first_frame_job_id: Optional[int] = None
+    first_frame_asset_id: Optional[int] = None
+    # A finished clip's real size and length (null: not probed, e.g. an
+    # older job; show the requested values).
+    result_width: Optional[int] = None
+    result_height: Optional[int] = None
+    result_duration_seconds: Optional[float] = None
+    # Reference pictures in reference_asset_ids that were deleted since.
+    missing_reference_ids: list[int] = Field(default_factory=list)
 
     @field_validator("reference_asset_ids", mode="before")
     @classmethod

@@ -113,7 +113,30 @@ def _merged(kind: str, provider_list) -> list[dict]:
 
 @router.get("/openrouter/video-models")
 def video_models(db: Session = Depends(get_db)) -> list[dict]:
-    return _trained_lora_entries(db, "video") + _merged("video", lambda: get_video().list_models())
+    """Each entry also says whether the model can start from a picture
+    (`first_frame`), for Studio's "Animate this"."""
+    entries = _trained_lora_entries(db, "video") + _merged("video", lambda: get_video().list_models())
+    from ..services import model_catalog
+
+    frames = {e.get("id"): e.get("frame_images") or []
+              for e in (model_catalog.get_snapshot() or {}).get("entries") or []
+              if e.get("kind") == "video" and "frame_images" in e}
+    return [{**e, "first_frame": _first_frame(e["id"], frames)} for e in entries]
+
+
+def _first_frame(model_id: str, catalog_frames: dict) -> bool:
+    """From the polled catalog when it lists the model, else the provider's
+    own capabilities (trained adapters: no)."""
+    if model_id.startswith("custom:"):
+        return False
+    if model_id in catalog_frames:
+        return "first_frame" in catalog_frames[model_id]
+    from ..providers import video_capabilities
+
+    try:
+        return bool(video_capabilities(model_id).first_frame)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 @router.get("/openrouter/image-models")

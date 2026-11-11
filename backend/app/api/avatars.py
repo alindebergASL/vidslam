@@ -11,6 +11,16 @@ from .auth import require_auth
 router = APIRouter(dependencies=[Depends(require_auth)])
 
 
+def _check_look(*texts: str | None) -> None:
+    """A Cast member's description and look go into its pictures' prompts
+    (character sheets, storyboard shots): the safety check runs on save."""
+    from ..services.minor_check import check_or_422
+
+    text = " ".join(t.strip() for t in texts if t and t.strip())
+    if text:
+        check_or_422(text, kind="image")
+
+
 @router.get("/avatars", response_model=list[AvatarOut])
 def list_avatars(db: Session = Depends(get_db)) -> list[models.Avatar]:
     return db.query(models.Avatar).order_by(models.Avatar.created_at.desc()).all()
@@ -18,7 +28,9 @@ def list_avatars(db: Session = Depends(get_db)) -> list[models.Avatar]:
 
 @router.post("/avatars", response_model=AvatarOut, status_code=201)
 def create_avatar(body: AvatarCreate, db: Session = Depends(get_db)) -> models.Avatar:
-    a = models.Avatar(**body.model_dump())
+    data = body.model_dump()
+    _check_look(data.get("visual_identity"), data.get("description"))
+    a = models.Avatar(**data)
     db.add(a)
     db.commit()
     db.refresh(a)
@@ -40,7 +52,10 @@ def update_avatar(
     a = db.get(models.Avatar, avatar_id)
     if a is None:
         raise HTTPException(404, "avatar not found")
-    for k, v in body.model_dump(exclude_none=True).items():
+    changes = body.model_dump(exclude_none=True)
+    if "visual_identity" in changes or "description" in changes:
+        _check_look(changes.get("visual_identity", a.visual_identity), changes.get("description", a.description))
+    for k, v in changes.items():
         setattr(a, k, v)
     db.commit()
     db.refresh(a)

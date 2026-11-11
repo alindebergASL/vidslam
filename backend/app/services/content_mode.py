@@ -89,4 +89,18 @@ def status() -> dict:
         "explicit": explicit() is not None,
         "text_model": s.adult_text_model or "",
         "planner": active_model("chat"),
+        "safety_check": _safety_check(),
     }
+
+
+def _safety_check() -> dict:
+    """{"model", "available"}: the planner checks prompts for minors before
+    they're sent (services/minor_check.py)."""
+    from .minor_check import availability
+
+    try:
+        return availability()
+    except Exception:  # noqa: BLE001 — a status line, never a failed page
+        from .model_registry import active_model
+
+        return {"model": active_model("chat"), "available": False}

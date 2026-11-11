@@ -57,19 +57,37 @@ const browser = await chromium.launch({
 const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
 const page = await ctx.newPage();
 
-await page.goto(`${BASE}/`, { waitUntil: 'networkidle' });
+// Signed-in pages keep one live-event stream (SSE) open, so the network is
+// never idle: wait for 'load' plus a settle delay instead of 'networkidle'.
+await page.goto(`${BASE}/`, { waitUntil: 'load' });
 await page.fill('#avs-password', PW);
 await page.click('button[type=submit]');
-await page.waitForLoadState('networkidle');
+await page.waitForLoadState('load');
+await page.waitForTimeout(800);
 
 const allViolations = [];
 let blocking = 0;
 
-for (const route of ROUTES) {
-  await page.goto(`${BASE}${route}`, { waitUntil: 'networkidle' });
+// The activity panel (bell in the side nav) is a dialog over any page: scan it open.
+const PANELS = [
+  {
+    name: '/ (activity panel)',
+    route: '/',
+    open: async () => {
+      await page.click('aside button[aria-haspopup="dialog"]');
+      await page.waitForSelector('[role=dialog]');
+      await page.waitForTimeout(800);
+    },
+  },
+];
+
+for (const target of [...ROUTES.map((route) => ({ name: route, route, open: null })), ...PANELS]) {
+  const route = target.name;
+  await page.goto(`${BASE}${target.route}`, { waitUntil: 'load' });
   // Let any in-flight skeletons / fetches settle before the scan; otherwise
   // axe sees an aria-busy loading region that's about to disappear.
-  await page.waitForTimeout(800);
+  await page.waitForTimeout(1500);
+  if (target.open) await target.open();
 
   const results = await new AxeBuilder({ page })
     .withTags(['wcag2a', 'wcag2aa', 'best-practice'])
@@ -99,7 +117,7 @@ for (const route of ROUTES) {
 await browser.close();
 
 console.log(
-  `\n${blocking === 0 ? 'ok' : 'FAIL'}: ${ROUTES.length} routes scanned, ` +
+  `\n${blocking === 0 ? 'ok' : 'FAIL'}: ${ROUTES.length + PANELS.length} pages scanned, ` +
     `${allViolations.length} total findings (${blocking} serious/critical)`
 );
 process.exit(blocking === 0 ? 0 : 1);

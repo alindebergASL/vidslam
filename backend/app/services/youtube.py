@@ -349,6 +349,13 @@ def _finish(db: Session, job: models.PublishJob, video: dict, client: httpx.Clie
                 publish_state.apply_video(job, found[vid])
         except Exception as e:  # noqa: BLE001 — the upload itself succeeded
             log.warning("couldn't read YouTube's state for %s after upload: %s", vid, e)
+    from . import events
+
+    try:
+        warning = job.warning  # e.g. YouTube kept it private
+    except Exception:  # noqa: BLE001
+        warning = ""
+    events.publish_event(db, job, "completed", warning=warning)
     db.commit()
     return job
 

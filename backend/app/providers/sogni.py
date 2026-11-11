@@ -932,12 +932,15 @@ class SogniClient:
         picture (`cast`), a prompt mentioning a child or a minor's age, or a
         sexual prompt whose avoid list (`negative`) removes signs of
         adulthood."""
-        from ..services.safety import check_prompt, mentions_minor, steers_young
+        from ..services.safety import check_prompt, is_sexual, mentions_minor, steers_young
 
         prompt = str(arguments.get("prompt") or "")
         negative = negative or str(arguments.get("negativePrompt") or "")
         check_prompt(prompt)
-        guarded = cast or mentions_minor(prompt) or steers_young(prompt, negative)
+        # Any reference picture with a sexual prompt: nobody has checked
+        # who is in the picture, so the safe filter is on.
+        pictures = bool(media_references) and is_sexual(prompt)
+        guarded = cast or pictures or mentions_minor(prompt) or steers_young(prompt, negative)
         body: dict = {
             "input": {"title": title[:120] or "vidslam", "steps": [
                 {"id": STEP_ID, "toolName": tool, "arguments": arguments},

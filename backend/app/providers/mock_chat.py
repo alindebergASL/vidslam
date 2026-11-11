@@ -33,8 +33,52 @@ VISION_REPLY: str | None = None
 VISION_CALLS: list[tuple[str, int]] = []
 
 
+# The mock safety check's verdict. Tests set a dict ({"minor_sexual": True,
+# "reason": ...}) to force a verdict, or an exception to make the check
+# fail; None = the deterministic rules in classify_minor.
+MINOR_REPLY: dict | BaseException | None = None
+# Every mock safety-check call (the text sent), for tests.
+MINOR_CALLS: list[str] = []
+
+# Signs of a child's look or setting that, with undressing or anything
+# sexual, mean a minor in a sexual context even with no minor word.
+_YOUNG_CUES = re.compile(
+    r"\b(?:school ?uniforms?|schoolgirl outfit|school (?:bag|backpack|desk)|pigtails|braces on (?:her|his) teeth|"
+    r"flat[- ]chested|flat chest|training bras?|stuffed animals?|teddy bears?|lunchbox|hall pass|"
+    r"childlike|child-like|young-looking|looks? (?:very )?young|barely 18)\b", re.I)
+_UNDRESS = re.compile(
+    r"\b(?:takes? off|taking off|took off|removes? (?:her|his)|removing (?:her|his)|strips?|stripping|"
+    r"undress\w*|in (?:her|his) underwear|on (?:the|her|his) bed|in bed)\b", re.I)
+# How services/minor_check.py marks the avoid list in the text it sends.
+AVOID_MARK = "\n\nAvoid list (negative prompt): "
+
+
+def mock_minor_verdict(text: str) -> dict:
+    """The rules the mock safety check applies (deterministic)."""
+    from ..services.safety import is_sexual, mentions_minor, steers_young
+
+    prompt, _, negative = text.partition(AVOID_MARK)
+    prompt = prompt.removeprefix("Prompt: ")
+    if mentions_minor(prompt) and is_sexual(prompt):
+        return {"minor_sexual": True, "reason": "A minor in a sexual context."}
+    if _YOUNG_CUES.search(prompt) and (is_sexual(prompt) or _UNDRESS.search(prompt)):
+        return {"minor_sexual": True, "reason": "Childlike cues in a sexual context."}
+    if steers_young(prompt, negative):
+        return {"minor_sexual": True, "reason": "The avoid list removes signs of adulthood."}
+    return {"minor_sexual": False, "reason": "No minor in a sexual context."}
+
+
 class MockChatProvider(ChatProvider):
     """Deterministic storyboard generator used in MOCK_PROVIDERS mode and tests."""
+
+    def classify_minor(self, text: str) -> dict:
+        """Deterministic (see mock_minor_verdict), unless MINOR_REPLY is set."""
+        MINOR_CALLS.append(text)
+        if isinstance(MINOR_REPLY, BaseException):
+            raise MINOR_REPLY
+        if MINOR_REPLY is not None:
+            return dict(MINOR_REPLY)
+        return mock_minor_verdict(text)
 
     def inspect_images(self, *, system: str, text: str, images: list[str],
                        note: str = "clip check", estimate: float = 0.0) -> str:

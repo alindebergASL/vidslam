@@ -24,6 +24,20 @@ export class ApiError extends Error {
   }
 }
 
+/** What to show the user for a failed call: the server's own sentence for a
+ *  refusal it explains (a 4xx such as the safety check's 422, or a 503 when
+ *  the queue is down), else the error's message. */
+export function errorText(e: unknown, fallback = "Something went wrong"): string {
+  if (e instanceof ApiError) {
+    if (e.status >= 400 && e.status < 600 && e.status !== 500 && e.detail && !e.detail.trim().startsWith("[")) {
+      return e.detail;
+    }
+    return e.message || fallback;
+  }
+  const m = (e as { message?: unknown } | null)?.message;
+  return typeof m === "string" && m ? m : fallback;
+}
+
 async function req<T>(
   path: string,
   init: RequestInit = {},
@@ -476,6 +490,15 @@ export type StudioJob = {
   /** Money recorded for this job so far; null = nothing recorded yet. */
   cost_usd?: number | null;
   cost_is_estimate?: boolean;
+  /** "Animate this": the Studio picture or Cast picture the clip starts from. */
+  first_frame_job_id?: number | null;
+  first_frame_asset_id?: number | null;
+  /** A finished clip's real size and length; null = not measured (show the requested values). */
+  result_width?: number | null;
+  result_height?: number | null;
+  result_duration_seconds?: number | null;
+  /** Ids in reference_asset_ids whose picture was deleted since. */
+  missing_reference_ids?: number[];
 };
 
 /** Filters for the Studio library list. All optional and combinable; newest first. */
@@ -534,6 +557,26 @@ export type StudioGenerateBody = {
   aspect_ratio?: "9:16" | "16:9" | "1:1" | null;
   /** 1..4, images only. */
   variations?: number;
+  /** Clips only, at most one: start from a finished Studio picture or a Cast picture. */
+  first_frame_job_id?: number | null;
+  first_frame_asset_id?: number | null;
+};
+
+/** A Studio clip filed as a shot's take (POST …/takes/from-studio). */
+export type TakeFromStudio = Take & {
+  /** "" = the clip fits; otherwise one or two plain sentences. */
+  warning: string;
+  /** The length kept (a longer clip is trimmed to the shot). */
+  duration_seconds: number | null;
+};
+
+/** One entry of the video model list. */
+export type VideoModelOption = {
+  id: string;
+  name: string;
+  description: string;
+  /** The model can start a clip from a picture ("Animate this"). */
+  first_frame?: boolean;
 };
 
 export type PromptDefaults = { image: string; video: string };
@@ -550,6 +593,8 @@ export type ContentMode = {
   text_model: string;
   /** The planner chosen in Settings → Models (used while adult mode is off). */
   planner: string;
+  /** The model that checks prompts for minors before they're sent. */
+  safety_check?: { model: string; available: boolean };
 };
 
 export type PromptPreset = {
@@ -1092,8 +1137,84 @@ function chunks<T>(xs: T[], size: number): T[][] {
   return out;
 }
 
+// ---------- live progress (events + activity) ----------
+
+export type AppEventKind =
+  | "render"
+  | "plan"
+  | "ambient_loop"
+  | "ambient_render"
+  | "studio_job"
+  | "training"
+  | "publish"
+  | "budget";
+
+export type AppEventStatus = "started" | "progress" | "completed" | "failed" | "cancelled";
+
+/** One row of the events table, as the stream and /api/events/recent send it. */
+export type AppEvent = {
+  id: number;
+  kind: AppEventKind | string;
+  entity_type: string;
+  entity_id: number;
+  project_id: number | null;
+  status: AppEventStatus | string;
+  title: string;
+  detail: string;
+  url: string;
+  severity: "info" | "warning" | "error" | string;
+  read: boolean;
+  created_at: string | null;
+};
+
+export type RecentEvents = {
+  events: AppEvent[];
+  has_more: boolean;
+  /** Unread finished / failed events (the badge). */
+  unread: number;
+  latest_id: number;
+};
+
+export type ActivityItem = {
+  kind: AppEventKind | string;
+  entity_type: string;
+  entity_id: number;
+  project_id: number | null;
+  title: string;
+  url: string;
+  stage: string;
+  status: string;
+  started_at: string | null;
+};
+
+export type Activity = {
+  items: ActivityItem[];
+  studio: {
+    count: number;
+    jobs: { id: number; output_kind: string; status: string; stage: string; prompt: string; label: string; started_at: string | null }[];
+  };
+  counts: { projects: number; ambient: number; studio: number; training: number; publish: number };
+};
+
 export const api = {
   base: API_BASE,
+
+  // live progress
+  /** The SSE stream's URL (`after` resumes after that event id). */
+  eventStreamUrl: (after?: number | null) =>
+    `${API_BASE}/api/events/stream${after ? `?after=${after}` : ""}`,
+  recentEvents: (opts: { limit?: number; before_id?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.limit) q.set("limit", String(opts.limit));
+    if (opts.before_id) q.set("before_id", String(opts.before_id));
+    return req<RecentEvents>(`/api/events/recent?${q}`);
+  },
+  markEventsRead: (body: { ids: number[] } | { all: true }) =>
+    req<{ updated: number; unread: number }>("/api/events/read", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  activeWork: () => req<Activity>("/api/activity/active"),
 
   // model catalog
   modelCatalog: (kind?: ModelKind) =>
@@ -1290,7 +1411,7 @@ export const api = {
 
   // providers
   providerStatus: () => req<Record<string, any>>("/api/providers/status"),
-  videoModels: () => req<{ id: string; name: string; description: string }[]>(
+  videoModels: () => req<VideoModelOption[]>(
     "/api/providers/openrouter/video-models"
   ),
   imageModels: () => req<{ id: string; name: string; description: string }[]>(
@@ -1596,7 +1717,12 @@ export const api = {
       voiceover_cost?: number;
     }>(`/api/projects/${id}/retry`, { method: "POST" }),
   cancelRender: (id: number) =>
-    req<{ render_id: number; status: string; action: "noop" | "signalled"; clips_in_flight?: number }>(
+    req<{
+      render_id: number | null;
+      status: string;
+      action: "noop" | "signalled" | "released";
+      clips_in_flight?: number;
+    }>(
       `/api/projects/${id}/cancel`,
       { method: "POST" }
     ),
@@ -1761,6 +1887,19 @@ export const api = {
       body: JSON.stringify(body),
     }),
   getStudioJob: (id: number) => req<StudioJob>(`/api/studio/jobs/${id}`),
+  /** These jobs only (at most 200; deleted ones are left out), whatever the filters. */
+  studioJobsByIds: (ids: number[]) =>
+    ids.length === 0
+      ? Promise.resolve([] as StudioJob[])
+      : req<StudioJob[]>(`/api/studio/jobs?ids=${ids.slice(0, 200).join(",")}`),
+  /** Stop waiting for a running job (it becomes failed, "Cancelled"); a finished one comes back unchanged. */
+  cancelStudioJob: (id: number) => req<StudioJob>(`/api/studio/jobs/${id}/cancel`, { method: "POST" }),
+  /** File a finished Studio clip as this shot's current take (free). */
+  takeFromStudio: (projectId: number, shotId: number, studioJobId: number) =>
+    req<TakeFromStudio>(`/api/projects/${projectId}/shots/${shotId}/takes/from-studio`, {
+      method: "POST",
+      body: JSON.stringify({ studio_job_id: studioJobId }),
+    }),
   // Files a COPY of a finished Studio image as a new cast asset. With no
   // options it goes to the job's own owner in the backend's default slot; a
   // bare string is still accepted as the slot for older callers.

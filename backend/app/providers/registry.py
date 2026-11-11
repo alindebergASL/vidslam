@@ -18,6 +18,72 @@ if TYPE_CHECKING:
 
 
 
+class _Guarded:
+    """A provider with the safety check (services/minor_check.py) run on
+    every prompt before it's delegated; everything else passes through.
+    The adapters keep their own word filter on the exact text they send."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+
+    @property
+    def __class__(self):  # noqa: D105 — isinstance(p, RunwareImageProvider) etc. still holds
+        return type(self.inner)
+
+    def __getattr__(self, name: str):
+        return getattr(self.inner, name)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.inner!r})"
+
+
+def _guard(prompt: str, negative: str, kind: str) -> None:
+    from ..services.minor_check import check_generation
+
+    check_generation(prompt or "", negative or "", kind=kind)
+
+
+class GuardedImageProvider(_Guarded):
+    def generate(self, *, model: str, prompt: str, references, negative_prompt: str = "",
+                 settings: dict | None = None, **kw) -> bytes:
+        _guard(prompt, negative_prompt, "image")
+        return self.inner.generate(model=model, prompt=prompt, references=references,
+                                   negative_prompt=negative_prompt, settings=settings, **kw)
+
+
+class GuardedVideoProvider(_Guarded):
+    def submit(self, *, model: str, prompt: str, references, negative_prompt: str = "",
+               reference_strategy: str = "input_references", duration_seconds: float = 5.0,
+               settings: dict | None = None, **kw):
+        _guard(prompt, negative_prompt, "video")
+        return self.inner.submit(model=model, prompt=prompt, references=references,
+                                 negative_prompt=negative_prompt, reference_strategy=reference_strategy,
+                                 duration_seconds=duration_seconds, settings=settings, **kw)
+
+
+class GuardedAvatarProvider(_Guarded):
+    def submit_avatar(self, *, script: str = "", motion_prompt: str = "", **kw):
+        from ..services.minor_check import check_generation
+        from ..services.safety import check_prompt
+
+        if (motion_prompt or "").strip():
+            check_prompt(motion_prompt)
+        check_generation(" ".join(x for x in (motion_prompt or "", script or "") if x.strip()),
+                         kind="lipsync")
+        return self.inner.submit_avatar(script=script, motion_prompt=motion_prompt, **kw)
+
+
+class GuardedTTSProvider(_Guarded):
+    def synthesize(self, *, text: str, voice_id: str, settings: dict | None = None, **kw) -> bytes:
+        _guard(text, "", "script")
+        return self.inner.synthesize(text=text, voice_id=voice_id, settings=settings, **kw)
+
+
+def unwrap(provider):
+    """The adapter inside a guarded provider (tests, type checks)."""
+    return provider.inner if isinstance(provider, _Guarded) else provider
+
+
 def _checked(kind: str, model: str) -> str:
     """The provider to build for `kind` with `model`; raises
     ProviderUnavailable (before any provider call) when it's switched off."""
@@ -102,7 +168,12 @@ def _route(kind: str, model: str | None) -> tuple[str, str]:
 
 def get_image(model: str | None = None) -> ImageProvider:
     """Image provider for `model` (a `sogni/` id goes to Sogni whatever is
-    active), or for the active image model when no model is given."""
+    active), or for the active image model when no model is given; every
+    prompt goes through the safety check first."""
+    return GuardedImageProvider(_image(model))
+
+
+def _image(model: str | None) -> ImageProvider:
     model, provider = _route("image", model)
     if provider == "mock":
         from .mock_image import MockImageProvider
@@ -122,7 +193,12 @@ def get_image(model: str | None = None) -> ImageProvider:
 
 
 def get_video(model: str | None = None) -> VideoProvider:
-    """Video provider for `model` (see get_image), else the active one."""
+    """Video provider for `model` (see get_image), else the active one,
+    with the safety check on every prompt."""
+    return GuardedVideoProvider(_video(model))
+
+
+def _video(model: str | None) -> VideoProvider:
     model, provider = _route("video", model)
     if provider == "mock":
         from .mock_video import get_singleton
@@ -192,6 +268,11 @@ def video_capabilities(model: str = "") -> "VideoCapabilities":
 
 
 def get_tts() -> TTSProvider:
+    """The voice provider; every script goes through the safety check."""
+    return GuardedTTSProvider(_tts())
+
+
+def _tts() -> TTSProvider:
     from ..services import model_catalog
     from ..services import model_registry as reg
 
@@ -266,10 +347,10 @@ def get_avatar():
     if provider == "mock":
         from .mock_avatar import MockAvatarProvider
 
-        return MockAvatarProvider(model=model)
+        return GuardedAvatarProvider(MockAvatarProvider(model=model))
     from .openrouter_avatar import OpenRouterAvatarProvider
 
-    return OpenRouterAvatarProvider(model=model)
+    return GuardedAvatarProvider(OpenRouterAvatarProvider(model=model))
 
 
 # Module-level singleton so the mock training provider's per-job poll

@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
-import { api, AmbientScene, LoopHealth, LoopHealthResult, LoopLevel } from "@/lib/api";
+import { api, AmbientScene, LoopHealth, LoopHealthResult, LoopLevel, errorText } from "@/lib/api";
 
 const DOT: Record<LoopLevel, string> = {
   good: "bg-emerald-400",
@@ -108,7 +108,7 @@ export function LoopHealthCard({
       onMeasured(r);
       toast.success("Loop measured again");
     } catch (e: any) {
-      toast.error(e.message || "Couldn't measure the loop");
+      toast.error(errorText(e, "Couldn't measure the loop"));
     } finally {
       setBusy(false);
     }

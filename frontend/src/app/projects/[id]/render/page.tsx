@@ -5,7 +5,12 @@ import { useParams, useSearchParams } from "next/navigation";
 import { AuthGate } from "@/components/AuthGate";
 import { useToast } from "@/components/Toaster";
 import { PublishPanel } from "@/components/PublishPanel";
-import { api, Project, Render } from "@/lib/api";
+import { GenerationProgress } from "@/components/GenerationProgress";
+import { useEvents } from "@/components/NotificationsProvider";
+import { api, errorText, Project, Render } from "@/lib/api";
+import { usePoll } from "@/lib/usePoll";
+
+const RENDER_DONE = ["completed", "failed", "cancelled"];
 
 export default function RenderPage() {
   return (
@@ -27,9 +32,10 @@ function Inner() {
   const [allRenders, setAllRenders] = useState<Render[]>([]);
   const toast = useToast();
 
-  useEffect(() => {
-    api.getProject(projectId).then(setProject);
-    api.listRenders(projectId).then((rs) => {
+  const load = async () => {
+    try {
+      const [p, rs] = await Promise.all([api.getProject(projectId), api.listRenders(projectId)]);
+      setProject(p);
       setAllRenders(rs);
       const primary = explicitRenderId
         ? rs.find((r) => r.id === explicitRenderId) || rs[0] || null
@@ -39,8 +45,29 @@ function Inner() {
         ? rs.find((r) => r.id === compareRenderId) || null
         : null;
       setCompareRender(secondary);
-    });
+    } catch (e) {
+      // One toast for a run of failed ticks (a restart or a blip), not one per tick.
+      toast.error(errorText(e, "Couldn't load the render"), { key: "render-load-error" });
+    }
+  };
+  useEffect(() => {
+    load();
   }, [projectId, explicitRenderId, compareRenderId]);
+
+  // Live while the shown render runs: refetch on this project's events, with
+  // a fallback poll (3 s, 12 s while the live stream is connected).
+  const running = !!render && !RENDER_DONE.includes(render.status);
+  const [kicked, setKicked] = useState(false);
+  useEffect(() => {
+    if (running) setKicked(false);
+  }, [running]);
+  useEffect(() => {
+    if (!kicked) return;
+    const t = setTimeout(() => setKicked(false), 60_000);
+    return () => clearTimeout(t);
+  }, [kicked]);
+  const poke = usePoll(load, { enabled: running || kicked, interval: 3000 });
+  useEvents({ project_id: projectId }, () => poke());
 
   if (!project) return <div className="p-8 text-ink-300">Loading…</div>;
 
@@ -140,10 +167,19 @@ function Inner() {
         </div>
       )}
 
-      {!render || render.status !== "completed" ? (
-        <div className="card p-6 text-ink-300">
-          {render?.status || "no render yet"}
-        </div>
+      {!render ? (
+        <div className="card p-6 text-ink-300">No render yet.</div>
+      ) : render.status !== "completed" ? (
+        <GenerationProgress
+          render={render}
+          shots={project.shots}
+          projectId={projectId}
+          onRetry={() => {
+            // Keep checking until the retried render shows up as running.
+            setKicked(true);
+            poke();
+          }}
+        />
       ) : comparing ? (
         <ComparePane
           left={render}

@@ -1,7 +1,9 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { api, Asset, CustomModel } from "@/lib/api";
 import { useToast } from "@/components/Toaster";
+import { useEvents } from "@/components/NotificationsProvider";
+import { usePoll } from "@/lib/usePoll";
 
 type Kind = CustomModel["kind"];
 
@@ -58,7 +60,6 @@ export function TrainPanel({
   const [jobs, setJobs] = useState<CustomModel[]>([]);
   const [opening, setOpening] = useState(false);
   const toast = useToast();
-  const pollers = useRef<Map<number, ReturnType<typeof setInterval>>>(new Map());
 
   const refresh = async () => {
     try {
@@ -69,40 +70,18 @@ export function TrainPanel({
   };
   useEffect(() => {
     refresh();
-    return () => {
-      for (const t of pollers.current.values()) clearInterval(t);
-      pollers.current.clear();
-    };
   }, [kind, id]);
 
-  // Poll in-flight jobs so the chip flips from "training" → "completed"
-  // without a manual refresh. Cleared when the component unmounts or the
-  // job hits terminal.
-  useEffect(() => {
-    for (const j of jobs) {
-      const terminal = ["completed", "failed", "cancelled"].includes(j.status);
-      if (terminal) {
-        const t = pollers.current.get(j.id);
-        if (t) {
-          clearInterval(t);
-          pollers.current.delete(j.id);
-        }
-        continue;
-      }
-      if (pollers.current.has(j.id)) continue;
-      pollers.current.set(
-        j.id,
-        setInterval(async () => {
-          try {
-            const fresh = await api.getTrainingJob(j.id);
-            setJobs((prev) => prev.map((x) => (x.id === fresh.id ? fresh : x)));
-          } catch {
-            /* keep polling */
-          }
-        }, 2000)
-      );
-    }
-  }, [jobs]);
+  // One list request every 2 s while any job trains (12 s while the live
+  // stream is connected), paused while the tab is hidden, so the chip flips
+  // from "training" to "completed" without a manual refresh. A training event
+  // for one of these jobs refetches at once.
+  const training = jobs.some((j) => !["completed", "failed", "cancelled"].includes(j.status));
+  const poke = usePoll(refresh, { enabled: training, interval: 2000 });
+  useEvents(
+    (ev) => ev.kind === "training" && (ev.entity_id === 0 || jobs.some((j) => j.id === ev.entity_id)),
+    () => poke()
+  );
 
   return (
     <div className="card p-4 mb-4 space-y-3">

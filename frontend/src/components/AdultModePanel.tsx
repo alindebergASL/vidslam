@@ -133,6 +133,26 @@ export function AdultModePanel() {
           <li>Always: prompts that sexualise minors are refused, and pictures of your Cast are always checked.</li>
         </ul>
       )}
+
+      {mode?.safety_check && (
+        <p className="mt-3 text-xs text-ink-300" data-testid="safety-check-line">
+          {mode.safety_check.available ? (
+            <>
+              Safety check: <b>{shortModel(mode.safety_check.model)}</b> checks prompts for minors before
+              they&rsquo;re sent (about $0.0005 per new prompt).
+            </>
+          ) : (
+            <span className="text-amber-200">
+              Safety check: <b>{shortModel(mode.safety_check.model) || "the planner"}</b> can&rsquo;t run right now,
+              so sexual prompts are paused until it can. Check the planner in{" "}
+              <a href="/settings#models" className="underline">
+                Settings → Models
+              </a>
+              .
+            </span>
+          )}
+        </p>
+      )}
     </section>
   );
 }

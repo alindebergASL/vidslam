@@ -4,7 +4,7 @@ import clsx from "clsx";
 import { Dialog } from "@/components/Dialog";
 import { ASSET_SLOTS, OwnerKind } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
-import { api, Avatar, CharacterSheetView, Ingredient, StudioJob } from "@/lib/api";
+import { api, Avatar, CharacterSheetView, Ingredient, StudioJob, errorText } from "@/lib/api";
 
 export type ModelOption = { id: string; name: string };
 
@@ -15,6 +15,21 @@ export function costText(job: Pick<StudioJob, "cost_usd" | "cost_is_estimate">):
   if (c === 0) return "free";
   const amount = c >= 0.01 ? c.toFixed(2) : c.toFixed(3);
   return `${job.cost_is_estimate ? "~" : ""}$${amount}`;
+}
+
+const STATUS_LABELS: Record<string, string> = {
+  pending: "Queued",
+  submitted: "Starting",
+  polling: "Making…",
+  failed: "Failed",
+  completed: "Done",
+  saved: "Saved",
+};
+
+/** A Studio job's status in plain words ("Making…" for polling); the raw value goes in a title. */
+export function studioStatusLabel(job: Pick<StudioJob, "status" | "error">): string {
+  if (job.status === "failed" && job.error === "Cancelled") return "Cancelled";
+  return STATUS_LABELS[job.status] || job.status;
 }
 
 /** One line for a bulk-save result: "Saved 3, skipped 1 (not an image)". */
@@ -147,7 +162,7 @@ export function BulkSaveDialog({
       else toast.error(msg);
       onDone();
     } catch (e: any) {
-      toast.error(e.message || "Couldn't save the pictures");
+      toast.error(errorText(e, "Couldn't save the pictures"));
     } finally {
       setBusy(false);
     }
@@ -248,7 +263,7 @@ export function CharacterSheetDialog({
       })
       .catch((e: any) => {
         setViews([]);
-        setError(e.message || "Couldn't load the views");
+        setError(errorText(e, "Couldn't load the views"));
       });
   }, []);
 
@@ -271,7 +286,7 @@ export function CharacterSheetDialog({
       toast.success(`Making ${res.jobs.length} views of ${avatar.name}`);
       onCreated(res);
     } catch (e: any) {
-      setError(e.message || "Couldn't start the character sheet");
+      setError(errorText(e, "Couldn't start the character sheet"));
     } finally {
       setBusy(false);
     }

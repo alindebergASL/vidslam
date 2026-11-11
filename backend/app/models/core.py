@@ -173,6 +173,13 @@ class VideoProject(Base):
     music_upload_path: Mapped[str] = mapped_column(String(500), default="")
     music_volume: Mapped[float] = mapped_column(Float, default=0.25)
     status: Mapped[str] = mapped_column(String(40), default="draft")
+    # The RQ job id of the plan or render job that claimed the project
+    # (migration 0009): the sweeper leaves a claim alone while it is queued.
+    queue_job_id: Mapped[str] = mapped_column(String(80), default="", server_default="")
+    # Unique per claim (Generate / Retry / plan / ambient): the queued job
+    # carries it and must consume it before doing anything, so a cancelled
+    # entry never runs under a newer claim. "" = no claim waiting.
+    claim_token: Mapped[str] = mapped_column(String(40), default="", server_default="")
     # draft|planning|planned|generating|completed|failed
     generated_plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Settings for mode="ambient_loop" (scene prompt, loop length, music mood,
@@ -380,6 +387,19 @@ class AssetGenerationJob(Base):
     # character-sheet jobs, "" otherwise). Migration 0004.
     favorite: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     label: Mapped[str] = mapped_column(String(80), default="", server_default="")
+    # "Animate this": the clip starts from a finished Studio image or a Cast
+    # picture (at most one of the two). Migration 0009.
+    first_frame_job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    first_frame_asset_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # A clip's real size and length, probed once when it lands (None for
+    # older jobs and images: show the requested values). Migration 0009.
+    result_width: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    result_height: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    result_duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # The RQ job id of its latest queue entry ("" before migration 0009, or
+    # "inline:..." when it ran inline): the sweeper only gives up on a
+    # pending job whose queue entry is gone.
+    queue_job_id: Mapped[str] = mapped_column(String(80), default="", server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
@@ -597,3 +617,38 @@ class SpendEntry(Base):
     source: Mapped[str] = mapped_column(String(20), default="provider", index=True)
     generation_id: Mapped[str] = mapped_column(String(120), default="")
     note: Mapped[str] = mapped_column(String(300), default="")
+
+
+class Event(Base):
+    """One thing that happened to a job, for live progress and the activity
+    panel (services/events.py). Written in the same transaction as the
+    status change it reports; streamed to browsers by /api/events/stream."""
+
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    # render|plan|ambient_loop|ambient_render|studio_job|training|publish|budget
+    entity_type: Mapped[str] = mapped_column(String(40))
+    entity_id: Mapped[int] = mapped_column(Integer)
+    project_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(20))  # started|progress|completed|failed|cancelled
+    title: Mapped[str] = mapped_column(String(200), default="")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    url: Mapped[str] = mapped_column(String(300), default="")  # deep link, e.g. /projects/12
+    severity: Mapped[str] = mapped_column(String(10), default="info")  # info|warning|error
+    read_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now, index=True)
+
+
+class PromptCheck(Base):
+    """Cached verdicts of the AI minors check, by a hash of the policy
+    version and the normalised prompt (services/minor_check.py)."""
+
+    __tablename__ = "prompt_checks"
+
+    text_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    verdict: Mapped[str] = mapped_column(String(16))  # ok|minor_sexual
+    model: Mapped[str] = mapped_column(String(120), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
