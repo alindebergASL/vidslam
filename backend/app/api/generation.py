@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -37,42 +38,46 @@ _IDLE = ("draft", "planned", "completed", "failed", "cancelled")
 _DONE_RENDER = ("completed", "failed", "cancelled")
 
 
-def claim_project(db: Session, project: models.VideoProject, to: str, busy: str) -> str:
+def claim_project(db: Session, project: models.VideoProject, to: str, busy: str) -> tuple[str, str]:
     """Move the project to `to` ("generating" / "planning") before its job is
     queued, atomically and only from an idle state with no render running,
     so a double-click or a second tab can't queue a second paid run (409
     `busy`), and the editor keeps polling while the job waits for a worker.
-    Returns the previous status, for release_project."""
+    Returns the previous status (for release_project) and the claim's
+    unique token, which the queued job must consume before it does anything."""
     latest = (db.query(models.Render.status).filter(models.Render.project_id == project.id)
               .order_by(models.Render.id.desc()).first())
     if latest is not None and latest[0] not in _DONE_RENDER:
         raise HTTPException(409, busy)
     previous = project.status or "draft"
+    token = uuid.uuid4().hex
     claimed = (db.query(models.VideoProject)
                .filter(models.VideoProject.id == project.id, models.VideoProject.status.in_(_IDLE))
-               .update({"status": to, "updated_at": datetime.utcnow()}, synchronize_session=False))
+               .update({"status": to, "claim_token": token, "updated_at": datetime.utcnow()},
+                       synchronize_session=False))
     db.commit()
     if not claimed:
         raise HTTPException(409, busy)
     db.refresh(project)
-    return previous if previous in _IDLE else "draft"
+    return (previous if previous in _IDLE else "draft"), token
 
 
-def release_project(db: Session, project_id: int, claimed: str, previous: str) -> None:
+def release_project(db: Session, project_id: int, claimed: str, previous: str, token: str) -> None:
     """The job could not be queued: give the claim back."""
     db.rollback()
     db.query(models.VideoProject).filter(
         models.VideoProject.id == project_id, models.VideoProject.status == claimed,
-    ).update({"status": previous}, synchronize_session=False)
+        models.VideoProject.claim_token == token,
+    ).update({"status": previous, "claim_token": ""}, synchronize_session=False)
     db.commit()
 
 
 def _enqueue_claimed(db: Session, project: models.VideoProject, to: str, busy: str, func, *args, **kwargs) -> str:  # noqa: ANN001
-    previous = claim_project(db, project, to, busy)
+    previous, token = claim_project(db, project, to, busy)
     try:
-        job_id = enqueue(func, *args, claim=to, **kwargs)
+        job_id = enqueue(func, *args, claim=to, claim_token=token, **kwargs)
     except Exception:
-        release_project(db, project.id, to, previous)
+        release_project(db, project.id, to, previous, token)
         raise
     # Kept while the claim holds, so the sweeper can tell a job waiting in a
     # busy queue from one whose queue entry is gone.
@@ -281,9 +286,13 @@ def _release_waiting_claim(db: Session, project: models.VideoProject) -> bool:
         return False
     from ..services import events
 
+    # Only while no worker has taken the claim over (its token is still
+    # set): after that the job owns it and cancel goes through its render.
     done = (db.query(models.VideoProject)
-            .filter(models.VideoProject.id == project.id, models.VideoProject.status == was)
-            .update({"status": "cancelled", "updated_at": datetime.utcnow()}, synchronize_session=False))
+            .filter(models.VideoProject.id == project.id, models.VideoProject.status == was,
+                    models.VideoProject.claim_token != "")
+            .update({"status": "cancelled", "claim_token": "", "updated_at": datetime.utcnow()},
+                    synchronize_session=False))
     if done != 1:
         db.rollback()
         return False

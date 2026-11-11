@@ -2212,13 +2212,19 @@ def resume_loop(db: Session, project_id: int) -> None:
         raise
 
 
-def resume_loop_job(project_id: int) -> None:
+def resume_loop_job(project_id: int, claim_token: str = "") -> None:
     """Queue entry point for resume_loop."""
     from ..db import SessionLocal
-    from . import provider_keys, spend
+    from . import pipeline, provider_keys, spend
 
     db = SessionLocal()
     try:
+        # Cancelled or replaced while queued: do nothing (and pay nothing).
+        if claim_token:
+            if not pipeline.consume_claim(db, project_id, "generating", claim_token):
+                db.rollback()
+                return
+            db.commit()
         with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
             resume_loop(db, project_id)
     finally:

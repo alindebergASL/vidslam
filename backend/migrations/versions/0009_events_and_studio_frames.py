@@ -44,6 +44,9 @@ def upgrade() -> None:
     if 'queue_job_id' not in _columns('video_projects'):
         op.add_column('video_projects', sa.Column('queue_job_id', sa.String(length=80), nullable=False,
                                                   server_default=''))
+    if 'claim_token' not in _columns('video_projects'):
+        op.add_column('video_projects', sa.Column('claim_token', sa.String(length=40), nullable=False,
+                                                  server_default=''))
     tables = _tables()
     if 'events' not in tables:
         op.create_table(
@@ -83,6 +86,7 @@ def downgrade() -> None:
     op.drop_index('ix_events_project_id', table_name='events')
     op.drop_table('events')
     with op.batch_alter_table('video_projects') as batch:
+        batch.drop_column('claim_token')
         batch.drop_column('queue_job_id')
     with op.batch_alter_table('asset_generation_jobs') as batch:
         for name, _ in reversed(_JOB_COLUMNS):

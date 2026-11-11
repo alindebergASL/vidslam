@@ -15,22 +15,24 @@ from ..services import events, pipeline, provider_keys, spend
 log = logging.getLogger("avs.jobs")
 
 
-def generate_plan_job(project_id: int, preserve_edits: bool = False, claim: str = "") -> None:
+def generate_plan_job(project_id: int, preserve_edits: bool = False, claim: str = "",
+                      claim_token: str = "") -> None:
     """`claim`: the status the API claimed the project with when it queued
     this job ("" for older queue entries)."""
     db = SessionLocal()
     try:
         with spend.scope(project_id=project_id):
-            pipeline.generate_plan(db, project_id, preserve_edits=preserve_edits, claim=claim or None)
+            pipeline.generate_plan(db, project_id, preserve_edits=preserve_edits, claim=claim or None,
+                                   claim_token=claim_token or None)
     finally:
         db.close()
 
 
-def generate_video_job(project_id: int, claim: str = "") -> None:
+def generate_video_job(project_id: int, claim: str = "", claim_token: str = "") -> None:
     db = SessionLocal()
     try:
         with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
-            pipeline.render_project(db, project_id, claim=claim or None)
+            pipeline.render_project(db, project_id, claim=claim or None, claim_token=claim_token or None)
     finally:
         db.close()
 
@@ -44,11 +46,14 @@ def regenerate_shot_job(project_id: int, shot_id: int, recompose: bool = True) -
         db.close()
 
 
-def recompose_project_job(project_id: int, claim: str = "") -> None:
+def recompose_project_job(project_id: int, claim: str = "", claim_token: str = "") -> None:
     db = SessionLocal()
     try:
-        if claim and not pipeline.claim_held(db, project_id, claim):
-            return
+        if claim:
+            if not pipeline.consume_claim(db, project_id, claim, claim_token or None):
+                db.rollback()
+                return
+            db.commit()
         pipeline.recompose_project(db, project_id)
     finally:
         db.close()
@@ -105,22 +110,34 @@ def train_custom_model_job(job_id: int) -> None:
         db.close()
 
 
-def generate_ambient_loop_job(project_id: int, regenerate_music: bool = True) -> None:
+def generate_ambient_loop_job(project_id: int, regenerate_music: bool = True, claim_token: str = "") -> None:
     from ..services import ambient
 
     db = SessionLocal()
     try:
+        # Cancelled or replaced while queued: do nothing (and pay nothing).
+        if claim_token:
+            if not pipeline.consume_claim(db, project_id, "generating", claim_token):
+                db.rollback()
+                return
+            db.commit()
         with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
             ambient.generate_loop(db, project_id, regenerate_music=regenerate_music)
     finally:
         db.close()
 
 
-def render_ambient_job(project_id: int) -> None:
+def render_ambient_job(project_id: int, claim_token: str = "") -> None:
     from ..services import ambient
 
     db = SessionLocal()
     try:
+        # Cancelled or replaced while queued: do nothing.
+        if claim_token:
+            if not pipeline.consume_claim(db, project_id, "generating", claim_token):
+                db.rollback()
+                return
+            db.commit()
         ambient.render_scene(db, project_id)
     finally:
         db.close()

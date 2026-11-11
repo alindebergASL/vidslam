@@ -212,7 +212,7 @@ def sweep_renders(db: Session, *, now: Optional[datetime] = None) -> dict:
         was = project.status
         res = db.execute(update(P).where(P.id == project.id, P.status == was,
                                          P.updated_at == project.updated_at)
-                         .values(status="failed", updated_at=_now()))
+                         .values(status="failed", claim_token="", updated_at=_now()))
         if res.rowcount != 1:
             db.rollback()
             continue

@@ -7,6 +7,7 @@ only adds the ambient-specific lifecycle.
 """
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -78,16 +79,19 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args,
         makes_music = bool(args[0]) if args else True
     provider_gate.require_ambient(svc._config_of(project), regenerate_music=makes_music, project=project)
     previous = project.status
+    token = uuid.uuid4().hex
     claimed = (
         db.query(models.VideoProject)
         .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
-        .update({"status": "generating"}, synchronize_session=False)
+        .update({"status": "generating", "claim_token": token}, synchronize_session=False)
     )
     db.commit()
     if not claimed:
         raise HTTPException(409, "scene is already generating")
     try:
-        return enqueue(job, project.id, *args)
+        # The job consumes the token before it starts: a cancel while it is
+        # queued (or a newer claim) makes it a no-op.
+        return enqueue(job, project.id, *args, claim_token=token)
     except Exception:
         # QueueUnavailable, or Redis dropping between the health check and
         # the enqueue: no job was accepted, so nothing would ever clear the
@@ -95,7 +99,8 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args,
         # (If a job did get through, its worker sets 'generating' itself.)
         db.query(models.VideoProject).filter(
             models.VideoProject.id == project.id, models.VideoProject.status == "generating",
-        ).update({"status": previous}, synchronize_session=False)
+            models.VideoProject.claim_token == token,
+        ).update({"status": previous, "claim_token": ""}, synchronize_session=False)
         db.commit()
         raise
 
@@ -412,20 +417,24 @@ def render_scene(scene_id: int, db: Session = Depends(get_db)) -> dict:
     # second tab can't queue a second render, and the page keeps polling
     # while the job waits for a worker.
     previous = project.status
+    token = uuid.uuid4().hex
     claimed = (
         db.query(models.VideoProject)
         .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
-        .update({"status": "generating"}, synchronize_session=False)
+        .update({"status": "generating", "claim_token": token}, synchronize_session=False)
     )
     db.commit()
     if not claimed:
         raise HTTPException(409, "scene is already generating")
     try:
-        job_id = enqueue(render_ambient_job, scene_id)
+        # The job consumes the token before rendering: cancelled while
+        # queued (or replaced by a newer claim) → it does nothing.
+        job_id = enqueue(render_ambient_job, scene_id, claim_token=token)
     except Exception:
         db.query(models.VideoProject).filter(
             models.VideoProject.id == project.id, models.VideoProject.status == "generating",
-        ).update({"status": previous}, synchronize_session=False)
+            models.VideoProject.claim_token == token,
+        ).update({"status": previous, "claim_token": ""}, synchronize_session=False)
         db.commit()
         raise
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}

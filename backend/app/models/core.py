@@ -174,8 +174,12 @@ class VideoProject(Base):
     music_volume: Mapped[float] = mapped_column(Float, default=0.25)
     status: Mapped[str] = mapped_column(String(40), default="draft")
     # The RQ job id of the plan or render job that claimed the project
-    # (migration 0010): the sweeper leaves a claim alone while it is queued.
+    # (migration 0009): the sweeper leaves a claim alone while it is queued.
     queue_job_id: Mapped[str] = mapped_column(String(80), default="", server_default="")
+    # Unique per claim (Generate / Retry / plan / ambient): the queued job
+    # carries it and must consume it before doing anything, so a cancelled
+    # entry never runs under a newer claim. "" = no claim waiting.
+    claim_token: Mapped[str] = mapped_column(String(40), default="", server_default="")
     # draft|planning|planned|generating|completed|failed
     generated_plan_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Settings for mode="ambient_loop" (scene prompt, loop length, music mood,
@@ -392,7 +396,7 @@ class AssetGenerationJob(Base):
     result_width: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     result_height: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     result_duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    # The RQ job id of its latest queue entry ("" before migration 0010, or
+    # The RQ job id of its latest queue entry ("" before migration 0009, or
     # "inline:..." when it ran inline): the sweeper only gives up on a
     # pending job whose queue entry is gone.
     queue_job_id: Mapped[str] = mapped_column(String(80), default="", server_default="")

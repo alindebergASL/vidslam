@@ -323,3 +323,131 @@ def test_queue_entry_state_without_an_rq_id():
 
     assert queue_entry_state("") == "gone"
     assert queue_entry_state("inline:generate_video_job") == "gone"
+
+
+# ---------- each claim has its own token ----------
+
+
+def test_a_cancelled_entry_never_runs_under_a_newer_claim(auth_client, monkeypatch):
+    pid = _project(auth_client)
+    held = _hold(monkeypatch)
+    assert auth_client.post(f"/api/projects/{pid}/generate-video").status_code == 202
+    assert auth_client.post(f"/api/projects/{pid}/cancel").json()["action"] == "released"
+    assert auth_client.post(f"/api/projects/{pid}/generate-video").status_code == 202
+    assert _status(pid) == "generating"
+    old_fn, old_args, old_kw = held[0]
+    new_fn, new_args, new_kw = held[1]
+    assert old_kw["claim_token"] and old_kw["claim_token"] != new_kw["claim_token"]
+    old_fn(*old_args, **old_kw)  # same status ("generating"), old token: does nothing
+    assert _renders(pid) == []
+    new_fn(*new_args, **new_kw)
+    assert len(_renders(pid)) == 1
+    new_fn(*new_args, **new_kw)  # the same entry delivered twice: the token is used up
+    assert len(_renders(pid)) == 1
+
+
+def test_a_plan_cancelled_while_the_planner_runs_is_not_written(auth_client, monkeypatch):
+    from app import models
+    from app.db import SessionLocal
+    from app.providers.mock_chat import MockChatProvider
+
+    pid = _project(auth_client)
+    with SessionLocal() as db:
+        before = db.get(models.VideoProject, pid).generated_plan_json
+        shots_before = len(db.get(models.VideoProject, pid).shots)
+    held = _hold(monkeypatch)
+    assert auth_client.post(f"/api/projects/{pid}/generate-plan").status_code == 202
+    orig = MockChatProvider.generate_storyboard
+
+    def slow_planner(self, *a, **k):
+        # The user presses Cancel while the planner is still answering.
+        assert auth_client.post(f"/api/projects/{pid}/cancel").json()["action"] == "released"
+        plan = orig(self, *a, **k)
+        plan.cleaned_voice_script = "A plan nobody wants any more."
+        return plan
+
+    monkeypatch.setattr(MockChatProvider, "generate_storyboard", slow_planner)
+    fn, args, kw = held[0]
+    assert fn(*args, **kw) is None
+    assert _status(pid) == "cancelled"
+    with SessionLocal() as db:
+        p = db.get(models.VideoProject, pid)
+        assert p.generated_plan_json == before and len(p.shots) == shots_before
+        assert p.claim_token == ""
+
+
+def test_a_failed_planner_after_cancel_keeps_the_cancel(auth_client, monkeypatch):
+    from app.providers.mock_chat import MockChatProvider
+
+    pid = _project(auth_client)
+    held = _hold(monkeypatch)
+    assert auth_client.post(f"/api/projects/{pid}/generate-plan").status_code == 202
+
+    def broken(self, *a, **k):
+        auth_client.post(f"/api/projects/{pid}/cancel")
+        raise RuntimeError("planner timed out")
+
+    monkeypatch.setattr(MockChatProvider, "generate_storyboard", broken)
+    fn, args, kw = held[0]
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        fn(*args, **kw)
+    assert _status(pid) == "cancelled"
+
+
+def test_cancel_after_the_worker_took_the_claim_goes_through_the_render(auth_client, monkeypatch):
+    from app import models
+    from app.db import SessionLocal
+    from app.services import pipeline
+
+    pid = _project(auth_client)
+    held = _hold(monkeypatch)
+    assert auth_client.post(f"/api/projects/{pid}/generate-plan").status_code == 202
+    fn, args, kw = held[0]
+    with SessionLocal() as db:  # a worker has consumed the claim but not committed its result yet
+        assert pipeline.consume_claim(db, pid, "planning", kw["claim_token"])
+        db.commit()
+    r = auth_client.post(f"/api/projects/{pid}/cancel")
+    assert r.status_code == 409  # nothing to release: the job owns it now
+    with SessionLocal() as db:
+        assert db.get(models.VideoProject, pid).status == "planning"
+
+
+def test_ambient_render_cancelled_while_queued_does_nothing(auth_client, monkeypatch):
+    sid = auth_client.post("/api/ambient", json={"config": SHORT_AMBIENT, "generate": True}).json()["id"]
+    renders_before = len(_renders(sid))
+    held = _hold(monkeypatch)
+    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
+    r = auth_client.post(f"/api/projects/{sid}/cancel")
+    assert r.status_code == 200 and r.json()["action"] == "released", r.text
+    fn, args, kw = held[0]
+    assert kw.get("claim_token")
+    fn(*args, **kw)
+    assert len(_renders(sid)) == renders_before
+    assert _status(sid) == "cancelled"
+    # A new render after the cancel runs normally.
+    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
+    fn, args, kw = held[1]
+    fn(*args, **kw)
+    assert _status(sid) == "completed"
+
+
+def test_ambient_generate_cancelled_while_queued_does_nothing(auth_client, monkeypatch):
+    from app import models
+    from app.db import SessionLocal
+
+    sid = auth_client.post("/api/ambient", json={"config": SHORT_AMBIENT}).json()["id"]
+    with SessionLocal() as db:
+        clips_before = [(s.id, s.clip_path) for s in db.get(models.VideoProject, sid).shots]
+        jobs_before = db.query(models.VideoJob).count()
+    held = _hold(monkeypatch)
+    assert auth_client.post(f"/api/ambient/{sid}/generate-loop").status_code == 202
+    assert auth_client.post(f"/api/projects/{sid}/cancel").json()["action"] == "released"
+    fn, args, kw = held[0]
+    fn(*args, **kw)
+    with SessionLocal() as db:
+        p = db.get(models.VideoProject, sid)
+        assert p.status == "cancelled"
+        assert [(s.id, s.clip_path) for s in p.shots] == clips_before
+        assert db.query(models.VideoJob).count() == jobs_before

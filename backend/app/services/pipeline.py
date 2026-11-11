@@ -245,25 +245,49 @@ def _check_plan(plan: StoryboardPlan) -> None:
     check_generation(plan.cleaned_voice_script or "", kind="script")
 
 
-def claim_held(db: Session, project_id: int, claim: str) -> bool:
-    """Whether the project is still in the state the API claimed it with
-    when it queued this job. Not when the claim was cancelled, or the
-    sweeper gave up on it while it waited in the queue: the job then does
-    nothing (and pays for nothing)."""
-    row = db.query(models.VideoProject.status).filter(models.VideoProject.id == project_id).first()
-    if row is None or row[0] != claim:
-        log.info("project %s is no longer %s (now %s); skipping its queued job",
+def claim_held(db: Session, project_id: int, claim: str, token: Optional[str] = None) -> bool:
+    """Whether the claim the API made when it queued this job still holds:
+    the project is still `claim` and, when the job carries a token, it is
+    still this claim's token. Not when the claim was cancelled, replaced by
+    a newer one, or given up by the sweeper while the job waited in the
+    queue: the job then does nothing (and pays for nothing)."""
+    row = (db.query(models.VideoProject.status, models.VideoProject.claim_token)
+           .filter(models.VideoProject.id == project_id).first())
+    if row is None or row[0] != claim or (token and row[1] != token):
+        log.info("project %s is no longer claimed by this job (%s, now %s); skipping it",
                  project_id, claim, row[0] if row else "gone")
+        return False
+    return True
+
+
+def consume_claim(db: Session, project_id: int, claim: str, token: Optional[str]) -> bool:
+    """Take over the claim atomically (conditional UPDATE, not committed:
+    the caller commits it together with its first write). After this a
+    cancel can no longer release the claim, and a second entry with the
+    same token can't start. Without a token (older queue entries) it only
+    checks the status."""
+    if not token:
+        return claim_held(db, project_id, claim)
+    done = (db.query(models.VideoProject)
+            .filter(models.VideoProject.id == project_id, models.VideoProject.status == claim,
+                    models.VideoProject.claim_token == token)
+            .update({"claim_token": ""}, synchronize_session=False))
+    if done != 1:
+        log.info("project %s claim %s was cancelled or replaced; skipping its job", project_id, claim)
         return False
     return True
 
 
 def generate_plan(
     db: Session, project_id: int, *, preserve_edits: bool = False, claim: Optional[str] = None,
+    claim_token: Optional[str] = None,
 ) -> Optional[StoryboardPlan]:
-    """`claim`: the status the API claimed the project with ("planning");
-    when it no longer holds, nothing is done and None is returned."""
-    if claim and not claim_held(db, project_id, claim):
+    """`claim` / `claim_token`: the claim the API made ("planning"). When it
+    no longer holds, nothing is done and None is returned. The claim stays
+    cancellable while the planner runs; the plan is only written if it
+    still holds then (consumed in the same commit), so a cancelled or
+    replaced run never overwrites the project."""
+    if claim and not claim_held(db, project_id, claim, claim_token):
         return None
     project = db.get(models.VideoProject, project_id)
     if project is None:
@@ -279,8 +303,12 @@ def generate_plan(
         plan = chat.generate_storyboard(project=_project_dict(project), cast=cast)
         _check_plan(plan)
     except Exception as e:  # noqa: BLE001
-        project.status = "failed"
-        events.plan_event(db, project, "failed", error=str(e))
+        db.rollback()
+        # Cancelled (or replaced) while the planner ran: leave that state.
+        if not claim or consume_claim(db, project_id, claim, claim_token):
+            project = db.get(models.VideoProject, project_id)
+            project.status = "failed"
+            events.plan_event(db, project, "failed", error=str(e))
         db.commit()
         _log_provider_call(
             db,
@@ -293,6 +321,12 @@ def generate_plan(
         )
         raise
 
+    # Publish only if the claim still holds, in the same commit as the plan.
+    db.rollback()
+    if claim and not consume_claim(db, project_id, claim, claim_token):
+        db.rollback()
+        return None
+    project = db.get(models.VideoProject, project_id)
     new_plan = plan.model_dump()
     old_plan = project.generated_plan_json or {}
     if preserve_edits and old_plan:
@@ -1443,11 +1477,14 @@ def generate_music_for_project(
     return out_path
 
 
-def render_project(db: Session, project_id: int, *, claim: Optional[str] = None) -> Optional[models.Render]:
+def render_project(db: Session, project_id: int, *, claim: Optional[str] = None,
+                   claim_token: Optional[str] = None) -> Optional[models.Render]:
     """`claim`: the status the API claimed the project with ("generating");
     when it no longer holds (cancelled, or failed by the sweeper while the
-    job waited in the queue) nothing is done and None is returned."""
-    if claim and not claim_held(db, project_id, claim):
+    job waited in the queue) nothing is done and None is returned. The claim
+    is consumed in the same commit that creates the Render row, after which
+    Cancel works through the render."""
+    if claim and not claim_held(db, project_id, claim, claim_token):
         return None
     project = db.get(models.VideoProject, project_id)
     if project is None:
@@ -1462,6 +1499,9 @@ def render_project(db: Session, project_id: int, *, claim: Optional[str] = None)
     except Exception as e:
         # Nothing was made: give up the claim so Generate works again.
         db.rollback()
+        if claim and not consume_claim(db, project_id, claim, claim_token):
+            db.rollback()  # cancelled or replaced meanwhile: leave that state
+            raise
         if project.status == "generating":
             project.status = "failed"
             events.emit(db, "render", "project", project.id, "failed",
@@ -1469,6 +1509,9 @@ def render_project(db: Session, project_id: int, *, claim: Optional[str] = None)
                         url=events.project_url(project), project_id=project.id)
             db.commit()
         raise
+    if claim and not consume_claim(db, project_id, claim, claim_token):
+        db.rollback()
+        return None
     render = models.Render(
         project_id=project.id,
         status="generating_audio",
