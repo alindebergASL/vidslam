@@ -451,3 +451,39 @@ def test_ambient_generate_cancelled_while_queued_does_nothing(auth_client, monke
         assert p.status == "cancelled"
         assert [(s.id, s.clip_path) for s in p.shots] == clips_before
         assert db.query(models.VideoJob).count() == jobs_before
+
+
+def test_an_expired_newest_render_does_not_lock_the_project(auth_client):
+    """Retention marks old renders "expired". The newest one expiring must
+    not leave the project looking busy: not listed as active, edits and
+    Generate allowed, and the sweeper still sees nothing running."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import pipeline, sweepers
+
+    client = auth_client
+    pid = _project(client)
+    assert client.post(f"/api/projects/{pid}/generate-video").status_code == 202
+    assert _renders(pid)[-1].status == "completed"
+    with SessionLocal() as db:
+        r = db.get(models.Render, _renders(pid)[-1].id)
+        r.status = "expired"
+        db.commit()
+
+    active = client.get("/api/activity/active").json()
+    assert not [i for i in active["items"] if i.get("project_id") == pid]
+    with SessionLocal() as db:
+        assert pipeline.busy_reason(db, db.get(models.VideoProject, pid)) is None
+    assert client.get(f"/api/projects/{pid}/status").json()["project_status"] == "completed"
+
+    # A claim whose job never ran is still swept, even with an expired render.
+    with SessionLocal() as db:
+        db.query(models.VideoProject).filter(models.VideoProject.id == pid).update(
+            {"status": "generating", "updated_at": datetime.utcnow() - timedelta(days=1)})
+        db.commit()
+    out = sweepers.sweep_renders(SessionLocal(), now=datetime.utcnow())
+    assert out["projects"] == 1 and _status(pid) == "failed"
+
+    # And Generate works again.
+    assert client.post(f"/api/projects/{pid}/generate-video").status_code == 202
+    assert _renders(pid)[-1].status == "completed"

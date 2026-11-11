@@ -196,7 +196,7 @@ _RENDER_STAGE = {
 }
 _STUDIO_STAGE = {"pending": "Queued", "submitted": "Starting", "polling": "Making…"}
 _IDLE_PROJECT = ("draft", "planned", "completed", "failed", "cancelled")
-_DONE_RENDER = ("completed", "failed", "cancelled")
+_DONE_RENDER = ("completed", "failed", "cancelled", "expired")
 
 
 def _iso(dt: Optional[datetime]) -> Optional[str]:

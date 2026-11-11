@@ -2278,7 +2278,7 @@ def render_scene(db: Session, project_id: int) -> models.Render:
     if problem:
         if project.status == "generating" and not db.query(models.Render.id).filter(
                 models.Render.project_id == project.id,
-                models.Render.status.notin_(("completed", "failed", "cancelled"))).first():
+                models.Render.status.notin_(("completed", "failed", "cancelled", "expired"))).first():
             # Claimed by the render request: don't leave the scene spinning.
             project.status = "failed"
             db.commit()
