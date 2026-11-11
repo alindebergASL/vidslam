@@ -353,6 +353,7 @@ def parse_reply(reply: str) -> dict:
     if verdict not in VERDICTS:
         return unsure
     issues = []
+    dropped = 0  # issues that only judged what the clip shows
     for it in data.get("issues") or []:
         if not isinstance(it, dict):
             continue
@@ -360,12 +361,15 @@ def parse_reply(reply: str) -> dict:
         if not detail:
             continue
         if content_judgement(detail):
+            dropped += 1
             continue
         kind = str(it.get("kind") or "other").strip().lower()
         issues.append({"kind": kind if kind in ISSUE_KINDS else "other", "detail": detail})
         if len(issues) >= MAX_ISSUES:
             break
     summary = _clean(data.get("summary"), 300)
+    if verdict == "problem" and not issues and dropped:
+        return unsure  # flagged only for what it shows: not a verdict on the clip
     if content_judgement(summary):
         if verdict == "problem" and not issues:
             return unsure  # flagged only for what it shows: not a verdict on the clip

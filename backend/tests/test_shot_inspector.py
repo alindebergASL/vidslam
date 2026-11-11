@@ -535,3 +535,14 @@ def test_a_content_judgement_is_never_a_problem_verdict():
     assert mixed["verdict"] == "problem"
     assert mixed["issues"] == [{"kind": "anatomy", "detail": "six fingers on the hand"}]
     assert mixed["summary"] == "six fingers on the hand"
+
+
+def test_a_problem_made_only_of_content_judgements_is_unsure_even_with_no_summary():
+    from app.services import inspector
+
+    got = inspector.parse_reply('{"verdict": "problem", "issues": [{"kind": "other", "detail": "Contains nudity"}],'
+                                ' "summary": ""}')
+    assert got["verdict"] == "unsure"
+    got = inspector.parse_reply('{"verdict": "problem", "issues": [{"kind": "other", "detail": "Contains nudity"},'
+                                ' {"kind": "anatomy", "detail": "six fingers on the left hand"}], "summary": ""}')
+    assert got["verdict"] == "problem" and [i["detail"] for i in got["issues"]] == ["six fingers on the left hand"]
