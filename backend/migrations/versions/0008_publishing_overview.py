@@ -58,11 +58,14 @@ def upgrade() -> None:
             sa.Column('id', sa.Integer(), nullable=False),
             sa.Column('publish_job_id', sa.Integer(), nullable=False),
             sa.Column('fetched_at', sa.DateTime(), nullable=False),
+            # The UTC day: one row per video per day, even with two fetches at once.
+            sa.Column('day', sa.Date(), nullable=False),
             sa.Column('views', sa.BigInteger(), nullable=False),
             sa.Column('likes', sa.Integer(), nullable=False),
             sa.Column('comments', sa.Integer(), nullable=False),
             sa.ForeignKeyConstraint(['publish_job_id'], ['publish_jobs.id'], ondelete='CASCADE'),
             sa.PrimaryKeyConstraint('id'),
+            sa.UniqueConstraint('publish_job_id', 'day', name='uq_video_stats_job_day'),
         )
         op.create_index('ix_video_stats_job_fetched', 'video_stats', ['publish_job_id', 'fetched_at'])
 

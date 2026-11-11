@@ -52,15 +52,23 @@ def _day_start(now: datetime) -> datetime:
 
 def store(db: Session, job: models.PublishJob, statistics: dict, now: Optional[datetime] = None) -> models.VideoStat:
     """Today's (UTC) snapshot for this job: updated if it exists, else added."""
+    from sqlalchemy.exc import IntegrityError
+
     now = now or datetime.utcnow()
-    row = (db.query(models.VideoStat)
-           .filter(models.VideoStat.publish_job_id == job.id,
-                   models.VideoStat.fetched_at >= _day_start(now),
-                   models.VideoStat.fetched_at < _day_start(now) + timedelta(days=1))
-           .order_by(models.VideoStat.id.desc()).first())
+    day = now.date()
+    S = models.VideoStat
+    row = db.query(S).filter(S.publish_job_id == job.id, S.day == day).first()
     if row is None:
-        row = models.VideoStat(publish_job_id=job.id)
-        db.add(row)
+        # Another fetch (the background one, or another process) may add
+        # today's row at the same moment: the unique (job, day) key keeps
+        # one, and this fetch then updates it.
+        try:
+            with db.begin_nested():
+                row = S(publish_job_id=job.id, day=day, fetched_at=now)
+                db.add(row)
+                db.flush()
+        except IntegrityError:
+            row = db.query(S).filter(S.publish_job_id == job.id, S.day == day).one()
     row.fetched_at = now
     row.views = _int(statistics.get("viewCount"))
     row.likes = _int(statistics.get("likeCount"))

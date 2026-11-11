@@ -322,8 +322,9 @@ def test_migration_0008(tmp_path, monkeypatch):
     assert {"uploaded_at", "yt_privacy_status", "yt_upload_status", "yt_publish_at", "yt_failure_reason",
             "yt_title", "yt_removed", "yt_checked_at"} <= set(cols)
     assert {c["name"] for c in insp.get_columns("video_stats")} == {
-        "id", "publish_job_id", "fetched_at", "views", "likes", "comments"}
+        "id", "publish_job_id", "fetched_at", "day", "views", "likes", "comments"}
     assert any(i["column_names"] == ["publish_job_id", "fetched_at"] for i in insp.get_indexes("video_stats"))
+    assert any(u["column_names"] == ["publish_job_id", "day"] for u in insp.get_unique_constraints("video_stats"))
     fk = insp.get_foreign_keys("video_stats")[0]
     assert fk["referred_table"] == "publish_jobs" and fk["options"].get("ondelete") == "CASCADE"
     with dbmod.engine.connect() as conn:
@@ -350,3 +351,60 @@ def test_deleting_a_project_drops_its_numbers(auth_client):
     db = _db()
     assert db.query(models.VideoStat).count() == 0
     db.close()
+
+
+def test_one_row_per_video_per_day_even_when_two_fetches_race(client):
+    """The (job, day) key holds: a second insert for the same day updates
+    the row the first one added instead of adding another."""
+    import threading
+
+    from app import models
+    from app.services import video_stats
+
+    db = _db()
+    try:
+        _pid, jid = _uploaded(db)
+    finally:
+        db.close()
+    now = datetime.utcnow()
+    barrier = threading.Barrier(2)
+
+    def fetch(views):
+        s = _db()
+        try:
+            job = s.get(models.PublishJob, jid)
+            barrier.wait()
+            video_stats.store(s, job, {"viewCount": str(views)}, now)
+            s.commit()
+        finally:
+            s.close()
+
+    threads = [threading.Thread(target=fetch, args=(v,)) for v in (10, 20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    db = _db()
+    try:
+        rows = db.query(models.VideoStat).filter_by(publish_job_id=jid).all()
+        assert len(rows) == 1 and rows[0].views in (10, 20) and rows[0].day == now.date()
+    finally:
+        db.close()
+
+
+def test_a_new_upload_on_the_same_job_starts_with_no_numbers(client):
+    from app import models
+    from app.services import publish_state, video_stats
+
+    db = _db()
+    try:
+        _pid, jid = _uploaded(db)
+        job = db.get(models.PublishJob, jid)
+        video_stats.store(db, job, {"viewCount": "500"})
+        db.commit()
+        publish_state.reset_for_new_upload(job)
+        db.commit()
+        assert db.query(models.VideoStat).filter_by(publish_job_id=jid).count() == 0
+        assert job.external_id == ""
+    finally:
+        db.close()

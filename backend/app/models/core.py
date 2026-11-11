@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import secrets
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy import (
     JSON,
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     false,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -523,11 +525,13 @@ class VideoStat(Base):
     publish job per UTC day: a later fetch the same day updates it."""
 
     __tablename__ = "video_stats"
-    __table_args__ = (Index("ix_video_stats_job_fetched", "publish_job_id", "fetched_at"),)
+    __table_args__ = (Index("ix_video_stats_job_fetched", "publish_job_id", "fetched_at"),
+                      UniqueConstraint("publish_job_id", "day", name="uq_video_stats_job_day"))
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     publish_job_id: Mapped[int] = mapped_column(ForeignKey("publish_jobs.id", ondelete="CASCADE"))
     fetched_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    day: Mapped[date] = mapped_column(Date)  # UTC day of fetched_at
     views: Mapped[int] = mapped_column(BigInteger, default=0)
     likes: Mapped[int] = mapped_column(Integer, default=0)
     comments: Mapped[int] = mapped_column(Integer, default=0)

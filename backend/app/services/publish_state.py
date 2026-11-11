@@ -79,7 +79,14 @@ def on_youtube(job: models.PublishJob) -> bool:
 
 def reset_for_new_upload(job: models.PublishJob) -> None:
     """Forget the earlier video before a fresh upload session starts, so
-    nothing YouTube said about it sticks to the new one."""
+    nothing YouTube said about it sticks to the new one (its numbers
+    included: they belong to the earlier video)."""
+    from sqlalchemy.orm import object_session
+
+    db = object_session(job)
+    if db is not None and job.id is not None:
+        db.query(models.VideoStat).filter(models.VideoStat.publish_job_id == job.id).delete(
+            synchronize_session=False)
     job.external_id = ""
     job.external_url = ""
     job.uploaded_at = None
