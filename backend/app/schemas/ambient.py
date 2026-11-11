@@ -293,6 +293,66 @@ class LoopResumeOut(BaseModel):
     model_changed: bool = False  # the scene would use a different model if started over now
 
 
+Level = Literal["good", "warn", "bad"]
+
+
+class SeamReadingOut(BaseModel):
+    verdict: Literal["seamless", "slight_jump", "visible_jump"]
+    level: Level
+    text: str
+    difference: float  # last frame vs first, mean abs luma difference 0-1
+    typical: float     # typical difference between neighbouring frames
+    ratio: float       # difference / typical (with a floor for near-still clips)
+    blend_seconds: float = 0.0  # how long the finished video dissolves across the join
+
+
+class FlickerReadingOut(BaseModel):
+    verdict: Literal["none", "slight", "strong"]
+    level: Level
+    text: str
+    percent: float
+
+
+class FrozenReadingOut(BaseModel):
+    # not_checked: an image-drift loop (a still picture by design)
+    verdict: Literal["none", "some", "long", "not_checked"]
+    level: Level
+    text: str
+    longest_seconds: float
+    total_seconds: float
+    at_seconds: Optional[float] = None  # where the longest frozen stretch starts
+
+
+class DriftReadingOut(BaseModel):
+    verdict: Literal["none", "slight", "strong"]
+    level: Level
+    text: str
+    distance: float  # first vs last second's average colour, 0-1
+
+
+class LoopHealthOut(BaseModel):
+    """Local measurement of one loop clip (services/loop_health.py)."""
+
+    shot_id: int
+    measured_at: str
+    clip_seconds: float
+    sample_fps: float
+    seam: SeamReadingOut
+    flicker: FlickerReadingOut
+    frozen: FrozenReadingOut
+    drift: DriftReadingOut
+    # Last few seconds then first few: the join plays at join_at_seconds.
+    seam_preview_url: str
+    join_at_seconds: float
+
+
+class LoopHealthResultOut(BaseModel):
+    """POST /api/ambient/{id}/loop-health."""
+
+    loop_health: Optional[LoopHealthOut] = None
+    variant_loop_health: list[Optional[LoopHealthOut]] = Field(default_factory=list)
+
+
 class AmbientOut(BaseModel):
     """Ambient scene = VideoProject(mode=ambient_loop) + its single loop shot
     + latest render, flattened so the UI never has to understand storyboards."""
@@ -311,6 +371,10 @@ class AmbientOut(BaseModel):
     loop_shot: Optional[ShotOut] = None
     # Variations 2..N (variation 1 is loop_shot), when config.variety is on.
     variant_shots: list[ShotOut] = Field(default_factory=list)
+    # Loop health of the loop clip as it is now (None = not measured yet, or
+    # the clip changed since); one entry per variant_shots item, same order.
+    loop_health: Optional[LoopHealthOut] = None
+    variant_loop_health: list[Optional[LoopHealthOut]] = Field(default_factory=list)
     # True once a music bed exists on disk (generated or uploaded).
     music_ready: bool
     # True once a nature-sound bed exists (config.sound != "none").

@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { Dialog } from "@/components/Dialog";
 import { useToast } from "@/components/Toaster";
+import { checkBlockedWhy, checkCostText, InspectionChip, useClipCheckSettings } from "@/components/InspectionChip";
 import { shotTypeLabel } from "@/lib/labels";
 import { AddShotType, api, Project, Shot, ShotEdit, ShotEditImpact, Take } from "@/lib/api";
 
@@ -310,7 +311,11 @@ export function TakesDialog({
   const [keep, setKeep] = useState(10);
   const [busy, setBusy] = useState<number | null>(null);
   const [switched, setSwitched] = useState(false);
+  const [checking, setChecking] = useState<number | null>(null);
   const inFlight = ["submitted", "polling", "running"].includes(shot.status);
+  const checkSettings = useClipCheckSettings();
+  const checkBlocked = checkBlockedWhy(checkSettings);
+  const checkCost = checkCostText(checkSettings?.cost_per_check);
 
   const load = async () => {
     try {
@@ -346,6 +351,25 @@ export function TakesDialog({
     }
   };
 
+  // Paid (about cost_per_check): one look by the vision model at a few frames.
+  const check = async (t: Take) => {
+    setChecking(t.id);
+    try {
+      const r = await api.checkClip(project.id, shot.id, t.id);
+      const v = r.inspection.verdict;
+      if (v === "ok") toast.success("The check says this take looks right");
+      else if (v === "problem")
+        toast.info(`The check flagged: ${r.inspection.issues[0]?.detail || r.inspection.summary || "something"}`);
+      else toast.info(r.inspection.summary || "Couldn't check this clip");
+      await load();
+      if (t.current) onChanged();
+    } catch (e: any) {
+      toast.error(e.message || "Couldn't check this take");
+    } finally {
+      setChecking(null);
+    }
+  };
+
   const remove = async (t: Take) => {
     if (!window.confirm("Delete this take? Its clip file is removed and can't be brought back.")) return;
     setBusy(t.id);
@@ -365,7 +389,8 @@ export function TakesDialog({
     <Dialog title={`Takes of shot ${shot.shot_order}`} onClose={onClose} className="max-w-3xl">
       <p className="text-xs text-ink-400">
         Every clip made for this shot is kept, so a re-roll never loses a good one. Switching takes is free.
-        The newest {keep} are kept per shot; older ones are deleted, never the one in use.
+        The newest {keep} are kept per shot; older ones are deleted, never the one in use. The clip check&apos;s
+        verdict on each take helps you pick; it&apos;s advice only.
       </p>
       {inFlight && (
         <p className="text-xs text-amber-300">
@@ -416,6 +441,29 @@ export function TakesDialog({
               <div className="flex items-center justify-between gap-1">
                 <span className="text-xs font-medium text-ink-100">Take {takes.length - i}</span>
                 {t.current && <span className="chip text-[10px] py-0.5 chip-active">In use</span>}
+              </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <InspectionChip inspection={t.inspection} />
+                {t.file_exists && (
+                  <button
+                    type="button"
+                    className="text-[11px] text-ink-300 underline-offset-2 hover:underline disabled:opacity-50 disabled:no-underline"
+                    onClick={() => check(t)}
+                    disabled={checking !== null || !!checkBlocked}
+                    title={
+                      checkBlocked ||
+                      `A vision model looks at a few frames of this take and says if anything looks off${
+                        checkCost ? ` (${checkCost})` : ""
+                      }. Advice only.`
+                    }
+                  >
+                    {checking === t.id
+                      ? "Checking…"
+                      : `${t.inspection && t.inspection.verdict !== "skipped" ? "Check again" : "Check this take"}${
+                          checkCost ? ` · ${checkCost}` : ""
+                        }`}
+                  </button>
+                )}
               </div>
               <div className="text-[11px] text-ink-300 break-words">
                 {t.provider_model || t.provider || "Unknown model"}

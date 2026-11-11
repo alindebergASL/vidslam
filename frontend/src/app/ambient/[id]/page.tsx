@@ -9,6 +9,7 @@ import { PublishPanel } from "@/components/PublishPanel";
 import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { ScenePicture } from "@/components/ambient/ScenePicture";
+import { LoopHealthCard } from "@/components/ambient/LoopHealthCard";
 import {
   aboutUsd,
   askBeforeDiscard,
@@ -451,6 +452,17 @@ function Inner() {
             <div className="px-4 py-3 border-t border-ink-800">
               <PlanSummary plan={plan} total={scene.total_seconds} />
             </div>
+            {loopReady && (
+              <LoopHealthCard
+                scene={scene}
+                disabled={inFlight}
+                onMeasured={(r) =>
+                  setScene((prev) =>
+                    prev ? { ...prev, loop_health: r.loop_health, variant_loop_health: r.variant_loop_health } : prev
+                  )
+                }
+              />
+            )}
             {scene.loop_shot?.prompt && (
               <details className="px-4 py-3 text-xs text-ink-300 border-t border-ink-800">
                 <summary className="cursor-pointer text-ink-200">Prompt sent to the model</summary>

@@ -69,6 +69,16 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     _db.reset_engine(f"sqlite:///{db}")
 
 
+@pytest.fixture(autouse=True)
+def _drain_side_jobs(_isolated_env):
+    """Side jobs (clip checks) run on a background thread without Redis:
+    finish them before this test's database goes away."""
+    yield
+    from app.workers.queue import wait_background
+
+    wait_background(60)
+
+
 @pytest.fixture
 def client():
     from fastapi.testclient import TestClient

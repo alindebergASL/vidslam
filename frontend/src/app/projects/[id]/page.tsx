@@ -13,14 +13,18 @@ import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { ProjectSettingsCard } from "@/components/ProjectSettingsCard";
 import { AddShotDialog, DeleteShotDialog, DuplicateShotDialog, TakesDialog } from "@/components/ShotEditing";
+import { checkBlockedWhy, checkCostText, InspectionChip, useClipCheckSettings } from "@/components/InspectionChip";
 import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
-import { api, Asset, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render } from "@/lib/api";
+import { api, Asset, ClipCheckSettings, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 
 // Project states in which a render (or a re-plan) can be started.
 const CAN_GENERATE = ["planned", "failed", "completed", "cancelled"];
 const usd = (n: number) => `$${n.toFixed(2)}`;
 const IN_FLIGHT = ["submitted", "polling", "running"];
+// After a clip lands with the automatic check on, keep polling this long for
+// its verdict (the check runs after the clip is stored, off the render's path).
+const AUTO_CHECK_WAIT_MS = 60_000;
 
 export default function ProjectEditorPage() {
   return (
@@ -60,6 +64,17 @@ function Inner() {
   >([]);
   const router = useRouter();
   const timer = useRef<NodeJS.Timeout | null>(null);
+  // Clip check: cost per check and whether checks can run (fetched once).
+  const clipCheck = useClipCheckSettings();
+  // refresh() also runs from a setInterval set up earlier: read these via refs.
+  const clipCheckRef = useRef<ClipCheckSettings | null>(null);
+  clipCheckRef.current = clipCheck;
+  // Per shot: was it in flight / which clip it had at the last refresh.
+  const lastSeen = useRef<Map<number, { inFlight: boolean; clip: string }>>(new Map());
+  // `${shot id}:${clip path}` → when the clip landed, while its automatic
+  // check's verdict hasn't arrived (bounded by AUTO_CHECK_WAIT_MS).
+  const awaitingCheck = useRef<Map<string, number>>(new Map());
+  const [checkPending, setCheckPending] = useState<Set<number>>(new Set());
 
   // Models list (base + trained LoRAs) is stable during a session — fetch
   // once, not per poll.
@@ -113,7 +128,33 @@ function Inner() {
       const shotsActive = p.shots.some((s) =>
         ["submitted", "polling", "running"].includes(s.status)
       );
-      setPolling(renderActive || projectActive || shotsActive);
+      // A clip that just landed with the automatic check on: its verdict is
+      // stored a few seconds later, so keep polling (bounded) until it arrives
+      // and show "Checking…" meanwhile (no second, paid manual check).
+      const cc = clipCheckRef.current;
+      const autoOn = !!cc && cc.auto_check && cc.available && !cc.adult_mode;
+      const now = Date.now();
+      const pending = new Set<number>();
+      for (const s of p.shots) {
+        const key = `${s.id}:${s.clip_path}`;
+        const landed = s.status === "completed" && !!s.clip_path && s.shot_type !== "end_card";
+        const before = lastSeen.current.get(s.id);
+        const fresh = !!before && (before.inFlight || (!!before.clip && before.clip !== s.clip_path));
+        if (autoOn && landed && fresh && !s.inspection && !awaitingCheck.current.has(key))
+          awaitingCheck.current.set(key, now);
+        lastSeen.current.set(s.id, { inFlight: IN_FLIGHT.includes(s.status), clip: s.clip_path });
+        const since = awaitingCheck.current.get(key);
+        if (since === undefined) continue;
+        if (!landed || s.inspection || now - since > AUTO_CHECK_WAIT_MS) awaitingCheck.current.delete(key);
+        else pending.add(s.id);
+      }
+      for (const key of [...awaitingCheck.current.keys()]) {
+        const id = Number(key.split(":", 1)[0]);
+        const s = p.shots.find((x) => x.id === id);
+        if (!s || `${s.id}:${s.clip_path}` !== key) awaitingCheck.current.delete(key);
+      }
+      setCheckPending(pending);
+      setPolling(renderActive || projectActive || shotsActive || pending.size > 0);
     } catch (e: any) {
       setError(e.message);
     }
@@ -279,6 +320,15 @@ function Inner() {
     hasClips &&
     (renderPlan.voiceover_changed || project.shots.some((s) => s.clip_stale));
   const planRows = new Map<number, RenderPlanShot>((renderPlan?.shots || []).map((s) => [s.id, s]));
+  const flagged = renderPlan?.flagged ?? [];
+  // A flagged shot may sit past the collapsed list: open it, then scroll there.
+  const goToShot = (shotId: number) => {
+    setShotsExpanded(true);
+    setTimeout(() => {
+      const el = document.getElementById(`shot-${shotId}`);
+      el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 50);
+  };
   // Ticked shots a re-roll can't fix (lip-synced, voiceover out of date).
   const blockedSelected = selected
     .map((sid) => planRows.get(sid))
@@ -539,6 +589,9 @@ function Inner() {
                   Re-compose is free but keeps the old voiceover and the old clips.
                 </p>
               )}
+              {flagged.length > 0 && (
+                <FlaggedLine flagged={flagged} onGo={goToShot} className="mt-2 text-amber-200/90" />
+              )}
             </div>
             <button
               className="btn-primary text-xs whitespace-nowrap"
@@ -547,6 +600,16 @@ function Inner() {
               Generate video · about {usd(renderPlan.total)}
             </button>
           </div>
+        </div>
+      )}
+
+      {!(outOfDate && renderPlan) && flagged.length > 0 && (
+        <div className="card p-3 mb-6 border-amber-500/40 bg-amber-500/10">
+          <FlaggedLine flagged={flagged} onGo={goToShot} className="text-amber-200" />
+          <p className="text-[11px] text-amber-200/70 mt-1">
+            The check is advice only: the video is still put together with these clips. Open a shot&apos;s takes to
+            pick another one, or regenerate it.
+          </p>
         </div>
       )}
 
@@ -639,7 +702,7 @@ function Inner() {
               ? project.shots
               : project.shots.slice(0, SHOTS_BEFORE_EXPAND)
             ).map((s, idx) => (
-              <div key={s.id}>
+              <div key={s.id} id={`shot-${s.id}`} className="scroll-mt-24">
               <ShotRow
                 index={idx}
                 projectId={projectId}
@@ -651,6 +714,8 @@ function Inner() {
                 onDelete={() => setDeleting(s)}
                 onTakes={() => setTakesFor(s)}
                 planRow={planRows.get(s.id)}
+                clipCheck={clipCheck}
+                checkPending={checkPending.has(s.id)}
                 castAssets={castAssets}
                 videoModels={videoModels}
                 onChange={refresh}
@@ -1020,6 +1085,8 @@ function ShotRow({
   onDelete,
   onTakes,
   planRow,
+  clipCheck,
+  checkPending,
   castAssets,
   videoModels,
   onChange,
@@ -1043,6 +1110,9 @@ function ShotRow({
   onDelete: () => void;
   onTakes: () => void;
   planRow?: RenderPlanShot;
+  clipCheck: ClipCheckSettings | null;
+  /** The automatic check of this clip is under way: no manual check meanwhile. */
+  checkPending: boolean;
   castAssets: Asset[];
   videoModels: { id: string; name: string; description: string }[];
   onChange: () => void;
@@ -1066,6 +1136,34 @@ function ShotRow({
   const needsNewVoice = !!planRow?.needs_new_voiceover;
   const voiceFirst =
     "Off for this shot: the spoken script or voice changed, and a re-roll would lip-sync to the old voiceover, so you would pay for the clip twice. Generate video makes the new voiceover and this clip together.";
+
+  const [checkBusy, setCheckBusy] = useState(false);
+  const hasClip = shot.status === "completed" && !!shot.clip_path && shot.shot_type !== "end_card";
+  const autoChecking = checkPending && !shot.inspection;
+  const checkBlocked =
+    checkBlockedWhy(clipCheck) ||
+    (autoChecking ? "The automatic check is looking at this clip; its verdict shows here in a moment." : null);
+  const checkCost = checkCostText(clipCheck?.cost_per_check);
+  const checked = !!shot.inspection && shot.inspection.verdict !== "skipped";
+  // Paid: a vision model looks at a few frames of the current clip. Advice only.
+  const checkClip = async () => {
+    setCheckBusy(true);
+    try {
+      const r = await api.checkClip(projectId, shot.id);
+      const v = r.inspection.verdict;
+      if (v === "ok") toast.success(`Shot ${shot.shot_order}: looks right`);
+      else if (v === "problem")
+        toast.info(
+          `Shot ${shot.shot_order}: ${r.inspection.issues[0]?.detail || r.inspection.summary || "something looks off"}`
+        );
+      else toast.info(`Shot ${shot.shot_order}: ${r.inspection.summary || "couldn't check this clip"}`);
+      onChange();
+    } catch (e: any) {
+      toast.error(e.message || "Couldn't check the clip");
+    } finally {
+      setCheckBusy(false);
+    }
+  };
 
   const regenerate = async (recompose: boolean) => {
     setRegenBusy(true);
@@ -1126,6 +1224,7 @@ function ShotRow({
             <span className="text-xs font-medium text-ink-200">Shot {shot.shot_order}</span>
             <span className="chip text-[10px] py-0.5">{shotTypeLabel(shot.shot_type)}</span>
             <StatusBadge status={shot.status} />
+            {hasClip && <InspectionChip inspection={shot.inspection} pending={autoChecking} />}
             {shot.clip_stale && (
               <span
                 className="chip text-[10px] py-0.5 bg-amber-500/10 border-amber-500/40 text-amber-300"
@@ -1311,6 +1410,22 @@ function ShotRow({
               Takes ({shot.takes_count})
             </button>
           )}
+          {hasClip && (
+            <button
+              className="btn-ghost w-full text-xs disabled:opacity-50"
+              onClick={checkClip}
+              disabled={checkBusy || !!checkBlocked}
+              title={
+                checkBlocked ||
+                `A vision model looks at a few frames of this clip and says if anything looks off (wrong face, broken hands, text, not what the prompt asks)${
+                  checkCost ? `. Costs ${checkCost}` : ""
+                }. Advice only: it never stops the video.`
+              }
+            >
+              {checkBusy || autoChecking ? "Checking…" : checked ? "Check again" : "Check this clip"}
+              {!checkBusy && !autoChecking && checkCost ? ` · ${checkCost}` : ""}
+            </button>
+          )}
           <div className="flex gap-1.5">
             {shot.shot_type !== "end_card" && (
               <button
@@ -1386,5 +1501,37 @@ function ShotRow({
         <div className="text-xs text-accent mt-2">Error: {shot.error}</div>
       )}
     </div>
+  );
+}
+
+/** "2 clips flagged by the check: shot 3 (face doesn't match Maya), shot 5 (…)" with links to the shots. */
+function FlaggedLine({
+  flagged,
+  onGo,
+  className = "",
+}: {
+  flagged: NonNullable<RenderPlan["flagged"]>;
+  onGo: (shotId: number) => void;
+  className?: string;
+}) {
+  return (
+    <p className={`text-xs ${className}`}>
+      {flagged.length === 1 ? "1 clip" : `${flagged.length} clips`} flagged by the check:{" "}
+      {flagged.map((f, i) => (
+        <span key={f.shot_id}>
+          {i > 0 ? ", " : ""}
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:text-amber-100"
+            onClick={() => onGo(f.shot_id)}
+            title={f.summary || f.first_issue}
+          >
+            shot {f.shot_order}
+          </button>
+          {f.first_issue ? ` (${f.first_issue})` : ""}
+        </span>
+      ))}
+      .
+    </p>
   );
 }

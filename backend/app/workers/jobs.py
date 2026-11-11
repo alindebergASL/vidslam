@@ -242,3 +242,17 @@ def recompose_after_regen_job(project_id: int) -> None:
         pipeline.recompose_project(db, project_id)
     finally:
         db.close()
+
+
+def inspect_take_job(take_id: int) -> None:
+    """The automatic clip check of a take that just landed (advisory: it
+    never touches the render)."""
+    from ..services import inspector
+
+    db = SessionLocal()
+    try:
+        inspector.run_auto(db, take_id)
+    except Exception:  # noqa: BLE001
+        log.exception("clip check of take %s failed", take_id)
+    finally:
+        db.close()

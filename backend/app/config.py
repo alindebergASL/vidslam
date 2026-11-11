@@ -201,6 +201,14 @@ class Settings(BaseSettings):
     # many seconds; a longer wait fails the call with the wait in the message.
     sogni_max_retry_after_seconds: float = 30.0
 
+    # Clip check (services/inspector.py): a vision-capable chat model on
+    # OpenRouter looks at 4 frames of each new storyboard clip. Settings →
+    # Clip check overrides it at runtime; when this id isn't in the polled
+    # catalog, a current vision model from the catalog is used instead.
+    inspector_model: str = "google/gemini-2.5-flash"
+    # Rough cost of one check when the catalog has no price for the model.
+    cost_clip_check: float = 0.004
+
     # cost estimate rates (USD). Rough placeholders — override per your providers' pricing.
     cost_chat_per_plan: float = 0.01
     # Runware (runware.ai) image + video models, ids "runware/<AIR>" (e.g.

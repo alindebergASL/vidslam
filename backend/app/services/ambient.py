@@ -45,7 +45,7 @@ from ..schemas.ambient import (
     SoundPresetOut,
 )
 from ..schemas.api import RenderOut, ShotOut
-from . import alerts, render_files, storage
+from . import alerts, loop_health, render_files, storage
 from .image_settings import best_image_settings
 from .model_registry import active_model as _active_model
 from .model_registry import switched_off as _switched_off
@@ -1611,6 +1611,9 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         loop_error=(shot.error if shot else ""),
         loop_shot=ShotOut.model_validate(shot) if shot else None,
         variant_shots=[ShotOut.model_validate(v) for v in _variant_shots(project)[:variant_count(cfg) - 1]],
+        loop_health=loop_health.current(project, shot),
+        variant_loop_health=[loop_health.current(project, v)
+                             for v in _variant_shots(project)[:variant_count(cfg) - 1]],
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         picture_ready=has_picture(project, cfg),
@@ -1988,6 +1991,8 @@ def _finalize_generation(
     generated["billed"] = 0.0 if mocked else generated["estimated_cost"]
     _set_state(project, _GENERATED_KEY, generated)
     db.commit()
+    # Loop health: local and free, a few seconds; never in the way.
+    loop_health.measure_quietly(db, project.id)
     # Music: (re)generate when asked, and always when the scene wants a bed
     # but doesn't have one yet — a first generate must yield a renderable scene.
     has_music = bool(project.music_upload_path and Path(project.music_upload_path).exists())
@@ -2224,6 +2229,19 @@ def generate_cost(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPl
     has_music = bool(project.music_upload_path and Path(project.music_upload_path).exists())
     skip = {"repeat"} | ({"track"} if has_music else set()) | ({"sound"} if has_music and sound_path(project).exists() else set())
     return round(sum(ln["cost"] for ln in estimate_ambient_cost(cfg, plan)["lines"] if ln["unit"] not in skip), 2)
+
+
+def render_seam_blend_seconds(project: models.VideoProject) -> float:
+    """How many seconds the finished video dissolves across the loop's join
+    (the same choice render_scene makes); 0 when the clip loops by
+    construction (Still + drift)."""
+    cfg = _config_of(project)
+    if cfg.source == "image_drift":
+        return 0.0
+    seam = float(cfg.crossfade_seconds or 0.0)
+    if bool(_generated_of(project).get("closed")) and cfg.source == "video":
+        seam = min(seam, CLOSED_SEAM_CROSSFADE)
+    return max(0.0, seam)
 
 
 def render_scene(db: Session, project_id: int) -> models.Render:

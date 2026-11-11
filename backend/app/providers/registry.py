@@ -54,6 +54,18 @@ def get_chat() -> ChatProvider:
     return OpenRouterChatProvider(model=model)
 
 
+def get_vision(model: str) -> ChatProvider:
+    """A chat provider for the clip check's vision model (services/inspector.py),
+    routed like any chat model; raises ProviderUnavailable when switched off."""
+    if _checked("chat", model) == "mock":
+        from .mock_chat import MockChatProvider
+
+        return MockChatProvider()
+    from .openrouter_chat import OpenRouterChatProvider
+
+    return OpenRouterChatProvider(model=model, json_mode=False)
+
+
 def is_sogni_model(model: str | None) -> bool:
     return bool(model) and str(model).startswith("sogni/")
 

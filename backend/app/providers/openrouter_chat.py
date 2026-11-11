@@ -211,6 +211,45 @@ class OpenRouterChatProvider(ChatProvider):
             raise RuntimeError("OpenRouter returned no message")
         return clean_enhanced(content)
 
+    def inspect_images(self, *, system: str, text: str, images: list[str],
+                       note: str = "clip check", estimate: float = 0.0) -> str:
+        """One vision call: the text, then each image as an image_url part
+        (data URLs). Returns the reply text; raises on an error body."""
+        parts: list[dict] = [{"type": "text", "text": text}]
+        parts += [{"type": "image_url", "image_url": {"url": u}} for u in images]
+        body: dict = {
+            "model": self.model,
+            "temperature": 0.0,
+            # Room for a model that thinks before answering; reasoning is
+            # kept short so the JSON verdict isn't cut off (and paid for).
+            "max_tokens": 1500,
+            "reasoning": {"effort": "low", "exclude": True},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": parts},
+            ],
+        }
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
+        with httpx.Client(timeout=90.0) as client:
+            r = client.post(url, headers=self._headers(), json=body)
+            r.raise_for_status()
+            data = r.json()
+        if "choices" not in data:
+            err = data.get("error") or {}
+            raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
+        from ..services import spend
+
+        spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
+                                generation_id=str(data.get("id") or ""), estimate=estimate, note=note)
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (IndexError, KeyError, TypeError):
+            raise RuntimeError("OpenRouter returned no message") from None
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        return content if isinstance(content, str) else ""
+
+
 # Tested blind (Nov 2026): typed descriptions full of hype words ("magical",
 # "8k ultra realistic", "crystal clear turquoise") scored 4.7-5.7; the same
 # descriptions rewritten like this scored 6.3-7.0. Plain ones didn't change.

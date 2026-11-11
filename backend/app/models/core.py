@@ -272,6 +272,16 @@ class VideoShot(Base):
         return n
 
     @property
+    def inspection(self) -> Optional[dict]:
+        """The clip check's verdict on the current clip (its take), or None."""
+        if not self.clip_path:
+            return None
+        for t in self.takes:
+            if t.clip_path == self.clip_path:
+                return t.inspection_json
+        return None
+
+    @property
     def clip_stale(self) -> bool:
         """The shot was edited since its clip was made: the next render
         makes (and bills) a new clip for it."""
@@ -297,6 +307,9 @@ class ShotTake(Base):
     # From the spend ledger when known; None = unknown (or free: mock).
     cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     note: Mapped[str] = mapped_column(Text, default="")
+    # The clip check's verdict on this take (services/inspector.py); None =
+    # not checked. {verdict, issues, summary, checked_at, model, ...}
+    inspection_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
     shot: Mapped[VideoShot] = relationship(back_populates="takes")

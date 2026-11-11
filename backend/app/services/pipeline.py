@@ -474,6 +474,10 @@ def on_shot_clip_ready(db: Session, job: models.VideoJob) -> None:
     if _remake_outdated(db, job, shot):
         return
     _after_shot(db, job)
+    # The clip check runs after the render has moved on: advisory, never in its way.
+    from . import inspector
+
+    inspector.queue_auto_check(db, db.get(models.VideoShot, job.ref_id) or shot)
 
 
 def _remake_outdated(db: Session, job: models.VideoJob, shot: models.VideoShot) -> bool:
@@ -1111,6 +1115,10 @@ def render_plan(db: Session, project: models.VideoProject) -> dict:
     voiceover_changed = _voiceover_changed(db, project)
     lipsync_on = _lipsync_available(db, project)
 
+    from .inspector import flagged_shots
+
+    body_ids = {s.id for s in _body_shots(project)}
+    flagged = [f for f in flagged_shots(project) if f["shot_id"] in body_ids]
     shots: list[dict] = []
     clip_cost = 0.0
     for shot in _body_shots(project):
@@ -1151,6 +1159,9 @@ def render_plan(db: Session, project: models.VideoProject) -> dict:
         "total": round(clip_cost + voice_cost, 4),
         "currency": "USD",
         "is_estimate": True,
+        # Current clips the clip check flagged ("2 clips flagged by the check").
+        "flagged": flagged,
+        "flagged_count": len(flagged),
     }
 
 
