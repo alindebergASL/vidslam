@@ -128,6 +128,13 @@ class ChatProvider(Protocol):
         rate-card cost when the provider reports none."""
         ...
 
+    def hook_ideas(self, *, script: str, hook: str, n: int, styles: list[str]) -> str:
+        """Hook lab: `n` other openings for `script` (whose first sentence is
+        `hook`), one per style in `styles`. Returns the reply text as is
+        (JSON {"hooks": [{"style", "text"}]}; services/hook_lab.py parses it).
+        Spend is recorded with the note "hook ideas"."""
+        ...
+
     def classify_minor(self, text: str) -> dict:
         """The safety check (services/minor_check.py): does `text` put a
         minor, or someone made to look like one, in a sexual context?

@@ -16,6 +16,7 @@ import { AddShotDialog, DeleteShotDialog, DuplicateShotDialog, TakesDialog } fro
 import { checkBlockedWhy, checkCostText, InspectionChip, useClipCheckSettings } from "@/components/InspectionChip";
 import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
 import { api, Asset, ClipCheckSettings, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render, ApiError, errorText } from "@/lib/api";
+import { firstSentence, replaceFirstSentence } from "@/lib/hook";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 import { usePoll } from "@/lib/usePoll";
 import { useEvents } from "@/components/NotificationsProvider";
@@ -473,6 +474,15 @@ function Inner() {
               >
                 Re-compose
               </button>
+              {render.status === "completed" && project.mode !== "ambient_loop" && (
+                <Link
+                  href={`/projects/${projectId}/hooks?base=${render.id}`}
+                  className="btn-ghost"
+                  title="Try other first lines (and optionally a new first shot) without paying for the whole video again"
+                >
+                  Try other openings
+                </Link>
+              )}
               <Link href={`/projects/${projectId}/render`} className="btn-primary">
                 Open Render →
               </Link>
@@ -1050,17 +1060,36 @@ function StoryboardScript({
   const plan = project.generated_plan_json || {};
   const [script, setScript] = useState<string>(plan.cleaned_voice_script || "");
   const [endCard, setEndCard] = useState<string>(plan.end_card_text || "");
+  // The opening line is the script's first sentence; it is edited on its
+  // own here and put back into the script when the field is left (or saved).
+  const [hook, setHook] = useState<string>(firstSentence(plan.cleaned_voice_script || ""));
   const [saving, setSaving] = useState(false);
   const toast = useToast();
 
+  const editScript = (next: string) => {
+    setScript(next);
+    setHook(firstSentence(next));
+  };
+  const withHook = () => (hook.trim() && hook.trim() !== firstSentence(script) ? replaceFirstSentence(script, hook) : script);
+  const applyHook = () => {
+    // An emptied field keeps the script's opening line (and shows it again).
+    if (!hook.trim()) {
+      setHook(firstSentence(script));
+      return;
+    }
+    const next = withHook();
+    if (next !== script) editScript(next);
+  };
+
+  const finalScript = withHook();
   const dirty =
-    script !== (plan.cleaned_voice_script || "") || endCard !== (plan.end_card_text || "");
+    finalScript !== (plan.cleaned_voice_script || "") || endCard !== (plan.end_card_text || "");
 
   const save = async (resync: boolean) => {
     setSaving(true);
     try {
       const updated = await api.editPlan(project.id, {
-        cleaned_voice_script: script,
+        cleaned_voice_script: finalScript,
         end_card_text: endCard,
         resync_captions: resync,
       });
@@ -1084,15 +1113,32 @@ function StoryboardScript({
           makes a new voiceover and keeps the clips that still match. Re-compose keeps the old voice.
         </span>
       </div>
+      <div className="rounded-lg border border-iris/40 bg-iris/10 p-3 mb-3">
+        <label className="label" htmlFor="proj-hook">Opening line (hook)</label>
+        <p className="text-[11px] text-ink-300 -mt-1 mb-2">
+          The first sentence people hear. It decides whether they keep watching. It is the start of the spoken
+          script below.
+        </p>
+        <input
+          id="proj-hook"
+          className="input font-medium"
+          value={hook}
+          maxLength={300}
+          onChange={(e) => setHook(e.target.value)}
+          onBlur={applyHook}
+          placeholder="Write a first sentence that stops the scroll"
+        />
+      </div>
       <label className="label" htmlFor="proj-spoken-script">Spoken script</label>
       <textarea
         id="proj-spoken-script"
         aria-label="Spoken script"
         className="input min-h-[90px]"
         value={script}
-        onChange={(e) => setScript(e.target.value)}
+        onFocus={applyHook}
+        onChange={(e) => editScript(e.target.value)}
       />
-      <EnhanceButton className="mt-2" text={script} kind="script" onUse={setScript} />
+      <EnhanceButton className="mt-2" text={script} kind="script" onUse={editScript} />
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
         <div>
           <label className="label" htmlFor="proj-end-card-text">End-card text</label>

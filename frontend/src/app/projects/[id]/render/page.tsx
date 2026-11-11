@@ -7,7 +7,7 @@ import { useToast } from "@/components/Toaster";
 import { PublishPanel } from "@/components/PublishPanel";
 import { GenerationProgress } from "@/components/GenerationProgress";
 import { useEvents } from "@/components/NotificationsProvider";
-import { api, errorText, Project, Render } from "@/lib/api";
+import { api, errorText, Project, Render, renderLabel } from "@/lib/api";
 import { usePoll } from "@/lib/usePoll";
 
 const RENDER_DONE = ["completed", "failed", "cancelled", "expired"];
@@ -37,9 +37,12 @@ function Inner() {
       const [p, rs] = await Promise.all([api.getProject(projectId), api.listRenders(projectId)]);
       setProject(p);
       setAllRenders(rs);
+      // Without an id: the newest version of the video itself, not one of
+      // its other openings (hook lab).
+      const newestBase = rs.find((r) => !r.hook_variant_id) || rs[0] || null;
       const primary = explicitRenderId
-        ? rs.find((r) => r.id === explicitRenderId) || rs[0] || null
-        : rs[0] || null;
+        ? rs.find((r) => r.id === explicitRenderId) || newestBase
+        : newestBase;
       setRender(primary);
       const secondary = compareRenderId
         ? rs.find((r) => r.id === compareRenderId) || null
@@ -71,8 +74,9 @@ function Inner() {
 
   if (!project) return <div className="p-8 text-ink-300">Loading…</div>;
 
-  const versionOf = (r: Render) =>
-    allRenders.length - allRenders.findIndex((x) => x.id === r.id);
+  const versionOf = (r: Render) => renderLabel(r);
+  const canTryOpenings =
+    !!render && render.status === "completed" && !render.hook_variant_id && project.mode !== "ambient_loop";
   const otherCompleted = allRenders.filter(
     (r) => r.id !== render?.id && r.status === "completed"
   );
@@ -87,14 +91,13 @@ function Inner() {
         ← {project.title || "Project"}
       </Link>
       <h1 className="text-3xl font-semibold tracking-tight mt-1 mb-2">
-        Render
-        {render ? ` · v${versionOf(render)}` : ""}
-        {comparing ? ` vs v${versionOf(compareRender!)}` : ""}
+        {render ? versionOf(render) : "Render"}
+        {comparing ? ` vs ${versionOf(compareRender!)}` : ""}
       </h1>
 
       {allRenders.length > 1 && (
         <div className="flex flex-wrap items-center gap-2 mb-6">
-          {allRenders.map((r, idx) => {
+          {allRenders.map((r) => {
             const isCurrent = render?.id === r.id;
             const isCompare = compareRender?.id === r.id;
             return (
@@ -106,7 +109,7 @@ function Inner() {
                 }`}
                 aria-current={isCurrent ? "page" : undefined}
               >
-                v{allRenders.length - idx}
+                {versionOf(r)}
                 {/* On the light active chip, ink-400 grey fails contrast;
                     use the chip's dark ink there. */}
                 <span className={`text-[10px] ${isCurrent ? "text-ink-700" : "text-ink-400"}`}>
@@ -153,7 +156,7 @@ function Inner() {
                     </option>
                     {otherCompleted.map((r) => (
                       <option key={r.id} value={r.id}>
-                        v{versionOf(r)} · {new Date(r.created_at).toLocaleTimeString([], {
+                        {versionOf(r)} · {new Date(r.created_at).toLocaleTimeString([], {
                           hour: "2-digit",
                           minute: "2-digit",
                         })}
@@ -169,6 +172,21 @@ function Inner() {
 
       {!render ? (
         <div className="card p-6 text-ink-300">No render yet.</div>
+      ) : render.status !== "completed" && render.hook_variant_id ? (
+        // Another opening (hook lab) has its own progress there.
+        <div className="card p-6 text-sm text-ink-200 space-y-3">
+          <p>
+            {render.status === "failed"
+              ? `This opening wasn't made${render.error ? `: ${render.error}` : "."}`
+              : "This opening is still being made."}
+          </p>
+          <Link
+            href={`/projects/${projectId}/hooks?base=${render.hook_base_render_id ?? render.composition_json?.base_render_id ?? ""}`}
+            className="btn-ghost text-sm"
+          >
+            Open the hook lab
+          </Link>
+        </div>
       ) : render.status !== "completed" ? (
         <GenerationProgress
           render={render}
@@ -184,8 +202,8 @@ function Inner() {
         <ComparePane
           left={render}
           right={compareRender!}
-          leftLabel={`v${versionOf(render)}`}
-          rightLabel={`v${versionOf(compareRender!)}`}
+          leftLabel={versionOf(render)}
+          rightLabel={versionOf(compareRender!)}
         />
       ) : (
         <>
@@ -238,6 +256,20 @@ function Inner() {
             >
               Copy share link
             </button>
+            {canTryOpenings && (
+              <Link
+                href={`/projects/${projectId}/hooks?base=${render.id}`}
+                className="btn-ghost"
+                title="Try other first lines (and optionally a new first shot) without paying for the whole video again"
+              >
+                Try other openings
+              </Link>
+            )}
+            {render.hook_variant_id && (
+              <Link href={`/projects/${projectId}/hooks?base=${render.hook_base_render_id ?? render.composition_json?.base_render_id ?? ""}`} className="btn-ghost">
+                All openings
+              </Link>
+            )}
             <Link href={`/projects/${projectId}`} className="btn-ghost">
               Edit shots
             </Link>

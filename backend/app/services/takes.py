@@ -98,9 +98,13 @@ def _referenced_elsewhere(db: Session, path: str, *, take_id: Optional[int] = No
 
 
 def remove_file(db: Session, path: str, *, take_id: Optional[int] = None,
-                shot_id: Optional[int] = None) -> bool:
-    """Delete a clip file unless something else still uses it."""
+                shot_id: Optional[int] = None, project_id: Optional[int] = None) -> bool:
+    """Delete a clip file unless something else still uses it (another
+    shot or take, or, given `project_id`, a render or hook-lab variant of
+    the project's hook lab still needs: in_use())."""
     if not path or _referenced_elsewhere(db, path, take_id=take_id, shot_id=shot_id):
+        return False
+    if project_id is not None and path in in_use(db, project_id)[1]:
         return False
     try:
         Path(path).unlink(missing_ok=True)
@@ -115,19 +119,73 @@ def delete(db: Session, shot: models.VideoShot, take: models.ShotTake) -> None:
     path, take_id = take.clip_path, take.id
     shot.takes.remove(take)
     db.flush()
-    remove_file(db, path, take_id=take_id)
+    remove_file(db, path, take_id=take_id, project_id=shot.project_id)
     db.commit()
+
+
+def protected(db: Session, project_id: int) -> tuple[set[int], set[str]]:
+    """(take ids, clip paths) that a render or a hook-lab variant still
+    needs: every take and clip a render's composition_json records (a
+    variant re-composes from its base render's clips), and the take a
+    variant picked for its shot 1."""
+    take_ids: set[int] = set()
+    paths: set[str] = set()
+    for (comp,) in (db.query(models.Render.composition_json)
+                    .filter(models.Render.project_id == project_id,
+                            models.Render.composition_json.isnot(None))):
+        for sh in (comp or {}).get("shots") or []:
+            if sh.get("take_id"):
+                take_ids.add(int(sh["take_id"]))
+            if sh.get("clip_path"):
+                paths.add(str(sh["clip_path"]))
+    for (tid,) in (db.query(models.HookVariant.shot1_take_id)
+                   .filter(models.HookVariant.project_id == project_id,
+                           models.HookVariant.shot1_take_id.isnot(None))):
+        take_ids.add(int(tid))
+    return take_ids, paths
+
+
+def in_use(db: Session, project_id: int) -> tuple[set[int], set[str]]:
+    """(take ids, clip paths) the hook lab needs right now, so deleting a
+    take or a shot must not remove them: the take an opening (not archived)
+    picked for its shot 1, and every clip of a version that has openings
+    (they are re-composed from its clips) or of an opening being made."""
+    take_ids: set[int] = set()
+    paths: set[str] = set()
+    V = models.HookVariant
+    bases: set[int] = set()
+    for tid, base_id in (db.query(V.shot1_take_id, V.base_render_id)
+                         .filter(V.project_id == project_id, V.status != "archived")):
+        if tid:
+            take_ids.add(int(tid))
+        bases.add(int(base_id))
+    R = models.Render
+    rows = db.query(R.composition_json).filter(R.project_id == project_id, R.composition_json.isnot(None))
+    rows = rows.filter((R.id.in_(bases)) | (R.hook_variant_id.isnot(None) & R.status.notin_(
+        ("completed", "failed", "cancelled", "expired")))) if bases else rows.filter(
+        R.hook_variant_id.isnot(None), R.status.notin_(("completed", "failed", "cancelled", "expired")))
+    for (comp,) in rows:
+        for sh in (comp or {}).get("shots") or []:
+            if sh.get("take_id"):
+                take_ids.add(int(sh["take_id"]))
+            if sh.get("clip_path"):
+                paths.add(str(sh["clip_path"]))
+    return take_ids, paths
 
 
 def prune(db: Session, shot: models.VideoShot) -> int:
     """Keep the newest KEEP takes (by when they were made); never the
-    current one. Returns how many were removed."""
+    current one, nor one a render or a hook-lab variant still needs
+    (protected()). Returns how many were removed."""
     takes = sorted(shot.takes, key=lambda t: t.id, reverse=True)
     if len(takes) <= KEEP:
         return 0
+    keep_ids, keep_paths = protected(db, shot.project_id)
     removed = 0
     for take in takes[KEEP:]:
         if take.clip_path and take.clip_path == shot.clip_path:
+            continue
+        if take.id in keep_ids or (take.clip_path and take.clip_path in keep_paths):
             continue
         delete(db, shot, take)
         removed += 1

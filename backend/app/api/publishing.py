@@ -26,13 +26,14 @@ from .auth import require_auth
 router = APIRouter(dependencies=[Depends(require_auth)])
 
 StatusFilter = Literal["all", "scheduled", "published", "failed", "uploading"]
-GroupBy = Literal["type", "preset", "time_weather", "length", "character", "model", "aspect"]
+GroupBy = Literal["type", "preset", "time_weather", "length", "character", "model", "aspect", "hook"]
 
 
 class PublishOverviewItem(BaseModel):
     id: int
     render_id: int
     render_version: Optional[int]
+    render_version_label: str = ""
     project_id: int
     project_title: str
     project_kind: Literal["storyboard", "ambient"]
@@ -70,6 +71,7 @@ class PublishOverviewPage(BaseModel):
 class NotPostedItem(BaseModel):
     render_id: int
     render_version: Optional[int]
+    render_version_label: str = ""
     project_id: int
     project_title: str
     project_kind: Literal["storyboard", "ambient"]
@@ -101,6 +103,7 @@ class ResultRow(BaseModel):
     publish_job_id: int
     render_id: int
     render_version: Optional[int]
+    render_version_label: str = ""
     project_id: int
     project_title: str
     project_kind: Literal["storyboard", "ambient"]
@@ -131,6 +134,55 @@ class ResultRow(BaseModel):
     character: str
     model: str
     aspect_ratio: str
+    # "project": the project's spend (without its other openings);
+    # "render": a hook-lab variant's own spend.
+    cost_scope: Literal["project", "render"] = "project"
+    # The opening (hook lab): a storyboard render is "A" (original); a
+    # variant has its label/style and its base render. Ambient: none.
+    hook_variant_id: Optional[int] = None
+    hook_base_render_id: Optional[int] = None
+    hook_label: str = ""
+    hook_style_key: str = ""
+    hook_style: str = ""
+    hook_text: str = ""
+
+
+class HookTestEntry(BaseModel):
+    hook_label: str
+    hook_style: str
+    hook_style_key: str
+    hook_text: str
+    is_base: bool
+    hook_variant_id: Optional[int]
+    render_id: int
+    render_version_label: str
+    publish_job_id: int
+    title: str
+    external_url: str
+    thumbnail_url: Optional[str]
+    published_at: datetime
+    age_days: int
+    views: Optional[int]
+    likes: Optional[int]
+    views_at_equal_age: Optional[int]
+    views_per_day_equal_age: Optional[float]
+    likes_per_1k_views: Optional[float]
+    cost_usd: float
+    cost_scope: Literal["project", "render"]
+    cost_is_estimate: bool
+
+
+class HookTest(BaseModel):
+    base_render_id: int
+    project_id: int
+    project_title: str
+    project_url: str
+    base_version_label: str
+    equal_age_days: Optional[int]
+    ready: bool
+    verdict: str
+    leader: Optional[str]
+    entries: list[HookTestEntry]
 
 
 class ResultGroup(BaseModel):
@@ -161,6 +213,8 @@ class ResultsOut(BaseModel):
     group_by: GroupBy
     group_label: str
     groups: list[ResultGroup]
+    # Base videos with other openings on YouTube, compared at equal age.
+    hook_tests: list[HookTest] = []
 
 
 class StatsRefreshOut(BaseModel):
@@ -206,7 +260,8 @@ def _items_for(db: Session, ids: set[int]) -> list[dict]:
     J = models.PublishJob
     rows = publishing._jobs_query(db).filter(J.id.in_(ids)).order_by(J.id.desc()).all()
     versions = publishing.render_versions(db, [p.id for _, _, p in rows])
-    return [publishing.job_item(j, r, p, versions.get(r.id)) for j, r, p in rows]
+    labels = publishing.version_labels(db, [r for _, r, _ in rows])
+    return [publishing.job_item(j, r, p, versions.get(r.id), labels.get(r.id, "")) for j, r, p in rows]
 
 
 @router.post("/publish-jobs/{job_id}/refresh", response_model=PublishOverviewItem)
@@ -241,6 +296,7 @@ def results(group_by: GroupBy = "type", db: Session = Depends(get_db)) -> dict:
         "group_by": group_by,
         "group_label": publishing.GROUPS[group_by][1],
         "groups": publishing.group_rows(rows, group_by),
+        "hook_tests": publishing.hook_tests(db, rows),
     }
 
 

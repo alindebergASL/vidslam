@@ -211,6 +211,47 @@ class OpenRouterChatProvider(ChatProvider):
             raise RuntimeError("OpenRouter returned no message")
         return clean_enhanced(content)
 
+    def hook_ideas(self, *, script: str, hook: str, n: int, styles: list[str]) -> str:
+        """One short call: other openings for the script (see HOOK_IDEAS_SYSTEM)."""
+        body: dict = {
+            "model": self.model,
+            "temperature": 0.7,
+            "messages": [
+                {"role": "system", "content": HOOK_IDEAS_SYSTEM},
+                {"role": "user", "content": json.dumps({
+                    "script": script, "opening_line": hook, "count": n, "styles": styles,
+                    "opening_words": len(hook.split()),
+                }, ensure_ascii=False)},
+            ],
+        }
+        if self.json_mode:
+            body["response_format"] = {"type": "json_object"}
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
+        with httpx.Client(timeout=60.0) as client:
+            r = client.post(url, headers=self._headers(), json=body)
+            if r.status_code == 400 and "response_format" in body:
+                body.pop("response_format")
+                r = client.post(url, headers=self._headers(), json=body)
+            r.raise_for_status()
+            data = r.json()
+        if "choices" not in data:
+            err = data.get("error") or {}
+            raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
+        from ..services import spend
+
+        spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
+                                generation_id=str(data.get("id") or ""), estimate=0.001,
+                                note="hook ideas")
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (IndexError, KeyError, TypeError):
+            raise RuntimeError("OpenRouter returned no message") from None
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if not isinstance(content, str):
+            raise RuntimeError("OpenRouter returned no message")
+        return content
+
     def inspect_images(self, *, system: str, text: str, images: list[str],
                        note: str = "clip check", estimate: float = 0.0) -> str:
         """One vision call: the text, then each image as an image_url part
@@ -314,6 +355,16 @@ def parse_minor_verdict(reply: str) -> dict:
 # Tested blind (Nov 2026): typed descriptions full of hype words ("magical",
 # "8k ultra realistic", "crystal clear turquoise") scored 4.7-5.7; the same
 # descriptions rewritten like this scored 6.3-7.0. Plain ones didn't change.
+HOOK_IDEAS_SYSTEM = """You write other openings (hooks) for a short video's voiceover. You get the whole spoken script, its current opening line, how many openings to write and the style of each. Reply with JSON only: {"hooks": [{"style": "...", "text": "..."}]}, one entry per requested style, in that order.
+
+Rules:
+- Each opening replaces only the first sentence: it must lead naturally into the rest of the script.
+- About as long as the current opening line (within 30% of its word count), one sentence, spoken aloud.
+- Use only facts that are in the script. Add no new claims, numbers, names or promises.
+- Styles: question = asks the viewer something; bold_claim = a confident statement; stat = leads with a number or fact from the script; story = starts a tiny personal moment; contrarian = pushes against a common belief.
+- Plain words, no hashtags, no emojis, no quotes around the text."""
+
+
 SCENE_REWRITE_SYSTEM = """You turn a short description of a calm place into a description for a realistic photograph, for an image model. Reply with JSON only: {"scene": "...", "light": "...", "camera": "..."}.
 - scene: 2-4 plain sentences describing a real, specific place: what is there, concrete materials, real plant and rock species, and a few untidy natural details (uneven, worn, scattered). Keep everything the user asked for (subjects, setting, season, time of day, weather) and add nothing they didn't ask for beyond ordinary detail.
 - Drop hype and style words: photorealistic, realistic, 8k, 4k, ultra, HD, cinematic, epic, breathtaking, stunning, beautiful, magical, ethereal, dreamy, vibrant, glowing, crystal clear, turquoise, golden hour, god rays, masterpiece. Describe colours as they really look (clear shallow water over pale sand is pale green-blue, not turquoise).

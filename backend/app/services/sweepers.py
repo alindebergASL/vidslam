@@ -146,6 +146,24 @@ def sweep_studio(db: Session, *, now: Optional[datetime] = None) -> dict:
 # ---------- renders ----------
 
 
+def _drop_scratch(render: models.Render) -> None:
+    """A compose killed mid-way leaves its tmp_<render id>/ (full-size
+    intermediate video) behind: remove it with the failed render."""
+    from . import render_files, storage
+
+    try:
+        render_files.drop_scratch(storage.render_subdir(render.project_id), render.id)
+    except Exception:  # noqa: BLE001
+        log.exception("removing the scratch dir of render %s failed", render.id)
+
+
+def sweep_hook_lab(db: Session, *, now: Optional[datetime] = None) -> dict:
+    """Other openings stuck between their clips and their compose."""
+    from . import hook_lab
+
+    return hook_lab.sweep(db, grace_seconds=COMPOSE_GRACE.total_seconds(), now=now or _now())
+
+
 def _fail_stuck_render(db: Session, render: models.Render) -> bool:
     res = db.execute(update(models.Render)
                      .where(models.Render.id == render.id, models.Render.status == render.status,
@@ -155,6 +173,7 @@ def _fail_stuck_render(db: Session, render: models.Render) -> bool:
         db.rollback()
         return False
     db.refresh(render)
+    _drop_scratch(render)
     project = db.get(models.VideoProject, render.project_id)
     if project is not None and project.status not in ("draft", "planned", "completed", "failed", "cancelled"):
         project.status = "failed"  # so Retry works
@@ -240,7 +259,7 @@ def run_once(*, now: Optional[datetime] = None) -> dict:
     result: dict = {}
     db = SessionLocal()
     try:
-        for name, step in (("studio", sweep_studio), ("renders", sweep_renders)):
+        for name, step in (("studio", sweep_studio), ("renders", sweep_renders), ("hook_lab", sweep_hook_lab)):
             try:
                 result[name] = step(db, now=now)
             except Exception:  # noqa: BLE001

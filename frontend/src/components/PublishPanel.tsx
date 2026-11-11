@@ -68,7 +68,9 @@ export function PublishPanel({ projectId, renderId }: { projectId: number; rende
     setUploadAgain(false);
     api.youtubeStatus().then(setYt).catch(() => setYt(null));
     loadJobs();
-    api.publishMeta(projectId).then((m) => {
+    // This render's own script and opening (a hook-lab opening has its own).
+    api.publishMeta(projectId, renderId).then((m) => {
+      if (shownRender.current !== renderId) return;
       setTitle(m.title);
       setDescription(m.description);
       setTags(m.tags.join(", "));
