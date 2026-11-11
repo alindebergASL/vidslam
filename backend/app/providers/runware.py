@@ -816,9 +816,9 @@ def build_image_task(model: str, prompt: str, references: list[ImageRef], *, neg
     if len(used) < len(refs):
         log.warning("runware %s: %d reference picture(s) not used (the model takes %s)", a,
                     len(refs) - len(used), "fewer" if used else "none of this kind")
-    # A Cast member's likeness, or a prompt about children, always goes
-    # through Runware's content check.
-    cast = any(r.role == "character" for r in used)
+    # A Cast member's likeness (unless marked "adult content allowed", in
+    # adult mode), or a prompt about children, goes through Runware's check.
+    cast = any(r.role == "character" and not _exempt(r) for r in used)
     sent = _name_refs(prompt, used)
     pictures = _pictures_need_check(used, sent)
     checked = _content_check(check_content, cast, sent, negative_prompt) or pictures
@@ -921,7 +921,7 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
         # the prompt (storyboard shots attach the Cast to every shot).
         log.warning("runware %s: %d reference picture(s) not used (the model takes %s)", a,
                     len(refs) - len(used), "fewer" if used else "only pinned frames")
-    cast = any(r.role == "character" for r in used)
+    cast = any(r.role == "character" and not _exempt(r) for r in used)
     sent = _name_refs(prompt, used if not first else [])
     pictures = _pictures_need_check(used, sent)
     checked = _content_check(check_content, cast, sent, negative_prompt) or pictures
@@ -1196,10 +1196,17 @@ def _content_check(explicit: Optional[bool], cast: bool, sent: str, negative: st
 def _pictures_need_check(used: list[ImageRef], sent: str) -> bool:
     """A sexual prompt sent with any reference picture (not only a Cast
     member's) always goes through Runware's content check: nobody has
-    checked who is in the picture."""
+    checked who is in the picture. Pictures of a Cast character marked
+    "adult content allowed" (adult mode) are the exception."""
     from ..services.safety import is_sexual
 
-    return bool(used) and is_sexual(sent)
+    return any(not _exempt(r) for r in used) and is_sexual(sent)
+
+
+def _exempt(ref: ImageRef) -> bool:
+    from ..services.content_mode import exempt
+
+    return exempt(ref)
 
 
 def _guard(prompt: str) -> None:
