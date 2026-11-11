@@ -321,7 +321,8 @@ def test_shot_references_keep_asset_order_and_accept_string_ids(client):
         db.add(shot)
         db.commit()
         shot_refs = pipeline._resolve_references_for_shot(db, project, shot)
-        assert [r.url.endswith(a1.public_token) for r in shot_refs] == [True, False]  # asset order, as before
+        # Asset order, as before (the URL carries ?ref=1, the scaled-down reference copy).
+        assert [r.url.split("?")[0].endswith(a1.public_token) for r in shot_refs] == [True, False]
     finally:
         db.close()
 
