@@ -17,6 +17,7 @@ from .core import (
     VideoJob,
     VideoProject,
     VideoShot,
+    VideoStat,
 )
 
 __all__ = [
@@ -38,4 +39,5 @@ __all__ = [
     "VideoJob",
     "VideoProject",
     "VideoShot",
+    "VideoStat",
 ]

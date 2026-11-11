@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { useParams, useRouter } from "next/navigation";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
@@ -34,7 +34,7 @@ import {
   VarietyControls,
   statusTone,
 } from "@/components/ambient/shared";
-import { api, AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, PhotoRewrite } from "@/lib/api";
+import { api, AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, PhotoRewrite, Render } from "@/lib/api";
 
 export default function AmbientScenePage() {
   return (
@@ -55,6 +55,21 @@ function Inner() {
   const [notFound, setNotFound] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [cacheBust, setCacheBust] = useState(0);
+  // ?render=<id> (from Publishing) opens the publish form for that finished
+  // render; otherwise it's for the newest finished one, even when a later
+  // render failed, was cancelled or is still running.
+  const search = useSearchParams();
+  const askedRender = search?.get("render") ? Number(search.get("render")) : null;
+  const [finished, setFinished] = useState<Render[]>([]);
+  const latestId = scene?.latest_render?.id;
+  const latestStatus = scene?.latest_render?.status;
+  useEffect(() => {
+    if (!id) return;
+    api
+      .listRenders(id)
+      .then((rs) => setFinished(rs.filter((r) => r.status === "completed")))
+      .catch(() => {});
+  }, [id, latestId, latestStatus]);
 
   const reload = useCallback(async () => {
     try {
@@ -140,6 +155,8 @@ function Inner() {
   const rendering = scene.status === "generating" && loopReady;
   const render = scene.latest_render;
   const rendered = render?.status === "completed";
+  const publishRender =
+    (askedRender != null ? finished.find((r) => r.id === askedRender) : undefined) ?? finished[0] ?? null;
   const plan = scene.plan;
   const resume = !inFlight ? scene.resume ?? null : null;
   const loopCost = aboutUsd(scene.generate_cost);
@@ -586,7 +603,25 @@ function Inner() {
             </div>
           )}
 
-          {rendered && render && <PublishPanel projectId={id} renderId={render.id} />}
+          {publishRender && (
+            <div className="space-y-2">
+              {publishRender.id !== render?.id && (
+                <p className="text-xs text-ink-400">
+                  Publishing the render finished {new Date(publishRender.created_at).toLocaleString()}
+                  {render?.status === "completed" ? ", not the newest one." : "."}
+                  {askedRender != null && (
+                    <>
+                      {" "}
+                      <Link href={`/ambient/${id}`} className="text-iris-soft hover:underline">
+                        Use the newest finished render
+                      </Link>
+                    </>
+                  )}
+                </p>
+              )}
+              <PublishPanel key={publishRender.id} projectId={id} renderId={publishRender.id} />
+            </div>
+          )}
 
           <RenderHistory projectId={id} />
         </div>
