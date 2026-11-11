@@ -22,6 +22,9 @@ import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 const CAN_GENERATE = ["planned", "failed", "completed", "cancelled"];
 const usd = (n: number) => `$${n.toFixed(2)}`;
 const IN_FLIGHT = ["submitted", "polling", "running"];
+// After a clip lands with the automatic check on, keep polling this long for
+// its verdict (the check runs after the clip is stored, off the render's path).
+const AUTO_CHECK_WAIT_MS = 60_000;
 
 export default function ProjectEditorPage() {
   return (
@@ -63,6 +66,15 @@ function Inner() {
   const timer = useRef<NodeJS.Timeout | null>(null);
   // Clip check: cost per check and whether checks can run (fetched once).
   const clipCheck = useClipCheckSettings();
+  // refresh() also runs from a setInterval set up earlier: read these via refs.
+  const clipCheckRef = useRef<ClipCheckSettings | null>(null);
+  clipCheckRef.current = clipCheck;
+  // Per shot: was it in flight / which clip it had at the last refresh.
+  const lastSeen = useRef<Map<number, { inFlight: boolean; clip: string }>>(new Map());
+  // `${shot id}:${clip path}` → when the clip landed, while its automatic
+  // check's verdict hasn't arrived (bounded by AUTO_CHECK_WAIT_MS).
+  const awaitingCheck = useRef<Map<string, number>>(new Map());
+  const [checkPending, setCheckPending] = useState<Set<number>>(new Set());
 
   // Models list (base + trained LoRAs) is stable during a session — fetch
   // once, not per poll.
@@ -116,7 +128,33 @@ function Inner() {
       const shotsActive = p.shots.some((s) =>
         ["submitted", "polling", "running"].includes(s.status)
       );
-      setPolling(renderActive || projectActive || shotsActive);
+      // A clip that just landed with the automatic check on: its verdict is
+      // stored a few seconds later, so keep polling (bounded) until it arrives
+      // and show "Checking…" meanwhile (no second, paid manual check).
+      const cc = clipCheckRef.current;
+      const autoOn = !!cc && cc.auto_check && cc.available && !cc.adult_mode;
+      const now = Date.now();
+      const pending = new Set<number>();
+      for (const s of p.shots) {
+        const key = `${s.id}:${s.clip_path}`;
+        const landed = s.status === "completed" && !!s.clip_path && s.shot_type !== "end_card";
+        const before = lastSeen.current.get(s.id);
+        const fresh = !!before && (before.inFlight || (!!before.clip && before.clip !== s.clip_path));
+        if (autoOn && landed && fresh && !s.inspection && !awaitingCheck.current.has(key))
+          awaitingCheck.current.set(key, now);
+        lastSeen.current.set(s.id, { inFlight: IN_FLIGHT.includes(s.status), clip: s.clip_path });
+        const since = awaitingCheck.current.get(key);
+        if (since === undefined) continue;
+        if (!landed || s.inspection || now - since > AUTO_CHECK_WAIT_MS) awaitingCheck.current.delete(key);
+        else pending.add(s.id);
+      }
+      for (const key of [...awaitingCheck.current.keys()]) {
+        const id = Number(key.split(":", 1)[0]);
+        const s = p.shots.find((x) => x.id === id);
+        if (!s || `${s.id}:${s.clip_path}` !== key) awaitingCheck.current.delete(key);
+      }
+      setCheckPending(pending);
+      setPolling(renderActive || projectActive || shotsActive || pending.size > 0);
     } catch (e: any) {
       setError(e.message);
     }
@@ -677,6 +715,7 @@ function Inner() {
                 onTakes={() => setTakesFor(s)}
                 planRow={planRows.get(s.id)}
                 clipCheck={clipCheck}
+                checkPending={checkPending.has(s.id)}
                 castAssets={castAssets}
                 videoModels={videoModels}
                 onChange={refresh}
@@ -1047,6 +1086,7 @@ function ShotRow({
   onTakes,
   planRow,
   clipCheck,
+  checkPending,
   castAssets,
   videoModels,
   onChange,
@@ -1071,6 +1111,8 @@ function ShotRow({
   onTakes: () => void;
   planRow?: RenderPlanShot;
   clipCheck: ClipCheckSettings | null;
+  /** The automatic check of this clip is under way: no manual check meanwhile. */
+  checkPending: boolean;
   castAssets: Asset[];
   videoModels: { id: string; name: string; description: string }[];
   onChange: () => void;
@@ -1097,7 +1139,10 @@ function ShotRow({
 
   const [checkBusy, setCheckBusy] = useState(false);
   const hasClip = shot.status === "completed" && !!shot.clip_path && shot.shot_type !== "end_card";
-  const checkBlocked = checkBlockedWhy(clipCheck);
+  const autoChecking = checkPending && !shot.inspection;
+  const checkBlocked =
+    checkBlockedWhy(clipCheck) ||
+    (autoChecking ? "The automatic check is looking at this clip; its verdict shows here in a moment." : null);
   const checkCost = checkCostText(clipCheck?.cost_per_check);
   const checked = !!shot.inspection && shot.inspection.verdict !== "skipped";
   // Paid: a vision model looks at a few frames of the current clip. Advice only.
@@ -1179,7 +1224,7 @@ function ShotRow({
             <span className="text-xs font-medium text-ink-200">Shot {shot.shot_order}</span>
             <span className="chip text-[10px] py-0.5">{shotTypeLabel(shot.shot_type)}</span>
             <StatusBadge status={shot.status} />
-            {hasClip && <InspectionChip inspection={shot.inspection} />}
+            {hasClip && <InspectionChip inspection={shot.inspection} pending={autoChecking} />}
             {shot.clip_stale && (
               <span
                 className="chip text-[10px] py-0.5 bg-amber-500/10 border-amber-500/40 text-amber-300"
@@ -1377,8 +1422,8 @@ function ShotRow({
                 }. Advice only: it never stops the video.`
               }
             >
-              {checkBusy ? "Checking…" : checked ? "Check again" : "Check this clip"}
-              {!checkBusy && checkCost ? ` · ${checkCost}` : ""}
+              {checkBusy || autoChecking ? "Checking…" : checked ? "Check again" : "Check this clip"}
+              {!checkBusy && !autoChecking && checkCost ? ` · ${checkCost}` : ""}
             </button>
           )}
           <div className="flex gap-1.5">

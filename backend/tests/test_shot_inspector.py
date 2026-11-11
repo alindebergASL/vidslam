@@ -416,3 +416,122 @@ def test_without_a_key_nothing_pretends_to_check(auth_client, monkeypatch, _visi
     finally:
         db.close()
     assert _vision.VISION_CALLS == []
+
+
+# ---------- off the render's path ----------
+
+
+def test_the_automatic_check_never_runs_in_the_caller(auth_client, monkeypatch, _vision):
+    """Inline / no Redis: the check runs on a background thread, so the
+    sweeper or a webhook (on the event loop) returns at once and the next
+    clip / compose isn't held up by frames and the vision model."""
+    import threading
+    import time
+
+    from app import models
+    from app.services import inspector
+
+    pid = _rendered(auth_client)
+    shot_id = _body(auth_client, pid)[0]["id"]
+    release, started = threading.Event(), threading.Event()
+    seen = []
+
+    def slow(db, take_id):
+        started.set()
+        seen.append(threading.current_thread().name)
+        release.wait(30)
+
+    monkeypatch.setattr(inspector, "run_auto", slow)
+    db = _db()
+    try:
+        shot = db.get(models.VideoShot, shot_id)
+        t = time.monotonic()
+        inspector.queue_auto_check(db, shot)
+        assert time.monotonic() - t < 2.0  # didn't wait for the check
+        assert started.wait(10) and seen and seen[0] != threading.current_thread().name
+    finally:
+        release.set()
+        db.close()
+    _settle()
+
+
+def test_with_redis_the_check_goes_on_its_own_low_priority_queue(auth_client, monkeypatch):
+    """Never on the shared "default" queue ahead of check_video / compose
+    jobs: its own "inspect" queue, which workers drain last."""
+    from app import models
+    from app.services import inspector
+    from app.workers import queue as q
+
+    class FakeQueue:
+        def __init__(self, name):
+            self.name, self.jobs = name, []
+
+        def enqueue(self, func, *args, **kw):
+            self.jobs.append((func.__name__, args))
+
+            class J:
+                id = "job-1"
+            return J()
+
+    pid = _rendered(auth_client)
+    shot_id = _body(auth_client, pid)[0]["id"]
+    made: dict = {}
+    monkeypatch.setattr(q, "_try_low_queue", lambda name: made.setdefault(name, FakeQueue(name)))
+    monkeypatch.setattr(q, "enqueue", lambda *a, **k: pytest.fail("clip check on the shared queue"))
+    monkeypatch.setattr(q.get_settings(), "queue_mode", "auto")
+    db = _db()
+    try:
+        inspector.queue_auto_check(db, db.get(models.VideoShot, shot_id))
+    finally:
+        db.close()
+    assert list(made) == [q.LOW_QUEUE] == ["inspect"]
+    assert made["inspect"].jobs and made["inspect"].jobs[0][0] == "inspect_take_job"
+    compose = Path(__file__).resolve().parents[2] / "docker-compose.yml"
+    assert "default inspect" in compose.read_text()  # workers drain "inspect" after "default"
+
+
+# ---------- adult mode ----------
+
+
+def test_adult_mode_sends_no_clip_and_says_why(auth_client, _vision):
+    """Adult mode: the vision models refuse (billed) or moralise, so no
+    clip is sent: the automatic check notes it, the manual one refuses."""
+    from app.services import inspector
+
+    pid = _rendered(auth_client)
+    sid = _body(auth_client, pid)[0]["id"]
+    assert auth_client.put("/api/settings/content", json={"adult": True}).json()["adult"] is True
+    assert auth_client.get("/api/settings/clip-check").json()["adult_mode"] is True
+    _vision.VISION_CALLS.clear()
+    assert auth_client.post(f"/api/projects/{pid}/shots/{sid}/regenerate").status_code == 202
+    shot = next(s for s in _body(auth_client, pid) if s["id"] == sid)
+    assert shot["inspection"]["verdict"] == "skipped"
+    assert shot["inspection"]["summary"] == inspector.ADULT_MODE == "not checked: adult mode is on"
+    assert _vision.VISION_CALLS == []
+    r = auth_client.post(f"/api/projects/{pid}/shots/{sid}/check")
+    assert r.status_code == 409 and r.json()["detail"] == inspector.ADULT_MODE_WHY
+    assert _vision.VISION_CALLS == []
+    plan = auth_client.get(f"/api/projects/{pid}/render-plan").json()
+    assert sid not in [f["shot_id"] for f in plan["flagged"]]
+    auth_client.put("/api/settings/content", json={"adult": False})
+    assert auth_client.get("/api/settings/clip-check").json()["adult_mode"] is False
+
+
+def test_a_content_judgement_is_never_a_problem_verdict():
+    """The model is told adult content is allowed; an "issue" about nudity,
+    explicitness or policy is dropped, and a problem flagged only for that
+    reads unsure, never problem."""
+    from app.services import inspector
+
+    assert "never an issue" in inspector.SYSTEM and "adult content" in inspector.SYSTEM
+    only = inspector.parse_reply(json.dumps({"verdict": "problem", "summary": "The clip contains nudity.",
+                                             "issues": [{"kind": "other", "detail": "clip contains nudity"},
+                                                        {"kind": "prompt_mismatch",
+                                                         "detail": "sexually explicit content"}]}))
+    assert only["verdict"] == "unsure" and only["issues"] == []
+    mixed = inspector.parse_reply(json.dumps({"verdict": "problem", "summary": "Explicit content; hands broken.",
+                                              "issues": [{"kind": "other", "detail": "content policy violation"},
+                                                         {"kind": "anatomy", "detail": "six fingers on the hand"}]}))
+    assert mixed["verdict"] == "problem"
+    assert mixed["issues"] == [{"kind": "anatomy", "detail": "six fingers on the hand"}]
+    assert mixed["summary"] == "six fingers on the hand"

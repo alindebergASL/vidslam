@@ -219,6 +219,8 @@ export type ClipCheckSettings = {
   takes_images: boolean | null;
   /** false = no OpenRouter key, so checks don't run. */
   available: boolean;
+  /** true = adult mode is on: no clip is checked (automatic or manual). */
+  adult_mode?: boolean;
   cost_per_check: number;
   currency: string;
 };

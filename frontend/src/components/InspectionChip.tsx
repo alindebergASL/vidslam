@@ -11,6 +11,7 @@ export function checkCostText(n: number | null | undefined): string {
 }
 
 const TONE: Record<string, string> = {
+  pending: "bg-ink-800 border-ink-600 text-ink-300 animate-pulse",
   ok: "bg-emerald-500/10 border-emerald-500/40 text-emerald-300",
   problem: "bg-amber-500/10 border-amber-500/40 text-amber-300",
   unsure: "bg-ink-800 border-ink-600 text-ink-300",
@@ -48,8 +49,20 @@ export function inspectionLabel(ins: Inspection | null | undefined): { text: str
   };
 }
 
-export function InspectionChip({ inspection, className = "" }: { inspection: Inspection | null | undefined; className?: string }) {
-  const l = inspectionLabel(inspection);
+export function InspectionChip({
+  inspection,
+  pending = false,
+  className = "",
+}: {
+  inspection: Inspection | null | undefined;
+  /** The automatic check of this clip is (probably) under way. */
+  pending?: boolean;
+  className?: string;
+}) {
+  const l =
+    pending && !inspection
+      ? { text: "Checking…", title: "The automatic clip check is looking at this clip.", tone: TONE.pending }
+      : inspectionLabel(inspection);
   return (
     <span
       className={`chip text-[10px] py-0.5 max-w-[16rem] truncate ${l.tone} ${className}`}
@@ -76,8 +89,12 @@ export function useClipCheckSettings(): ClipCheckSettings | null {
   return s;
 }
 
+/** Adult mode on: vision models refuse (and still bill) or moralise, so no clip is sent. */
+export const ADULT_MODE_WHY = "Clip check is off while adult mode is on.";
+
 /** Why a manual check can't run right now (null = it can). */
 export function checkBlockedWhy(s: ClipCheckSettings | null): string | null {
+  if (s && s.adult_mode) return ADULT_MODE_WHY;
   if (s && !s.available) return "Add an OpenRouter key in Settings → API keys to check clips.";
   if (s && s.provider === "unavailable") return "The clip check's model is switched off in Settings → API keys.";
   return null;

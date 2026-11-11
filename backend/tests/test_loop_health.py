@@ -135,6 +135,59 @@ def test_a_long_clip_is_sampled_sparsely_and_fast(tmp_path):
     assert r["sample_fps"] == pytest.approx(lh.MAX_SAMPLES / 90, abs=0.01)
 
 
+def colour_cut(path: Path) -> Path:
+    """A blue/teal scene with red held at 10 (a night sea): a box moves,
+    then the picture turns another teal for the last half second. Only green
+    and blue change at the join."""
+    return _make(path, "[0][1]overlay=x='20+70*t':y=70,"
+                       "drawbox=x=0:y=0:w=iw:h=ih:color=0x0A9060:t=fill:enable='gte(t,3.5)'",
+                 bg="color=c=0x0A4080:s=320x180:d={d}:r=24")
+
+
+def slow_pan(path: Path, seconds: float = 10.0) -> Path:
+    """A calm scene that never stops: a soft 20-level gradient drifting
+    sideways (one cycle every 2 minutes), like fog or still water."""
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"nullsrc=s=320x180:r=24:d={seconds},"
+                    "geq=lum='118+20*sin(2*PI*(X/W+T/120))':cb=128:cr=128",
+                    *ENC, str(path)], check=True)
+    return path
+
+
+def test_a_colour_only_cut_at_the_join_reads_visible_jump(tmp_path):
+    """Seam and freezing compare every channel, not red only: a cut where
+    only green and blue change is a visible jump."""
+    from PIL import Image
+
+    from app.services import loop_health as lh
+
+    a = Image.new("RGB", (8, 8), (10, 64, 128))
+    assert lh._diff(a, Image.new("RGB", (8, 8), (10, 144, 96))) > 0.05
+    assert lh._diff(a, Image.new("RGB", (8, 8), (10, 64, 200))) > 0.05
+    r = lh.measure(colour_cut(tmp_path / "bc.mp4"))
+    assert r["seam"]["verdict"] == "visible_jump" and r["seam"]["level"] == "bad"
+    assert r["seam"]["ratio"] > lh.SEAM_SLIGHT_RATIO
+
+
+def test_slow_continuous_motion_is_not_a_freeze(tmp_path):
+    """Tiny steps that add up end a "frozen" stretch: each sample is compared
+    with the first of the stretch, not its neighbour."""
+    from PIL import Image
+
+    from app.services import loop_health as lh
+
+    # Each step is under FROZEN_DIFF, but they add up quickly.
+    frames = [Image.new("RGB", (16, 16), (100 + i // 4, 100 + i // 4, 100 + i // 4)) for i in range(80)]
+    assert lh._diff(frames[0], frames[1]) < lh.FROZEN_DIFF
+    assert lh._frozen(frames, 8.0, still=False)["verdict"] == "none"
+    # Truly identical frames still read frozen.
+    held = frames[:8] + [frames[8]] * 40 + frames[8:]
+    fz = lh._frozen(held, 8.0, still=False)
+    assert fz["verdict"] == "long" and fz["longest_seconds"] >= 4.5
+    r = lh.measure(slow_pan(tmp_path / "calm.mp4"))
+    assert r["frozen"]["verdict"] == "none" and r["frozen"]["text"] == "No frozen moments"
+
+
 # ---------- the scene ----------
 
 
@@ -254,3 +307,56 @@ def test_the_state_keeps_only_live_clips(auth_client):
         json.dumps(entry)  # plain JSON in the scene's state
     finally:
         db.close()
+
+
+def test_overlapping_seam_previews_never_break_the_cached_file(tmp_path):
+    """Requests at once (a second tab, the player asking again) all get the
+    same playable file; a broken cached file is remade; another clip whose
+    name starts the same keeps its preview."""
+    import threading
+
+    from app.services import loop_health as lh
+    from app.services.renderer import _probe_duration
+
+    clip = seamless(tmp_path / "loop.mp4", seconds=6.0)
+    other = seamless(tmp_path / "loop_2.mp4")
+    other_dst, _ = lh.seam_preview(other)
+    results, errors = [], []
+
+    def go():
+        try:
+            results.append(lh.seam_preview(clip))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=go) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors and len(results) == 4
+    dst = results[0][0]
+    assert all(r[0] == dst for r in results) and _probe_duration(dst) > 5.0
+    assert not list(tmp_path.glob("*.part.mp4"))
+    assert other_dst.is_file()  # "seam_loop_" is not "seam_loop_2_"'s prefix
+    # A cached file that doesn't play (an earlier crash) is remade, not served.
+    dst.write_bytes(b"not a video")
+    again, _ = lh.seam_preview(clip)
+    assert again == dst and _probe_duration(dst) > 5.0
+
+
+def test_a_seam_preview_that_takes_too_long_is_an_error_not_a_crash(tmp_path, monkeypatch):
+    from app.services import loop_health as lh
+
+    clip = seamless(tmp_path / "slow.mp4")
+    real = subprocess.run
+
+    def slow(cmd, *a, **k):
+        if "-filter_complex" in cmd:
+            raise subprocess.TimeoutExpired(cmd, 120)
+        return real(cmd, *a, **k)
+
+    monkeypatch.setattr(lh.subprocess, "run", slow)
+    with pytest.raises(RuntimeError, match="took too long"):
+        lh.seam_preview(clip)
+    assert not list(tmp_path.glob("seam_*"))

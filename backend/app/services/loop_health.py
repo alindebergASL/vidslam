@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import statistics
 import subprocess
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -38,8 +40,10 @@ log = logging.getLogger("avs.loop_health")
 STATE_KEY = "_loop_health"
 
 # ---- thresholds (one place; tuned on synthetic clips and closed Wan/H3 loops) ----
-# Frames are compared as 160 px wide greyscale; differences are mean
-# absolute luma differences on a 0-1 scale.
+# Frames are compared at 160 px wide; a difference is the mean absolute
+# difference over all three colour channels on a 0-1 scale (so a change in
+# green or blue alone counts as much as one in red; for grey pictures it is
+# the luma difference).
 ANALYSIS_WIDTH = 160
 SAMPLE_FPS = 8.0          # sampled rate for flicker / freezing / drift
 MAX_SAMPLES = 480         # long clips are sampled more sparsely (60 s → 8 fps)
@@ -53,8 +57,10 @@ SEAM_SLIGHT_RATIO = 6.0
 # Flicker, % of mean brightness: real calm scenes stay well under 1 %.
 FLICKER_SLIGHT = 1.0
 FLICKER_STRONG = 3.0
-# Freezing: neighbouring samples closer than this are "the same frame";
-# stretches shorter than FROZEN_MIN don't count (a calm scene can rest).
+# Freezing: samples closer than this to the first frame of the stretch are
+# "the same frame" (against the first, not the neighbour, so slow steady
+# motion builds up and ends the stretch); stretches shorter than FROZEN_MIN
+# don't count (a calm scene can rest).
 FROZEN_DIFF = 0.0015
 FROZEN_MIN = 1.0
 FROZEN_LONG = 3.0
@@ -64,6 +70,7 @@ DRIFT_SLIGHT = 0.02
 DRIFT_STRONG = 0.06
 
 SEAM_PREVIEW_SECONDS = 3.0
+PART_ABANDONED_SECONDS = 600  # a half-written preview older than this is a crash's leftover
 
 
 # ---------- frame reading ----------
@@ -95,7 +102,10 @@ def _read_frames(cmd_in: list[str], vf_pre: str, size: tuple[int, int]) -> list[
 
 
 def _diff(a: Image.Image, b: Image.Image) -> float:
-    return ImageStat.Stat(ImageChops.difference(a, b)).mean[0] / 255.0
+    """Mean absolute difference over every channel (0-1): a cut or a change
+    in one colour only (a teal sea, a night sky) counts, not just red."""
+    means = ImageStat.Stat(ImageChops.difference(a, b)).mean
+    return sum(means) / len(means) / 255.0
 
 
 def _median(xs: list[float]) -> float:
@@ -160,19 +170,18 @@ def _frozen(frames: list[Image.Image], fps: float, *, still: bool) -> dict:
                 "text": "A still picture with slow camera drift, so freezing isn't checked",
                 "longest_seconds": 0.0, "total_seconds": 0.0, "at_seconds": None}
     step = 1.0 / fps
-    runs: list[tuple[int, int]] = []  # (start index, pairs)
-    start, count = 0, 0
-    for i, (a, b) in enumerate(zip(frames, frames[1:], strict=False)):
-        if _diff(a, b) < FROZEN_DIFF:
-            if count == 0:
-                start = i
-            count += 1
-        else:
-            if count:
-                runs.append((start, count))
-            count = 0
-    if count:
-        runs.append((start, count))
+    runs: list[tuple[int, int]] = []  # (start index, steps)
+    # Each sample is compared with the first of the current stretch, so a
+    # slow pan or drifting fog (tiny steps that add up) ends the stretch.
+    anchor = 0
+    for i in range(1, len(frames)):
+        if _diff(frames[anchor], frames[i]) < FROZEN_DIFF:
+            continue
+        if i - 1 > anchor:
+            runs.append((anchor, i - 1 - anchor))
+        anchor = i
+    if len(frames) - 1 > anchor:
+        runs.append((anchor, len(frames) - 1 - anchor))
     runs = [(s, c) for s, c in runs if c * step >= FROZEN_MIN]
     total = sum(c for _, c in runs) * step
     if not runs:
@@ -392,17 +401,26 @@ def seam_preview(clip: Path) -> tuple[Path, float]:
     tail = round(min(SEAM_PREVIEW_SECONDS, duration / 2.0), 3)
     prefix = f"seam_{clip.stem}_"
     dst = clip.with_name(f"{prefix}{stamp}.mp4")
-    if dst.is_file() and dst.stat().st_size > 0:
+    if _playable(dst):
         return dst, tail
     with _clip_lock(clip):
-        if dst.is_file() and dst.stat().st_size > 0:  # made while we waited
+        if _playable(dst):  # made while we waited
             return dst, tail
         # Under the lock nobody else is writing one for this clip: older
-        # versions and leftovers of a crashed attempt can go.
+        # versions (and a cached file that doesn't play) go. Only this clip's
+        # own files ("seam_loop_<n>", never "seam_loop_2_<n>"); a .part file
+        # only once it is clearly a crashed attempt's leftover.
+        mine = re.compile(rf"^{re.escape(prefix)}\d+(\.[0-9a-f]{{32}}\.part)?\.mp4$")
         for old in clip.parent.glob(f"{prefix}*.mp4"):
-            if old != dst:
-                old.unlink(missing_ok=True)
-        dst.unlink(missing_ok=True)
+            m = mine.match(old.name)
+            if m is None:
+                continue
+            try:
+                if m.group(1) and time.time() - old.stat().st_mtime < PART_ABANDONED_SECONDS:
+                    continue
+            except OSError:
+                continue
+            old.unlink(missing_ok=True)
         tmp = dst.with_name(f"{dst.stem}.{uuid.uuid4().hex}.part.mp4")
         cmd = ["ffmpeg", "-y", "-v", "error", "-sseof", f"-{tail:.3f}", "-i", str(clip),
                "-t", f"{tail:.3f}", "-i", str(clip),
