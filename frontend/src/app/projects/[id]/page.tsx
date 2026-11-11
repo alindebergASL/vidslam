@@ -13,8 +13,9 @@ import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { ProjectSettingsCard } from "@/components/ProjectSettingsCard";
 import { AddShotDialog, DeleteShotDialog, DuplicateShotDialog, TakesDialog } from "@/components/ShotEditing";
+import { checkBlockedWhy, checkCostText, InspectionChip, useClipCheckSettings } from "@/components/InspectionChip";
 import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
-import { api, Asset, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render } from "@/lib/api";
+import { api, Asset, ClipCheckSettings, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 
 // Project states in which a render (or a re-plan) can be started.
@@ -60,6 +61,8 @@ function Inner() {
   >([]);
   const router = useRouter();
   const timer = useRef<NodeJS.Timeout | null>(null);
+  // Clip check: cost per check and whether checks can run (fetched once).
+  const clipCheck = useClipCheckSettings();
 
   // Models list (base + trained LoRAs) is stable during a session — fetch
   // once, not per poll.
@@ -279,6 +282,15 @@ function Inner() {
     hasClips &&
     (renderPlan.voiceover_changed || project.shots.some((s) => s.clip_stale));
   const planRows = new Map<number, RenderPlanShot>((renderPlan?.shots || []).map((s) => [s.id, s]));
+  const flagged = renderPlan?.flagged ?? [];
+  // A flagged shot may sit past the collapsed list: open it, then scroll there.
+  const goToShot = (shotId: number) => {
+    setShotsExpanded(true);
+    setTimeout(() => {
+      const el = document.getElementById(`shot-${shotId}`);
+      el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 50);
+  };
   // Ticked shots a re-roll can't fix (lip-synced, voiceover out of date).
   const blockedSelected = selected
     .map((sid) => planRows.get(sid))
@@ -539,6 +551,9 @@ function Inner() {
                   Re-compose is free but keeps the old voiceover and the old clips.
                 </p>
               )}
+              {flagged.length > 0 && (
+                <FlaggedLine flagged={flagged} onGo={goToShot} className="mt-2 text-amber-200/90" />
+              )}
             </div>
             <button
               className="btn-primary text-xs whitespace-nowrap"
@@ -547,6 +562,16 @@ function Inner() {
               Generate video · about {usd(renderPlan.total)}
             </button>
           </div>
+        </div>
+      )}
+
+      {!(outOfDate && renderPlan) && flagged.length > 0 && (
+        <div className="card p-3 mb-6 border-amber-500/40 bg-amber-500/10">
+          <FlaggedLine flagged={flagged} onGo={goToShot} className="text-amber-200" />
+          <p className="text-[11px] text-amber-200/70 mt-1">
+            The check is advice only: the video is still put together with these clips. Open a shot&apos;s takes to
+            pick another one, or regenerate it.
+          </p>
         </div>
       )}
 
@@ -639,7 +664,7 @@ function Inner() {
               ? project.shots
               : project.shots.slice(0, SHOTS_BEFORE_EXPAND)
             ).map((s, idx) => (
-              <div key={s.id}>
+              <div key={s.id} id={`shot-${s.id}`} className="scroll-mt-24">
               <ShotRow
                 index={idx}
                 projectId={projectId}
@@ -651,6 +676,7 @@ function Inner() {
                 onDelete={() => setDeleting(s)}
                 onTakes={() => setTakesFor(s)}
                 planRow={planRows.get(s.id)}
+                clipCheck={clipCheck}
                 castAssets={castAssets}
                 videoModels={videoModels}
                 onChange={refresh}
@@ -1020,6 +1046,7 @@ function ShotRow({
   onDelete,
   onTakes,
   planRow,
+  clipCheck,
   castAssets,
   videoModels,
   onChange,
@@ -1043,6 +1070,7 @@ function ShotRow({
   onDelete: () => void;
   onTakes: () => void;
   planRow?: RenderPlanShot;
+  clipCheck: ClipCheckSettings | null;
   castAssets: Asset[];
   videoModels: { id: string; name: string; description: string }[];
   onChange: () => void;
@@ -1066,6 +1094,31 @@ function ShotRow({
   const needsNewVoice = !!planRow?.needs_new_voiceover;
   const voiceFirst =
     "Off for this shot: the spoken script or voice changed, and a re-roll would lip-sync to the old voiceover, so you would pay for the clip twice. Generate video makes the new voiceover and this clip together.";
+
+  const [checkBusy, setCheckBusy] = useState(false);
+  const hasClip = shot.status === "completed" && !!shot.clip_path && shot.shot_type !== "end_card";
+  const checkBlocked = checkBlockedWhy(clipCheck);
+  const checkCost = checkCostText(clipCheck?.cost_per_check);
+  const checked = !!shot.inspection && shot.inspection.verdict !== "skipped";
+  // Paid: a vision model looks at a few frames of the current clip. Advice only.
+  const checkClip = async () => {
+    setCheckBusy(true);
+    try {
+      const r = await api.checkClip(projectId, shot.id);
+      const v = r.inspection.verdict;
+      if (v === "ok") toast.success(`Shot ${shot.shot_order}: looks right`);
+      else if (v === "problem")
+        toast.info(
+          `Shot ${shot.shot_order}: ${r.inspection.issues[0]?.detail || r.inspection.summary || "something looks off"}`
+        );
+      else toast.info(`Shot ${shot.shot_order}: ${r.inspection.summary || "couldn't check this clip"}`);
+      onChange();
+    } catch (e: any) {
+      toast.error(e.message || "Couldn't check the clip");
+    } finally {
+      setCheckBusy(false);
+    }
+  };
 
   const regenerate = async (recompose: boolean) => {
     setRegenBusy(true);
@@ -1126,6 +1179,7 @@ function ShotRow({
             <span className="text-xs font-medium text-ink-200">Shot {shot.shot_order}</span>
             <span className="chip text-[10px] py-0.5">{shotTypeLabel(shot.shot_type)}</span>
             <StatusBadge status={shot.status} />
+            {hasClip && <InspectionChip inspection={shot.inspection} />}
             {shot.clip_stale && (
               <span
                 className="chip text-[10px] py-0.5 bg-amber-500/10 border-amber-500/40 text-amber-300"
@@ -1311,6 +1365,22 @@ function ShotRow({
               Takes ({shot.takes_count})
             </button>
           )}
+          {hasClip && (
+            <button
+              className="btn-ghost w-full text-xs disabled:opacity-50"
+              onClick={checkClip}
+              disabled={checkBusy || !!checkBlocked}
+              title={
+                checkBlocked ||
+                `A vision model looks at a few frames of this clip and says if anything looks off (wrong face, broken hands, text, not what the prompt asks)${
+                  checkCost ? `. Costs ${checkCost}` : ""
+                }. Advice only: it never stops the video.`
+              }
+            >
+              {checkBusy ? "Checking…" : checked ? "Check again" : "Check this clip"}
+              {!checkBusy && checkCost ? ` · ${checkCost}` : ""}
+            </button>
+          )}
           <div className="flex gap-1.5">
             {shot.shot_type !== "end_card" && (
               <button
@@ -1386,5 +1456,37 @@ function ShotRow({
         <div className="text-xs text-accent mt-2">Error: {shot.error}</div>
       )}
     </div>
+  );
+}
+
+/** "2 clips flagged by the check: shot 3 (face doesn't match Maya), shot 5 (…)" with links to the shots. */
+function FlaggedLine({
+  flagged,
+  onGo,
+  className = "",
+}: {
+  flagged: NonNullable<RenderPlan["flagged"]>;
+  onGo: (shotId: number) => void;
+  className?: string;
+}) {
+  return (
+    <p className={`text-xs ${className}`}>
+      {flagged.length === 1 ? "1 clip" : `${flagged.length} clips`} flagged by the check:{" "}
+      {flagged.map((f, i) => (
+        <span key={f.shot_id}>
+          {i > 0 ? ", " : ""}
+          <button
+            type="button"
+            className="underline underline-offset-2 hover:text-amber-100"
+            onClick={() => onGo(f.shot_id)}
+            title={f.summary || f.first_issue}
+          >
+            shot {f.shot_order}
+          </button>
+          {f.first_issue ? ` (${f.first_issue})` : ""}
+        </span>
+      ))}
+      .
+    </p>
   );
 }

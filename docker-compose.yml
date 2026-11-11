@@ -49,7 +49,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    command: rq worker --url redis://redis:6379/0 default
+    # "inspect" (advisory clip checks) is listed last: RQ drains queues in order.
+    command: rq worker --url redis://redis:6379/0 default inspect
 
   frontend:
     build:

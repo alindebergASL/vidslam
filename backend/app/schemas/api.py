@@ -194,6 +194,24 @@ class ProjectUpdate(BaseModel):
     voice_id: Optional[str] = Field(None, max_length=120)
 
 
+class InspectionIssueOut(BaseModel):
+    kind: Literal["likeness", "anatomy", "text", "prompt_mismatch", "artifact", "other"] = "other"
+    detail: str
+
+
+class InspectionOut(BaseModel):
+    """The clip check's verdict on a clip (services/inspector.py).
+    verdict: ok = looks right; problem = see issues; unsure = couldn't
+    check it; skipped = the automatic check didn't run (summary says why)."""
+    verdict: Literal["ok", "problem", "unsure", "skipped"]
+    issues: list[InspectionIssueOut] = Field(default_factory=list)
+    summary: str = ""
+    checked_at: Optional[str] = None
+    model: str = ""
+    auto: bool = False
+    cost_estimate: float = 0.0
+
+
 class ShotOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -218,6 +236,8 @@ class ShotOut(BaseModel):
     clip_aspect_ratio: str = ""
     # Clips kept for this shot (the current one included).
     takes_count: int = 0
+    # The clip check's verdict on the current clip; None = not checked.
+    inspection: Optional[InspectionOut] = None
 
 
 AddShotType = Literal["hero", "b_roll", "talking_head", "transition"]
@@ -326,6 +346,7 @@ class TakeOut(BaseModel):
     aspect_ratio: str = ""
     file_exists: bool
     url: str
+    inspection: Optional[InspectionOut] = None
     created_at: Optional[str] = None
 
 

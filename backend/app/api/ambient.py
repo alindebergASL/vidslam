@@ -24,6 +24,7 @@ from ..schemas.ambient import (
     AmbientOut,
     AmbientPresetsOut,
     AmbientUpdate,
+    LoopHealthResultOut,
     PictureFrom,
 )
 from ..services import ambient as svc
@@ -397,3 +398,56 @@ def render_scene(scene_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(409, "generate the loop clip first")
     job_id = enqueue(render_ambient_job, scene_id)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
+
+
+# ---------- loop health (local measurement, free) ----------
+
+
+def _health_result(project: models.VideoProject) -> LoopHealthResultOut:
+    from ..services import loop_health
+
+    shots = loop_health.clip_shots(project)
+    return LoopHealthResultOut(
+        loop_health=loop_health.current(project, shots[0]) if shots else None,
+        variant_loop_health=[loop_health.current(project, s) for s in shots[1:]],
+    )
+
+
+@router.post("/{scene_id}/loop-health", response_model=LoopHealthResultOut,
+             dependencies=[Depends(rate_limit("generation"))])
+def measure_loop_health(scene_id: int, db: Session = Depends(get_db)) -> LoopHealthResultOut:
+    """Measure the loop clip (and each variation's) again now. Free: no
+    provider is called. 409 while generating or when there is no clip."""
+    from ..services import loop_health
+
+    project = _get_scene(db, scene_id)
+    if project.status == "generating":
+        raise HTTPException(409, "The loop is still being made. Measure it once it's ready.")
+    shots = [s for s in loop_health.clip_shots(project)
+             if s.clip_path and s.status == "completed" and Path(s.clip_path).is_file()]
+    if not shots:
+        raise HTTPException(409, "There's no loop clip to measure yet. Generate the loop first.")
+    loop_health.measure_scene(db, project, force=True)
+    db.refresh(project)
+    return _health_result(project)
+
+
+@router.get("/{scene_id}/seam-preview")
+def seam_preview(scene_id: int, shot_id: Optional[int] = None, db: Session = Depends(get_db)) -> FileResponse:
+    """The last 3 s of the loop followed by its first 3 s (MP4), made once
+    per version of the clip. The join is at X-Join-At seconds."""
+    from ..services import loop_health
+
+    project = _get_scene(db, scene_id)
+    shots = loop_health.clip_shots(project)
+    shot = next((s for s in shots if s.id == shot_id), None) if shot_id is not None else (shots[0] if shots else None)
+    if shot is None:
+        raise HTTPException(404, "no such loop clip in this scene")
+    if not shot.clip_path or shot.status != "completed" or not Path(shot.clip_path).is_file():
+        raise HTTPException(404, "this loop has no clip yet")
+    try:
+        path, join_at = loop_health.seam_preview(Path(shot.clip_path))
+    except RuntimeError as e:
+        raise HTTPException(500, str(e)) from None
+    return FileResponse(path, media_type="video/mp4", headers={"X-Join-At": f"{join_at:.2f}",
+                                                              "Cache-Control": "no-cache"})

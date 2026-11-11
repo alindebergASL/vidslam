@@ -190,7 +190,42 @@ export type Shot = {
   clip_aspect_ratio?: string;
   /** Clips kept for this shot, the current one included (0 = no clip). */
   takes_count?: number;
+  /** The clip check's verdict on the current clip; null = not checked. */
+  inspection?: Inspection | null;
 };
+
+export type InspectionIssueKind = "likeness" | "anatomy" | "text" | "prompt_mismatch" | "artifact" | "other";
+
+/** The clip check's verdict on one clip (a vision model looked at a few frames). */
+export type Inspection = {
+  /** skipped = the automatic check didn't run; summary says why. */
+  verdict: "ok" | "problem" | "unsure" | "skipped";
+  issues: { kind: InspectionIssueKind; detail: string }[];
+  summary: string;
+  checked_at: string | null;
+  model: string;
+  /** True = the automatic check after the clip landed. */
+  auto: boolean;
+  cost_estimate: number;
+};
+
+export type ClipCheckSettings = {
+  auto_check: boolean;
+  model: string;
+  default_model: string;
+  is_default: boolean;
+  provider: string;
+  /** null = the model isn't in the catalog. */
+  takes_images: boolean | null;
+  /** false = no OpenRouter key, so checks don't run. */
+  available: boolean;
+  cost_per_check: number;
+  currency: string;
+};
+
+export type ClipCheckModel = { id: string; name: string; usable: boolean; cost_per_check: number };
+
+export type ClipCheckResult = { shot_id: number; take_id: number; inspection: Inspection; shot: Shot };
 
 /** Result of adding, duplicating or deleting a shot. */
 export type ShotEdit = {
@@ -230,6 +265,8 @@ export type Take = {
   file_exists: boolean;
   /** Path under the API, e.g. /api/projects/1/shots/2/takes/3/clip */
   url: string;
+  /** The clip check's verdict on this take; null = not checked. */
+  inspection?: Inspection | null;
   created_at: string | null;
 };
 
@@ -283,6 +320,9 @@ export type RenderPlan = {
   total: number;
   currency: string;
   is_estimate: boolean;
+  /** Body shots whose current clip the check flagged, by shot order. */
+  flagged?: { shot_id: number; shot_order: number; summary: string; first_issue: string }[];
+  flagged_count?: number;
 };
 
 export type Render = {
@@ -624,6 +664,40 @@ export type AmbientPresets = {
   default_video_off?: boolean;
 };
 
+export type LoopLevel = "good" | "warn" | "bad";
+
+/** Local measurement of one loop clip: how it joins, flickers, freezes, drifts. */
+export type LoopHealth = {
+  shot_id: number;
+  measured_at: string;
+  clip_seconds: number;
+  sample_fps: number;
+  seam: {
+    verdict: "seamless" | "slight_jump" | "visible_jump";
+    level: LoopLevel;
+    text: string;
+    difference: number;
+    typical: number;
+    ratio: number;
+  };
+  flicker: { verdict: "none" | "slight" | "strong"; level: LoopLevel; text: string; percent: number };
+  frozen: {
+    verdict: "none" | "some" | "long" | "not_checked";
+    level: LoopLevel;
+    text: string;
+    longest_seconds: number;
+    total_seconds: number;
+    at_seconds: number | null;
+  };
+  drift: { verdict: "none" | "slight" | "strong"; level: LoopLevel; text: string; distance: number };
+  /** Path under the API: the last seconds of the loop, then its first seconds. */
+  seam_preview_url: string;
+  /** Where the join plays in the seam preview. */
+  join_at_seconds: number;
+};
+
+export type LoopHealthResult = { loop_health: LoopHealth | null; variant_loop_health: (LoopHealth | null)[] };
+
 export type AmbientScene = {
   id: number;
   title: string;
@@ -636,6 +710,10 @@ export type AmbientScene = {
   loop_shot: Shot | null;
   /** Variations 2..N (variation 1 is loop_shot). */
   variant_shots?: Shot[];
+  /** Loop health of the loop clip as it is now; null = not measured, or the clip changed since. */
+  loop_health?: LoopHealth | null;
+  /** One per variant_shots item, same order. */
+  variant_loop_health?: (LoopHealth | null)[];
   music_ready: boolean;
   sound_ready?: boolean;
   picture_ready?: boolean;
@@ -1207,6 +1285,18 @@ export const api = {
     req<Shot>(`/api/projects/${projectId}/shots/${shotId}/takes/${takeId}/use`, { method: "POST" }),
   deleteTake: (projectId: number, shotId: number, takeId: number) =>
     req<void>(`/api/projects/${projectId}/shots/${shotId}/takes/${takeId}`, { method: "DELETE" }),
+  /** Check a clip now (paid, about cost_per_check). Without takeId: the shot's current clip. */
+  checkClip: (projectId: number, shotId: number, takeId?: number) =>
+    req<ClipCheckResult>(`/api/projects/${projectId}/shots/${shotId}/check`, {
+      method: "POST",
+      body: JSON.stringify(takeId != null ? { take_id: takeId } : {}),
+    }),
+  clipCheckSettings: () => req<ClipCheckSettings>("/api/settings/clip-check"),
+  setClipCheckSettings: (body: { auto_check?: boolean; model?: string; reset_model?: boolean; allow_unlisted?: boolean }) =>
+    req<ClipCheckSettings>("/api/settings/clip-check", { method: "PUT", body: JSON.stringify(body) }),
+  clipCheckModels: () => req<{ models: ClipCheckModel[]; active: string }>("/api/settings/clip-check/models"),
+  /** Measure the loop (and each variation) again. Free. */
+  measureLoopHealth: (id: number) => req<LoopHealthResult>(`/api/ambient/${id}/loop-health`, { method: "POST" }),
   /** A path the API returned (e.g. a take's or a voiceover's `url`) as a full URL. */
   mediaUrl: (path: string) => `${API_BASE}${path}`,
   voiceoverPreview: (id: number) => req<VoiceoverPreview>(`/api/projects/${id}/voiceover/preview`),

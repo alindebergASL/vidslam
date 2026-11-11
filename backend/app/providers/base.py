@@ -116,6 +116,14 @@ class ChatProvider(Protocol):
         improved text only."""
         ...
 
+    def inspect_images(self, *, system: str, text: str, images: list[str],
+                       note: str = "clip check", estimate: float = 0.0) -> str:
+        """One call to a vision-capable model: `text` plus `images` (data
+        URLs, in order) under `system`. Returns the reply text as is (the
+        caller parses it). Spend is recorded with `note`; `estimate` is the
+        rate-card cost when the provider reports none."""
+        ...
+
 
 class ImageProvider(Protocol):
     def list_models(self) -> list[ModelInfo]: ...

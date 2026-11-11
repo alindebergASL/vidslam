@@ -77,6 +77,7 @@ def record(db: Session, shot: models.VideoShot, job: models.VideoJob) -> Optiona
     take.video_job_id = job.id
     take.cost_usd = _ledger_cost(db, job.id) if job.cost_usd is None else round(float(job.cost_usd), 6)
     take.note = str((job.context_json or {}).get("note", "") or "")[:500]
+    take.inspection_json = None  # a new clip: an earlier verdict doesn't apply to it
     db.commit()
     prune(db, shot)
     return take
@@ -158,5 +159,6 @@ def out(project_id: int, shot: models.VideoShot, take: models.ShotTake) -> dict:
         "aspect_ratio": take.aspect_ratio or "",
         "file_exists": bool(take.clip_path) and Path(take.clip_path).is_file(),
         "url": f"/api/projects/{project_id}/shots/{shot.id}/takes/{take.id}/clip",
+        "inspection": take.inspection_json,
         "created_at": take.created_at.isoformat() if take.created_at else None,
     }

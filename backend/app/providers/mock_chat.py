@@ -26,8 +26,24 @@ _HYPE = re.compile(r"\b(photorealistic|realistic|8k|4k|ultra|hd|cinematic|epic|b
                    r"beautiful|magical|ethereal|dreamy|vibrant|glowing|masterpiece)\b,?\s*", re.I)
 
 
+# The mock clip check's reply. Tests set it to a "problem" verdict, a
+# refusal or garbage; None = the deterministic "ok" below.
+VISION_REPLY: str | None = None
+# Every mock vision call: (text, number of images), for tests.
+VISION_CALLS: list[tuple[str, int]] = []
+
+
 class MockChatProvider(ChatProvider):
     """Deterministic storyboard generator used in MOCK_PROVIDERS mode and tests."""
+
+    def inspect_images(self, *, system: str, text: str, images: list[str],
+                       note: str = "clip check", estimate: float = 0.0) -> str:
+        """Deterministic: every clip looks right (unless VISION_REPLY is set)."""
+        VISION_CALLS.append((text, len(images)))
+        if VISION_REPLY is not None:
+            return VISION_REPLY
+        return ('{"verdict": "ok", "issues": [], '
+                '"summary": "The clip matches the shot description."}')
 
     def rewrite_scene(self, text: str) -> dict:
         scene = re.sub(r"\s{2,}", " ", _HYPE.sub("", text)).strip(" ,.") or text.strip()

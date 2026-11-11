@@ -45,7 +45,7 @@ from ..schemas.ambient import (
     SoundPresetOut,
 )
 from ..schemas.api import RenderOut, ShotOut
-from . import alerts, render_files, storage
+from . import alerts, loop_health, render_files, storage
 from .image_settings import best_image_settings
 from .model_registry import active_model as _active_model
 from .model_registry import switched_off as _switched_off
@@ -1611,6 +1611,9 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         loop_error=(shot.error if shot else ""),
         loop_shot=ShotOut.model_validate(shot) if shot else None,
         variant_shots=[ShotOut.model_validate(v) for v in _variant_shots(project)[:variant_count(cfg) - 1]],
+        loop_health=loop_health.current(project, shot),
+        variant_loop_health=[loop_health.current(project, v)
+                             for v in _variant_shots(project)[:variant_count(cfg) - 1]],
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         picture_ready=has_picture(project, cfg),
@@ -1988,6 +1991,8 @@ def _finalize_generation(
     generated["billed"] = 0.0 if mocked else generated["estimated_cost"]
     _set_state(project, _GENERATED_KEY, generated)
     db.commit()
+    # Loop health: local and free, a few seconds; never in the way.
+    loop_health.measure_quietly(db, project.id)
     # Music: (re)generate when asked, and always when the scene wants a bed
     # but doesn't have one yet — a first generate must yield a renderable scene.
     has_music = bool(project.music_upload_path and Path(project.music_upload_path).exists())

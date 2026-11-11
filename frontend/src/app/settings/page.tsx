@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
 import { AdultModePanel } from "@/components/AdultModePanel";
 import { ApiKeysPanel } from "@/components/ApiKeysPanel";
+import { ClipCheckPanel } from "@/components/ClipCheckPanel";
 import { ModelsPanel } from "@/components/ModelsPanel";
 import { PromptingPanel } from "@/components/PromptingPanel";
 import { SpendPanel } from "@/components/SpendPanel";
@@ -58,6 +59,7 @@ function Inner() {
         {[
           ["adult", "Adult content"],
           ["models", "Models"],
+          ["clip-check", "Clip check"],
           ["prompting", "Prompting"],
           ["spend", "Spend"],
           ["youtube", "YouTube"],
@@ -79,6 +81,10 @@ function Inner() {
 
       <div id="models" className="scroll-mt-16">
         <ModelsPanel />
+      </div>
+
+      <div id="clip-check" className="scroll-mt-16">
+        <ClipCheckPanel />
       </div>
 
       <div id="prompting" className="scroll-mt-16">
