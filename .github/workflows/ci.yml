@@ -15,7 +15,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+        # apt first, bounded; prebuilt ffmpeg/ffprobe and DejaVu fonts from
+        # GitHub releases when the Ubuntu mirrors are unreachable.
+        timeout-minutes: 20
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/install-ffmpeg.sh"
 
       - uses: actions/setup-python@v5
         with:
@@ -61,7 +64,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+        # apt first, bounded; prebuilt ffmpeg/ffprobe and DejaVu fonts from
+        # GitHub releases when the Ubuntu mirrors are unreachable.
+        timeout-minutes: 20
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/install-ffmpeg.sh"
 
       - uses: actions/setup-python@v5
         with:
@@ -125,7 +131,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core
+        # apt first, bounded; prebuilt ffmpeg/ffprobe and DejaVu fonts from
+        # GitHub releases when the Ubuntu mirrors are unreachable.
+        timeout-minutes: 20
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/install-ffmpeg.sh"
 
       - uses: actions/setup-python@v5
         with:
@@ -156,10 +165,16 @@ jobs:
       # Pinned: an unpinned install picks up a release whose playwright-core
       # isn't on npm yet (playwright 1.65.0 shipped without it), which fails
       # ui-smoke on every PR. Bump on purpose.
+      # The browser download comes from Playwright's CDN; its system packages
+      # come from the Ubuntu mirrors, which are sometimes unreachable. The
+      # runner image already has Chrome's libraries, so those are best effort.
       - name: Install playwright + chromium
+        timeout-minutes: 15
         run: |
           npm install --no-save --no-audit --no-fund playwright@1.64.1
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
+          timeout 240 npx playwright install-deps chromium \
+            || echo "playwright system packages skipped (Ubuntu mirrors unreachable); using the runner's libraries"
 
       # Boot the stack ---
       - name: Start backend
