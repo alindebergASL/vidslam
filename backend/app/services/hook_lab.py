@@ -852,7 +852,7 @@ def _fail(db: Session, variant: models.HookVariant, error: str) -> None:
     variant.status = "failed"
     variant.error = error[:800]
     render = db.get(models.Render, variant.render_id) if variant.render_id else None
-    if render is not None and render.status not in ("completed", "failed", "cancelled"):
+    if render is not None and render.status not in ("completed", "failed", "cancelled", "expired"):
         render.status = "failed"
         render.error = error[:800]
     project = db.get(models.VideoProject, variant.project_id)
@@ -1214,7 +1214,7 @@ def cancel(db: Session, variant: models.HookVariant) -> None:
                            "or it is done).")
     db.refresh(variant)
     render = db.get(models.Render, variant.render_id) if variant.render_id else None
-    if render is not None and render.status not in ("completed", "failed", "cancelled"):
+    if render is not None and render.status not in ("completed", "failed", "cancelled", "expired"):
         render.status = "cancelled"
         render.error = ""
     events.hook_variant_event(db, variant, db.get(models.VideoProject, variant.project_id), "failed",
