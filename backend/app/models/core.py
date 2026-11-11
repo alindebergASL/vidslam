@@ -176,6 +176,13 @@ class VideoProject(Base):
     # other mode. Kept as JSON because these knobs evolve faster than the
     # storyboard pipeline's columns and never need to be queried individually.
     ambient_config_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # The project's own TTS voice; None = the primary character's voice
+    # (and so the voiceover fingerprint of older projects is unchanged).
+    voice_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    # The voiceover heard before paying for video ("Make voiceover"):
+    # {path, fingerprint, duration_seconds, cost_estimate, created_at}.
+    # A render whose voice fingerprint matches uses this file at no charge.
+    voiceover_preview_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     primary_avatar_id: Mapped[Optional[int]] = mapped_column(ForeignKey("avatars.id"))
     brand_kit_id: Mapped[Optional[int]] = mapped_column(ForeignKey("brand_kits.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
@@ -241,11 +248,28 @@ class VideoShot(Base):
     # Hash of what the clip was made from (services/fingerprints.py).
     # "" = made before fingerprints existed: counts as current.
     clip_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    # The project's aspect ratio when the clip was made; "" = unknown (a
+    # clip from before this was kept, filled in by migration 0006). A clip
+    # whose aspect differs from the project's is out of date.
+    clip_aspect_ratio: Mapped[str] = mapped_column(String(10), default="", server_default="")
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
 
     project: Mapped[VideoProject] = relationship(back_populates="shots")
+    takes: Mapped[list[ShotTake]] = relationship(
+        back_populates="shot", cascade="all, delete-orphan", passive_deletes=True,
+        order_by="ShotTake.id",
+    )
+
+    @property
+    def takes_count(self) -> int:
+        """Clips kept for this shot, the current one included (a clip from
+        before takes existed counts until it is recorded as a take)."""
+        n = len(self.takes)
+        if self.clip_path and not any(t.clip_path == self.clip_path for t in self.takes):
+            n += 1
+        return n
 
     @property
     def clip_stale(self) -> bool:
@@ -254,6 +278,28 @@ class VideoShot(Base):
         from ..services.fingerprints import shot_is_stale
 
         return shot_is_stale(self)
+
+
+class ShotTake(Base):
+    """One clip made for a storyboard shot. Re-rolling keeps the earlier
+    takes so the creator can go back to one without paying again."""
+
+    __tablename__ = "shot_takes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    shot_id: Mapped[int] = mapped_column(ForeignKey("video_shots.id", ondelete="CASCADE"), index=True)
+    clip_path: Mapped[str] = mapped_column(String(500), default="")
+    clip_fingerprint: Mapped[str] = mapped_column(String(64), default="", server_default="")
+    aspect_ratio: Mapped[str] = mapped_column(String(10), default="", server_default="")
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    provider_model: Mapped[str] = mapped_column(String(300), default="")
+    video_job_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # From the spend ledger when known; None = unknown (or free: mock).
+    cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+    shot: Mapped[VideoShot] = relationship(back_populates="takes")
 
 
 class Render(Base):

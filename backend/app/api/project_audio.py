@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -11,10 +12,12 @@ from .. import models
 from ..config import get_settings
 from ..db import get_db
 from ..schemas import ProjectOut
+from ..schemas.api import VoiceoverPreviewOut
 from ..services import pipeline, storage
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from .auth import require_auth
+from .projects import refuse_while_busy
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 settings = get_settings()
@@ -64,6 +67,7 @@ async def upload_voiceover(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    refuse_while_busy(db, project, "The voiceover")
     path = _save_audio(file, project_id=project_id, kind="voiceover")
     project.voiceover_upload_path = str(path)
     project.voiceover_source = "upload"
@@ -77,6 +81,8 @@ def delete_voiceover(project_id: int, db: Session = Depends(get_db)) -> models.V
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    if project.voiceover_upload_path or project.voiceover_source == "upload":
+        refuse_while_busy(db, project, "The voiceover")
     if project.voiceover_upload_path:
         try:
             Path(project.voiceover_upload_path).unlink(missing_ok=True)
@@ -171,3 +177,97 @@ def generate_music(
         raise HTTPException(502, f"music provider failed: {e}") from e
     db.refresh(project)
     return project
+
+
+# ---------- hear the voiceover before paying for video ----------
+
+
+def _preview_out(db: Session, project: models.VideoProject, info: dict, *, reused: bool = False) -> dict:
+    fit = pipeline.voiceover_fit(project, float(info.get("duration_seconds") or 0.0))
+    fp = str(info.get("fingerprint") or "")
+    return {
+        "url": f"/api/projects/{project.id}/voiceover/preview/audio?v={fp[:12] or 'x'}",
+        "source": info.get("source", "preview"),
+        "fingerprint": fp,
+        "current": bool(info.get("current")),
+        "duration_seconds": fit["audio_seconds"],
+        "video_seconds": fit["video_seconds"],
+        "difference_seconds": fit["difference_seconds"],
+        "fit": fit["fit"],
+        "fit_text": fit["fit_text"],
+        "cost_estimate": float(info.get("cost_estimate") or 0.0),
+        "reused": reused,
+        "created_at": info.get("created_at"),
+    }
+
+
+_preview_locks: dict[int, threading.Lock] = {}
+_preview_locks_guard = threading.Lock()
+
+
+def _preview_lock(project_id: int) -> threading.Lock:
+    """One voiceover at a time per project (a double click must not pay twice)."""
+    with _preview_locks_guard:
+        return _preview_locks.setdefault(project_id, threading.Lock())
+
+
+@router.post("/projects/{project_id}/voiceover/preview", response_model=VoiceoverPreviewOut,
+             dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
+def make_voiceover_preview(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """Make the voiceover from the current spoken script and voice (paid
+    TTS), so it can be heard before any clip is paid for. The next Generate
+    video uses it at no charge. When an identical voiceover already exists,
+    nothing is paid for and that one comes back (`reused: true`)."""
+    from ..services import fingerprints, provider_gate, spend
+
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    if not project.generated_plan_json:
+        raise HTTPException(409, "generate a storyboard plan first")
+    if fingerprints.voice_source(project) != "tts":
+        raise HTTPException(409, str(pipeline.VoiceoverNotSynthesized(project)))
+    # A render makes its own voiceover; making one here at the same time
+    # would pay for the same voiceover twice.
+    refuse_while_busy(db, project, "The voiceover")
+    if not pipeline._reusable_voiceover(db, project, fingerprints.voice_fingerprint(db, project)):
+        provider_gate.require_model("tts")
+    if not _preview_lock(project.id).acquire(blocking=False):
+        raise HTTPException(409, "A voiceover for this project is already being made. Wait for it to finish.")
+    try:
+        with spend.scope(project_id=project.id):
+            made = pipeline.make_voiceover_preview(db, project)
+    except pipeline.VoiceoverFailed as e:
+        raise HTTPException(502, f"Voiceover failed: {e}") from e
+    finally:
+        _preview_lock(project.id).release()
+    db.refresh(project)
+    info = pipeline.current_voiceover(db, project) or {}
+    if info.get("path") != made["path"]:  # (cannot happen: the one just made is current)
+        info = {"source": "preview", "path": made["path"], "fingerprint": made["fingerprint"], "current": True}
+    info = {**info, "cost_estimate": made["cost_estimate"]}
+    return _preview_out(db, project, info, reused=made["reused"])
+
+
+@router.get("/projects/{project_id}/voiceover/preview", response_model=VoiceoverPreviewOut)
+def get_voiceover_preview(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """The voiceover to play in the editor (the one made with "Make
+    voiceover", else the last render's), or 404 when there is none."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    info = pipeline.current_voiceover(db, project)
+    if info is None:
+        raise HTTPException(404, "no voiceover yet")
+    return _preview_out(db, project, info)
+
+
+@router.get("/projects/{project_id}/voiceover/preview/audio")
+def stream_voiceover_preview(project_id: int, db: Session = Depends(get_db)) -> FileResponse:
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        raise HTTPException(404, "project not found")
+    info = pipeline.current_voiceover(db, project)
+    if info is None or not Path(info["path"]).is_file():
+        raise HTTPException(404, "no voiceover yet")
+    return FileResponse(info["path"], media_type="audio/mp4")

@@ -282,23 +282,31 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     }
 
 
-def _refuse_stale_voice_reroll(db: Session, project: models.VideoProject, shots: list) -> None:
-    """409 when a re-roll would lip-sync a shot to a voiceover that is out
-    of date: the paid clip would still not match, and the next Generate
-    video would buy it again."""
-    from ..services.pipeline import regen_needs_new_voiceover
+def _refuse_stale_voice_reroll(db: Session, project: models.VideoProject, shots: list,
+                               *, recompose: bool = True) -> None:
+    """409 when a re-roll would leave lip-sync out of step with the
+    voiceover: either it would be cut from a voiceover that is out of date
+    (paid for twice), or the recompose would put the new voiceover under
+    other clips still cut from the old one."""
+    from ..services.pipeline import current_voiceover_made, regen_needs_new_voiceover
 
-    blocked = regen_needs_new_voiceover(db, project, shots)
+    blocked = regen_needs_new_voiceover(db, project, shots, recompose=recompose)
     if not blocked:
         return
     orders = ", ".join(str(s.shot_order) for s in sorted(blocked, key=lambda s: s.shot_order))
     one = len(blocked) == 1
+    if current_voiceover_made(db, project):
+        why = ("The new voiceover is made, but re-composing now would put it under lip-synced clips "
+               "still cut from the old one, so the video would be out of step. Re-roll "
+               f"{'it' if one else 'them'} together, or use Generate video: it makes "
+               f"{'this clip' if one else 'these clips'} with the new voiceover.")
+    else:
+        why = ("A re-roll would use the old voiceover and be paid for twice. Use Generate video: it "
+               f"makes the new voiceover and {'this clip' if one else 'these clips'} together.")
     raise HTTPException(
         409,
         f"Shot{'' if one else 's'} {orders} {'is' if one else 'are'} lip-synced to the voiceover, "
-        "and the spoken script or voice changed since the voiceover was made. A re-roll would use "
-        "the old voiceover and be paid for twice. Use Generate video: it makes the new voiceover "
-        f"and {'this clip' if one else 'these clips'} together.",
+        f"and the spoken script or voice changed since the voiceover was made. {why}",
     )
 
 
@@ -357,7 +365,7 @@ def regenerate_shot(
     shot = db.get(models.VideoShot, shot_id)
     if shot is None or shot.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
-    _refuse_stale_voice_reroll(db, shot.project, [shot])
+    _refuse_stale_voice_reroll(db, shot.project, [shot], recompose=recompose)
     provider_gate.require_model("video", shot.model_override or None, db)
     job_id = enqueue(regenerate_shot_job, project_id, shot_id, recompose)
     return {

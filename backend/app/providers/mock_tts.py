@@ -16,7 +16,7 @@ def _estimate_seconds(text: str) -> float:
 
 class MockTTSProvider(TTSProvider):
     def list_voices(self) -> list[dict]:
-        return [{"voice_id": "mock-voice", "name": "Mock Voice"}]
+        return [{"voice_id": "mock-voice", "name": "Mock Voice", "preview_url": ""}]
 
     def synthesize(
         self,

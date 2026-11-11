@@ -7,7 +7,8 @@ import { Dropzone } from "@/components/Dropzone";
 import { TrainPanel } from "@/components/TrainPanel";
 import { AssignDialog, ASSET_SLOTS, demoteOtherHeroes, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
-import { api, Asset, Avatar, Ingredient, Project } from "@/lib/api";
+import { VoiceSampleButton } from "@/components/VoiceSampleButton";
+import { api, Asset, Avatar, Ingredient, Project, Voice } from "@/lib/api";
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
 
@@ -411,7 +412,7 @@ function DetailDrawer({
   const [assetType, setAssetType] = useState(kind === "avatar" ? "hero" : "hero");
   const [rights, setRights] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [voices, setVoices] = useState<{ voice_id: string; name: string }[]>([]);
+  const [voices, setVoices] = useState<Voice[]>([]);
   const [addingFromStudio, setAddingFromStudio] = useState(false);
   const [busyAsset, setBusyAsset] = useState<number | null>(null);
   const toast = useToast();
@@ -596,6 +597,10 @@ function DetailDrawer({
                     </option>
                   )}
               </select>
+              {(() => {
+                const cur = voices.find((v) => v.voice_id === (entity as Avatar).elevenlabs_voice_id);
+                return <VoiceSampleButton url={cur?.preview_url} name={cur?.name} />;
+              })()}
             </div>
             <div className="text-[10px] text-ink-400">
               {voices.length === 0

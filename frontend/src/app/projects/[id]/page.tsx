@@ -11,13 +11,16 @@ import { RenderHistory } from "@/components/RenderHistory";
 import { GenerationProgress } from "@/components/GenerationProgress";
 import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
+import { ProjectSettingsCard } from "@/components/ProjectSettingsCard";
+import { AddShotDialog, DeleteShotDialog, DuplicateShotDialog, TakesDialog } from "@/components/ShotEditing";
 import { formatDuration, modeLabel, shotTypeLabel } from "@/lib/labels";
-import { api, Asset, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, Render } from "@/lib/api";
+import { api, Asset, CostEstimate, Project, RenderPlan, RenderPlanShot, Shot, ShotEdit, ShotEditImpact, Render } from "@/lib/api";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 
 // Project states in which a render (or a re-plan) can be started.
 const CAN_GENERATE = ["planned", "failed", "completed", "cancelled"];
 const usd = (n: number) => `$${n.toFixed(2)}`;
+const IN_FLIGHT = ["submitted", "polling", "running"];
 
 export default function ProjectEditorPage() {
   return (
@@ -45,6 +48,11 @@ function Inner() {
   // What "Generate video" would make, reuse and cost right now.
   const [renderPlan, setRenderPlan] = useState<RenderPlan | null>(null);
   const [showReplan, setShowReplan] = useState(false);
+  // Storyboard editing: add (after a shot, or null = at the end), delete, takes.
+  const [adding, setAdding] = useState<{ after: Shot | null } | null>(null);
+  const [deleting, setDeleting] = useState<Shot | null>(null);
+  const [takesFor, setTakesFor] = useState<Shot | null>(null);
+  const [duplicating, setDuplicating] = useState<{ shot: Shot; impact: ShotEditImpact | null } | null>(null);
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [selected, setSelected] = useState<number[]>([]);
   const [videoModels, setVideoModels] = useState<
@@ -200,6 +208,52 @@ function Inner() {
     [project, projectId, showPreflight, showShortcuts, showReplan]
   );
 
+  const recompose = async () => {
+    try {
+      await api.recompose(projectId);
+      toast.info("Re-composing the video…");
+      setPolling(true);
+    } catch (e: any) {
+      toast.error(e.message || "Re-compose failed");
+    }
+  };
+
+  // A shot was added, duplicated or deleted: show the renumbered storyboard
+  // now, then reload the render plan and checks.
+  const applyShotEdit = (r: ShotEdit) => {
+    setProject(r.project);
+    setSelected((cur) => cur.filter((id) => r.project.shots.some((s) => s.id === id)));
+    refresh();
+  };
+
+  // Duplicating asks first only when it puts lip-synced clips out of date.
+  const duplicateShot = async (shot: Shot, confirmed = false) => {
+    if (!confirmed) {
+      try {
+        const impact = await api.shotEditImpact(projectId, { op: "duplicate", shot_id: shot.id });
+        if (impact.stale_count > 0) {
+          setDuplicating({ shot, impact });
+          return;
+        }
+      } catch {
+        // Can't tell what it affects: ask, and say so.
+        setDuplicating({ shot, impact: null });
+        return;
+      }
+    }
+    try {
+      const r = await api.duplicateShot(projectId, shot.id);
+      toast.success(
+        `Shot ${shot.shot_order} duplicated as shot ${r.shot?.shot_order ?? ""}, without a clip${
+          r.captions_resynced ? " · captions resynced to the new length" : ""
+        }`
+      );
+      applyShotEdit(r);
+    } catch (e: any) {
+      toast.error(e.message || "Couldn't duplicate the shot");
+    }
+  };
+
   const replan = async (preserve: boolean) => {
     setShowReplan(false);
     try {
@@ -231,6 +285,27 @@ function Inner() {
     .filter((r): r is RenderPlanShot => !!r?.needs_new_voiceover)
     .map((r) => r.shot_order)
     .sort((a, b) => a - b);
+
+  // Adding, duplicating or deleting shots waits while a render or re-plan runs.
+  // A clip still being made (a re-roll, or one left from a cancelled run) counts too.
+  const clipsInFlight = !!project?.shots.some((s) => IN_FLIGHT.includes(s.status));
+  const canEditShots = !!project && CAN_GENERATE.includes(project.status) && !clipsInFlight;
+  const editLockedWhy = clipsInFlight
+    ? "Wait until the clips being made are back (they are already paid for)."
+    : "Wait until the current step (planning or making the video) finishes.";
+  const bodyCount = project ? project.shots.filter((s) => s.shot_type !== "end_card").length : 0;
+  const deleteBlockedWhy = (s: Shot): string | null => {
+    if (!project) return null;
+    if (s.shot_type === "end_card") {
+      return project.cta_text.trim()
+        ? "The end card shows your end-card text. Clear the end-card text in Project settings to drop it."
+        : null;
+    }
+    if (bodyCount <= 1) return "A video needs at least one shot. Add another shot before deleting this one.";
+    if (IN_FLIGHT.includes(s.status))
+      return "This shot's clip is still being made (and is already paid for). Wait until it is back.";
+    return null;
+  };
 
   if (error)
     return <div className="p-8 text-accent">{error}</div>;
@@ -303,15 +378,7 @@ function Inner() {
               <button
                 className="btn-ghost"
                 title="Puts the video together again from the clips and voiceover that already exist. Free. It does not make a new voiceover or new clips."
-                onClick={async () => {
-                  try {
-                    await api.recompose(projectId);
-                    toast.info("Re-composing the video…");
-                    setPolling(true);
-                  } catch (e: any) {
-                    toast.error(e.message || "Re-compose failed");
-                  }
-                }}
+                onClick={recompose}
               >
                 Re-compose
               </button>
@@ -419,7 +486,25 @@ function Inner() {
         </div>
       )}
 
-      <AudioPanel project={project} onChange={(p) => setProject(p)} />
+      <ProjectSettingsCard
+        project={project}
+        onSaved={(p) => {
+          setProject(p);
+          refresh(); // the aspect or cast may change what Generate video makes
+        }}
+        onReplan={() => {
+          if (project.generated_plan_json && CAN_GENERATE.includes(project.status)) setShowReplan(true);
+          else toast.info("Re-plan is available once the current step finishes");
+        }}
+        onRecompose={render ? recompose : undefined}
+      />
+
+      <AudioPanel
+        project={project}
+        onChange={(p) => setProject(p)}
+        renderPlan={renderPlan}
+        onRefresh={refresh}
+      />
 
       {project.generated_plan_json && (
         <StoryboardScript
@@ -510,6 +595,20 @@ function Inner() {
                 {project.shots.length > 1 && (
                   <span className="hidden sm:inline text-xs text-ink-400">Drag to reorder · tick to bulk re-roll</span>
                 )}
+                {project.generated_plan_json && (
+                  <button
+                    className="btn-ghost text-xs disabled:opacity-50"
+                    disabled={!canEditShots}
+                    title={
+                      canEditShots
+                        ? "Adds a shot without a clip. Adding is free; the dialog says if lip-synced clips after it go out of date."
+                        : editLockedWhy
+                    }
+                    onClick={() => setAdding({ after: null })}
+                  >
+                    + Add shot
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setShowShortcuts(true)}
@@ -540,11 +639,17 @@ function Inner() {
               ? project.shots
               : project.shots.slice(0, SHOTS_BEFORE_EXPAND)
             ).map((s, idx) => (
+              <div key={s.id}>
               <ShotRow
-                key={s.id}
                 index={idx}
                 projectId={projectId}
                 shot={s}
+                projectAspect={project.aspect_ratio}
+                editLocked={canEditShots ? null : editLockedWhy}
+                deleteBlocked={deleteBlockedWhy(s)}
+                onDuplicate={() => duplicateShot(s)}
+                onDelete={() => setDeleting(s)}
+                onTakes={() => setTakesFor(s)}
                 planRow={planRows.get(s.id)}
                 castAssets={castAssets}
                 videoModels={videoModels}
@@ -566,12 +671,37 @@ function Inner() {
                   const next = [...project.shots];
                   const [moved] = next.splice(dragIndex, 1);
                   next.splice(idx, 0, moved);
+                  const before = project;
                   setProject({ ...project, shots: next });
                   setDragIndex(null);
-                  await api.reorderShots(projectId, next.map((x) => x.id));
+                  try {
+                    await api.reorderShots(projectId, next.map((x) => x.id));
+                    // A new order moves lip-synced shots within the voiceover:
+                    // reload so their out-of-date chips and the cost show.
+                    await refresh();
+                  } catch (err: any) {
+                    setProject(before);
+                    toast.error(err.message || "Couldn't reorder the shots");
+                  }
                 }}
                 onDragEnd={() => setDragIndex(null)}
               />
+              {s.shot_type !== "end_card" && canEditShots && project.generated_plan_json && (
+                <div className="group flex items-center gap-2 h-3 my-0.5">
+                  <div className="flex-1 border-t border-transparent group-hover:border-ink-700 group-focus-within:border-ink-700" />
+                  <button
+                    type="button"
+                    className="text-[11px] text-ink-500 hover:text-ink-100 focus:text-ink-100 opacity-60 group-hover:opacity-100 focus:opacity-100 px-1"
+                    onClick={() => setAdding({ after: s })}
+                    aria-label={`Add a shot after shot ${s.shot_order}`}
+                    title={`Add a shot after shot ${s.shot_order}. No clip is made until you generate; the dialog says if lip-synced clips after it go out of date.`}
+                  >
+                    + Add shot here
+                  </button>
+                  <div className="flex-1 border-t border-transparent group-hover:border-ink-700 group-focus-within:border-ink-700" />
+                </div>
+              )}
+              </div>
             ))}
             {!shotsExpanded && project.shots.length > SHOTS_BEFORE_EXPAND && (
               <button
@@ -601,6 +731,54 @@ function Inner() {
               setError(e.message);
             }
           }}
+        />
+      )}
+
+      {adding && (
+        <AddShotDialog
+          project={project}
+          after={adding.after}
+          onClose={() => setAdding(null)}
+          onDone={(r) => {
+            setAdding(null);
+            applyShotEdit(r);
+          }}
+        />
+      )}
+
+      {deleting && (
+        <DeleteShotDialog
+          project={project}
+          shot={deleting}
+          onClose={() => setDeleting(null)}
+          onDone={(r) => {
+            setDeleting(null);
+            applyShotEdit(r);
+          }}
+        />
+      )}
+
+      {duplicating && (
+        <DuplicateShotDialog
+          project={project}
+          shot={duplicating.shot}
+          impact={duplicating.impact}
+          onClose={() => setDuplicating(null)}
+          onConfirm={async () => {
+            const shot = duplicating.shot;
+            setDuplicating(null);
+            await duplicateShot(shot, true);
+          }}
+        />
+      )}
+
+      {takesFor && (
+        <TakesDialog
+          project={project}
+          shot={project.shots.find((x) => x.id === takesFor.id) || takesFor}
+          onClose={() => setTakesFor(null)}
+          onChanged={refresh}
+          onRecompose={render ? recompose : undefined}
         />
       )}
 
@@ -835,6 +1013,12 @@ function ShotRow({
   index,
   projectId,
   shot,
+  projectAspect,
+  editLocked,
+  deleteBlocked,
+  onDuplicate,
+  onDelete,
+  onTakes,
   planRow,
   castAssets,
   videoModels,
@@ -850,6 +1034,14 @@ function ShotRow({
   index: number;
   projectId: number;
   shot: Shot;
+  projectAspect: string;
+  /** Why adding/duplicating/deleting is off right now (null = allowed). */
+  editLocked: string | null;
+  /** Why this shot can't be deleted (null = it can). */
+  deleteBlocked: string | null;
+  onDuplicate: () => void;
+  onDelete: () => void;
+  onTakes: () => void;
   planRow?: RenderPlanShot;
   castAssets: Asset[];
   videoModels: { id: string; name: string; description: string }[];
@@ -950,7 +1142,15 @@ function ShotRow({
                   " Re-compose keeps the old clip."
                 }
               >
-                {shot.provider === "lipsync" ? "Voiceover changed since this clip" : "Edited since this clip"}
+                {/* The label follows the actual reason; a changed shape comes first (it remakes every clip). */}
+                {shot.clip_aspect_ratio && shot.clip_aspect_ratio !== projectAspect
+                  ? `Clip is ${shot.clip_aspect_ratio}`
+                  : shot.provider === "lipsync" &&
+                    (needsNewVoice || (planRow?.reason || "").includes("voiceover, which changed"))
+                  ? "Voiceover changed since this clip"
+                  : shot.provider === "lipsync"
+                  ? "Moved or edited since this clip"
+                  : "Edited since this clip"}
                 {planRow && planRow.cost > 0 ? ` · new clip about ${usd(planRow.cost)}` : ""}
               </span>
             )}
@@ -959,7 +1159,7 @@ function ShotRow({
             {shot.status === "completed" && shot.clip_path && shot.shot_type !== "end_card" && (
               <video
                 key={shot.clip_path}
-                src={`${api.shotClip(projectId, shot.id)}#t=0.1`}
+                src={`${api.shotClip(projectId, shot.id)}?v=${encodeURIComponent(shot.clip_path.split("/").pop() || "")}#t=0.1`}
                 preload="metadata"
                 className="w-20 sm:w-24 shrink-0 rounded-sm bg-black aspect-9/16 object-cover"
                 muted
@@ -1102,6 +1302,39 @@ function ShotRow({
           >
             Regenerate clip only
           </button>
+          {(shot.takes_count ?? 0) > 0 && shot.shot_type !== "end_card" && (
+            <button
+              className="btn-ghost w-full text-xs"
+              onClick={onTakes}
+              title="Every clip made for this shot. Pick the one the video uses; switching is free."
+            >
+              Takes ({shot.takes_count})
+            </button>
+          )}
+          <div className="flex gap-1.5">
+            {shot.shot_type !== "end_card" && (
+              <button
+                className="btn-ghost flex-1 text-[11px] px-2 py-1 disabled:opacity-50"
+                onClick={onDuplicate}
+                disabled={!!editLocked}
+                title={
+                  editLocked ||
+                  "A copy of this shot's settings right after it, without a clip. Asks first if lip-synced clips after it would go out of date."
+                }
+              >
+                Duplicate
+              </button>
+            )}
+            <button
+              className="btn-ghost flex-1 text-[11px] px-2 py-1 disabled:opacity-50"
+              onClick={onDelete}
+              disabled={!!editLocked || !!deleteBlocked}
+              title={editLocked || deleteBlocked || "Delete this shot (asks first)"}
+              aria-label={`Delete shot ${shot.shot_order}`}
+            >
+              Delete
+            </button>
+          </div>
           {shot.shot_type !== "end_card" && videoModels.length > 0 && (
             <div>
               <label className="label" htmlFor={`shot-${shot.id}-model`}>

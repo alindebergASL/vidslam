@@ -186,6 +186,77 @@ export type Shot = {
   error: string;
   /** Edited since its clip was made: the next render makes a new clip. */
   clip_stale?: boolean;
+  /** Aspect ratio the current clip was made at ("" = unknown or no clip). */
+  clip_aspect_ratio?: string;
+  /** Clips kept for this shot, the current one included (0 = no clip). */
+  takes_count?: number;
+};
+
+/** Result of adding, duplicating or deleting a shot. */
+export type ShotEdit = {
+  project: Project;
+  /** The new shot; null after a delete. */
+  shot: Shot | null;
+  captions_resynced: boolean;
+  /** Delete only: clip files thrown away. */
+  clips_discarded: number;
+};
+
+export type AddShotType = "hero" | "b_roll" | "talking_head" | "transition";
+
+/** Before adding, duplicating or deleting a shot: what it would put out of date. */
+export type ShotEditImpact = {
+  /** Lip-synced clips whose slice of the voiceover would move. */
+  stale_shots: { id: number; shot_order: number; cost: number }[];
+  stale_count: number;
+  /** What the next Generate video would pay to make them again. */
+  stale_cost: number;
+  /** Add / duplicate: the new shot's own clip, made at the next Generate video. */
+  new_clip_cost: number;
+  currency: string;
+  is_estimate: boolean;
+};
+
+/** One kept clip of a shot. */
+export type Take = {
+  id: number;
+  shot_id: number;
+  current: boolean;
+  provider: string;
+  provider_model: string;
+  cost_usd: number | null;
+  note: string;
+  aspect_ratio: string;
+  file_exists: boolean;
+  /** Path under the API, e.g. /api/projects/1/shots/2/takes/3/clip */
+  url: string;
+  created_at: string | null;
+};
+
+export type Voice = {
+  voice_id: string;
+  name: string;
+  /** Free sample from the voice provider; "" when there is none. */
+  preview_url?: string;
+};
+
+/** The voiceover the editor can play before any clip is paid for. */
+export type VoiceoverPreview = {
+  /** Path under the API, with a cache-buster. */
+  url: string;
+  source: "preview" | "render";
+  fingerprint: string;
+  /** Still matches the spoken script, voice and voice model. */
+  current: boolean;
+  duration_seconds: number;
+  video_seconds: number;
+  difference_seconds: number;
+  fit: "fits" | "too_long" | "too_short";
+  fit_text: string;
+  cost_estimate: number;
+  /** POST only: an identical voiceover already existed, so nothing was paid. */
+  reused: boolean;
+  created_at: string | null;
 };
 
 /** What "Generate video" would do right now, before anything is paid for. */
@@ -251,6 +322,8 @@ export type Project = {
   status: string;
   primary_avatar_id: number | null;
   brand_kit_id: number | null;
+  /** The project's own voice; null = the main character's voice. */
+  voice_id?: string | null;
   generated_plan_json: any;
   created_at: string;
   updated_at: string;
@@ -931,7 +1004,7 @@ export const api = {
   imageModels: () => req<{ id: string; name: string; description: string }[]>(
     "/api/providers/openrouter/image-models"
   ),
-  voices: () => req<{ voice_id: string; name: string }[]>("/api/providers/elevenlabs/voices"),
+  voices: () => req<Voice[]>("/api/providers/elevenlabs/voices"),
   captionStyles: () => req<string[]>("/api/providers/caption-styles"),
   healthCheck: () =>
     req<{
@@ -1099,6 +1172,46 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ shot_ids: shotIds }),
     }),
+  addShot: (
+    projectId: number,
+    body: { after_shot_id?: number | null; shot_type?: AddShotType; prompt?: string; duration_seconds?: number }
+  ) =>
+    req<ShotEdit>(`/api/projects/${projectId}/shots`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  shotEditImpact: (
+    projectId: number,
+    q: {
+      op: "add" | "duplicate" | "delete";
+      shot_id?: number | null;
+      after_shot_id?: number | null;
+      duration_seconds?: number;
+      shot_type?: string;
+    }
+  ) => {
+    const params = new URLSearchParams({ op: q.op });
+    if (q.shot_id != null) params.set("shot_id", String(q.shot_id));
+    if (q.after_shot_id != null) params.set("after_shot_id", String(q.after_shot_id));
+    if (q.duration_seconds != null) params.set("duration_seconds", String(q.duration_seconds));
+    if (q.shot_type) params.set("shot_type", q.shot_type);
+    return req<ShotEditImpact>(`/api/projects/${projectId}/shots/edit-impact?${params.toString()}`);
+  },
+  duplicateShot: (projectId: number, shotId: number) =>
+    req<ShotEdit>(`/api/projects/${projectId}/shots/${shotId}/duplicate`, { method: "POST" }),
+  deleteShot: (projectId: number, shotId: number) =>
+    req<ShotEdit>(`/api/projects/${projectId}/shots/${shotId}`, { method: "DELETE" }),
+  shotTakes: (projectId: number, shotId: number) =>
+    req<{ takes: Take[]; keep: number }>(`/api/projects/${projectId}/shots/${shotId}/takes`),
+  useTake: (projectId: number, shotId: number, takeId: number) =>
+    req<Shot>(`/api/projects/${projectId}/shots/${shotId}/takes/${takeId}/use`, { method: "POST" }),
+  deleteTake: (projectId: number, shotId: number, takeId: number) =>
+    req<void>(`/api/projects/${projectId}/shots/${shotId}/takes/${takeId}`, { method: "DELETE" }),
+  /** A path the API returned (e.g. a take's or a voiceover's `url`) as a full URL. */
+  mediaUrl: (path: string) => `${API_BASE}${path}`,
+  voiceoverPreview: (id: number) => req<VoiceoverPreview>(`/api/projects/${id}/voiceover/preview`),
+  makeVoiceoverPreview: (id: number) =>
+    req<VoiceoverPreview>(`/api/projects/${id}/voiceover/preview`, { method: "POST" }),
   castAssets: (projectId: number) =>
     req<Asset[]>(`/api/projects/${projectId}/cast-assets`),
   deleteProject: (id: number) =>
