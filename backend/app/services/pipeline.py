@@ -198,6 +198,9 @@ def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
     if not ids:
         return []
     rows = {r.id: r for r in db.query(models.Asset).filter(models.Asset.id.in_(ids)).all()}
+    from .content_mode import adult_ok_avatars
+
+    adult_ok = adult_ok_avatars()
     refs: list[ImageRef] = []
     for aid in dict.fromkeys(ids):
         row = rows.get(aid)
@@ -213,7 +216,8 @@ def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
                 row.ingredient.kind, "scene")
             name = row.ingredient.name
         refs.append(ImageRef(url=storage.public_url_for_token(row.public_token),
-                             role=role, name=name))  # type: ignore[arg-type]
+                             role=role, name=name,  # type: ignore[arg-type]
+                             adult_ok=role == "character" and row.avatar_id in adult_ok))
     return refs
 
 

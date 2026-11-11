@@ -595,6 +595,8 @@ export type ContentMode = {
   planner: string;
   /** The model that checks prompts for minors before they're sent. */
   safety_check?: { model: string; available: boolean };
+  /** Cast characters marked "adult content allowed" (fictional, or the person consented). */
+  adult_ok_avatars?: number[];
 };
 
 export type PromptPreset = {
@@ -1793,6 +1795,11 @@ export const api = {
   /** null = back to ADULT_MODE. */
   setContentMode: (adult: boolean | null) =>
     req<ContentMode>("/api/settings/content", { method: "PUT", body: JSON.stringify({ adult }) }),
+  setAvatarAdultOk: (avatarId: number, adultOk: boolean) =>
+    req<ContentMode>(`/api/settings/content/avatars/${avatarId}`, {
+      method: "PUT",
+      body: JSON.stringify({ adult_ok: adultOk }),
+    }),
   enhancePrompt: (body: { text: string; kind: EnhanceKind; model?: string | null }) =>
     req<{ text: string; model: string }>("/api/prompts/enhance", {
       method: "POST",

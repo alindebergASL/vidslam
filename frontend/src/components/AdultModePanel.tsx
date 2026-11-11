@@ -130,7 +130,11 @@ export function AdultModePanel() {
               <li>Runware&rsquo;s content check and Sogni&rsquo;s safe filter are on.</li>
             </>
           )}
-          <li>Always: prompts that sexualise minors are refused, and pictures of your Cast are always checked.</li>
+          <li>
+            Always: prompts that sexualise minors are refused. Pictures of your Cast are checked, except characters you
+            mark &ldquo;Adult content allowed&rdquo; in Cast (fictional, or the person consented), and only while
+            Adult mode is on.
+          </li>
         </ul>
       )}
 

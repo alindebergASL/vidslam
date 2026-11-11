@@ -69,6 +69,38 @@ def text_model() -> str:
     return (get_settings().adult_text_model or "") if adult_mode() else ""
 
 
+# Cast characters marked "adult content allowed": fictional, or the person
+# consented. Their pictures skip the forced content filter in adult mode.
+ADULT_OK_KEY = "content.adult_ok_avatars"  # {"ids": [avatar id, ...]}
+
+
+def adult_ok_avatars() -> set[int]:
+    try:
+        from .model_registry import get_setting
+
+        rec = get_setting(ADULT_OK_KEY)
+    except Exception:  # noqa: BLE001 — unreadable: nobody is exempt
+        return set()
+    ids = rec.get("ids") if isinstance(rec, dict) else None
+    return {int(i) for i in ids or [] if isinstance(i, int) or str(i).isdigit()}
+
+
+def set_avatar_adult_ok(avatar_id: int, value: bool) -> dict:
+    from .model_registry import put_setting
+
+    ids = adult_ok_avatars()
+    (ids.add if value else ids.discard)(int(avatar_id))
+    put_setting(ADULT_OK_KEY, {"ids": sorted(ids)} if ids else None)
+    log.info("cast character %s: adult content %s", avatar_id, "allowed" if value else "not allowed")
+    return status()
+
+
+def exempt(ref) -> bool:  # noqa: ANN001 — ImageRef
+    """A picture that skips the forced content filter: a Cast character
+    marked "adult content allowed", while adult mode is on."""
+    return bool(getattr(ref, "adult_ok", False)) and adult_mode()
+
+
 def set_adult_mode(value: Optional[bool]) -> dict:
     """Switch adult mode on/off; None goes back to ADULT_MODE."""
     from .model_registry import put_setting
@@ -90,6 +122,7 @@ def status() -> dict:
         "text_model": s.adult_text_model or "",
         "planner": active_model("chat"),
         "safety_check": _safety_check(),
+        "adult_ok_avatars": sorted(adult_ok_avatars()),
     }
 
 
