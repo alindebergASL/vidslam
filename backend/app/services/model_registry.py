@@ -14,6 +14,9 @@ Model id conventions per kind:
                          ("google/lyria-3.5", "google/lyria-3-clip-preview").
   lipsync                "" (off) or an OpenRouter avatar model
                          ("heygen/avatar-iv").
+  bg_removal · upscale   picture operations: "runware/<AIR>", or for
+                         upscale "local/lanczos" (free, no AI). Never
+                         OpenRouter.
 """
 from __future__ import annotations
 
@@ -25,8 +28,14 @@ from .. import models
 from ..config import get_settings
 from ..db import SessionLocal
 
-Kind = Literal["chat", "image", "video", "tts", "music", "lipsync"]
-KINDS: tuple[str, ...] = ("chat", "image", "video", "tts", "music", "lipsync")
+Kind = Literal["chat", "image", "video", "tts", "music", "lipsync", "bg_removal", "upscale"]
+KINDS: tuple[str, ...] = ("chat", "image", "video", "tts", "music", "lipsync", "bg_removal", "upscale")
+# Operations on an existing picture: served by Runware, locally or by the
+# mock, never by OpenRouter.
+OP_KINDS: tuple[str, ...] = ("bg_removal", "upscale")
+LOCAL_PREFIX = "local/"
+# Models that run in this app (Pillow), per kind.
+LOCAL_MODELS = {"upscale": ("local/lanczos",)}
 
 MOCK_DEFAULTS = {
     "chat": "mock/chat-default",
@@ -35,6 +44,8 @@ MOCK_DEFAULTS = {
     "tts": "elevenlabs",
     "music": "elevenlabs",
     "lipsync": "",
+    "bg_removal": "mock/bg-removal",
+    "upscale": "mock/upscale",
 }
 
 LYRIA_PREFIX = "google/lyria"
@@ -62,6 +73,8 @@ def env_default(kind: str) -> str:
         "tts": "elevenlabs",
         "music": "elevenlabs",
         "lipsync": "",
+        "bg_removal": s.bg_removal_model,
+        "upscale": s.upscale_model,
     }[kind] or ""
 
 
@@ -150,7 +163,8 @@ RESERVED_PREFIXES = {"replicate/": "replicate"}
 def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[str]]:
     """(provider, blocked) for `kind` with the active (or given) model.
     provider: "mock" | "openrouter" | "elevenlabs" | "gemini" | "sogni" |
-    "off" (no lip-sync) | "unavailable"; blocked names the provider that
+    "runware" | "local" (picture operations run here) | "off" (no lip-sync)
+    | "unavailable"; blocked names the provider that
     would serve it but is switched off (or isn't supported/set up)."""
     from .provider_keys import enabled, has, in_continuation
 
@@ -158,6 +172,9 @@ def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[st
     m = active_model(kind) if model is None else model
     if kind == "lipsync" and not m:
         return "off", None
+    if kind in OP_KINDS and m.startswith(LOCAL_PREFIX):
+        # Runs here: nothing to switch off, nothing billed (mock mode too).
+        return ("local", None) if m in LOCAL_MODELS.get(kind, ()) else ("unavailable", "local")
     if s.mock_providers:
         return "mock", None
     for prefix, name in RESERVED_PREFIXES.items():
@@ -185,8 +202,10 @@ def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[st
                 return cands[0], None
             return ("unavailable", cands[0]) if cands else ("mock", None)
         return pick("elevenlabs")
-    if kind in ("image", "video"):
+    if kind in ("image", "video", *OP_KINDS):
         for prefix, name in ROUTED_PREFIXES.items():
+            if kind in OP_KINDS and name != "runware":
+                continue  # only Runware has picture operations
             if m.startswith(prefix):
                 # Served by its own provider whatever else is active. A
                 # provider you add later (Runware) without its key isn't set
@@ -198,6 +217,8 @@ def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[st
                 return pick(name)
     if m.startswith("mock/"):
         return "mock", None
+    if kind in OP_KINDS:
+        return "unavailable", None  # never sent to OpenRouter
     return pick("openrouter")
 
 
@@ -225,6 +246,10 @@ def unavailable(kind: str, model: Optional[str] = None, blocked: Optional[str] =
     from .provider_keys import KEYS, ProviderUnavailable, has
 
     m = active_model(kind) if model is None else model
+    if kind in OP_KINDS and (blocked is None or blocked == "local"):
+        # An id no picture-operation provider serves.
+        name = "local" if blocked == "local" else (m.split("/", 1)[0] if "/" in m else "provider")
+        return ProviderUnavailable(name, kind=kind, model=m, reason="unsupported")
     if blocked in RESERVED_PREFIXES.values() and any(m.startswith(p) for p in RESERVED_PREFIXES):
         reason = "unsupported"
     else:

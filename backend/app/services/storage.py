@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import re
 import uuid
 from pathlib import Path
@@ -283,6 +284,105 @@ def save_generated_bytes(
     return path
 
 
+# Pictures sent to providers as references are at most this long (a 4×
+# upscale saved to the Cast would otherwise go out at full size).
+REFERENCE_LONG_SIDE = 2048
+_REF_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".webp": "WEBP"}
+
+
+# Reference copies not used for this long are swept (see prune_reference_cache).
+REFERENCE_CACHE_MAX_AGE_SECONDS = 3 * 24 * 3600
+
+
+def _reference_cache_dir() -> Path:
+    return settings.data_path / "cache" / "references"
+
+
+def _reference_cache_path(path: Path, long_side: int = REFERENCE_LONG_SIDE) -> Path:
+    """Where the scaled-down copy of `path` (as it is now) is cached."""
+    st = path.stat()
+    key = hashlib.sha256(f"{path.resolve()}:{st.st_mtime_ns}:{st.st_size}:{long_side}".encode()).hexdigest()[:32]
+    return _reference_cache_dir() / f"{key}{path.suffix.lower()}"
+
+
+def drop_reference_copy(path: Path) -> None:
+    """Delete the cached reference copy of `path` (call before the picture
+    itself is deleted: the cache key needs the file's size and time)."""
+    try:
+        Path(_reference_cache_path(Path(path))).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def prune_reference_cache(max_age_seconds: float = REFERENCE_CACHE_MAX_AGE_SECONDS,
+                          now: Optional[float] = None) -> int:
+    """Delete reference copies not used for `max_age_seconds` (a copy is
+    made again when it's needed). Returns how many were deleted."""
+    import time
+
+    cutoff = (now if now is not None else time.time()) - max_age_seconds
+    n = 0
+    d = _reference_cache_dir()
+    if not d.is_dir():
+        return 0
+    for f in d.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                n += 1
+        except OSError:
+            continue
+    return n
+
+
+def reference_copy(path: Path, long_side: int = REFERENCE_LONG_SIDE) -> Path:
+    """`path` itself when its long side is at most `long_side`, else a
+    scaled-down copy (cached by the file's path, size and time; the stored
+    picture is never changed). Unreadable files are answered as they are."""
+    path = Path(path)
+    fmt = _REF_FORMATS.get(path.suffix.lower())
+    if fmt is None:
+        return path
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+    except Exception:  # noqa: BLE001 — not a picture we can read: send it as is
+        return path
+    if max(w, h) <= long_side:
+        return path
+    out = _reference_cache_path(path, long_side)
+    if out.exists():
+        try:
+            os.utime(out)  # still in use: the age sweep keeps it
+        except OSError:
+            pass
+        return out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(path) as img:
+        img.load()
+        small = img.copy()
+    small.thumbnail((long_side, long_side), Image.LANCZOS)
+    kwargs: dict = {}
+    if fmt == "JPEG":
+        small = small.convert("RGB")
+        kwargs = {"quality": 92}
+    elif fmt == "WEBP":
+        kwargs = {"quality": 92}
+    tmp = out.with_name(f"{out.stem}.{uuid.uuid4().hex}.tmp")
+    small.save(tmp, format=fmt, **kwargs)
+    tmp.replace(out)
+    return out
+
+
+def image_size(path: Path) -> tuple[int, int]:
+    """(width, height) from the file's header; (0, 0) when unreadable."""
+    try:
+        with Image.open(path) as img:
+            return img.size
+    except Exception:  # noqa: BLE001
+        return 0, 0
+
+
 def render_subdir(project_id: int) -> Path:
     p = settings.data_path / "renders" / str(project_id)
     p.mkdir(parents=True, exist_ok=True)
@@ -290,7 +390,10 @@ def render_subdir(project_id: int) -> Path:
 
 
 def public_url_for_token(token: str) -> str:
-    return f"{settings.public_base_url.rstrip('/')}/api/public-assets/{token}"
+    """The URL a provider fetches a Cast picture from: `?ref=1` makes a big
+    picture go out as its scaled-down reference copy (the app's own views use
+    the plain URL and get the full-size picture)."""
+    return f"{settings.public_base_url.rstrip('/')}/api/public-assets/{token}?ref=1"
 
 
 def repair_image_types(db) -> tuple[int, int]:

@@ -18,6 +18,9 @@ JPEG = b"\xff\xd8\xff\xe0fake-runware"
 MP4 = b"\x00\x00\x00\x18ftypmp42fake"
 PIC = "https://vid.ai-lab1.com/public/a/scene.jpg"
 FACE = "https://vid.ai-lab1.com/public/a/face.jpg"
+# A real 1×1 PNG (base64 of it fits the schemas' data URI pattern).
+PNG_BYTES = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+                          "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")
 
 
 def _reset():
@@ -362,7 +365,16 @@ def test_every_curated_model_builds_a_valid_request(client, live):
         sch = b["schemas"][a]
         model = f"runware/{a}"
         caps = set(sch["capabilities"])
-        if runware.kind_of(caps) == "image":
+        kind = runware.kind_of(caps)
+        if kind in ("bg_removal", "upscale"):
+            # Picture operations: the picture goes inline (data URI).
+            op = "remove_background" if kind == "bg_removal" else "upscale"
+            tasks = [runware.build_operation_task(model, op, PNG_BYTES, "image/png", {"factor": f})
+                     for f in (runware.upscale_factors(model) if op == "upscale" else [1])]
+            for t in tasks:
+                assert runware.schema_error(sch, t) is None, (a, t["taskType"])
+            continue
+        if kind == "image":
             tasks = [runware.build_image_task(model, "a quiet street", [_ref(), _ref(FACE, "character")])]
             if "text-to-image" in caps:
                 tasks.append(runware.build_image_task(model, "a quiet street", [], negative_prompt="cgi"))

@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
@@ -8,7 +8,14 @@ import { TrainPanel } from "@/components/TrainPanel";
 import { AssignDialog, ASSET_SLOTS, demoteOtherHeroes, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
-import { api, Asset, Avatar, Ingredient, Project, Voice, errorText } from "@/lib/api";
+import { api, Asset, Avatar, ImageOp, Ingredient, Project, StudioJob, Voice, errorText } from "@/lib/api";
+import { UpscaleDialog, removeBgLabel, useOpModels } from "@/components/ImageOps";
+import { usePoll } from "@/lib/usePoll";
+import { useEvents } from "@/components/NotificationsProvider";
+
+/** A remove-background / upscale run started from a Cast picture. */
+type OpRun = { job: StudioJob; assetType: string; saved: boolean };
+const OP_DONE = ["completed", "saved", "failed"];
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
 
@@ -432,6 +439,112 @@ function DetailDrawer({
   const [addingFromStudio, setAddingFromStudio] = useState(false);
   const [busyAsset, setBusyAsset] = useState<number | null>(null);
   const toast = useToast();
+  // Remove background / upscale on a picture: the results land in Studio
+  // (owned by this cast member) and are listed here until the drawer closes.
+  const opModels = useOpModels();
+  const [upscaling, setUpscaling] = useState<Asset | null>(null);
+  const [runs, setRuns] = useState<OpRun[]>([]);
+  const running = runs.filter((r) => !OP_DONE.includes(r.job.status));
+  // The latest runs, for handlers called from an older render (the toast's
+  // action, a poll rerun before React re-renders).
+  const runsRef = useRef(runs);
+  runsRef.current = runs;
+  // Saves under way (each save files a new copy, so never twice), results
+  // already announced, and pictures whose operation is being started.
+  const savingRef = useRef<Set<number>>(new Set());
+  const [savingIds, setSavingIds] = useState<number[]>([]);
+  const announcedRef = useRef<Set<number>>(new Set());
+  const startingRef = useRef<Set<number>>(new Set());
+  const [startingIds, setStartingIds] = useState<number[]>([]);
+
+  const saveBack = async (jobId: number) => {
+    const run = runsRef.current.find((r) => r.job.id === jobId);
+    if (!run || run.saved || savingRef.current.has(jobId)) return;
+    savingRef.current.add(jobId);
+    setSavingIds((cur) => [...cur, jobId]);
+    const markSaved = (saved: boolean) =>
+      setRuns((cur) => cur.map((r) => (r.job.id === jobId ? { ...r, saved } : r)));
+    markSaved(true);
+    try {
+      // Same slot as the picture it was made from; the result is saved full size.
+      let asset: Asset;
+      try {
+        asset = await api.saveStudioJob(jobId, { asset_type: run.assetType });
+      } catch (e) {
+        markSaved(false);
+        throw e;
+      }
+      // One main picture per cast member: the old one moves to the reference slot.
+      let demoted = 0;
+      if (run.assetType === "hero" && entity) {
+        demoted = await demoteOtherHeroes(kind, entity.assets, asset.id).catch(() => 0);
+      }
+      toast.success(
+        `Saved as ${slotLabel(kind, run.assetType)}` +
+          (demoted ? " (the previous main picture moved to the reference slot)" : "")
+      );
+      await reload();
+      onChange();
+    } catch (e) {
+      toast.error(errorText(e, "Couldn't save it"));
+    } finally {
+      savingRef.current.delete(jobId);
+      setSavingIds((cur) => cur.filter((x) => x !== jobId));
+    }
+  };
+  const saveBackRef = useRef(saveBack);
+  saveBackRef.current = saveBack;
+
+  const checkRuns = async () => {
+    const ids = runsRef.current.filter((r) => !OP_DONE.includes(r.job.status)).map((r) => r.job.id);
+    if (ids.length === 0) return;
+    const fresh = await api.studioJobsByIds(ids);
+    for (const j of fresh) {
+      const was = runsRef.current.find((r) => r.job.id === j.id);
+      if (!was || OP_DONE.includes(was.job.status) || !OP_DONE.includes(j.status)) continue;
+      // A poll rerun can see the same finish before React re-renders: once.
+      if (announcedRef.current.has(j.id)) continue;
+      announcedRef.current.add(j.id);
+      if (j.status === "failed") {
+        toast.error(`${j.label || "It"} failed: ${j.error || "unknown error"}`, { action: { label: "Open in Studio", href: `/studio?job=${j.id}` } });
+      } else {
+        toast.success(`${j.label || "Result"} is ready`, {
+          action: { label: "Save back to this slot", onClick: () => saveBackRef.current(j.id) },
+          duration: 10000,
+        });
+      }
+    }
+    const next = runsRef.current.map((r) => ({ ...r, job: fresh.find((j) => j.id === r.job.id) || r.job }));
+    runsRef.current = next;
+    setRuns((cur) => cur.map((r) => ({ ...r, job: fresh.find((j) => j.id === r.job.id) || r.job })));
+  };
+  const pokeRuns = usePoll(checkRuns, { enabled: running.length > 0, interval: 3000 });
+  useEvents({ kind: "studio_job" }, (ev) => {
+    if (ev === null || runs.some((r) => r.job.id === ev.entity_id)) pokeRuns();
+  });
+
+  const startOp = async (op: ImageOp, a: Asset, job?: StudioJob) => {
+    // One start at a time per picture: a double click would queue (and bill) two.
+    if (!job && startingRef.current.has(a.id)) return;
+    if (!job) {
+      startingRef.current.add(a.id);
+      setStartingIds((cur) => [...cur, a.id]);
+    }
+    try {
+      const j = job || (await api.runImageOp(op, { assetId: a.id }));
+      setRuns((cur) => [{ job: j, assetType: a.asset_type, saved: false }, ...cur]);
+      toast.info(op === "remove_background" ? "Removing the background…" : "Upscaling…", {
+        action: { label: "Open in Studio", href: `/studio?job=${j.id}` },
+      });
+    } catch (e) {
+      toast.error(errorText(e, op === "remove_background" ? "Couldn't remove the background" : "Couldn't upscale it"));
+    } finally {
+      if (!job) {
+        startingRef.current.delete(a.id);
+        setStartingIds((cur) => cur.filter((x) => x !== a.id));
+      }
+    }
+  };
 
   useEffect(() => {
     if (kind === "avatar") {
@@ -644,7 +757,7 @@ function DetailDrawer({
               <div className="aspect-square bg-ink-800 relative">
                 <img
                   src={api.publicAsset(a.public_token)}
-                  className="w-full h-full object-cover"
+                  className={clsx("w-full h-full", a.mime_type === "image/png" ? "object-contain checker" : "object-cover")}
                   alt={slotLabel(kind, a.asset_type)}
                 />
                 {a.asset_type === "hero" && (
@@ -679,10 +792,102 @@ function DetailDrawer({
                   )}
                 </select>
                 <div className="text-[10px] text-ink-400">{a.source === "generated" ? "Generated" : "Uploaded"}</div>
+                <div className="flex flex-col gap-1 pt-0.5">
+                  <button
+                    type="button"
+                    className="chip text-[11px] py-1 w-full justify-center text-center"
+                    disabled={busyAsset === a.id || startingIds.includes(a.id)}
+                    onClick={() => startOp("remove_background", a)}
+                    title="Make a copy with the background cut out (transparent PNG). It lands in Studio; this picture stays."
+                    aria-label={`${removeBgLabel(opModels)}: ${slotLabel(kind, a.asset_type)} image`}
+                  >
+                    {removeBgLabel(opModels)}
+                  </button>
+                  <button
+                    type="button"
+                    className="chip text-[11px] py-1 w-full justify-center text-center"
+                    disabled={busyAsset === a.id || startingIds.includes(a.id)}
+                    onClick={() => setUpscaling(a)}
+                    title="Make a larger copy (×2 or ×4). It lands in Studio; this picture stays."
+                    aria-label={`Upscale ${slotLabel(kind, a.asset_type)} image`}
+                  >
+                    Upscale…
+                  </button>
+                </div>
               </div>
             </div>
           ))}
         </div>
+
+        {runs.length > 0 && (
+          <div className="mt-4">
+            <div className="label">New versions</div>
+            <ul className="space-y-2" aria-label="Background removal and upscale results">
+              {runs.map(({ job: j, assetType, saved }) => {
+                const done = j.status === "completed" || j.status === "saved";
+                return (
+                  <li key={j.id} className="card p-2 flex items-center gap-3">
+                    <div
+                      className={clsx(
+                        "w-14 h-14 shrink-0 rounded-sm overflow-hidden bg-ink-800 flex items-center justify-center",
+                        done && j.operation === "remove_background" && "checker"
+                      )}
+                    >
+                      {done ? (
+                        <img src={api.studioPreview(j.id)} alt={j.label || "Result"} className="w-full h-full object-contain" />
+                      ) : (
+                        <span className="text-[10px] text-ink-400">{j.status === "failed" ? "Failed" : "Making…"}</span>
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm truncate">{j.label || j.prompt}</div>
+                      <div className="text-[11px] text-ink-400 truncate">
+                        {j.status === "failed"
+                          ? j.error || "Failed"
+                          : done
+                          ? j.result_width && j.result_height
+                            ? `${j.result_width} × ${j.result_height} px`
+                            : "Ready"
+                          : "Working on it…"}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap justify-end gap-1 shrink-0">
+                      {done && (
+                        <button
+                          type="button"
+                          className="chip text-[11px] py-1 disabled:opacity-50"
+                          disabled={saved || savingIds.includes(j.id)}
+                          onClick={() => saveBack(j.id)}
+                          title={`Save it to this ${kind === "avatar" ? "character" : "cast member"} as ${slotLabel(kind, assetType)}`}
+                        >
+                          {savingIds.includes(j.id) ? "Saving…" : saved ? "Saved ✓" : "Save back to this slot"}
+                        </button>
+                      )}
+                      <Link href={`/studio?job=${j.id}`} className="chip text-[11px] py-1">
+                        Open in Studio
+                      </Link>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
+
+        {upscaling && (
+          <UpscaleDialog
+            source={{ assetId: upscaling.id }}
+            sourceLabel={`this ${slotLabel(kind, upscaling.asset_type).toLowerCase()} picture`}
+            models={opModels.upscale}
+            modelsLoaded={opModels.loaded}
+            onClose={() => setUpscaling(null)}
+            onStarted={(j) => {
+              const a = upscaling;
+              setUpscaling(null);
+              startOp("upscale", a, j);
+            }}
+          />
+        )}
 
         {addingFromStudio && (
           <AssignDialog

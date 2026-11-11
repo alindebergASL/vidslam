@@ -148,6 +148,18 @@ class ImageProvider(Protocol):
         ...
 
 
+# Picture operations (Studio "Remove background" / "Upscale").
+ImageOp = Literal["remove_background", "upscale"]
+
+
+class ImageOpProvider(Protocol):
+    def run(self, op: ImageOp, model: str, image_bytes: bytes, mime: str, options: dict) -> bytes:
+        """One operation on one picture (`mime` is its type, e.g.
+        "image/png"); `options` carries e.g. {"factor": 2} for an upscale.
+        Returns the result's bytes (PNG when transparency must survive)."""
+        ...
+
+
 class VideoProvider(Protocol):
     def list_models(self) -> list[ModelInfo]: ...
 
