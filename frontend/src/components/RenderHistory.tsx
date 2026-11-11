@@ -7,7 +7,7 @@ import { useEvents, useLiveConnected } from "./NotificationsProvider";
 import { usePoll } from "@/lib/usePoll";
 import { statusLabel } from "@/lib/labels";
 
-const DONE = ["completed", "failed", "cancelled"];
+const DONE = ["completed", "failed", "cancelled", "expired"];
 
 export function RenderHistory({ projectId }: { projectId: number }) {
   const [renders, setRenders] = useState<Render[]>([]);

@@ -1251,7 +1251,7 @@ def _active_job_for(db: Session, shot_id: int) -> Optional[models.VideoJob]:
 # Project / render states during which a planning, render or re-roll step is
 # running (anything else: draft, planned, completed, failed, cancelled).
 _IDLE_PROJECT = ("draft", "planned", "completed", "failed", "cancelled")
-_DONE_RENDER = ("completed", "failed", "cancelled")
+_DONE_RENDER = ("completed", "failed", "cancelled", "expired")
 
 
 def busy_reason(db: Session, project: models.VideoProject) -> Optional[str]:

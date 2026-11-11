@@ -29,7 +29,7 @@ STUDIO_APPLY_GRACE = timedelta(minutes=1)
 RENDER_GRACE = timedelta(minutes=10)
 COMPOSE_GRACE = timedelta(minutes=2)
 STUCK_RENDER = ("pending", "planning", "generating_audio", "rendering")
-DONE_RENDER = ("completed", "failed", "cancelled")
+DONE_RENDER = ("completed", "failed", "cancelled", "expired")
 STOPPED = "Stopped unexpectedly; Retry continues from where it stopped"
 
 _last_prune: float = 0.0

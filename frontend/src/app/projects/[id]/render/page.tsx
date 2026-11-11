@@ -10,7 +10,7 @@ import { useEvents } from "@/components/NotificationsProvider";
 import { api, errorText, Project, Render, renderLabel } from "@/lib/api";
 import { usePoll } from "@/lib/usePoll";
 
-const RENDER_DONE = ["completed", "failed", "cancelled"];
+const RENDER_DONE = ["completed", "failed", "cancelled", "expired"];
 
 export default function RenderPage() {
   return (

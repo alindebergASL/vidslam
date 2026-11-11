@@ -119,7 +119,7 @@ function Inner() {
       // before the user even clicks Generate Video. Skip while a render is
       // actively in flight (cheap call, but pointless every 2s during polling).
       const activeRender = st.latest_render &&
-        !["completed", "failed", "cancelled"].includes(st.latest_render.status);
+        !["completed", "failed", "cancelled", "expired"].includes(st.latest_render.status);
       if (!activeRender) {
         try {
           const pf = await api.preflight(projectId);
@@ -143,7 +143,7 @@ function Inner() {
       }
       const renderActive =
         !!st.latest_render &&
-        !["completed", "failed", "cancelled"].includes(st.latest_render.status);
+        !["completed", "failed", "cancelled", "expired"].includes(st.latest_render.status);
       // "regenerating" (shots re-rolling before a recompose) counts as active.
       const projectActive = !["completed", "failed", "draft", "planned", "cancelled"].includes(
         st.project_status
@@ -504,7 +504,7 @@ function Inner() {
         )}
 
       {project.status === "generating" &&
-        (!render || ["completed", "failed", "cancelled"].includes(render.status)) && (
+        (!render || ["completed", "failed", "cancelled", "expired"].includes(render.status)) && (
           <div className="card p-3 mb-6 flex items-center gap-3 text-sm" role="status">
             <span className="flex-1 text-ink-300">Waiting to start this video…</span>
             <button className="btn-ghost text-xs" onClick={cancelWaiting}>
