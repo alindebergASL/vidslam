@@ -360,3 +360,21 @@ def test_a_seam_preview_that_takes_too_long_is_an_error_not_a_crash(tmp_path, mo
     with pytest.raises(RuntimeError, match="took too long"):
         lh.seam_preview(clip)
     assert not list(tmp_path.glob("seam_*"))
+
+
+def test_a_jump_the_render_blends_says_so(monkeypatch):
+    """The reading is of the raw clip; when the finished video dissolves
+    across the join, the text says so and the level is a warning."""
+    from types import SimpleNamespace
+
+    from app.services import ambient, loop_health
+
+    monkeypatch.setattr(ambient, "render_seam_blend_seconds", lambda p: 2.0)
+    entry = {"seam": {"verdict": "visible_jump", "level": "bad", "text": "There's a visible jump at the join",
+                      "difference": 0.3, "typical": 0.01, "ratio": 30.0}, "clip_seconds": 10}
+    view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), entry)
+    assert view["seam"]["level"] == "warn" and view["seam"]["blend_seconds"] == 2.0
+    assert "blends it over 2 s" in view["seam"]["text"]
+    monkeypatch.setattr(ambient, "render_seam_blend_seconds", lambda p: 0.0)
+    view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), entry)
+    assert view["seam"]["level"] == "bad" and "visible jump" in view["seam"]["text"]

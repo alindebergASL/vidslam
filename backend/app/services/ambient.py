@@ -2231,6 +2231,19 @@ def generate_cost(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPl
     return round(sum(ln["cost"] for ln in estimate_ambient_cost(cfg, plan)["lines"] if ln["unit"] not in skip), 2)
 
 
+def render_seam_blend_seconds(project: models.VideoProject) -> float:
+    """How many seconds the finished video dissolves across the loop's join
+    (the same choice render_scene makes); 0 when the clip loops by
+    construction (Still + drift)."""
+    cfg = _config_of(project)
+    if cfg.source == "image_drift":
+        return 0.0
+    seam = float(cfg.crossfade_seconds or 0.0)
+    if bool(_generated_of(project).get("closed")) and cfg.source == "video":
+        seam = min(seam, CLOSED_SEAM_CROSSFADE)
+    return max(0.0, seam)
+
+
 def render_scene(db: Session, project_id: int) -> models.Render:
     """Tile the loop clip to the full target duration under the music bed."""
     from .pipeline import RenderCancelled, _check_cancel, _music_path_if_any

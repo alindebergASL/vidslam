@@ -220,7 +220,10 @@ class OpenRouterChatProvider(ChatProvider):
         body: dict = {
             "model": self.model,
             "temperature": 0.0,
-            "max_tokens": 600,
+            # Room for a model that thinks before answering; reasoning is
+            # kept short so the JSON verdict isn't cut off (and paid for).
+            "max_tokens": 1500,
+            "reasoning": {"effort": "low", "exclude": True},
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": parts},

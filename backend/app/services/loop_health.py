@@ -290,6 +290,22 @@ def current(project: models.VideoProject, shot: Optional[models.VideoShot]) -> O
 def out(project: models.VideoProject, shot: models.VideoShot, entry: dict) -> dict:
     view = {k: v for k, v in entry.items() if k not in ("clip_path", "clip_mtime_ns")}
     view["shot_id"] = shot.id
+    # The reading is of the raw clip; the finished video dissolves across the
+    # join, which hides most of a small jump. Say so rather than alarm.
+    seam = dict(view.get("seam") or {})
+    try:
+        from .ambient import render_seam_blend_seconds
+
+        blend = render_seam_blend_seconds(project)
+    except Exception:  # noqa: BLE001 — a note, never a failure
+        blend = 0.0
+    seam["blend_seconds"] = round(blend, 2)
+    if blend > 0 and seam.get("verdict") in ("slight_jump", "visible_jump"):
+        jump = "a slight jump" if seam["verdict"] == "slight_jump" else "a visible jump"
+        seam["text"] = f"The raw clip has {jump} at the join; the finished video blends it over {blend:g} s"
+        if seam.get("level") == "bad":
+            seam["level"] = "warn"
+    view["seam"] = seam
     view["seam_preview_url"] = f"/api/ambient/{project.id}/seam-preview?shot_id={shot.id}"
     view["join_at_seconds"] = round(min(SEAM_PREVIEW_SECONDS, float(entry.get("clip_seconds") or 0) / 2.0), 2)
     return view

@@ -427,7 +427,10 @@ def measure_loop_health(scene_id: int, db: Session = Depends(get_db)) -> LoopHea
              if s.clip_path and s.status == "completed" and Path(s.clip_path).is_file()]
     if not shots:
         raise HTTPException(409, "There's no loop clip to measure yet. Generate the loop first.")
-    loop_health.measure_scene(db, project, force=True)
+    got = loop_health.measure_scene(db, project, force=True)
+    if not got:
+        raise HTTPException(502, "Couldn't measure the loop clip (the file may be damaged). Try again, "
+                                 "or regenerate the loop.")
     db.refresh(project)
     return _health_result(project)
 

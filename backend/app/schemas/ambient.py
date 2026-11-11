@@ -303,6 +303,7 @@ class SeamReadingOut(BaseModel):
     difference: float  # last frame vs first, mean abs luma difference 0-1
     typical: float     # typical difference between neighbouring frames
     ratio: float       # difference / typical (with a floor for near-still clips)
+    blend_seconds: float = 0.0  # how long the finished video dissolves across the join
 
 
 class FlickerReadingOut(BaseModel):
