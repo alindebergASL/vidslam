@@ -8,6 +8,7 @@ import { TrainPanel } from "@/components/TrainPanel";
 import { AssignDialog, ASSET_SLOTS, demoteOtherHeroes, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
+import { useContentModeState } from "@/components/AdultModePanel";
 import { api, Asset, Avatar, Ingredient, Project, Voice, errorText } from "@/lib/api";
 
 type Tab = "characters" | "scenes" | "styles" | "objects";
@@ -630,6 +631,8 @@ function DetailDrawer({
           </div>
         )}
 
+        {kind === "avatar" && <AdultOkCard avatarId={id} name={entity.name} />}
+
         <TrainPanel kind={kind} id={id} assets={(entity as any).assets} />
 
         <div className="flex items-center justify-between gap-2 mb-2">
@@ -696,6 +699,73 @@ function DetailDrawer({
           />
         )}
       </div>
+    </div>
+  );
+}
+
+
+/**
+ * "Adult content allowed" for one Cast character: an adult (18+), fictional
+ * or a real adult who consented. While Adult mode is on, requests whose
+ * pictures are all of marked characters skip the forced content filter
+ * (Sogni's safe filter, Runware's content check). Minors are always refused.
+ */
+function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
+  const toast = useToast();
+  const { mode, failed, reload } = useContentModeState();
+  const [busy, setBusy] = useState(false);
+  if (!mode) {
+    return failed ? (
+      <div className="card p-4 mb-4 text-xs text-ink-400">
+        Couldn&rsquo;t load the adult content setting.{" "}
+        <button type="button" className="underline" onClick={reload}>
+          Retry
+        </button>
+      </div>
+    ) : null;
+  }
+  const allowed = (mode.adult_ok_avatars ?? []).includes(avatarId);
+
+  const toggle = async (next: boolean) => {
+    if (
+      next &&
+      !window.confirm(
+        `Allow adult content with ${name}'s pictures?\n\nConfirm that ${name} is an adult (18 or older), either fictional or a real adult who has consented, and that the pictures you put on ${name}'s card show ${name}.\n\nWhile Adult mode is on, requests whose pictures are all of marked characters then skip Sogni's safe filter and Runware's content check. Any other picture in the request keeps them on, and a picture made in Studio from someone else's picture doesn't count. Prompts involving minors are always refused.`
+      )
+    )
+      return;
+    setBusy(true);
+    try {
+      await api.setAvatarAdultOk(avatarId, next);
+      window.dispatchEvent(new Event("content-mode-changed"));
+      toast.success(next ? `${name}: adult content allowed` : `${name}: pictures are always checked`);
+    } catch (err) {
+      toast.error(errorText(err, "Couldn't change the setting"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="card p-4 mb-4 space-y-2">
+      <label className="flex items-start gap-2 text-sm">
+        <input
+          type="checkbox"
+          className="mt-1"
+          checked={allowed}
+          disabled={busy}
+          onChange={(e) => toggle(e.target.checked)}
+        />
+        <span>
+          <span className="font-medium">Adult content allowed</span>
+          <span className="block text-xs text-ink-400">
+            {name} is an adult (18+), fictional or a real adult who consented. While Adult mode is on, requests whose
+            pictures are all of marked characters skip Sogni&rsquo;s safe filter and Runware&rsquo;s content check.
+            {mode.adult ? "" : " Adult mode is off, so this has no effect right now."} Prompts involving minors are
+            always refused.
+          </span>
+        </span>
+      </label>
     </div>
   );
 }
