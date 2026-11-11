@@ -1,6 +1,6 @@
 "use client";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { fmtLocal, PublishStateBadge } from "@/components/PublishState";
@@ -80,14 +80,22 @@ function Inner() {
   const [refreshing, setRefreshing] = useState(false);
   const [sort, setSort] = useState<{ key: SortKey; dir: "asc" | "desc" }>({ key: "published_at", dir: "desc" });
 
+  // Only the latest request may land: switching "Group by" quickly (or a
+  // refresh racing a switch) must not show an older grouping.
+  const loadSeq = useRef(0);
   const load = useCallback(() => {
+    const seq = ++loadSeq.current;
     return api
       .results(groupBy)
       .then((d) => {
+        if (seq !== loadSeq.current) return;
         setData(d);
         setError(null);
       })
-      .catch((e) => setError(errText(e, "Couldn't load results")));
+      .catch((e) => {
+        if (seq !== loadSeq.current) return;
+        setError(errText(e, "Couldn't load results"));
+      });
   }, [groupBy]);
 
   useEffect(() => {
@@ -105,6 +113,8 @@ function Inner() {
       await load();
     } catch (e) {
       toast.error(errText(e, "Couldn't refresh numbers"));
+      // The failed try is recorded: reload so "Last try … failed" shows now.
+      await load().catch(() => {});
     } finally {
       setRefreshing(false);
     }
@@ -155,6 +165,12 @@ function Inner() {
           {data?.last_refreshed_at && (
             <span className="text-[11px] text-ink-400">Last updated {fmtLocal(data.last_refreshed_at)}</span>
           )}
+          {data?.last_attempt_failed && (
+            <span className="text-[11px] text-amber-200" title={data.last_attempt_error || undefined}>
+              Last try{data.last_attempt_at ? ` (${fmtLocal(data.last_attempt_at)})` : ""} failed
+              {data.last_attempt_error ? `: ${data.last_attempt_error}` : ""}
+            </span>
+          )}
         </div>
       </header>
 
@@ -167,7 +183,7 @@ function Inner() {
             <div className="h-64 skeleton rounded-xl" />
           </div>
         )
-      ) : !connected ? (
+      ) : !connected && data.rows.length === 0 ? (
         <Empty
           title="Connect YouTube in Settings"
           body="Once a channel is connected, uploads and their views, likes and comments show up here."
@@ -181,7 +197,13 @@ function Inner() {
         />
       ) : (
         <>
-          {!data.has_numbers && (
+          {!connected && (
+            <div className="card p-3 mb-4 text-sm text-amber-200 flex flex-wrap items-center justify-between gap-2" role="status">
+              <span>YouTube isn&apos;t connected — numbers stop updating until you reconnect</span>
+              <Link href="/settings#youtube" className="btn-ghost text-sm">Open Settings</Link>
+            </div>
+          )}
+          {connected && !data.has_numbers && (
             <div className="card p-3 mb-4 text-sm text-ink-200">
               Numbers appear a few hours after the first upload.
             </div>

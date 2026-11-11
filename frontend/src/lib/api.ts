@@ -972,7 +972,12 @@ export type ResultGroup = {
 export type ResultsOut = {
   configured: boolean;
   connected: boolean;
+  /** Last successful fetch of the numbers. */
   last_refreshed_at: string | null;
+  /** Last attempt (successful or not); failed = it ended in an error. */
+  last_attempt_at?: string | null;
+  last_attempt_failed?: boolean;
+  last_attempt_error?: string;
   has_numbers: boolean;
   rows: ResultRow[];
   group_by: ResultsGroupBy;

@@ -68,6 +68,23 @@ class YouTubeError(RuntimeError):
     pass
 
 
+def upstream_message(e: Exception) -> str:
+    """A plain sentence for a failed call to Google: our own errors as they
+    are, network trouble (timeouts, refused connections) in words."""
+    if isinstance(e, YouTubeError):
+        return str(e)
+    if isinstance(e, httpx.TimeoutException):
+        return "YouTube didn't answer in time — try again in a minute"
+    if isinstance(e, httpx.HTTPError):
+        return "Couldn't reach YouTube — check the connection and try again"
+    return "Something went wrong talking to YouTube — try again"
+
+
+# What a call to Google can fail with: our own errors and httpx's
+# (timeouts, connection errors).
+UPSTREAM_ERRORS = (YouTubeError, httpx.HTTPError)
+
+
 def configured() -> bool:
     s = get_settings()
     return bool(s.youtube_client_id and s.youtube_client_secret)
@@ -176,7 +193,11 @@ def access_token(client: httpx.Client) -> str:
     })
     if r.status_code >= 400:
         raise YouTubeError(f"token refresh failed ({r.status_code}): {r.text[:200]} — reconnect YouTube")
-    tok = r.json()
+    try:
+        tok = r.json()
+        tok["access_token"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise YouTubeError("token refresh failed: Google sent an unexpected answer — try again") from e
     _access.clear()
     _access.update(token=tok["access_token"], key=key, expires=time.time() + int(tok.get("expires_in", 3600)) - 60)
     return _access["token"]

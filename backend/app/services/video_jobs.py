@@ -491,12 +491,13 @@ def start_sweeper(interval: float = 5.0) -> bool:
                     spend.reconcile_pending()
                 except Exception:  # noqa: BLE001
                     log.exception("spend reconcile failed")
-                # YouTube numbers for the results page: runs itself about
-                # every 6 hours, never raises, no-op without YouTube.
+                # YouTube numbers for the results page: about every 6 hours,
+                # on its own thread (one at a time) so a slow YouTube never
+                # stalls job polling; never raises, no-op without YouTube.
                 try:
                     from . import video_stats
 
-                    video_stats.periodic_tick()
+                    video_stats.start_periodic()
                 except Exception:  # noqa: BLE001
                     log.exception("YouTube numbers refresh failed")
 

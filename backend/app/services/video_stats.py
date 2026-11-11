@@ -6,12 +6,17 @@
 later fetch the same day updates that row) and stores YouTube's state on each
 job, so "processing" and "scheduled" move on without a manual check. The
 extra parts cost no extra quota.
-`periodic_tick()` hangs off the video-jobs sweeper and runs it about every
-6 hours; it never raises and skips silently without YouTube credentials.
+`start_periodic()` is called by the video-jobs sweeper about once a minute
+and, when a fetch is due (about every 6 hours), runs `periodic_tick()` on
+its own daemon thread, one at a time, so a slow YouTube never holds up
+video-job polling. It never raises and skips silently without YouTube
+credentials. The last attempt (which throttles the 6 hours) and the last
+successful fetch (what the page shows as "Last updated") are kept apart.
 """
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
@@ -28,7 +33,8 @@ log = logging.getLogger("avs.video_stats")
 
 WINDOW = timedelta(days=90)
 EVERY = timedelta(hours=6)
-LAST_RUN_KEY = "youtube.stats_last_run"
+LAST_RUN_KEY = "youtube.stats_last_run"  # last attempt: {at, ok, error}
+LAST_OK_KEY = "youtube.stats_last_ok"  # last successful fetch: {at}
 MANUAL_KEY = "youtube.stats_manual_at"
 MANUAL_COOLDOWN = timedelta(minutes=2)
 
@@ -127,33 +133,111 @@ def _parse(value) -> Optional[datetime]:
 
 
 def last_run() -> Optional[datetime]:
+    """When a fetch was last attempted (successful or not)."""
     return _parse((store_get(LAST_RUN_KEY) or {}).get("at"))
+
+
+def last_success() -> Optional[datetime]:
+    """When numbers were last fetched successfully."""
+    return _parse((store_get(LAST_OK_KEY) or {}).get("at"))
+
+
+def last_attempt() -> dict:
+    """{at, failed, error} for the last attempt; `failed` only once it has
+    actually failed (not while it runs)."""
+    v = store_get(LAST_RUN_KEY) or {}
+    return {"at": _parse(v.get("at")), "failed": v.get("ok") is False, "error": v.get("error") or ""}
 
 
 def store_get(key: str) -> Optional[dict]:
     return settings_store.get_setting(key)
 
 
+def _iso(now: datetime) -> str:
+    return now.isoformat(timespec="seconds")
+
+
+def record_attempt(now: datetime) -> None:
+    settings_store.put_setting(LAST_RUN_KEY, {"at": _iso(now), "ok": None, "error": ""})
+
+
+def record_outcome(now: datetime, error: str = "") -> None:
+    """After a fetch: success (no error) also moves "Last updated"."""
+    settings_store.put_setting(LAST_RUN_KEY, {"at": _iso(now), "ok": not error, "error": error[:300]})
+    if not error:
+        settings_store.put_setting(LAST_OK_KEY, {"at": _iso(now)})
+
+
+_fetch_lock = threading.Lock()
+_periodic_thread: Optional[threading.Thread] = None
+
+
+def _due(now: datetime) -> bool:
+    last = last_run()
+    return last is None or now - last >= EVERY
+
+
 def periodic_tick(now: Optional[datetime] = None) -> bool:
-    """Run `snapshot()` if the last run was ≥6 h ago. Never raises. Returns
-    True when it fetched."""
+    """Run `snapshot()` if the last attempt was ≥6 h ago. Never raises.
+    Returns True when it fetched. At most one runs at a time."""
+    if not _fetch_lock.acquire(blocking=False):
+        return False
     try:
         from . import youtube as yt
 
         if not yt.can_read():
             return False
         now = now or datetime.utcnow()
-        last = last_run()
-        if last is not None and now - last < EVERY:
+        if not _due(now):
             return False
         # Claim the run first so a failing YouTube isn't retried every minute.
-        settings_store.put_setting(LAST_RUN_KEY, {"at": now.isoformat(timespec="seconds")})
-        result = snapshot(now=now)
+        record_attempt(now)
+        try:
+            result = snapshot(now=now)
+        except Exception as e:  # noqa: BLE001
+            record_outcome(now, yt.upstream_message(e))
+            raise
+        if result.get("skipped"):
+            record_outcome(now, "YouTube isn't connected")
+            return False
+        record_outcome(now)
         log.info("YouTube numbers: %s", result)
         return True
     except Exception:  # noqa: BLE001 — never take the sweeper down
         log.exception("YouTube numbers refresh failed")
         return False
+    finally:
+        _fetch_lock.release()
+
+
+def start_periodic(now: Optional[datetime] = None) -> bool:
+    """From the sweeper: start `periodic_tick()` on its own daemon thread when
+    a fetch is due and none is running. Returns at once; never raises.
+    True when a thread was started."""
+    global _periodic_thread
+    try:
+        from . import youtube as yt
+
+        if _fetch_lock.locked() or (_periodic_thread is not None and _periodic_thread.is_alive()):
+            return False
+        if not yt.can_read() or not _due(now or datetime.utcnow()):
+            return False
+        _periodic_thread = threading.Thread(target=periodic_tick, args=(now,), name="youtube-numbers",
+                                            daemon=True)
+        _periodic_thread.start()
+        return True
+    except Exception:  # noqa: BLE001
+        log.exception("YouTube numbers refresh couldn't start")
+        return False
+
+
+def wait_periodic(timeout: float = 30.0) -> bool:
+    """Wait for a running periodic fetch (tests, shutdown). True when idle."""
+    t = _periodic_thread
+    if t is not None:
+        t.join(timeout)
+        return not t.is_alive()
+    return True
 
 
 def manual_wait_seconds(now: Optional[datetime] = None) -> int:
@@ -167,5 +251,5 @@ def manual_wait_seconds(now: Optional[datetime] = None) -> int:
 
 def mark_manual(now: Optional[datetime] = None) -> None:
     now = now or datetime.utcnow()
-    settings_store.put_setting(MANUAL_KEY, {"at": now.isoformat(timespec="seconds")})
-    settings_store.put_setting(LAST_RUN_KEY, {"at": now.isoformat(timespec="seconds")})
+    settings_store.put_setting(MANUAL_KEY, {"at": _iso(now)})
+    record_attempt(now)

@@ -150,7 +150,12 @@ class ResultGroup(BaseModel):
 class ResultsOut(BaseModel):
     configured: bool
     connected: bool
+    # Last successful fetch; the last attempt is reported separately so a
+    # failed one doesn't pass for fresh numbers.
     last_refreshed_at: Optional[datetime]
+    last_attempt_at: Optional[datetime] = None
+    last_attempt_failed: bool = False
+    last_attempt_error: str = ""
     has_numbers: bool
     rows: list[ResultRow]
     group_by: GroupBy
@@ -191,8 +196,9 @@ def _refresh(db: Session, ids: list[int]) -> dict:
         raise HTTPException(404, "publish job not found")
     try:
         summary = yt.refresh_jobs(db, jobs)
-    except yt.YouTubeError as e:
-        raise HTTPException(502, str(e)) from e
+    except yt.UPSTREAM_ERRORS as e:
+        db.rollback()
+        raise HTTPException(502, yt.upstream_message(e)) from e
     return {"items": _items_for(db, {j.id for j in jobs}), **summary}
 
 
@@ -221,11 +227,15 @@ def refresh_many(body: RefreshMany, db: Session = Depends(get_db)) -> dict:
 @router.get("/results", response_model=ResultsOut)
 def results(group_by: GroupBy = "type", db: Session = Depends(get_db)) -> dict:
     st = yt.status()
+    attempt = video_stats.last_attempt()
     rows = publishing.result_rows(db)
     return {
         "configured": st["configured"],
         "connected": st["connected"],
-        "last_refreshed_at": video_stats.last_run(),
+        "last_refreshed_at": video_stats.last_success(),
+        "last_attempt_at": attempt["at"],
+        "last_attempt_failed": attempt["failed"],
+        "last_attempt_error": attempt["error"],
         "has_numbers": any(r["views"] is not None for r in rows),
         "rows": rows,
         "group_by": group_by,
@@ -247,6 +257,10 @@ def refresh_numbers(db: Session = Depends(get_db)) -> dict:
     video_stats.mark_manual(now)
     try:
         out = video_stats.snapshot(db, now=now)
-    except yt.YouTubeError as e:
-        raise HTTPException(502, str(e)) from e
+    except yt.UPSTREAM_ERRORS as e:
+        db.rollback()
+        msg = yt.upstream_message(e)
+        video_stats.record_outcome(now, msg)
+        raise HTTPException(502, msg) from e
+    video_stats.record_outcome(now, "YouTube isn't connected" if out.get("skipped") else "")
     return {**out, "refreshed_at": now}
