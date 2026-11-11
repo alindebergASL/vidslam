@@ -12,7 +12,6 @@ import { StudioViewer, ViewerItem, downloadName, mayBeTransparent } from "@/comp
 import {
   OpModels,
   UpscaleDialog,
-  priceForFactor,
   priceFromText,
   removeBgLabel,
   sourceChipText,
@@ -197,6 +196,26 @@ function Studio() {
   const [retrying, setRetrying] = useState<StudioJob | null>(null);
   // Picture operations: the models offered (with prices) and the Upscale dialog.
   const opModels = useOpModels();
+  // Server estimates for running an upscale again on its own source
+  // (job id → USD, null when it couldn't be priced).
+  const [upscaleEstimates, setUpscaleEstimates] = useState<Record<number, number | null>>({});
+  const asked = useRef(new Set<number>());
+  useEffect(() => {
+    for (const j of jobs) {
+      if (j.operation !== "upscale" || !j.provider_model || asked.current.has(j.id)) continue;
+      const source: ImageOpSource | null = j.source_job_id
+        ? { jobId: j.source_job_id }
+        : j.source_asset_id
+        ? { assetId: j.source_asset_id }
+        : null;
+      if (!source) continue;
+      asked.current.add(j.id);
+      api
+        .imageOpEstimate("upscale", { model: j.provider_model, factor: j.options?.factor || 2, source })
+        .then((e) => setUpscaleEstimates((cur) => ({ ...cur, [j.id]: e.free ? 0 : e.cost_usd })))
+        .catch(() => setUpscaleEstimates((cur) => ({ ...cur, [j.id]: null })));
+    }
+  }, [jobs]);
   const [upscaling, setUpscaling] = useState<{ source: ImageOpSource; label: string } | null>(null);
   // The last character sheet made here, for "Select this sheet".
   const [lastSheet, setLastSheet] = useState<{ avatarId: number; ids: number[] } | null>(null);
@@ -472,11 +491,14 @@ function Studio() {
     const m = modelOptionsFor(job).find((x) => x.id === job.provider_model);
     if (!m?.price_text) return "";
     if (m.price_text === "free") return "free";
-    // An upscale runs again at its own factor (×2 and ×4 cost differently).
-    const p =
-      job.operation === "upscale"
-        ? priceForFactor(m.price_text, job.options?.factor || 2)
-        : priceFromText(m.price_text);
+    // An upscale is priced by its source's size (the catalog price is for
+    // 1 MP), so it shows the server's estimate for this picture, and no
+    // price until that has arrived.
+    if (job.operation === "upscale") {
+      const est = upscaleEstimates[job.id];
+      return est === undefined || est === null ? "" : est === 0 ? "free" : `about ${usd(est)}`;
+    }
+    const p = priceFromText(m.price_text);
     if (p === null) return "";
     // Clips are priced per 5 s in the picker.
     const n = job.output_kind === "video_clip" && !job.operation ? p * ((job.duration_seconds || 5) / 5) : p;
