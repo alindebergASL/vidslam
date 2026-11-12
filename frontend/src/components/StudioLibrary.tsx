@@ -4,10 +4,131 @@ import clsx from "clsx";
 import { Dialog } from "@/components/Dialog";
 import { ASSET_SLOTS, OwnerKind } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
-import { api, Avatar, CharacterSheetView, Ingredient, StudioJob, errorText } from "@/lib/api";
+import { usd } from "@/components/ImageOps";
+import {
+  api,
+  Asset,
+  Avatar,
+  CharacterSheetView,
+  Ingredient,
+  PictureIntent,
+  SogniEditor,
+  StudioJob,
+  WithPictures,
+  errorText,
+} from "@/lib/api";
 
-/** A model in a Studio picker; price_text is the rough price in plain words ("" = unknown). */
-export type ModelOption = { id: string; name: string; price_text?: string };
+/** A model in a Studio picker; price_text is the rough price in plain words ("" = unknown).
+ *  with_pictures: the Sogni editor it runs as when it gets reference pictures. */
+export type ModelOption = { id: string; name: string; price_text?: string; with_pictures?: WithPictures | null };
+
+/** What reference pictures are for, as the server decides: a Cast
+ *  character's picture (not its logo) keeps a likeness; anything else guides. */
+export function pictureIntent(assets: Pick<Asset, "owner_kind" | "asset_type">[]): PictureIntent | null {
+  if (assets.length === 0) return null;
+  return assets.some((a) => a.owner_kind === "avatar" && a.asset_type !== "logo") ? "identity" : "guide";
+}
+
+/** The Sogni editor a model really runs as with `count` reference pictures; null = the model itself runs. */
+export function editorFor(m: ModelOption | undefined, intent: PictureIntent | null, count: number): SogniEditor | null {
+  const e = intent && count > 0 ? m?.with_pictures?.[intent] : null;
+  if (!e) return null;
+  return count > e.max_refs && e.over_max ? e.over_max : e;
+}
+
+/** This editor's price with `count` reference pictures, as Spend counts it:
+ *  "about $0.07 per image", or "free (Free Spark)" for a Sogni editor on Free Spark.
+ *  It's sent at most max_refs of them, and only those are counted. */
+export function editorPriceText(e: SogniEditor, count: number): string {
+  const sent = Math.max(Math.min(count, e.max_refs), 1);
+  const total = e.usd + e.usd_per_ref * (sent - 1);
+  return total > 0 ? `about ${usd(total)} per image` : e.price_text || "free";
+}
+
+/** Each Sogni editor you can get once, picked through a model that runs as it (its own model first). */
+export function editorChoices(
+  models: ModelOption[],
+  intent: PictureIntent | null,
+  count: number
+): { id: string; editor: SogniEditor }[] {
+  const out = new Map<string, { id: string; editor: SogniEditor }>();
+  for (const m of models) {
+    const e = editorFor(m, intent, count);
+    if (!e) continue;
+    const cur = out.get(e.id);
+    if (!cur || (e.own && !cur.editor.own)) out.set(e.id, { id: m.id, editor: e });
+  }
+  return Array.from(out.values());
+}
+
+/** A Studio job's reference pictures that are still there (deleted ones aren't sent). */
+export function liveReferenceIds(job: Pick<StudioJob, "reference_asset_ids" | "missing_reference_ids">): number[] {
+  const missing = new Set(job.missing_reference_ids || []);
+  return (job.reference_asset_ids || []).filter((id) => !missing.has(id));
+}
+
+/** What a Studio picture job's reference pictures are for, and how many are
+ *  still there (deleted ones aren't sent); no intent for clips and operations. */
+export function jobPictures(
+  job: Pick<StudioJob, "output_kind" | "operation" | "ref_intent" | "reference_asset_ids" | "missing_reference_ids">
+): { intent: PictureIntent | null; count: number } {
+  const intent = job.output_kind === "image" && !job.operation ? job.ref_intent ?? null : null;
+  return { intent, count: intent ? liveReferenceIds(job).length : 0 };
+}
+
+/** "Ran on Krea 2 Identity Edit (Sogni)" when a Sogni editor made it, not the
+ *  picked model; "Tried on …" when it started there and then failed. */
+export function ranOnText(
+  job: Pick<StudioJob, "ran_on_name" | "ran_on_editor" | "provider_model" | "status">
+): string | null {
+  if (!job.ran_on_name) return null;
+  if (job.ran_on_editor && `sogni/${job.ran_on_editor}` === job.provider_model) return null;
+  return `${job.status === "failed" ? "Tried on" : "Ran on"} ${job.ran_on_name} (Sogni)`;
+}
+
+/** The options of a Studio model picker. With reference pictures, each Sogni
+ *  model says which Sogni editor it runs as, and each editor you can get is
+ *  listed once on top. `note` adds a few words to an option. */
+export function ModelOptions({
+  models,
+  intent,
+  count,
+  prices = true,
+  note,
+}: {
+  models: ModelOption[];
+  intent: PictureIntent | null;
+  count: number;
+  prices?: boolean;
+  note?: (id: string, editor: SogniEditor | null) => string;
+}) {
+  const editors = editorChoices(models, intent, count);
+  const price = (text?: string) => (prices && text ? ` · ${text}` : "");
+  const items = models.map((m) => {
+    const e = editorFor(m, intent, count);
+    return (
+      <option key={m.id} value={m.id}>
+        {m.name || m.id}
+        {e ? ` — with your pictures runs as ${e.name}${price(editorPriceText(e, count))}` : price(m.price_text)}
+        {note?.(m.id, e) || ""}
+      </option>
+    );
+  });
+  if (editors.length === 0) return <>{items}</>;
+  return (
+    <>
+      <optgroup label="Sogni editors (what runs with your pictures)">
+        {editors.map(({ id, editor }) => (
+          <option key={`editor-${editor.id}`} value={id}>
+            {editor.name} (Sogni){price(editorPriceText(editor, count))}
+            {note?.(id, editor) || ""}
+          </option>
+        ))}
+      </optgroup>
+      <optgroup label="All models">{items}</optgroup>
+    </>
+  );
+}
 
 /** "$0.04", "~$0.04" for an estimate, "free" for 0, null when nothing is recorded. */
 export function costText(job: Pick<StudioJob, "cost_usd" | "cost_is_estimate">): string | null {
@@ -52,17 +173,33 @@ export function ModelPickerDialog({
   onPick: (model: string) => Promise<void> | void;
   onClose: () => void;
 }) {
+  // With reference pictures a Sogni model runs on one of Sogni's editors:
+  // the one this job ran on, else the one its model runs as now.
+  const isOp = Boolean(job.operation);
+  const { intent, count } = jobPictures(job);
+  const jobEditor =
+    (intent && job.ran_on_editor) || editorFor(models.find((m) => m.id === job.provider_model), intent, count)?.id || null;
+  const sameEditor = (e: SogniEditor | null) => Boolean(jobEditor) && e?.id === jobEditor;
+  // The first choice is a model that would make it differently.
   const others = models.filter((m) => m.id !== job.provider_model);
-  const [model, setModel] = useState(others[0]?.id || models[0]?.id || "");
+  const fresh = others.filter((m) => !sameEditor(editorFor(m, intent, count)));
+  const [model, setModel] = useState(fresh[0]?.id || others[0]?.id || models[0]?.id || "");
   const [busy, setBusy] = useState(false);
   const kind = job.output_kind === "image" ? "image" : "clip";
   const picked = models.find((m) => m.id === model);
-  const isOp = Boolean(job.operation);
+  const pickedEditor = editorFor(picked, intent, count);
+  const pickedPrice = pickedEditor ? editorPriceText(pickedEditor, count) : picked?.price_text;
+  const ranOn = ranOnText(job);
+  const note = (id: string, e: SogniEditor | null) =>
+    id === job.provider_model ? " (same as before)" : sameEditor(e) ? " (same Sogni editor as before)" : "";
   return (
     <Dialog title="Try another model" onClose={onClose}>
       <p className="text-xs text-ink-300 line-clamp-3">{job.prompt || `Studio ${kind}`}</p>
       {job.provider_model && (
-        <p className="text-[11px] text-ink-400">Made with {job.provider_model}</p>
+        <p className="text-[11px] text-ink-400">
+          Made with {job.provider_model}
+          {ranOn ? ` · ${ranOn}` : ""}
+        </p>
       )}
       {models.length === 0 ? (
         <p className="text-sm text-ink-400">No {kind} models are available right now.</p>
@@ -70,17 +207,17 @@ export function ModelPickerDialog({
         <div>
           <label className="label" htmlFor="retry-model">Model</label>
           <select id="retry-model" className="input" value={model} onChange={(e) => setModel(e.target.value)}>
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.name || m.id}
-                {m.price_text ? ` · ${m.price_text}` : ""}
-                {m.id === job.provider_model ? " (same as before)" : ""}
-              </option>
-            ))}
+            <ModelOptions models={models} intent={intent} count={count} note={note} />
           </select>
-          {picked?.price_text && (
+          {pickedEditor && (
             <p className="text-xs text-ink-200 mt-1.5">
-              {picked.price_text.charAt(0).toUpperCase() + picked.price_text.slice(1)}
+              With these reference pictures, Sogni runs this as {pickedEditor.name}
+              {sameEditor(pickedEditor) ? ", the same editor as before." : "."}
+            </p>
+          )}
+          {pickedPrice && (
+            <p className="text-xs text-ink-200 mt-1.5">
+              {pickedPrice.charAt(0).toUpperCase() + pickedPrice.slice(1)}
             </p>
           )}
         </div>
@@ -279,6 +416,13 @@ export function CharacterSheetDialog({
   }, []);
 
   const hasPictures = avatar.assets.some((a) => (a.mime_type || "image/").startsWith("image/"));
+  // The views use up to 4 of the character's own pictures (never the logo),
+  // so a Sogni model runs as its likeness editor.
+  const sheetRefs = Math.min(
+    4,
+    avatar.assets.filter((a) => (a.mime_type || "image/").startsWith("image/") && a.asset_type !== "logo").length
+  );
+  const sheetEditor = editorFor(models.find((m) => m.id === model), "identity", sheetRefs);
   const toggle = (id: string) =>
     setPicked((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
 
@@ -341,10 +485,11 @@ export function CharacterSheetDialog({
           <div>
             <label className="label" htmlFor="sheet-model">Image model</label>
             <select id="sheet-model" className="input" value={model} onChange={(e) => setModel(e.target.value)}>
-              {models.map((m) => (
-                <option key={m.id} value={m.id}>{m.name || m.id}</option>
-              ))}
+              <ModelOptions models={models} intent="identity" count={sheetRefs} prices={false} />
             </select>
+            {sheetEditor && (
+              <p className="text-[11px] text-ink-400 mt-1">Sogni runs this as {sheetEditor.name}.</p>
+            )}
           </div>
         )}
         <div>
