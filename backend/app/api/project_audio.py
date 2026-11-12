@@ -12,7 +12,7 @@ from .. import models
 from ..config import get_settings
 from ..db import get_db
 from ..schemas import ProjectOut
-from ..schemas.api import VoiceoverPreviewOut
+from ..schemas.api import VoiceoverFitOut, VoiceoverPreviewOut
 from ..services import pipeline, storage
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
@@ -97,6 +97,25 @@ def delete_voiceover(project_id: int, db: Session = Depends(get_db)) -> models.V
     db.commit()
     db.refresh(project)
     return project
+
+
+@router.get("/projects/{project_id}/voiceover/fit", response_model=VoiceoverFitOut)
+def uploaded_voiceover_fit(project_id: int, db: Session = Depends(get_db)) -> dict:
+    """The uploaded voiceover's length against the shots, in plain words:
+    a long one is cut at the end of the video, and this says so before
+    anything is rendered."""
+    from ..services.renderer import _probe_duration
+
+    project = db.get(models.VideoProject, project_id)
+    if project is None or not project.voiceover_upload_path:
+        raise HTTPException(404, "no voiceover uploaded")
+    path = Path(project.voiceover_upload_path)
+    if not path.is_file():
+        raise HTTPException(404, "voiceover file missing")
+    fit = pipeline.voiceover_fit(project, float(_probe_duration(path) or 0.0))
+    return {"duration_seconds": fit["audio_seconds"], "video_seconds": fit["video_seconds"],
+            "difference_seconds": fit["difference_seconds"], "fit": fit["fit"],
+            "fit_text": fit["fit_text"], "cut_seconds": fit["cut_seconds"]}
 
 
 @router.get("/projects/{project_id}/voiceover")
@@ -198,6 +217,7 @@ def _preview_out(db: Session, project: models.VideoProject, info: dict, *, reuse
         "difference_seconds": fit["difference_seconds"],
         "fit": fit["fit"],
         "fit_text": fit["fit_text"],
+        "cut_seconds": fit["cut_seconds"],
         "cost_estimate": float(info.get("cost_estimate") or 0.0),
         "reused": reused,
         "created_at": info.get("created_at"),

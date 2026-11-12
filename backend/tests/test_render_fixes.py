@@ -131,7 +131,10 @@ def test_a_voiceover_longer_than_the_clips_is_never_cut_off(auth_client, tmp_pat
         last = r.composition_json["shots"][-1]
         assert last["planned_seconds"] == pytest.approx(4.0)
         assert last["held_seconds"] == pytest.approx(last["seconds"], abs=0.01) and last["seconds"] > 5.0
+        # ...and how long it played before the hold (the hold's cap counts from it).
+        assert last["own_seconds"] == pytest.approx(4.0, abs=0.01)
         assert r.composition_json["shots"][0]["held_seconds"] is None
+        assert r.composition_json["shots"][0]["own_seconds"] is None
     finally:
         db.close()
 
@@ -161,6 +164,105 @@ def test_the_hold_for_a_long_voiceover_is_capped(auth_client, tmp_path, monkeypa
         assert r.composition_json["body_seconds"] == pytest.approx(8.0 + cap, abs=0.05)
         assert _duration(r.final_video_path) == pytest.approx(8.0 + cap, abs=0.2)
         assert r.composition_json["shots"][-1]["held_seconds"] == pytest.approx(4.0 + cap, abs=0.05)
+        # The render records how much of the voice was cut (20 s of voice, 12 s of video).
+        assert r.composition_json["voice_cut_seconds"] == pytest.approx(20.0 - (8.0 + cap), abs=0.15)
+    finally:
+        db.close()
+
+
+def test_a_long_uploaded_voiceover_warns_and_the_render_records_the_cut(auth_client, tmp_path):
+    """An uploaded voiceover far longer than the storyboard: the editor can
+    read its fit (how much is cut) before rendering, and the finished render
+    records the cut seconds so the render page can say so."""
+    from app import models
+    from app.services import pipeline
+
+    pid = _planned(auth_client)
+    voice = tmp_path / "upload.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=30",
+                    "-c:a", "aac", str(voice)], check=True)
+    r = auth_client.post(f"/api/projects/{pid}/voiceover",
+                         files={"file": ("v.m4a", voice.read_bytes(), "audio/mp4")})
+    assert r.status_code == 200, r.text
+    db = _db()
+    try:
+        video = pipeline._body_seconds(db.get(models.VideoProject, pid))
+    finally:
+        db.close()
+    cap = pipeline.VOICE_HOLD_MAX_SECONDS
+    fit = auth_client.get(f"/api/projects/{pid}/voiceover/fit")
+    assert fit.status_code == 200, fit.text
+    body = fit.json()
+    assert body["fit"] == "too_long" and "of the voice are cut" in body["fit_text"]
+    assert body["cut_seconds"] == pytest.approx(30.0 - (video + cap), abs=0.15)
+    r = auth_client.post(f"/api/projects/{pid}/generate-video", params={"force": "true"})
+    assert r.status_code == 202, r.text
+    assert auth_client.get(f"/api/projects/{pid}/status").json()["project_status"] == "completed"
+    newest = auth_client.get(f"/api/projects/{pid}/renders").json()[0]
+    comp = newest["composition_json"]
+    assert comp["voice_cut_seconds"] > 10.0
+    assert comp["voice_cut_seconds"] == pytest.approx(30.0 - comp["body_seconds"], abs=0.2)
+    # No upload: nothing to read.
+    other = _planned(auth_client)
+    assert auth_client.get(f"/api/projects/{other}/voiceover/fit").status_code == 404
+
+
+def test_a_voiceover_that_fits_records_no_cut(auth_client):
+    pid = _rendered(auth_client)
+    newest = auth_client.get(f"/api/projects/{pid}/renders").json()[0]
+    assert newest["composition_json"]["voice_cut_seconds"] == 0.0
+
+
+def test_the_fit_counts_the_real_clip_lengths(tmp_path):
+    """Clips shorter than their shots make the video shorter: the fit says
+    what the render does with those clips (held, then cut), not what the
+    planned lengths would give. A shot without a clip yet counts its
+    planned length."""
+    from types import SimpleNamespace
+
+    from app.services import pipeline
+
+    voice = tmp_path / "voice.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=16",
+                    "-c:a", "aac", str(voice)], check=True)
+    paths = [_clip(tmp_path / f"c{i}.mp4", 3.0) for i in range(2)]
+    project = SimpleNamespace(cta_text="", shots=[
+        SimpleNamespace(shot_type="b_roll", duration_seconds=8.0, clip_path=str(p)) for p in paths])
+    fit = pipeline.voiceover_fit(project, 16.0)
+    clips = pipeline.cover_voice([pipeline.ComposeClip(path=p, seconds=8.0) for p in paths], voice, 0.0)
+    rendered = sum(pipeline.clip_seconds(c) for c in clips)
+    assert rendered == pytest.approx(10.0, abs=0.1)
+    assert fit["fit"] == "too_long" and "of the voice are cut" in fit["fit_text"]
+    assert fit["video_seconds"] == pytest.approx(6.0, abs=0.1)
+    assert fit["cut_seconds"] == pytest.approx(pipeline.voice_cut_seconds(clips, voice, 0.0), abs=0.15)
+    assert fit["cut_seconds"] == pytest.approx(6.0, abs=0.15)
+    # Before the second clip is made, it counts its planned 8 s.
+    project.shots[1].clip_path = None
+    assert pipeline.voiceover_fit(project, 16.0)["video_seconds"] == pytest.approx(11.0, abs=0.1)
+
+
+def test_the_fit_counts_a_stale_clip_at_its_planned_length(auth_client):
+    """A clip that is out of date (its shot was made longer after it was
+    made) is made again at the shot's length by the next render: the fit
+    counts the shot's planned length, not the old clip's."""
+    from app import models
+    from app.services import fingerprints, pipeline
+
+    pid = _rendered(auth_client)
+    db = _db()
+    try:
+        project = db.get(models.VideoProject, pid)
+        body = pipeline._body_shots(project)
+        last = body[-1]
+        assert last.status == "completed" and Path(last.clip_path).is_file()
+        last.duration_seconds = float(last.duration_seconds) + 6.0
+        db.commit()
+        assert fingerprints.shot_is_stale(last)
+        others = sum(min(_duration(s.clip_path), float(s.duration_seconds)) for s in body[:-1])
+        planned = others + float(last.duration_seconds)
+        fit = pipeline.voiceover_fit(project, planned)
+        assert fit["video_seconds"] == pytest.approx(planned, abs=0.1)
+        assert fit["fit"] == "fits" and fit["cut_seconds"] == 0.0
     finally:
         db.close()
 
@@ -188,6 +290,34 @@ def test_a_held_clip_is_not_held_again(tmp_path):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=9.5",
                     "-c:a", "aac", str(short)], check=True)
     assert pipeline.cover_voice(once, short, 0.0)[-1].seconds == pytest.approx(4.0 + cap)
+
+
+def test_a_held_clip_is_held_from_the_length_it_played(tmp_path):
+    """A clip shorter than its shot is held from the clip's own length, so
+    a hook-lab variant composed from its base's held clip holds it the same
+    way: counted from what the base recorded (or, for an older record,
+    from the file cut to the shot's length), never from the shot's planned
+    length, which would give the variant a longer ending than its base."""
+    from app.services import pipeline
+
+    voice = tmp_path / "long_voice.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=20",
+                    "-c:a", "aac", str(voice)], check=True)
+    cap = pipeline.VOICE_HOLD_MAX_SECONDS
+    first = pipeline.ComposeClip(path=_clip(tmp_path / "a.mp4", 4.0), seconds=4.0)
+    short = _clip(tmp_path / "short.mp4", 2.0)  # a 2 s clip for a 4 s shot
+    base = pipeline.cover_voice([first, pipeline.ComposeClip(path=short, seconds=4.0)], voice, 0.0)
+    assert base[-1].seconds == pytest.approx(2.0 + cap, abs=0.05)
+    assert base[-1].planned_seconds == 4.0 and base[-1].own_seconds == pytest.approx(2.0, abs=0.05)
+    # The same clip again (a variant of that base): the same length.
+    assert pipeline.cover_voice(base, voice, 0.0)[-1].seconds == pytest.approx(base[-1].seconds, abs=1 / 30)
+    # An older record without its own length: counted from the file.
+    old = pipeline.ComposeClip(path=short, seconds=2.0 + cap, exact=True, planned_seconds=4.0)
+    assert pipeline.cover_voice([first, old], voice, 0.0)[-1].seconds == pytest.approx(2.0 + cap, abs=0.05)
+    # The recorded length wins over the file (a variant may play a take there).
+    swapped = pipeline.ComposeClip(path=_clip(tmp_path / "take.mp4", 4.0), seconds=2.0 + cap, exact=True,
+                                   planned_seconds=4.0, own_seconds=2.0)
+    assert pipeline.cover_voice([first, swapped], voice, 0.0)[-1].seconds == pytest.approx(2.0 + cap)
 
 
 def test_renderer_cuts_only_clips_with_a_limit(tmp_path):

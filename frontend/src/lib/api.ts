@@ -324,6 +324,8 @@ export type VoiceoverPreview = {
   difference_seconds: number;
   fit: "fits" | "too_long" | "too_short";
   fit_text: string;
+  /** Seconds of the voice's end the video would cut off (0: none). */
+  cut_seconds: number;
   cost_estimate: number;
   /** POST only: an identical voiceover already existed, so nothing was paid. */
   reused: boolean;
@@ -357,6 +359,17 @@ export type RenderPlan = {
   /** Body shots whose current clip the check flagged, by shot order. */
   flagged?: { shot_id: number; shot_order: number; summary: string; first_issue: string }[];
   flagged_count?: number;
+};
+
+/** An uploaded voiceover's length against the shots, and what the render does with it. */
+export type VoiceoverFit = {
+  duration_seconds: number;
+  video_seconds: number;
+  difference_seconds: number;
+  fit: "fits" | "too_long" | "too_short";
+  fit_text: string;
+  /** Seconds of the voice's end the video would cut off (0: none). */
+  cut_seconds: number;
 };
 
 export type Render = {
@@ -2022,6 +2035,7 @@ export const api = {
   deleteProject: (id: number) =>
     req<void>(`/api/projects/${id}`, { method: "DELETE" }),
 
+  voiceoverFit: (id: number) => req<VoiceoverFit>(`/api/projects/${id}/voiceover/fit`),
   voiceoverUrl: (id: number) => `${API_BASE}/api/projects/${id}/voiceover`,
   musicUrl: (id: number) => `${API_BASE}/api/projects/${id}/music`,
   uploadVoiceover: async (id: number, file: File) => {

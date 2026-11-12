@@ -399,8 +399,10 @@ def base_clips(db: Session, render: models.Render) -> list["ComposeClip"]:
     composition_json). A render from before that was recorded: the project's
     current clips, when they are still the ones it was made from. Raises
     HookLabError("Re-compose this version first") otherwise."""
+    from dataclasses import replace
+
     from . import fingerprints
-    from .pipeline import ComposeClip, _body_shots, shot_clips
+    from .pipeline import ComposeClip, _body_shots, held_from, shot_clips
 
     comp = render.composition_json or {}
     shots = comp.get("shots") or []
@@ -414,6 +416,7 @@ def base_clips(db: Session, render: models.Render) -> list["ComposeClip"]:
             exact=bool(s.get("held_seconds")),
             planned_seconds=(float(s["planned_seconds"]) if s.get("held_seconds") and s.get("planned_seconds")
                              else None),
+            own_seconds=float(s["own_seconds"]) if s.get("held_seconds") and s.get("own_seconds") else None,
             shot_id=s.get("shot_id"), shot_order=s.get("shot_order"), shot_type=str(s.get("shot_type") or ""),
             take_id=s.get("take_id"), fingerprint=str(s.get("fingerprint") or ""),
             provider_model=str(s.get("provider_model") or ""),
@@ -426,7 +429,11 @@ def base_clips(db: Session, render: models.Render) -> list["ComposeClip"]:
             negative_prompt=str(s["negative_prompt"] or "") if "negative_prompt" in s else None,
         ) for s in shots]
         if all(c.path.is_file() for c in clips):
-            return clips
+            # A held clip recorded before its own length was: counted now
+            # from the base's own file, as the base's compose counted it
+            # (a variant may swap that file for a take or a new clip).
+            return [replace(c, own_seconds=held_from(c)) if c.planned_seconds is not None
+                    and c.own_seconds is None else c for c in clips]
         raise HookLabError("Some clips of this version are gone. Re-compose this version first.")
     project = db.get(models.VideoProject, render.project_id)
     # Not recorded: only the newest version can be rebuilt from the
@@ -1369,6 +1376,19 @@ def _make_one(db: Session, variant: models.HookVariant) -> None:
         variant.shot1_clip_path = db.get(models.VideoJob, plan["reused"]["0"]).result_path or ""
     events.hook_variant_event(db, variant, project, "started", detail="Making the opening's voice")
     db.commit()
+    # A clip taken while still being made may have failed (or finished)
+    # since it was priced, before this round recorded it: nothing told the
+    # round then. Failed: the opening fails now with that clip's error, and
+    # nothing more is paid for. Finished: it is simply used.
+    for job_id in sorted(_reused_ids(variant)):
+        job = db.get(models.VideoJob, job_id)
+        db.refresh(job)
+        if job.status == "failed":
+            on_clip_failed(db, job)
+            return
+        if job.status == "completed" and int((job.context_json or {}).get("index") or 0) == 0:
+            variant.shot1_clip_path = job.result_path or ""
+            db.commit()
     claim_clip_spend(db, variant, render)
     with spend.scope(render_id=render.id):
         precheck(db, project, variant, clips, [i for i in plan["needed"] if str(i) not in plan["reused"]])
@@ -1881,7 +1901,7 @@ def compose_variant(db: Session, variant_id: int) -> Optional[models.Render]:
             clips[0] = ComposeClip(path=Path(take.clip_path), seconds=round(slots[0][1], 3), shot_id=c.shot_id,
                                    shot_order=c.shot_order, shot_type=c.shot_type, take_id=take.id,
                                    fingerprint=take.clip_fingerprint or "", provider_model=take.provider_model or "",
-                                   exact=True, planned_seconds=c.planned_seconds)
+                                   exact=True, planned_seconds=c.planned_seconds, own_seconds=c.own_seconds)
             variant.shot1_clip_path = take.clip_path
         made = variant_clips(db, variant) or ((variant.clips_json or {}).get("clips") or {})
         for key, path in made.items():
@@ -1889,7 +1909,8 @@ def compose_variant(db: Session, variant_id: int) -> Optional[models.Render]:
             c = clips[i]
             clips[i] = ComposeClip(path=Path(path), seconds=round(slots[i][1], 3), shot_id=c.shot_id,
                                    shot_order=c.shot_order, shot_type=c.shot_type, take_id=None, fingerprint="",
-                                   provider_model=c.provider_model, exact=True, planned_seconds=c.planned_seconds)
+                                   provider_model=c.provider_model, exact=True, planned_seconds=c.planned_seconds,
+                                   own_seconds=c.own_seconds)
         render.status = "rendering"
         events.hook_variant_event(db, variant, project, "progress", detail="Putting the video together")
         db.commit()
