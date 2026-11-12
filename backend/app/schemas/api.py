@@ -380,10 +380,24 @@ class VoiceoverPreviewOut(BaseModel):
     difference_seconds: float
     fit: Literal["fits", "too_long", "too_short"]
     fit_text: str
+    # Seconds of the voice's end the video would cut off (0.0: none).
+    cut_seconds: float = 0.0
     cost_estimate: float
     # POST only: true when an identical voiceover existed, so nothing was paid.
     reused: bool = False
     created_at: Optional[str] = None
+
+
+class VoiceoverFitOut(BaseModel):
+    """An uploaded voiceover's length against the shots, and what the render
+    does with it (pipeline.voiceover_fit)."""
+    duration_seconds: float
+    video_seconds: float
+    difference_seconds: float
+    fit: Literal["fits", "too_long", "too_short"]
+    fit_text: str
+    # Seconds of the voice's end the video would cut off (0.0: none).
+    cut_seconds: float = 0.0
 
 
 class RenderOut(BaseModel):

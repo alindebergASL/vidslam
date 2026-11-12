@@ -1196,6 +1196,48 @@ def test_a_variant_of_a_capped_hold_is_not_held_again(auth_client, monkeypatch):
     assert vr.composition_json["shots"][0]["planned_seconds"] == pytest.approx(3.0)
 
 
+def test_a_variant_of_a_held_base_is_as_long_as_the_base(auth_client, monkeypatch):
+    """A base whose last clip (2 s, for a 3 s shot) was held for the most
+    it may be: the variant with the same voice holds it the same way,
+    counted from the clip's 2 s as the base did, not from the shot's
+    planned 3 s, so the opening is as long as the version it is compared
+    with. Also for a base recorded before the clip's own length was."""
+    from app import models
+    from app.services import hook_lab, pipeline
+
+    monkeypatch.setattr(pipeline, "VOICE_HOLD_MAX_SECONDS", 1.0)
+    pid, base_id = _base(auth_client)
+    db = _db()
+    try:
+        base = db.get(models.Render, base_id)
+        comp = dict(base.composition_json)
+        short = _clip(Path(comp["shots"][0]["clip_path"]).with_name("short_held.mp4"), 2.0)
+        # As recorded by a compose that held its only clip (2 s of a 3 s
+        # shot) for 1 s at most, before the clip's own length was recorded.
+        shot1 = dict(comp["shots"][0], clip_path=str(short), planned_seconds=3.0, held_seconds=3.0, seconds=3.0)
+        shot1.pop("own_seconds", None)
+        comp["shots"] = [shot1]
+        comp["body_seconds"] = 3.0
+        base.composition_json = comp
+        db.commit()
+        assert hook_lab.base_clips(db, base)[0].own_seconds == pytest.approx(2.0, abs=0.05)
+        base_body = comp["body_seconds"]
+        end_card = comp["end_card_seconds"]
+    finally:
+        db.close()
+    made = _create(auth_client, pid, base_id, [{"hook_text": "Stop scrolling now!", "style": "original"}])
+    vid = made["variants"][0]["id"]
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    vr = _get(models.Render, _get(models.HookVariant, vid).render_id)
+    assert vr.status == "completed", vr.error
+    assert _duration(vr.audio_path) > 4.1  # the voice runs past the cap
+    frame = 1 / 30
+    assert vr.composition_json["body_seconds"] == pytest.approx(base_body, abs=frame)
+    assert vr.composition_json["shots"][0]["held_seconds"] == pytest.approx(3.0, abs=frame)
+    assert vr.composition_json["shots"][0]["own_seconds"] == pytest.approx(2.0, abs=0.05)
+    assert _duration(vr.final_video_path) == pytest.approx(base_body + end_card, abs=0.1)
+
+
 def test_a_new_shot_1_is_asked_for_at_the_length_it_is_priced_at(auth_client):
     from app import models
 
@@ -2144,6 +2186,58 @@ def test_a_clip_an_earlier_round_took_doesnt_reach_the_next_make_before_it_start
         assert v.status == "making" and v.error == "", (v.status, v.error)
     finally:
         db.close()
+
+
+def test_a_clip_taken_while_being_made_that_fails_before_the_round_starts_fails_it(auth_client, monkeypatch):
+    """A clip an earlier try is still making, taken by Make, may fail
+    between the pricing and the round starting (before the round records
+    it, so nothing tells the round). The opening fails right away with that
+    clip's error, and no other clip is paid for."""
+    from app import models
+    from app.providers.mock_avatar import MockAvatarProvider
+    from app.services import hook_lab, video_jobs
+
+    pid, base_id = _talking_base(auth_client, extra_shot=True)
+    (vid,) = (v["id"] for v in _create(auth_client, pid, base_id, [
+        {"hook_text": "Hi, quick test here.", "style": "custom", "shot1_source": "new",
+         "shot1_prompt": "a red car"},
+    ], window=3.5)["variants"])
+    real_avatar, real_check, real_parts = MockAvatarProvider.submit_avatar, video_jobs.check, hook_lab.parts
+
+    def refuse(self, **kw):
+        raise RuntimeError("lip-sync provider is down")
+
+    def slow_shots(db, job_id):  # a new shot 1 stays at the provider; the rest finish at once
+        job = db.get(models.VideoJob, job_id)
+        return job.status if job.purpose == "hook_shot" else real_check(db, job_id)
+
+    monkeypatch.setattr(MockAvatarProvider, "submit_avatar", refuse)
+    monkeypatch.setattr(video_jobs, "check", slow_shots)
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    (shot_job,) = _jobs(pid, "hook_shot")
+    assert shot_job.status == "submitted"
+    avatars = len(_jobs(pid, "hook_avatar"))
+
+    def priced_then_lost(db, variant, **kw):
+        out = real_parts(db, variant, **kw)
+        job = db.get(models.VideoJob, shot_job.id)
+        if "clips" not in kw or out["reused"] != {"0": shot_job.id} or job.status != "submitted":
+            return out  # not the worker's pricing (_make_one passes the base's clips)
+        # Priced as taken; the provider gives up on it now (the poller finds no round waiting).
+        job.status, job.error = "failed", "the provider refused it"
+        db.commit()
+        hook_lab.on_clip_failed(db, job)
+        return out
+
+    monkeypatch.setattr(MockAvatarProvider, "submit_avatar", real_avatar)
+    monkeypatch.setattr(hook_lab, "parts", priced_then_lost)
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    v = _get(models.HookVariant, vid)
+    assert v.status == "failed" and "refused it" in v.error, (v.status, v.error)
+    assert v.clips_json["reused"] == {"0": shot_job.id}
+    assert _get(models.Render, v.render_id).status == "failed"
+    assert len(_jobs(pid, "hook_avatar")) == avatars  # nothing more paid for
+    assert [j.id for j in _jobs(pid, "hook_shot")] == [shot_job.id]
 
 
 # ---------- the project page while other openings are being made ----------

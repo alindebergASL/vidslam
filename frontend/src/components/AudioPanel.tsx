@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
-import { api, Project, RenderPlan, Voice, VoiceoverPreview } from "@/lib/api";
+import { api, Project, RenderPlan, Voice, VoiceoverFit, VoiceoverPreview } from "@/lib/api";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
@@ -140,6 +140,30 @@ export function AudioPanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.id, voiceoverKey]);
 
+  // An uploaded voiceover's length against the shots: a long one is cut at
+  // the end of the video, so say so before anything is rendered.
+  const [uploadFit, setUploadFit] = useState<VoiceoverFit | null>(null);
+  const uploaded = project.voiceover_source === "upload" && !!project.voiceover_upload_path;
+  useEffect(() => {
+    if (!uploaded) {
+      setUploadFit(null);
+      return;
+    }
+    let live = true;
+    api
+      .voiceoverFit(project.id)
+      .then((f) => {
+        if (live) setUploadFit(f);
+      })
+      .catch(() => {
+        if (live) setUploadFit(null);
+      });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.id, uploaded, voiceoverKey, project.voiceover_upload_path]);
+
   const tts = project.voiceover_source === "tts";
   const newVoiceoverCost =
     renderPlan && renderPlan.voiceover === "new" ? renderPlan.voiceover_cost : null;
@@ -247,6 +271,21 @@ export function AudioPanel({
               >
                 Remove
               </button>
+            </div>
+          )}
+          {uploaded && uploadFit && (
+            <div
+              className={clsx("text-xs mt-1", uploadFit.fit === "fits" ? "text-emerald-300" : "text-amber-300")}
+            >
+              {uploadFit.fit === "fits"
+                ? `Fits the ${uploadFit.video_seconds.toFixed(1)} s of shots.`
+                : `Your voiceover (${uploadFit.duration_seconds.toFixed(1)} s) is ${uploadFit.fit_text}.`}
+              {uploadFit.cut_seconds > 0 && (
+                <span className="text-ink-400">
+                  {" "}
+                  Make the shots longer or upload a shorter file to keep all of it.
+                </span>
+              )}
             </div>
           )}
           <input

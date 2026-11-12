@@ -232,6 +232,15 @@ function Inner() {
               poster={api.renderThumb(render.id)}
             />
           </div>
+          {Number(render.composition_json?.voice_cut_seconds) > 0 && (
+            // The last shot is held only a few seconds for a long voiceover;
+            // the rest of the voice is cut where the video ends.
+            <div className="text-xs text-amber-300 mb-3">
+              The last {Number(render.composition_json?.voice_cut_seconds).toFixed(1)} s of the voiceover were
+              cut because the video is shorter than the voice. Make the shots longer or the voiceover shorter
+              to keep all of it.
+            </div>
+          )}
           {(render.estimated_cost > 0 || render.actual_cost > 0) && (
             <div className="text-xs text-ink-400 mb-3">
               Cost: actual ${render.actual_cost.toFixed(2)} · estimated $
