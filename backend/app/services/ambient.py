@@ -989,13 +989,20 @@ def _invalidate_loop(project: models.VideoProject) -> None:
     _set_state(project, _GENERATED_KEY, None)
 
 
+# Whose Cast picture the scene's own picture is, recorded when it is set:
+# {"avatar_id": id}, or {"avatar_id": None} for any other picture.
+_PICTURE_CAST_KEY = "_picture_cast"
+
+
 def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: str, *,
-                discard_loop: bool = False) -> models.VideoProject:
+                discard_loop: bool = False, cast_avatar: Optional[int] = None) -> models.VideoProject:
+    """`cast_avatar`: the picture is this Cast character's (picture_from)."""
     png = _crop_to_aspect(raw, project.aspect_ratio)
     _check_discard(db, project, discard_loop)
     picture_path(project).write_bytes(png)
     _invalidate_loop(project)
     _set_state(project, "picture_origin", origin)
+    _set_state(project, _PICTURE_CAST_KEY, {"avatar_id": cast_avatar})
     db.commit()
     db.refresh(project)
     return project
@@ -1009,9 +1016,30 @@ def clear_picture(db: Session, project: models.VideoProject, *, discard_loop: bo
     if had:
         _invalidate_loop(project)
     _set_state(project, "picture_origin", "")
+    _set_state(project, _PICTURE_CAST_KEY, None)
     db.commit()
     db.refresh(project)
     return project
+
+
+def _picture_mark(db: Session, project: models.VideoProject) -> dict:
+    """How the content filter sees the scene's own picture and every frame
+    and still made from it: as that Cast character's picture when it is
+    one (`cast_picture`; `adult_ok` when the character is ticked "adult
+    content allowed", read now so a tick or untick since applies), else
+    as a scene picture. Sent as a scene or a frame either way."""
+    rec = (project.ambient_config_json or {}).get(_PICTURE_CAST_KEY)
+    if not isinstance(rec, dict):
+        # Chosen before this was recorded: a picture from Cast may be
+        # anyone's, so it keeps the filter (choose it again to update it).
+        legacy = _config_of(project).picture_origin == "asset"
+        return {"cast_picture": legacy, "adult_ok": False}
+    if rec.get("avatar_id") is None:
+        return {"cast_picture": False, "adult_ok": False}
+    from .content_mode import adult_ok_avatars
+    from .pipeline import avatar_adult_ok
+
+    return {"cast_picture": True, "adult_ok": avatar_adult_ok(db, int(rec["avatar_id"]), adult_ok_avatars())}
 
 
 def still_prompt(cfg: AmbientConfig) -> str:
@@ -1055,18 +1083,24 @@ def generate_picture(db: Session, project: models.VideoProject, *,
 
 def picture_from(db: Session, project: models.VideoProject, *, asset_id: Optional[int] = None,
                  studio_job_id: Optional[int] = None, discard_loop: bool = False) -> models.VideoProject:
+    """A Cast character's picture (or a cutout or upscale of one) is
+    recorded as theirs, so the loop made from it keeps their content
+    filter unless they're ticked "adult content allowed"."""
+    from .pipeline import cast_avatar_of, studio_cast_avatar
+
     if asset_id is not None:
         asset = db.get(models.Asset, asset_id)
         if asset is None or not asset.file_path or not Path(asset.file_path).exists():
             raise LookupError("asset not found")
-        return set_picture(db, project, Path(asset.file_path).read_bytes(), "asset", discard_loop=discard_loop)
+        return set_picture(db, project, Path(asset.file_path).read_bytes(), "asset", discard_loop=discard_loop,
+                           cast_avatar=cast_avatar_of(asset))
     if studio_job_id is not None:
         job = db.get(models.AssetGenerationJob, studio_job_id)
         if (job is None or job.output_kind != "image" or job.status not in ("completed", "saved")
                 or not job.result_path or not Path(job.result_path).exists()):
             raise LookupError("studio image not found")
         return set_picture(db, project, Path(job.result_path).read_bytes(), "studio",
-                           discard_loop=discard_loop)
+                           discard_loop=discard_loop, cast_avatar=studio_cast_avatar(db, job))
     raise PictureError("give asset_id or studio_job_id")
 
 
@@ -1848,7 +1882,8 @@ def _start_video_chain(
             if picture and variant == 0:
                 shutil.copyfile(picture_path(project), anchor)
             else:
-                refs = [ImageRef(url=anchor0_url, role="scene")] if variant > 0 and anchor0_url else []
+                refs = ([ImageRef(url=anchor0_url, role="scene", **_picture_mark(db, project))]
+                        if variant > 0 and anchor0_url else [])
                 vcfg = variant_config(cfg, variant)
                 png, _ = generate_still(db, cfg, prompt=still_prompt(vcfg), aspect_ratio=project.aspect_ratio,
                                         references=refs, edit_prompt=same_place_prompt(vcfg) if refs else "",
@@ -1887,10 +1922,11 @@ def _submit_segment(db: Session, project: models.VideoProject, index: int, *, pr
     seg = db.get(models.VideoShot, chain["segment_ids"][index])
     n = len(chain["segment_ids"])
     refs: list[ImageRef] = []
+    mark = _picture_mark(db, project)  # the loop is made from the scene's picture when it has one
     if prev_url:
-        refs.append(ImageRef(url=prev_url, role="scene", frame_type="first_frame"))
+        refs.append(ImageRef(url=prev_url, role="scene", frame_type="first_frame", **mark))
     if plan.closed and index == n - 1 and chain.get("anchor_url"):
-        refs.append(ImageRef(url=chain["anchor_url"], role="scene", frame_type="last_frame"))
+        refs.append(ImageRef(url=chain["anchor_url"], role="scene", frame_type="last_frame", **mark))
     seg.reference_strategy = "frame_images" if refs else "input_references"
     db.commit()
     submit_shot_clip(db, project, seg, purpose="ambient_segment", after="none",
@@ -2085,7 +2121,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
                 target.provider_model = still_model_chain(cfg)[0]
                 target.provider = provider_label("image", target.provider_model)
                 db.commit()
-                refs = [ImageRef(url=first_url, role="scene")] if first_url else []
+                refs = [ImageRef(url=first_url, role="scene", **_picture_mark(db, project))] if first_url else []
                 png, used = generate_still(db, cfg, prompt=target.prompt, aspect_ratio=project.aspect_ratio,
                                            references=refs,
                                            edit_prompt=same_place_prompt(variant_config(cfg, i)) if refs else "",

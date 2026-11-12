@@ -911,9 +911,12 @@ function DetailDrawer({
 
 /**
  * "Adult content allowed" for one Cast character: an adult (18+), fictional
- * or a real adult who consented. While Adult mode is on, requests whose
- * pictures are all of marked characters skip the forced content filter
- * (Sogni's safe filter, Runware's content check). Minors are always refused.
+ * or a real adult who consented. While Adult mode is on, every picture on a
+ * ticked character's card skips the content filter that's forced on for Cast
+ * pictures (Sogni's safe filter, Runware's content check), however it was
+ * made, and follows the filter settings like any other picture. Pictures of
+ * unticked characters always get it, and so does a prompt that mentions a
+ * child. Minors are always refused.
  */
 function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   const toast = useToast();
@@ -935,7 +938,7 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
     if (
       next &&
       !window.confirm(
-        `Allow adult content with ${name}'s pictures?\n\nConfirm that ${name} is an adult (18 or older), either fictional or a real adult who has consented, and that the pictures you put on ${name}'s card show ${name}.\n\nWhile Adult mode is on, requests whose pictures are all of marked characters then skip Sogni's safe filter and Runware's content check. Any other picture in the request keeps them on, and a picture made in Studio from someone else's picture doesn't count. Prompts involving minors are always refused.`
+        `Allow adult content with ${name}'s pictures?\n\nConfirm that ${name} is an adult (18 or older), either fictional or a real adult who has consented, and that the pictures you put on ${name}'s card show ${name}.\n\nWhile Adult mode is on, every picture on ${name}'s card then skips the filter that's forced on for Cast pictures (Sogni's safe filter, Runware's content check), however it was made (uploaded, made in Studio, upscaled or cut out). It follows your Sogni and Runware filter settings, like any other picture. Pictures of characters that aren't ticked always get the filter, and so does a prompt that mentions a child. Prompts involving minors are always refused.`
       )
     )
       return;
@@ -964,8 +967,11 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
         <span>
           <span className="font-medium">Adult content allowed</span>
           <span className="block text-xs text-ink-400">
-            {name} is an adult (18+), fictional or a real adult who consented. While Adult mode is on, requests whose
-            pictures are all of marked characters skip Sogni&rsquo;s safe filter and Runware&rsquo;s content check.
+            {name} is an adult (18+), fictional or a real adult who consented. While Adult mode is on, every picture
+            on {name}&rsquo;s card skips the filter that&rsquo;s forced on for Cast pictures (Sogni&rsquo;s safe
+            filter, Runware&rsquo;s content check), however it was made, and follows your filter settings like any
+            other picture. Pictures of characters that aren&rsquo;t ticked always get the filter, and so does a
+            prompt that mentions a child.
             {mode.adult ? "" : " Adult mode is off, so this has no effect right now."} Prompts involving minors are
             always refused.
           </span>

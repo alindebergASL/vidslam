@@ -217,44 +217,65 @@ def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
             name = row.ingredient.name
         refs.append(ImageRef(url=storage.public_url_for_token(row.public_token),
                              role=role, name=name,  # type: ignore[arg-type]
-                             adult_ok=role == "character" and _exempt_asset(db, row, marked)))
+                             adult_ok=role == "character" and _exempt_asset(row, marked)))
     return refs
 
 
-def _exempt_asset(db: Session, asset: Optional[models.Asset], marked: set[int], depth: int = 0) -> bool:
+def _exempt_asset(asset: Optional[models.Asset], marked: set[int]) -> bool:
     """Whether a Cast picture counts as its marked character ("adult content
-    allowed"): a non-logo picture on a marked character's card whose own
-    text names no minor, either filed there (uploaded) or generated only
-    from that same character's counted pictures (so a picture made from
-    someone else's photo and saved to the card never counts)."""
+    allowed"): any non-logo picture on a marked character's card, as long
+    as the character's own text names no minor. How the picture was made
+    doesn't matter (uploaded, generated, a cutout or upscale, from any
+    picture, even one deleted since): the tick covers every picture the
+    owner keeps on that card."""
     if asset is None or asset.owner_kind != "avatar" or asset.asset_type == "logo" or asset.avatar_id not in marked:
         return False
-    if depth == 0:
-        from .content_mode import describes_minor
+    from .content_mode import describes_minor
 
-        if asset.avatar is None or describes_minor(asset.avatar):
-            return False
-    if asset.source == "generated" and asset.generation_job_id:
-        if depth >= 8:
-            return False
-        job = db.get(models.AssetGenerationJob, asset.generation_job_id)
-        if job is None or job.first_frame_job_id:
-            return False  # unknown, or made from a Studio result
-        if job.operation:
-            # A cutout or upscale is its source picture: it counts only when
-            # that is one of this character's counted Cast pictures (never a
-            # Studio result, which may be anyone).
-            if job.source_job_id or not job.source_asset_id:
-                return False
-            inputs = [job.source_asset_id]
-        else:
-            inputs = _asset_ids(job.reference_asset_ids_json) + (
-                [job.first_frame_asset_id] if job.first_frame_asset_id else [])
-        for aid in inputs:
-            src = db.get(models.Asset, aid)
-            if src is None or src.avatar_id != asset.avatar_id or not _exempt_asset(db, src, marked, depth + 1):
-                return False
-    return True
+    return asset.avatar is not None and not describes_minor(asset.avatar)
+
+
+def cast_avatar_of(asset: Optional[models.Asset]) -> Optional[int]:
+    """The Cast character a picture shows: any non-logo picture on their
+    card. None for a logo or an ingredient's picture."""
+    if asset is None or asset.owner_kind != "avatar" or asset.asset_type == "logo" or asset.avatar_id is None:
+        return None
+    return int(asset.avatar_id)
+
+
+def avatar_adult_ok(db: Session, avatar_id: int, marked: set[int]) -> bool:
+    """Whether a Cast character's pictures skip the forced content filter:
+    marked "adult content allowed" and its own text names no minor (as
+    _exempt_asset, for a picture that is no longer on the card)."""
+    if avatar_id not in marked:
+        return False
+    from .content_mode import describes_minor
+
+    avatar = db.get(models.Avatar, avatar_id)
+    return avatar is not None and not describes_minor(avatar)
+
+
+def studio_cast_avatar(db: Session, job: Optional[models.AssetGenerationJob]) -> Optional[int]:
+    """The Cast character a Studio picture shows when it is only a cutout
+    or upscale of one of their pictures (followed back through each
+    operation to the picture it started from), else None: a picture made
+    in Studio is a new picture, not the character's. When the starting
+    picture was deleted since, the operation's owner (copied from its
+    source when it was made) says whose it was."""
+    seen: set[int] = set()
+    while job is not None and job.operation and job.id not in seen:
+        seen.add(job.id)
+        if job.source_asset_id:
+            asset = db.get(models.Asset, job.source_asset_id)
+            if asset is not None:
+                return cast_avatar_of(asset)
+        elif job.source_job_id:
+            src = db.get(models.AssetGenerationJob, job.source_job_id)
+            if src is not None:
+                job = src
+                continue
+        return int(job.owner_id) if job.owner_kind == "avatar" and job.owner_id is not None else None
+    return None
 
 
 # ---------- public entry points ----------
@@ -1960,18 +1981,29 @@ def studio_first_frame(db: Session, job: models.AssetGenerationJob) -> Optional[
                 or not src.result_path or not Path(src.result_path).exists()):
             raise ValueError("the picture this clip starts from was deleted")
         from . import public_media
+        from .content_mode import adult_ok_avatars
 
-        return ImageRef(url=public_media.publish(storage.reference_copy(Path(src.result_path))), role="scene",
-                        name="first frame", frame_type="first_frame")
+        # A cutout or upscale of a Cast picture is still that character's
+        # picture (a newly made Studio picture isn't).
+        avatar_id = studio_cast_avatar(db, src)
+        return ImageRef(url=public_media.publish(storage.reference_copy(Path(src.result_path))),
+                        role="scene" if avatar_id is None else "character",
+                        name="first frame", frame_type="first_frame",
+                        adult_ok=avatar_id is not None and avatar_adult_ok(db, avatar_id, adult_ok_avatars()))
     if job.first_frame_asset_id:
         asset = db.get(models.Asset, job.first_frame_asset_id)
         if asset is None or not (asset.mime_type or "").startswith("image/"):
             raise ValueError("the picture this clip starts from was deleted")
         from .content_mode import adult_ok_avatars
 
-        return ImageRef(url=storage.public_url_for_token(asset.public_token), role="scene",
+        # A Cast character's picture is that character's likeness, first
+        # frame or not: unless the character is marked "adult content
+        # allowed", the content filter stays on for it.
+        cast = asset.owner_kind == "avatar" and asset.asset_type != "logo"
+        return ImageRef(url=storage.public_url_for_token(asset.public_token),
+                        role="character" if cast else "scene",
                         name="first frame", frame_type="first_frame",
-                        adult_ok=_exempt_asset(db, asset, adult_ok_avatars()))
+                        adult_ok=cast and _exempt_asset(asset, adult_ok_avatars()))
     return None
 
 
