@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -56,6 +57,11 @@ async def upload_avatar_asset(
     db.add(a)
     db.commit()
     db.refresh(a)
+    from ..services import cast_pictures, content_mode
+
+    if content_mode.is_tick_picture(a):
+        # A ticked character's new picture is checked off this request.
+        await run_in_threadpool(cast_pictures.picture_added, avatar_id)
     return a
 
 
@@ -146,9 +152,15 @@ def update_asset(asset_id: int, body: AssetUpdate, db: Session = Depends(get_db)
     allowed = ASSET_TYPES.get(a.owner_kind, ())
     if body.asset_type not in allowed:
         raise HTTPException(422, f"asset_type must be one of {', '.join(allowed)}")
+    from ..services import cast_pictures, content_mode
+
+    was_picture = content_mode.is_tick_picture(a)
     a.asset_type = body.asset_type
     db.commit()
     db.refresh(a)
+    if not was_picture and content_mode.is_tick_picture(a):
+        # A logo moved to a picture slot is a new picture for a ticked character.
+        cast_pictures.picture_added(a.avatar_id)
     return a
 
 

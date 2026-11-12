@@ -687,14 +687,30 @@ export type ContentMode = {
   text_model: string;
   /** The planner chosen in Settings → Models (used while adult mode is off). */
   planner: string;
-  /** The model that checks prompts for minors before they're sent. */
-  safety_check?: { model: string; available: boolean; note?: string };
+  /** The model that checks prompts (and Cast cards' text) for minors before they're sent, and the
+   * model that looks at the pictures on Cast cards (CHARACTER_PICTURE_CHECK_MODEL, through OpenRouter). */
+  safety_check?: {
+    model: string;
+    available: boolean;
+    note?: string;
+    picture_model?: string;
+    picture_available?: boolean;
+  };
   /** Cast characters marked "adult content allowed" (fictional, or the person consented), whose tick holds. */
   adult_ok_avatars?: number[];
-  /** Ticked characters' pictures added since the check, by character id: they keep the filter until checked. */
+  /** Ticked characters' pictures not checked yet, by character id (added since, or the check couldn't run):
+   * they keep the filter until checked. */
   adult_ok_unchecked?: Record<string, number>;
+  /** Ticked characters' pictures the picture model wouldn't judge, by character id: they keep the filter. */
+  adult_ok_declined?: Record<string, { id: number; name: string }[]>;
+  /** Ticked characters whose added pictures are being checked now. */
+  adult_ok_checking?: number[];
+  /** Why a check of an added picture took a character's tick off, by character id. */
+  adult_ok_notices?: Record<string, string>;
   /** Ticks that no longer hold (the card changed, or it was ticked before the current check): tick again. */
   adult_ok_stale?: number[];
+  /** Ticking (PUT …/avatars/{id}): the pictures the picture model wouldn't judge (they keep the filter). */
+  notice?: string;
 };
 
 /** What the AI safety check remembers (Settings → Adult content). */

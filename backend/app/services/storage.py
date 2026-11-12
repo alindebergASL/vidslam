@@ -396,14 +396,16 @@ def public_url_for_token(token: str) -> str:
     return f"{settings.public_base_url.rstrip('/')}/api/public-assets/{token}?ref=1"
 
 
-def repair_image_types(db) -> tuple[int, int]:
+def repair_image_types(db, became_pictures: "set[int] | None" = None) -> tuple[int, int]:
     """Correct assets whose recorded type doesn't match the file's contents.
 
     Images saved before types were read from the bytes can be JPEG data
     recorded (and served) as image/png; HeyGen rejects those with "Content
     type not match". Only the header of each file is read. The file name is
     left alone: it's referenced elsewhere, and the served type comes from
-    the record. Returns (types corrected, sizes filled in)."""
+    the record. Returns (types corrected, sizes filled in); the ids of the
+    Cast characters with a file that only now counts as a picture go into
+    `became_pictures` (their tick's picture check: cast_pictures)."""
     from sqlalchemy import or_
 
     from .. import models
@@ -424,6 +426,9 @@ def repair_image_types(db) -> tuple[int, int]:
         if types is None:
             continue
         if asset.mime_type != types[1]:
+            if (became_pictures is not None and asset.owner_kind == "avatar" and asset.avatar_id is not None
+                    and not (asset.mime_type or "").startswith("image/")):
+                became_pictures.add(int(asset.avatar_id))
             asset.mime_type = types[1]
             types_fixed += 1
         if not asset.width or not asset.height:

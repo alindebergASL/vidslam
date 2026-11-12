@@ -39,9 +39,10 @@ VISION_CALLS: list[tuple[str, int]] = []
 MINOR_REPLY: dict | BaseException | None = None
 # Every mock safety-check call (the text sent), for tests.
 MINOR_CALLS: list[str] = []
-# The mock picture check (Cast pictures before a tick): the asset ids it
-# was asked about, and a reply tests can set ({"minor": bool, "reason"} or
-# an exception). None: every picture is an adult.
+# The mock picture check (Cast pictures before a tick, and pictures added
+# to a ticked card): the asset ids it was asked about, and a reply tests
+# can set ({"minor": bool, "reason"}, an exception, or a function of the
+# asset id returning one of those or None). None: every picture is an adult.
 PICTURE_CALLS: list[int] = []
 PICTURE_REPLY = None
 

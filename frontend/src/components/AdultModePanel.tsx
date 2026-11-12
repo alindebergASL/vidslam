@@ -6,7 +6,7 @@ import { useToast } from "@/components/Toaster";
 import { SafetyMemory } from "@/components/SafetyMemory";
 
 /** "deepseek/deepseek-v4-flash" → "deepseek-v4-flash". */
-function shortModel(id: string): string {
+export function shortModel(id: string): string {
   return id.replace(/^~/, "").split("/").pop() || id;
 }
 
@@ -129,9 +129,10 @@ export function AdultModePanel() {
               </li>
               <li>
                 The pictures on the card of a Cast character ticked &ldquo;Adult content allowed&rdquo; that the
-                safety check looked at follow these settings like any other picture, however they were made
-                (uploaded, made in Studio, upscaled or cut out). A picture added later keeps the filter until it is
-                checked.
+                picture check (<b>{shortModel(mode.safety_check?.picture_model || "") || "the picture model"}</b>)
+                judged adult follow these settings like any other picture, however they were made (uploaded, made in
+                Studio, upscaled or cut out). A picture added later is checked automatically and keeps the filter
+                until it is, and so does one the picture model won&rsquo;t judge.
               </li>
             </>
           ) : (
@@ -177,15 +178,37 @@ export function AdultModePanel() {
           )}
         </p>
       )}
+      {mode?.safety_check?.picture_model !== undefined && (
+        <p className="mt-1 text-xs text-ink-300" data-testid="picture-check-line">
+          {mode.safety_check.picture_available === false ? (
+            <span className="text-amber-200">
+              Picture check (<b>{shortModel(mode.safety_check.picture_model) || "no model set"}</b>): it can&rsquo;t
+              run right now (OpenRouter is off or has no key in{" "}
+              <a href="/settings#keys" className="underline">
+                Settings → API keys
+              </a>
+              ), so a Cast character with pictures can&rsquo;t be ticked &ldquo;Adult content allowed&rdquo;, and
+              pictures added to a ticked card keep the filter.
+            </span>
+          ) : (
+            <>
+              Picture check (<b>{shortModel(mode.safety_check.picture_model)}</b>): it looks at the pictures on Cast
+              cards ticked &ldquo;Adult content allowed&rdquo;, and at each picture added to them.
+            </>
+          )}
+        </p>
+      )}
       <SafetyMemory />
     </section>
   );
 }
 
 /** Where prompts and scripts are sent, in this mode. Short and factual:
- * the safety check (the planner) and the text model run through OpenRouter. */
+ * the safety check (the planner), the picture check (Cast pictures) and the
+ * text model run through OpenRouter. */
 function WhereTextGoes({ mode }: { mode: ContentMode }) {
   const checker = shortModel(mode.safety_check?.model || mode.planner) || "the planner";
+  const pictureChecker = shortModel(mode.safety_check?.picture_model || "") || "the picture model";
   return (
     <div className="mt-3" data-testid="where-text-goes">
       <h3 className="text-xs font-medium text-ink-200">Where your text goes</h3>
@@ -215,9 +238,11 @@ function WhereTextGoes({ mode }: { mode: ContentMode }) {
           </>
         )}
         <li>
-          Ticking a Cast character &ldquo;Adult content allowed&rdquo; sends its name, description, persona and look,
-          and a small copy of each picture on its card, to <b>{checker}</b> through OpenRouter. So does each later
-          change to that text while it&rsquo;s ticked, and &ldquo;Check new pictures&rdquo;.
+          Ticking a Cast character &ldquo;Adult content allowed&rdquo; sends its name, description, persona and look
+          to <b>{checker}</b>, and a small copy of each picture on its card to <b>{pictureChecker}</b> (the picture
+          check), through OpenRouter. While it&rsquo;s ticked, each later change to that text goes to{" "}
+          <b>{checker}</b>, and a small copy of each picture added to the card goes to <b>{pictureChecker}</b>{" "}
+          automatically. &ldquo;Check new pictures&rdquo; sends the pictures not checked yet again.
         </li>
         <li>Prompts, scripts and pictures go to the picture, video, lip-sync or voice provider you pick.</li>
         <li>

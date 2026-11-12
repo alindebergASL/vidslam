@@ -26,8 +26,9 @@ the model reads is treated as one the check can't run on.
 
 Cast characters ticked "Adult content allowed" get a check of their own:
 is the character described as, or likely to be shown as, under 18
-(check_character), and does anyone in each picture on the card look under
-18 (check_pictures)?
+(check_character, the planner), and does anyone in each picture on the
+card look under 18 (check_pictures, CHARACTER_PICTURE_CHECK_MODEL: a
+model that takes images, through OpenRouter)?
 """
 from __future__ import annotations
 
@@ -122,8 +123,10 @@ def check_model() -> str:
 
 
 def availability() -> dict:
-    """{"model", "available", "note"} for the Settings page: available when
-    the planner can answer (a real provider, or the mock one in mock mode)."""
+    """{"model", "available", "note", "picture_model", "picture_available"}
+    for the Settings page and the Cast cards: available when the planner
+    can answer (a real provider, or the mock one in mock mode); the picture
+    model likewise (it judges the pictures on a Cast card)."""
     from ..config import get_settings
     from . import model_registry
 
@@ -134,7 +137,11 @@ def availability() -> dict:
         provider = "unavailable"
     available = bool(provider not in ("unavailable", "off") and (
         provider != "mock" or bool(get_settings().mock_providers)))
-    return {"model": model, "available": available, "note": _note(available)}
+    pictures, _ = _picture_route()
+    return {"model": model, "available": available, "note": _note(available),
+            "picture_model": picture_model(),
+            "picture_available": pictures == "openrouter" or (
+                pictures == "mock" and bool(get_settings().mock_providers))}
 
 
 def _note(available: bool) -> str:
@@ -243,9 +250,11 @@ def _forget(key: str) -> None:
         _lru.pop(key, None)
 
 
-def cached(key: str) -> Optional[str]:
-    """The cached verdict ("ok" | "minor_sexual") or None."""
-    current = _identity()
+def cached(key: str, *, judge=None) -> Optional[str]:  # noqa: ANN001
+    """The cached verdict ("ok" | "minor_sexual") or None. `judge` says who
+    would judge the text now (default _identity: the planner; the Cast
+    pictures pass _picture_identity): an "ok" counts only from that judge."""
+    current = (judge or _identity)()
     with _lock:
         hit = _lru.get(key)
         if hit is not None:
@@ -465,10 +474,12 @@ def check_or_422(prompt: str, negative: str = "", *, kind: str) -> None:
 # that this check looked at skip the forced content filter in adult mode,
 # and the prompt check never sees the card or the pictures. So before a
 # tick (and when a ticked card is edited) the planner is asked about the
-# card itself (check_character), and about each picture on it
-# (check_pictures). The word filter (safety.character_minor) runs first;
-# an "ok" is cached like a prompt's (30 days, same planner), a refusal
-# until the owner clears it.
+# card itself (check_character), and the picture model
+# (CHARACTER_PICTURE_CHECK_MODEL, through OpenRouter) about each picture on
+# it (check_pictures; again for each picture added to a ticked card:
+# services/cast_pictures.py). The word filter (safety.character_minor) runs
+# first; an "ok" is cached like a prompt's (30 days, and only from the
+# model that judges now), a refusal until the owner clears it.
 
 CHARACTER_POLICY = "character-2"
 PICTURE_POLICY = "picture-1"
@@ -482,11 +493,14 @@ CHARACTER_TOO_LONG = ("This character's card is too long for the safety check to
                       "characters). Shorten the description or persona, then tick again.")
 PICTURE_REFUSED = ("The safety check thinks a picture on this card ({picture}) shows someone under 18, so adult "
                    "content isn't allowed for this character. Remove that picture, then tick again.")
-PICTURE_DECLINED = ("The safety check model declined to judge a picture on this card ({picture}), which counts "
-                    "as a no. Remove it, or try a different planner model (Settings → Models).")
-PICTURE_UNAVAILABLE = ("The safety check couldn't look at this card's pictures, so adult content can't be "
-                       "allowed for this character right now. Try again later (check the planner model in "
-                       "Settings → Models).")
+# A picture the picture model won't judge keeps the filter; the rest of the
+# card is still allowed (a decline on the card's text is a no:
+# CHARACTER_DECLINED).
+PICTURE_DECLINED = ("{model} wouldn't judge {count} on this card ({pictures}), so {they} the content filter. "
+                    "\"Check new pictures\" asks again.")
+PICTURE_UNAVAILABLE = ("The picture check ({model}, through OpenRouter) couldn't look at this card's pictures, so "
+                       "adult content can't be allowed for this character right now. Try again later (OpenRouter "
+                       "must be on and have a key in Settings → API keys).")
 # The card fields the check reads, with the label it sees: the look and
 # persona first, as they shape every picture.
 CARD_FIELDS = (("name", "Name"), ("visual_identity", "Look"), ("persona", "Persona"),
@@ -573,15 +587,15 @@ def _verdict(out: object) -> tuple[bool, str]:
     return verdict, str(out.get("reason") or "")[:500]
 
 
-def _ask(system: str, text: str, images: list[str]) -> dict:
-    """One call to the planner with its own instructions. Raises
-    CheckDeclined or CheckUnavailable."""
+def _ask(chat, system: str, text: str, images: list[str]) -> dict:  # noqa: ANN001 — a chat provider
+    """One plain call (system, text, images) to `chat`: the planner for a
+    card, the picture model for a picture. Raises CheckDeclined or
+    CheckUnavailable."""
     from ..providers.openrouter_chat import MINOR_CHECK_ESTIMATE, ModelDeclined
 
-    chat, _ = _classifier()
     ask = getattr(chat, "inspect_images", None)
     if not callable(ask):
-        raise CheckUnavailable("the planner has no safety check")
+        raise CheckUnavailable("that model has no safety check")
     try:
         return _parse_character(ask(system=system, text=text, images=images, note="safety check",
                                     estimate=MINOR_CHECK_ESTIMATE))
@@ -611,7 +625,7 @@ def _classify_character(card: str) -> tuple[bool, str, str]:
                 raise CheckDeclined(str(e)) from None
             raise CheckUnavailable(f"{type(e).__name__}: {str(e)[:200]}") from None
     else:
-        out = _ask(character_system(), card, [])
+        out = _ask(chat, character_system(), card, [])
     verdict, reason = _verdict(out)
     return verdict, reason, judge
 
@@ -663,6 +677,77 @@ def _reason(key: str) -> str:
 
 
 # ---------- the pictures on a Cast card ----------
+#
+# Judged by the picture model (CHARACTER_PICTURE_CHECK_MODEL), never the
+# planner nor the adult text model: one plain call per picture, through
+# OpenRouter (so it waits while OpenRouter is switched off or has no key).
+# Its "ok" verdicts count only while it is the picture model.
+
+
+def picture_model() -> str:
+    from ..config import get_settings
+
+    return (get_settings().character_picture_check_model or "").strip()
+
+
+def short_model(model: str) -> str:
+    """"deepseek/deepseek-v4.1-flash" → "deepseek-v4.1-flash" (for messages)."""
+    return (model or "").lstrip("~").rsplit("/", 1)[-1] or model or "the picture model"
+
+
+def _picture_route() -> tuple[str, str]:
+    """(provider, model) for the picture model: provider as route_info
+    ("openrouter", "mock" or "unavailable")."""
+    from . import model_registry
+
+    model = picture_model()
+    if not model:
+        return "unavailable", ""
+    try:
+        provider, _ = model_registry.route_info("chat", model)
+    except Exception:  # noqa: BLE001
+        provider = "unavailable"
+    return provider, model
+
+
+NO_PICTURE_MODEL = "(no picture model)"
+
+
+def _picture_identity() -> str:
+    """Who would judge a picture now: the picture model, or "mock:<model>"
+    when the mock check answers. With no picture model set, a name no
+    verdict has: no remembered "ok" counts (a remembered refusal still does)."""
+    provider, model = _picture_route()
+    if not model:
+        return NO_PICTURE_MODEL
+    return MOCK_PREFIX + model if provider == "mock" else model
+
+
+def _picture_judge() -> tuple[object, str]:
+    """(chat provider, judge) for the picture model; raises CheckUnavailable
+    when it can't answer: no model set, OpenRouter switched off, no key
+    (the mock check outside mock mode is not a check), or a model that
+    isn't served by OpenRouter."""
+    from ..config import get_settings
+
+    provider, model = _picture_route()
+    if not model:
+        raise CheckUnavailable("no picture check model is set")
+    if provider == "mock":
+        if not get_settings().mock_providers:
+            raise CheckUnavailable("no OpenRouter key for the picture check")
+        from ..providers.mock_chat import MockChatProvider
+
+        return MockChatProvider(), MOCK_PREFIX + model
+    if provider != "openrouter":
+        raise CheckUnavailable(f"{model} is switched off" if provider == "unavailable"
+                               else f"{model} isn't served through OpenRouter")
+    from ..providers.openrouter_chat import OpenRouterChatProvider
+
+    try:
+        return OpenRouterChatProvider(model=model), model
+    except Exception as e:  # noqa: BLE001
+        raise CheckUnavailable(str(e)[:200]) from None
 
 
 def picture_hash(asset) -> str:  # noqa: ANN001 — models.Asset
@@ -697,18 +782,23 @@ def _picture_data_url(path: str) -> Optional[str]:
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
+UNREADABLE = "the picture can't be read"
+
+
 def _classify_picture(name: str, asset) -> tuple[bool, str, str]:  # noqa: ANN001
-    """(minor, reason, judge) for one picture; raises CheckUnavailable
-    (CheckDeclined)."""
+    """(minor, reason, judge) for one picture, from the picture model;
+    raises CheckUnavailable (CheckDeclined)."""
     from ..providers import mock_chat
     from ..providers.mock_chat import MockChatProvider
 
-    chat, model = _classifier()
-    judge = _identity() or model
+    chat, judge = _picture_judge()
     if isinstance(chat, MockChatProvider):
         mock_chat.PICTURE_CALLS.append(int(asset.id))
+        reply = mock_chat.PICTURE_REPLY
         try:
-            out = _mock_reply(mock_chat.PICTURE_REPLY, {"minor": False, "reason": "An adult."})
+            if callable(reply):  # tests: a reply per picture
+                reply = reply(int(asset.id))
+            out = _mock_reply(reply, {"minor": False, "reason": "An adult."})
         except Exception as e:  # noqa: BLE001
             from ..providers.openrouter_chat import ModelDeclined
 
@@ -718,37 +808,57 @@ def _classify_picture(name: str, asset) -> tuple[bool, str, str]:  # noqa: ANN00
     else:
         url = _picture_data_url(asset.file_path)
         if url is None:
-            raise CheckUnavailable("the picture can't be read")
+            raise CheckUnavailable(UNREADABLE)
         text = (f"A picture on the card of the character \"{' '.join((name or '').split())[:80]}\". "
                 "Is anyone in it under 18, or likely to be seen as under 18?")
-        out = _ask(PICTURE_SYSTEM, text, [url])
+        out = _ask(chat, PICTURE_SYSTEM, text, [url])
     verdict, reason = _verdict(out)
     return verdict, reason, judge
 
 
-def _picture_label(asset) -> str:  # noqa: ANN001
-    return (asset.original_filename or "").strip() or f"picture {asset.id}"
+def picture_label(asset) -> str:  # noqa: ANN001
+    return (getattr(asset, "original_filename", "") or "").strip() or f"picture {asset.id}"
+
+
+def picture_declined(labels: list[str], model: Optional[str] = None) -> str:
+    """The note for pictures the picture model wouldn't judge (PICTURE_DECLINED)."""
+    n = len(labels)
+    shown = ", ".join(f'"{x}"' for x in labels[:5]) + (f" and {n - 5} more" if n > 5 else "")
+    return PICTURE_DECLINED.format(model=short_model(model or picture_model()),
+                                   count="1 picture" if n == 1 else f"{n} pictures", pictures=shown,
+                                   they="it keeps" if n == 1 else "they keep")
 
 
 def check_pictures(name: str, assets: list) -> dict:
-    """Ask about each picture on a card (cached by its file). Returns
-    {"verdict": "ok" | "minor" | "declined" | "unavailable", "checked":
-    [ids that passed], "picture": the label of the one that failed,
-    "reason"}. A picture the check can't read is left out of "checked"
-    (it keeps the filter). At most PICTURE_LIMIT pictures not judged before
-    are asked about per call, the newest first; the rest keep the filter
-    until the next call."""
+    """Ask the picture model about each picture on a card (cached by its
+    file). Returns {"verdict": "ok" | "minor" | "unavailable", "checked":
+    [ids judged adult], "declined": [{"id", "picture"}: pictures the model
+    wouldn't judge], "picture": the label of the one that failed, "id": its
+    id, "reason"}.
+
+    - "minor": a picture looks under 18 (the first found; "checked" and
+      "declined" are empty: nothing is covered).
+    - "unavailable": the model couldn't answer for at least one picture;
+      "checked" and "declined" still say what it did answer.
+    - A decline isn't a no and isn't remembered: that picture is left out
+      of "checked" (it keeps the filter) and listed in "declined"; a later
+      check asks again.
+    - A picture that can't be read is left out of "checked" (it keeps the
+      filter).
+    At most PICTURE_LIMIT pictures not judged before are asked about per
+    call, the newest first; the rest keep the filter until the next call."""
     from concurrent.futures import ThreadPoolExecutor
 
     checked: list[int] = []
+    declined: list[dict] = []
     asks = []
     for a in sorted(assets, key=lambda a: a.id, reverse=True):
-        hit = cached(picture_hash(a))
+        hit = cached(picture_hash(a), judge=_picture_identity)
         if hit == "ok":
             checked.append(int(a.id))
         elif hit == "minor_sexual":
-            return {"verdict": "minor", "checked": [], "picture": _picture_label(a),
-                    "reason": _reason(picture_hash(a))}
+            return {"verdict": "minor", "checked": [], "declined": [], "picture": picture_label(a),
+                    "id": int(a.id), "reason": _reason(picture_hash(a))}
         else:
             asks.append(a)
     asks = asks[:PICTURE_LIMIT]
@@ -761,22 +871,27 @@ def check_pictures(name: str, assets: list) -> dict:
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(pool.map(one, asks))
-    worst: Optional[dict] = None
+    unavailable: Optional[dict] = None
     for a, out, err in results:
         if out is not None:
             minor, reason, judge = out
             _store(picture_hash(a), "minor_sexual" if minor else "ok", judge, reason)
             if minor:
                 log.warning("safety check refused a Cast picture (asset %s): %s", a.id, reason[:200])
-                return {"verdict": "minor", "checked": [], "picture": _picture_label(a), "reason": reason}
+                return {"verdict": "minor", "checked": [], "declined": [], "picture": picture_label(a),
+                        "id": int(a.id), "reason": reason}
             checked.append(int(a.id))
         elif isinstance(err, CheckDeclined):
-            worst = {"verdict": "declined", "checked": [], "picture": _picture_label(a), "reason": ""}
-        elif str(err) == "the picture can't be read":
+            # Not remembered: asked again next time. It keeps the filter.
+            log.warning("the picture check declined a Cast picture (asset %s): it keeps the filter", a.id)
+            declined.append({"id": int(a.id), "picture": picture_label(a)})
+        elif str(err) == UNREADABLE:
             log.info("Cast picture %s can't be read: left out of the tick", a.id)
-        elif worst is None:
-            log.warning("safety check unavailable for a Cast picture (%s)", err)
-            worst = {"verdict": "unavailable", "checked": [], "picture": _picture_label(a), "reason": ""}
-    if worst is not None:
-        return worst
-    return {"verdict": "ok", "checked": sorted(checked), "picture": "", "reason": ""}
+        elif unavailable is None:
+            log.warning("picture check unavailable for a Cast picture (%s)", err)
+            unavailable = {"picture": picture_label(a), "id": int(a.id)}
+    out = {"verdict": "ok", "checked": sorted(checked), "declined": sorted(declined, key=lambda d: d["id"]),
+           "picture": "", "id": None, "reason": ""}
+    if unavailable is not None:
+        out.update(verdict="unavailable", **unavailable)
+    return out

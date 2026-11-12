@@ -78,6 +78,13 @@ class Settings(BaseSettings):
     adult_mode: bool = False
     adult_text_model: str = "deepseek/deepseek-v4-flash"
     adult_text_fallback_model: str = "deepseek/deepseek-v4-pro"
+    # The Cast picture check (services/minor_check.py, check_pictures): before
+    # a character is ticked "Adult content allowed", and when a picture is
+    # added to a ticked card, a small copy of each picture goes to this model
+    # through OpenRouter, which says whether anyone in it looks under 18. It
+    # must take images (DeepSeek V4.1 Flash does; ADULT_TEXT_MODEL is
+    # text-only). The card's text is still judged by the planner.
+    character_picture_check_model: str = "deepseek/deepseek-v4.1-flash"
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
     # Studio picture operations (Settings → Models: "Remove background",

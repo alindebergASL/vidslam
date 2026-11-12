@@ -2698,6 +2698,11 @@ def save_studio_result_as_asset(
     job.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(asset)
+    if kind == "avatar":
+        from . import cast_pictures
+
+        # A ticked character's new picture is checked off this request.
+        cast_pictures.picture_added(oid, asset)
     return asset
 
 
