@@ -46,7 +46,8 @@ class KeySpec:
     # once a key is set: a provider the user adds later).
     default_enabled: Optional[bool] = True
     # Per-provider switches shown on its row: option name -> config.Settings
-    # field holding the default (e.g. Runware's content check).
+    # field holding the default (Runware's content check, Sogni's safe
+    # filter). Both only apply in adult mode: outside it they're always on.
     options: tuple[tuple[str, str], ...] = ()
 
 
@@ -67,7 +68,8 @@ KEYS: dict[str, KeySpec] = {
                 "https://replicate.com/account/api-tokens", default_enabled=None),
         KeySpec("sogni", "Sogni", "SOGNI_API_KEY", "sogni_api_key",
                 "Sogni image and video models (sogni/…)",
-                "https://dashboard.sogni.ai/api-keys"),
+                "https://dashboard.sogni.ai/api-keys",
+                options=(("safe_filter", "sogni_safe_content_filter"),)),
         KeySpec("runware", "Runware", "RUNWARE_API_KEY", "runware_api_key",
                 "Runware image and video models (runware/…), incl. uncensored open models",
                 "https://my.runware.ai/keys", default_enabled=None,

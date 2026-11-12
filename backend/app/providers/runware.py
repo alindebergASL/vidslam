@@ -17,10 +17,17 @@ Never resend a task that may have run: after a 5xx or a timeout the client
 asks getResponse about the same taskUUID instead (a resend is a second paid
 generation). 429/503 mean the task didn't run and are retried.
 
-Content: Runware's own check (safety.checkContent) is off unless switched on
-in Settings or the request carries a Cast member's picture. Prompts involving
-minors are refused before anything is sent (services/safety.check_prompt).
-Vendor models (Google, Kling, Alibaba Wan, ...) stay moderated by their vendor.
+Content: Runware's own check (safety.checkContent) is always on while adult
+mode is off. In adult mode it follows the box on Runware's row in Settings →
+API keys (default RUNWARE_CHECK_CONTENT), and it is still forced on for a
+picture of a Cast character not ticked "Adult content allowed", a prompt that
+mentions a child or a minor's age, and a sexual prompt whose avoid list
+steers young (_content_check, _pictures_need_check). Prompts involving minors
+are refused before anything is sent (services/safety.check_prompt). In adult
+mode, vendor safety settings are loosened only where a model's schema offers
+them (_PERMISSIVE; none of the curated models does). Vendor models (Google,
+Kling, Alibaba Wan, ...) stay moderated by their vendor. A content refusal is
+final (RunwareError.refused): no other model is tried in its place.
 """
 from __future__ import annotations
 
@@ -583,6 +590,21 @@ _QUIET = (
     (("settings", "promptExpansion"), False), (("providerSettings", "alibaba", "promptExtend"), False),
 )
 # Vendor safety knobs at their most permissive (the vendor still moderates).
+# Set only in adult mode, and only where the model's published schema has
+# the field and allows the value (_put): a model that doesn't document one
+# never gets it. Runware's public docs, checked 2026-11-12:
+# - providerSettings.bfl.safetyTolerance is on BFL's own models, e.g.
+#   https://runware.ai/docs/models/bfl-flux-1-1-pro (0-6) and
+#   https://runware.ai/docs/models/bfl-flux-2-pro (0-5).
+# - settings.moderation ("auto" or "low") is on OpenAI's, e.g.
+#   https://runware.ai/docs/models/openai-gpt-image-2-6-sunburst.
+# - settings.safetyTolerance on https://runware.ai/docs/models/google-nano-banana-2-1
+#   is a word ("high" ... "off"), not a number, so "max" isn't sent there.
+# - settings.safetyFilter: not found on any model checked.
+# None of the curated generation models documents any of them: each schema
+# (https://runware.ai/docs/models/<id>/schema.json, ids in runware_models.json)
+# has only safety.checkContent (and safety.mode on video). So they never get
+# these (tests/test_runware_vendor_knobs.py).
 _PERMISSIVE = (
     (("providerSettings", "bfl", "safetyTolerance"), "max"), (("settings", "safetyTolerance"), "max"),
     (("settings", "moderation"), "low"), (("settings", "safetyFilter"), False),
@@ -772,10 +794,12 @@ def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str
         # allowed", in adult mode), or any picture with a sexual prompt
         # (in adult mode only when the minors rules want the check), never
         # goes out without the check.
+        # Refused (final): another model in a fallback chain must not get it either.
         if cast:
-            raise RunwareError(f"{model_air} has no content check, so it can't be sent pictures of your Cast")
+            raise RunwareError(f"{model_air} has no content check, so it can't be sent pictures of your Cast",
+                               refused=True, final=True)
         raise RunwareError(f"{model_air} has no content check, so it can't be sent a picture with a "
-                           "sexual prompt; remove the picture or pick another model")
+                           "sexual prompt; remove the picture or pick another model", refused=True, final=True)
     quiet = copy.deepcopy(task)
     for path, value in _QUIET:
         _put(quiet, props, path, value)
