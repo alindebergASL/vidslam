@@ -378,10 +378,19 @@ class VoiceoverPreviewOut(BaseModel):
     duration_seconds: float
     video_seconds: float
     difference_seconds: float
-    fit: Literal["fits", "too_long", "too_short"]
+    # "no_plan": no storyboard yet, so there are no shots to fit.
+    fit: Literal["fits", "too_long", "too_short", "no_plan"]
     fit_text: str
     # Seconds of the voice's end the video would cut off (0.0: none).
     cut_seconds: float = 0.0
+    # What a Re-compose with the current clips does, set only when it
+    # differs from the fit above (which is what Generate video does).
+    recompose_fit: Optional[Literal["fits", "too_long", "too_short"]] = None
+    recompose_fit_text: str = ""
+    recompose_video_seconds: Optional[float] = None
+    recompose_cut_seconds: Optional[float] = None
+    # Both in one plain sentence ("" when they agree).
+    recompose_note: str = ""
     cost_estimate: float
     # POST only: true when an identical voiceover existed, so nothing was paid.
     reused: bool = False
@@ -394,10 +403,19 @@ class VoiceoverFitOut(BaseModel):
     duration_seconds: float
     video_seconds: float
     difference_seconds: float
-    fit: Literal["fits", "too_long", "too_short"]
+    # "no_plan": no storyboard yet, so there are no shots to fit.
+    fit: Literal["fits", "too_long", "too_short", "no_plan"]
     fit_text: str
     # Seconds of the voice's end the video would cut off (0.0: none).
     cut_seconds: float = 0.0
+    # What a Re-compose with the current clips does, set only when it
+    # differs from the fit above (which is what Generate video does).
+    recompose_fit: Optional[Literal["fits", "too_long", "too_short"]] = None
+    recompose_fit_text: str = ""
+    recompose_video_seconds: Optional[float] = None
+    recompose_cut_seconds: Optional[float] = None
+    # Both in one plain sentence ("" when they agree).
+    recompose_note: str = ""
 
 
 class RenderOut(BaseModel):

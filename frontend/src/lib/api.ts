@@ -322,10 +322,18 @@ export type VoiceoverPreview = {
   duration_seconds: number;
   video_seconds: number;
   difference_seconds: number;
-  fit: "fits" | "too_long" | "too_short";
+  /** "no_plan": no storyboard yet, so there are no shots to fit. */
+  fit: "fits" | "too_long" | "too_short" | "no_plan";
   fit_text: string;
   /** Seconds of the voice's end the video would cut off (0: none). */
   cut_seconds: number;
+  /** What a Re-compose with the current clips does, set only when it differs from Generate video. */
+  recompose_fit?: "fits" | "too_long" | "too_short" | null;
+  recompose_fit_text?: string;
+  recompose_video_seconds?: number | null;
+  recompose_cut_seconds?: number | null;
+  /** Both in one plain sentence ("" when they agree). */
+  recompose_note?: string;
   cost_estimate: number;
   /** POST only: an identical voiceover already existed, so nothing was paid. */
   reused: boolean;
@@ -366,10 +374,18 @@ export type VoiceoverFit = {
   duration_seconds: number;
   video_seconds: number;
   difference_seconds: number;
-  fit: "fits" | "too_long" | "too_short";
+  /** "no_plan": no storyboard yet, so there are no shots to fit. */
+  fit: "fits" | "too_long" | "too_short" | "no_plan";
   fit_text: string;
   /** Seconds of the voice's end the video would cut off (0: none). */
   cut_seconds: number;
+  /** What a Re-compose with the current clips does, set only when it differs from Generate video. */
+  recompose_fit?: "fits" | "too_long" | "too_short" | null;
+  recompose_fit_text?: string;
+  recompose_video_seconds?: number | null;
+  recompose_cut_seconds?: number | null;
+  /** Both in one plain sentence ("" when they agree). */
+  recompose_note?: string;
 };
 
 export type Render = {

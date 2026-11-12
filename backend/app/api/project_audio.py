@@ -99,6 +99,15 @@ def delete_voiceover(project_id: int, db: Session = Depends(get_db)) -> models.V
     return project
 
 
+_FIT_KEYS = ("video_seconds", "difference_seconds", "fit", "fit_text", "cut_seconds", "recompose_fit",
+             "recompose_fit_text", "recompose_video_seconds", "recompose_cut_seconds", "recompose_note")
+
+
+def _fit_out(fit: dict) -> dict:
+    """pipeline.voiceover_fit's result as the API's fit fields."""
+    return {"duration_seconds": fit["audio_seconds"], **{k: fit[k] for k in _FIT_KEYS}}
+
+
 @router.get("/projects/{project_id}/voiceover/fit", response_model=VoiceoverFitOut)
 def uploaded_voiceover_fit(project_id: int, db: Session = Depends(get_db)) -> dict:
     """The uploaded voiceover's length against the shots, in plain words:
@@ -113,9 +122,7 @@ def uploaded_voiceover_fit(project_id: int, db: Session = Depends(get_db)) -> di
     if not path.is_file():
         raise HTTPException(404, "voiceover file missing")
     fit = pipeline.voiceover_fit(project, float(_probe_duration(path) or 0.0))
-    return {"duration_seconds": fit["audio_seconds"], "video_seconds": fit["video_seconds"],
-            "difference_seconds": fit["difference_seconds"], "fit": fit["fit"],
-            "fit_text": fit["fit_text"], "cut_seconds": fit["cut_seconds"]}
+    return _fit_out(fit)
 
 
 @router.get("/projects/{project_id}/voiceover")
@@ -212,12 +219,7 @@ def _preview_out(db: Session, project: models.VideoProject, info: dict, *, reuse
         "source": info.get("source", "preview"),
         "fingerprint": fp,
         "current": bool(info.get("current")),
-        "duration_seconds": fit["audio_seconds"],
-        "video_seconds": fit["video_seconds"],
-        "difference_seconds": fit["difference_seconds"],
-        "fit": fit["fit"],
-        "fit_text": fit["fit_text"],
-        "cut_seconds": fit["cut_seconds"],
+        **_fit_out(fit),
         "cost_estimate": float(info.get("cost_estimate") or 0.0),
         "reused": reused,
         "created_at": info.get("created_at"),
