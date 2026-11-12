@@ -33,7 +33,11 @@ export function GenerationProgress({
   onRetry?: () => void;
 }) {
   const failed = render.status === "failed";
-  const current = stageIndex(render.status);
+  // An expired render did finish; the retention policy removed its files later.
+  // Show it as finished, not as still planning.
+  const expired = render.status === "expired";
+  const finished = render.status === "completed" || expired;
+  const current = expired ? STAGES.length - 1 : stageIndex(render.status);
   const toast = useToast();
   const [retrying, setRetrying] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -110,6 +114,8 @@ export function GenerationProgress({
             ? "Generation failed"
             : cancelled
             ? "Generation cancelled"
+            : expired
+            ? "Render expired"
             : render.status === "completed"
             ? "Generation complete"
             : "Generating…"}
@@ -136,9 +142,9 @@ export function GenerationProgress({
       <div className="flex items-center gap-1">
         {STAGES.map((stage, i) => {
           const isDone = !failed && i < current;
-          const isCurrent = !failed && i === current && render.status !== "completed";
-          const isComplete = render.status === "completed" && i === STAGES.length - 1;
-          const reached = isDone || isCurrent || isComplete || (render.status === "completed" && i < current);
+          const isCurrent = !failed && i === current && !finished;
+          const isComplete = finished && i === STAGES.length - 1;
+          const reached = isDone || isCurrent || isComplete || (finished && i < current);
           const isFailedHere = failed && i === current;
           return (
             <div key={stage.label} className="flex-1">
@@ -146,7 +152,7 @@ export function GenerationProgress({
                 className={`h-1.5 rounded-full transition-colors ${
                   isFailedHere
                     ? "bg-red-500"
-                    : reached || render.status === "completed"
+                    : reached || finished
                     ? "grad"
                     : "bg-ink-700"
                 } ${isCurrent ? "animate-pulse" : ""}`}
@@ -154,7 +160,7 @@ export function GenerationProgress({
               <div className="mt-2">
                 <div
                   className={`text-xs font-medium ${
-                    isCurrent ? "text-accent" : reached || render.status === "completed" ? "text-ink-100" : "text-ink-400"
+                    isCurrent ? "text-accent" : reached || finished ? "text-ink-100" : "text-ink-400"
                   }`}
                 >
                   {stage.label}
@@ -185,6 +191,12 @@ export function GenerationProgress({
             />
           ))}
         </div>
+      )}
+
+      {expired && (
+        <p className="mt-3 text-xs text-ink-300">
+          This render expired (its files were removed by the retention policy).
+        </p>
       )}
 
       {(failed || cancelled) && (

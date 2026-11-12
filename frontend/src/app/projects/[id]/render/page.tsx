@@ -172,6 +172,10 @@ function Inner() {
 
       {!render ? (
         <div className="card p-6 text-ink-300">No render yet.</div>
+      ) : render.status === "expired" ? (
+        <div className="card p-6 text-ink-300">
+          This render expired (its files were removed by the retention policy).
+        </div>
       ) : render.status !== "completed" && render.hook_variant_id ? (
         // Another opening (hook lab) has its own progress there.
         <div className="card p-6 text-sm text-ink-200 space-y-3">

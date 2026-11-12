@@ -83,6 +83,8 @@ def test_provider_status_endpoint(auth_client):
         # Both default to the mock training provider in tests.
         "training_lora": "mock",
         "training_voice": "mock",
+        # Nothing is waiting on a missing key in mock mode.
+        "needs_key": [],
     }
 
 

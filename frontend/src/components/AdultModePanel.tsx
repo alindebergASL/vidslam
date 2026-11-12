@@ -120,6 +120,11 @@ export function AdultModePanel() {
                 you turn them on); vendor safety knobs are at their loosest. Vendor models (Google, Kling, Wan…)
                 stay moderated by their vendor.
               </li>
+              <li>
+                Every picture on the card of a Cast character ticked &ldquo;Adult content allowed&rdquo; follows
+                these settings like any other picture, however it was made (uploaded, made in Studio, upscaled or
+                cut out).
+              </li>
             </>
           ) : (
             <>
@@ -131,9 +136,10 @@ export function AdultModePanel() {
             </>
           )}
           <li>
-            Always: prompts that sexualise minors are refused. Pictures of your Cast are checked, except adult
-            characters you mark &ldquo;Adult content allowed&rdquo; in Cast, while Adult mode is on and only when
-            every picture in the request is of a marked character.
+            Always: prompts that sexualise minors are refused. Sogni&rsquo;s safe filter and Runware&rsquo;s
+            content check are on for a prompt that mentions a child, and for pictures of Cast characters that
+            aren&rsquo;t ticked &ldquo;Adult content allowed&rdquo; (also when upscaled, cut out or used as an
+            ambient scene&rsquo;s picture).
           </li>
         </ul>
       )}

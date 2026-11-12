@@ -12,8 +12,11 @@ Off (the default):
 - Runware's content check and Sogni's safe filter are on, and vendor safety
   knobs stay at the vendor's defaults.
 
-In both: prompts sexualising minors are refused (services/safety.py), and
-Runware always checks requests carrying a Cast member's picture.
+In both: prompts sexualising minors are refused (services/safety.py), and a
+picture of a Cast character keeps Sogni's safe filter and Runware's content
+check on, unless adult mode is on and the character is marked "adult
+content allowed" (then every picture on its card skips them, however it
+was made).
 """
 from __future__ import annotations
 
@@ -70,8 +73,9 @@ def text_model() -> str:
 
 
 # Cast characters marked "adult content allowed": an adult (18+), fictional
-# or a real adult who consented. Their pictures skip the forced content
-# filter in adult mode (pipeline._exempt_asset decides which pictures count).
+# or a real adult who consented. In adult mode every picture on their card
+# (not a logo) skips the forced content filter, however it was made
+# (pipeline._exempt_asset).
 # One row per character, so marking two at once can't overwrite each other.
 ADULT_OK_PREFIX = "content.adult_ok.avatar."  # + id → {"enabled": true, "at": iso}
 
@@ -120,6 +124,14 @@ def exempt(ref) -> bool:  # noqa: ANN001 — ImageRef
     """A picture that skips the forced content filter: a Cast character
     marked "adult content allowed", while adult mode is on."""
     return bool(getattr(ref, "adult_ok", False)) and adult_mode()
+
+
+def forces_filter(ref) -> bool:  # noqa: ANN001 — ImageRef
+    """A picture that turns the content filter on: a Cast character's
+    picture (role "character", or `cast_picture` for one sent as a scene or
+    a frame) that isn't exempt."""
+    cast = getattr(ref, "role", "") == "character" or bool(getattr(ref, "cast_picture", False))
+    return cast and not exempt(ref)
 
 
 def set_adult_mode(value: Optional[bool]) -> dict:

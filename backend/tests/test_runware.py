@@ -697,3 +697,17 @@ def test_models_the_app_cannot_drive_are_not_offered(client, live):
     ids = {e["id"] for e in runware.catalog_entries(True)}
     assert not ids & {f"runware/{a}" for a in b["unusable"]}
     assert all(f"runware/{a}" in ids for a in b["curated"])
+
+
+def test_the_snapshot_script_keeps_every_bundled_curated_model():
+    """Re-running scripts/runware_snapshot.py must not drop a curated model
+    (or a picture-operation default) from the bundle."""
+    from app.config import Settings
+    from app.providers import runware
+    from scripts.runware_snapshot import CURATED
+
+    b = runware.bundle()
+    defaults = (Settings.model_fields["bg_removal_model"].default, Settings.model_fields["upscale_model"].default)
+    assert [a for a in b["curated"] if a not in CURATED] == []
+    for model in (*defaults, *(f"runware/{a}" for a in runware._OP_NOTES)):
+        assert runware.air(model) in CURATED, model
