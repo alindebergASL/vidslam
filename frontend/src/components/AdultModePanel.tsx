@@ -13,8 +13,9 @@ function shortModel(id: string): string {
 /**
  * Settings → Adult content: one switch. On, text work (storyboard planning,
  * ✨ Enhance, ambient scene rewrites) uses the adult text model and the
- * picture/video filters follow their own settings; off, the planner and the
- * filters on. Other panels listen for "content-mode-changed".
+ * picture/video filters follow their switches in Settings → API keys; off,
+ * the planner and the filters on. Also says where prompts are sent. Other
+ * panels listen for "content-mode-changed".
  */
 export function AdultModePanel() {
   const toast = useToast();
@@ -44,7 +45,9 @@ export function AdultModePanel() {
       !window.confirm(
         `Turn on Adult mode? Storyboard planning, ✨ Enhance and scene rewrites move to ${shortModel(
           mode.text_model
-        )}, and Runware's content check and Sogni's safe filter follow their own settings (off unless you turn them on). Prompts that sexualise minors are always refused.`
+        )}, and Runware's content check and Sogni's safe filter follow their switches in Settings → API keys. Each new picture, clip and lip-sync prompt is first sent to ${
+          shortModel(mode.safety_check?.model || mode.planner) || "the planner"
+        } for a safety check. Prompts that sexualise minors are always refused.`
       )
     )
       return;
@@ -117,9 +120,12 @@ export function AdultModePanel() {
                 rewrites adult prompts instead of refusing them.
               </li>
               <li>
-                Runware&rsquo;s content check and Sogni&rsquo;s safe filter follow their own settings (off unless
-                you turn them on); vendor safety knobs are at their loosest. Vendor models (Google, Kling, Wan…)
-                stay moderated by their vendor.
+                Runware&rsquo;s content check and Sogni&rsquo;s safe filter follow their switches in{" "}
+                <a href="/settings#keys" className="underline">
+                  Settings → API keys
+                </a>
+                . Runware&rsquo;s vendor safety settings are loosened where a model offers them. Vendor models
+                (Google, Kling, Wan…) stay moderated by their vendor.
               </li>
               <li>
                 Every picture on the card of a Cast character ticked &ldquo;Adult content allowed&rdquo; follows
@@ -145,6 +151,8 @@ export function AdultModePanel() {
         </ul>
       )}
 
+      {mode && <WhereTextGoes mode={mode} />}
+
       {mode?.safety_check && (
         <p className="mt-3 text-xs text-ink-300" data-testid="safety-check-line">
           {mode.safety_check.available ? (
@@ -166,6 +174,48 @@ export function AdultModePanel() {
       )}
       <SafetyMemory />
     </section>
+  );
+}
+
+/** Where prompts and scripts are sent, in this mode. Short and factual:
+ * the safety check (the planner) and the text model run through OpenRouter. */
+function WhereTextGoes({ mode }: { mode: ContentMode }) {
+  const checker = shortModel(mode.safety_check?.model || mode.planner) || "the planner";
+  return (
+    <div className="mt-3" data-testid="where-text-goes">
+      <h3 className="text-xs font-medium text-ink-200">Where your text goes</h3>
+      <ul className="mt-1 space-y-1 text-xs text-ink-300 list-disc pl-5">
+        {mode.adult ? (
+          <>
+            <li>
+              Safety check: each new picture, clip and lip-sync prompt (with its avoid list) goes to{" "}
+              <b>{checker}</b> (the planner from Settings → Models) through OpenRouter. So does any sexual voiceover
+              script.
+            </li>
+            <li>
+              Storyboard planning, ✨ Enhance and scene rewrites go to <b>{shortModel(mode.text_model)}</b> through
+              OpenRouter. If it declines, Enhance asks a second adult text model.
+            </li>
+          </>
+        ) : (
+          <>
+            <li>
+              Storyboard planning, ✨ Enhance and scene rewrites go to the planner (<b>{shortModel(mode.planner)}</b>)
+              through OpenRouter.
+            </li>
+            <li>
+              Safety check: prompts that look risky (plainly sexual, or mentioning a child) and sexual voiceover
+              scripts go to <b>{checker}</b> through OpenRouter.
+            </li>
+          </>
+        )}
+        <li>Prompts, scripts and pictures go to the picture, video, lip-sync or voice provider you pick.</li>
+        <li>
+          The safety check&rsquo;s verdicts stay in this app&rsquo;s database: a fingerprint of the text (not the
+          text itself), the verdict, its reason and which model gave it.
+        </li>
+      </ul>
+    </div>
   );
 }
 

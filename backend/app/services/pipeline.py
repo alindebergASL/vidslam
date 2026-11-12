@@ -21,6 +21,7 @@ from ..providers import (
     uses_webhooks,
 )
 from ..providers.base import CastContext, ImageRef
+from ..providers.refusals import ContentRefused, is_content_refusal, is_refusal_text
 from ..schemas.storyboard import StoryboardPlan
 from . import alerts, events, fingerprints, render_files, storage, takes
 from .captions import CaptionTiming, chunks_to_timed
@@ -713,8 +714,14 @@ def on_shot_clip_failed(db: Session, job: models.VideoJob) -> None:
         # failed late by the sweeper): its newer clip stands.
         return
     project = db.get(models.VideoProject, job.project_id)
-    if job.purpose == "avatar" and project is not None:
-        # Lip-sync failed → fall back to the regular video model for this shot.
+    error = job.error or ""
+    if job.purpose == "avatar" and project is not None and is_refusal_text(error):
+        # Refused for its content: the video model doesn't get it instead
+        # (it may have no filter). The shot fails, like any other refusal.
+        error = lipsync_refused_message(error)
+    elif job.purpose == "avatar" and project is not None:
+        # Lip-sync failed (an outage, a timeout…) → fall back to the
+        # regular video model for this shot.
         shot.error = f"lip-sync failed, used video model instead: {job.error[:300]}"
         db.commit()
         _log_provider_call(db, project_id=project.id, provider="avatar", endpoint="avatar.submit",
@@ -728,11 +735,11 @@ def on_shot_clip_failed(db: Session, job: models.VideoJob) -> None:
             _after_shot(db, job)
         return
     shot.status = "failed"
-    shot.error = job.error[:500]
+    shot.error = error[:500]
     db.commit()
     _log_provider_call(db, project_id=job.project_id, provider=job.provider or "video",
                        endpoint="video.job", request_summary={"shot": shot.id, "job": job.id},
-                       response_summary={"error": job.error[:500]}, status="error")
+                       response_summary={"error": (job.error or "")[:500]}, status="error")
     _after_shot(db, job)
 
 
@@ -875,7 +882,13 @@ def submit_talking_head(
     the submit itself fails, a note to keep on the shot. Anything but True
     means the caller uses the regular video model.
     If the avatar job later fails, on_shot_clip_failed falls back to the
-    regular video model for this shot."""
+    regular video model for this shot.
+
+    A refusal is never worked around with the video model: the app's
+    minors refusal raises UnsafeScriptError, and a lip-sync provider
+    refusing the shot for its content marks the shot failed and raises
+    ContentRefused (on_shot_clip_failed does the same for a job refused
+    later)."""
     from ..providers import get_avatar
     from . import public_media, video_jobs
     from .renderer import slice_audio
@@ -935,10 +948,31 @@ def submit_talking_head(
         db.rollback()
         raise
     except Exception as e:  # noqa: BLE001 — submit failed: use the video model
-        log.warning("talking-head submit failed for shot %s, falling back: %s", shot.id, e)
         db.rollback()
+        if is_content_refusal(e):
+            # Refused for its content by the lip-sync provider: never redone
+            # on the video model (it may have no filter). The shot fails.
+            msg = lipsync_refused_message(str(e))
+            log.warning("talking-head shot %s refused for its content: %s", shot.id, e)
+            shot = db.get(models.VideoShot, shot.id)
+            shot.status = "failed"
+            shot.error = msg
+            db.commit()
+            _log_provider_call(db, project_id=project.id, provider="avatar", endpoint="avatar.submit",
+                               request_summary={"shot": shot.id}, response_summary={"error": str(e)[:500],
+                                                                                    "refused": True},
+                               status="error")
+            raise ContentRefused(msg) from e
+        log.warning("talking-head submit failed for shot %s, falling back: %s", shot.id, e)
         return f"lip-sync failed, used video model instead: {str(e)[:300]}"
     return True
+
+
+def lipsync_refused_message(error: str) -> str:
+    """The shot's error when the lip-sync provider refused it for its content."""
+    why = str(error or "").removeprefix("submit failed: ").strip()
+    return ("The lip-sync provider refused this shot for its content, so it wasn't made "
+            f"(and wasn't redone on the video model): {why[:300]}")
 
 
 def _talking_head_script(project: models.VideoProject, shot: models.VideoShot, plan: StoryboardPlan) -> str:

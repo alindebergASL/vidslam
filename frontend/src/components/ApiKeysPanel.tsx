@@ -21,6 +21,27 @@ const SOURCE_CHIP: Record<ApiKeyStatus["source"], { text: string; cls: string }>
   unreadable: { text: "Unreadable — re-enter", cls: "border-red-500/40 bg-red-500/10 text-red-300" },
 };
 
+/** Each provider's own content switch, shown on its row. Both only apply
+ * while Adult mode is on: off, they're always on. */
+const CONTENT_OPTIONS: { key: string; name: string; offText: string; onSaved: string; offSaved: string }[] = [
+  {
+    key: "check_content",
+    name: "content check",
+    offText:
+      "Off = uncensored output on the open models Runware hosts; vendor models (Google, Kling, Wan…) stay moderated by their vendor.",
+    onSaved: "content check is on: its open models are moderated too.",
+    offSaved: "content check is off: its open models are uncensored (minors are always refused).",
+  },
+  {
+    key: "safe_filter",
+    name: "safe filter",
+    offText:
+      "Off = no filter on Sogni's own models; vendor models (GPT Image, Seedance, Wan…) stay moderated by their vendor.",
+    onSaved: "safe filter is on: its own models are filtered too.",
+    offSaved: "safe filter is off: its own models are unfiltered (minors are always refused).",
+  },
+];
+
 function when(iso: string | null): string {
   if (!iso) return "";
   const d = new Date(iso);
@@ -102,7 +123,7 @@ function KeyRow({
 }: {
   row: ApiKeyStatus;
   onChange: (r: ApiKeyStatus) => void;
-  /** Adult mode (null: unknown). Off forces the content check on. */
+  /** Adult mode (null: unknown). Off forces the content check and safe filter on. */
   adult: boolean | null;
 }) {
   const uid = useId();
@@ -208,17 +229,18 @@ function KeyRow({
     }
   };
 
+  const contentOption = row.options ? CONTENT_OPTIONS.find((o) => o.key in row.options!) : undefined;
+
   const setCheck = async (value: boolean) => {
+    if (!contentOption) return;
     setBusy("option");
     setMessage(null);
     try {
-      const updated = await api.setProviderOptions(row.name, { check_content: value });
+      const updated = await api.setProviderOptions(row.name, { [contentOption.key]: value });
       onChange(updated);
       setMessage({
         ok: true,
-        text: value
-          ? `${row.label} content check is on: its open models are moderated too.`
-          : `${row.label} content check is off: its open models are uncensored (minors are always refused).`,
+        text: `${row.label} ${value ? contentOption.onSaved : contentOption.offSaved}`,
       });
     } catch (err: any) {
       setMessage({ ok: false, text: err.message || "Couldn't change the setting." });
@@ -270,26 +292,21 @@ function KeyRow({
           )}
         </div>
       </div>
-      {row.options && "check_content" in row.options && (
+      {row.options && contentOption && (
         <label className="mt-2 flex items-start gap-2 text-[11px] text-ink-300">
           <input
             type="checkbox"
             className="mt-0.5"
-            checked={adult === false || !!row.options.check_content}
+            checked={adult === false || !!row.options[contentOption.key]}
             disabled={busy !== null || adult === false}
             onChange={(e) => setCheck(e.target.checked)}
           />
           <span>
-            {row.label} content check{busy === "option" ? " …" : ""}.{" "}
-            {adult === false ? (
-              <>Always on while Adult mode is off (Settings → Adult content).</>
-            ) : (
-              <>
-                Off = uncensored output on the open models {row.label} hosts; vendor models (Google, Kling, Wan…)
-                stay moderated by their vendor.
-              </>
-            )}{" "}
-            Prompts involving minors are always refused, and pictures of your Cast are always checked.
+            {row.label} {contentOption.name}
+            {busy === "option" ? " …" : ""}.{" "}
+            {adult === false ? <>Always on while Adult mode is off (Settings → Adult content).</> : contentOption.offText}{" "}
+            Prompts involving minors are always refused. It stays on for a prompt that mentions a child, and for
+            pictures of Cast characters not ticked &ldquo;Adult content allowed&rdquo;.
           </span>
         </label>
       )}

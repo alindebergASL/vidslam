@@ -133,7 +133,9 @@ class _FlakyImages:
     def generate(self, *, model, prompt, references, negative_prompt="", settings=None):
         self.calls.append((model, settings or {}))
         if model == self.fail_model:
-            raise httpx.HTTPStatusError("moderation", request=None, response=None)  # type: ignore[arg-type]
+            # An outage: a content refusal never falls back (test_refusal_fallbacks.py).
+            raise httpx.HTTPStatusError("OpenRouter image 503: Service Unavailable",  # type: ignore[arg-type]
+                                        request=None, response=None)
         return b"\x89PNG-from-" + model.encode()
 
 

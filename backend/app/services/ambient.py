@@ -732,8 +732,14 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
                    endpoint: str = "image.generate(still)",
                    summary: Optional[dict] = None) -> tuple[bytes, str]:
     """One still for this scene, at the model's best settings. If the
-    primary model fails (an error, a timeout, a refused prompt), retry once
+    primary model fails (an outage, a timeout, another error), retry once
     with the fallback model. Returns (image bytes, model used).
+
+    A refusal for content is final for this still, never retried on
+    another model: the app's minors refusal, a Sogni safety pause, a
+    Runware content refusal, or a vendor's moderation saying no
+    (providers/refusals.is_content_refusal). The next model may have no
+    filter at all (the default fallback is an OpenRouter model).
 
     With `references` (Day to night's "same place"), `prompt` is the full
     still prompt and `edit_prompt` an instruction to change only the light
@@ -762,14 +768,20 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
             png = image.generate(model=model, prompt=call_prompt, references=(references or []) if with_refs else [],
                                  negative_prompt=negative_prompt, settings=settings)
         except Exception as e:  # noqa: BLE001 — try the fallback model
+            from ..providers.refusals import is_content_refusal
             from .safety import UnsafeScriptError
 
             if isinstance(e, UnsafeScriptError):
                 raise  # refused for minors: no other model gets it either
-            last = e
-            log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
-            if isinstance(e, _ProviderUnavailable):
-                continue  # switched off in Settings: a refusal, not a provider error
+            refused = is_content_refusal(e)
+            if not refused:
+                last = e
+                log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
+                if isinstance(e, _ProviderUnavailable):
+                    continue  # switched off in Settings: a refusal, not a provider error
+            else:
+                log.warning("still with %s refused for its content (%s); not trying another model",
+                            model, str(e)[:300])
             # Recorded (status=error) so the provider-error alerts see it.
             route = getattr(image, "last_route", None)
             _log_provider_call(db, project_id=project_id,
@@ -777,7 +789,12 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
                                endpoint=endpoint,
                                request_summary={"model": model, "reference": with_refs, **(summary or {}),
                                                 **({"edit_model": route.model.selector} if route else {})},
-                               response_summary={"error": str(e)[:500]}, status="error")
+                               response_summary={"error": str(e)[:500], **({"refused": True} if refused else {})},
+                               status="error")
+            if refused:
+                # Refused for its content (a safety pause, a vendor's
+                # moderation): no other model gets it either.
+                raise
             continue
         route = getattr(image, "last_route", None)
         _log_provider_call(db, project_id=project_id, provider=_pname(image), endpoint=endpoint,
