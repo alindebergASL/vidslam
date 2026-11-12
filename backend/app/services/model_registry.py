@@ -165,7 +165,7 @@ def adult_only(model: Optional[str]) -> bool:
         from ..providers import sogni
 
         return sogni.hidden(m)
-    if content_mode.looks_adult(m):
+    if content_mode.looks_adult(m) or content_mode.is_adult_text_model(m):
         return True
     # Any other provider: what the stored catalog says about it (e.g. an
     # OpenRouter chat model whose name or description says "Uncensored").

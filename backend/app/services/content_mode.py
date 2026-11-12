@@ -78,10 +78,35 @@ def looks_adult(*texts: Optional[str]) -> bool:
     return any(t and _ADULT_WORDS.search(str(t)) for t in texts)
 
 
+def _base_id(model_id: str) -> str:
+    """A model id compared the way providers route it: case-insensitive and
+    without an OpenRouter variant suffix (":nitro", ":floor", ":free"...),
+    which reaches the same model."""
+    return (model_id or "").strip().lower().split(":", 1)[0]
+
+
+def adult_text_ids() -> frozenset[str]:
+    """The text models adult mode switches to (ADULT_TEXT_MODEL and
+    ADULT_TEXT_FALLBACK_MODEL), as base ids (see _base_id), empty ones left
+    out. On a clean deployment they are adult-only even though their names
+    don't say so."""
+    s = get_settings()
+    return frozenset(_base_id(m) for m in (s.adult_text_model, s.adult_text_fallback_model)
+                     if m and m.strip())
+
+
+def is_adult_text_model(model_id: Optional[str]) -> bool:
+    """One of the adult text models, whatever its case or variant suffix."""
+    return bool(model_id) and _base_id(str(model_id)) in adult_text_ids()
+
+
 def adult_entry(e: dict) -> bool:
     """A catalog entry marked uncensored, or whose id, name or description
-    says so. Hidden and refused on a clean deployment."""
-    return bool(e.get("uncensored")) or looks_adult(e.get("id"), e.get("name"), e.get("description"))
+    says so, or one of the adult text models. Hidden and refused on a clean
+    deployment."""
+    return (bool(e.get("uncensored"))
+            or looks_adult(e.get("id"), e.get("name"), e.get("description"))
+            or is_adult_text_model(e.get("id")))
 
 
 def adult_mode() -> bool:

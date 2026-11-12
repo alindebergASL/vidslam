@@ -111,6 +111,33 @@ def _repair_image_types() -> None:
             cast_pictures.picture_added(avatar_id)
 
 
+def _warn_adult_leftovers() -> None:
+    """On a clean deployment (ADULT_FEATURES=false), warn when the database
+    was used with adult content before (it has saved Adult content settings):
+    its pictures, videos and prompts stay visible. A clean deployment should
+    start from an empty database and data folder. A warning only; never
+    blocks startup."""
+    try:
+        if get_settings().adult_features:
+            return
+        from . import models
+
+        db = SessionLocal()
+        try:
+            n = (db.query(models.AppSetting)
+                 .filter(models.AppSetting.key.like("content.adult%")).count())
+        finally:
+            db.close()
+        if n:
+            log.warning(
+                "ADULT_FEATURES=false, but this database has %d saved Adult content setting(s): "
+                "it was used with adult content, and the pictures, videos and prompts made then "
+                "are still shown. A clean deployment should start from an empty database and "
+                "data folder, not a copy of one that allowed adult content.", n)
+    except Exception as e:  # noqa: BLE001
+        log.warning("adult content leftover check skipped: %s", e)
+
+
 def create_app() -> FastAPI:
     from contextlib import asynccontextmanager
 
@@ -119,6 +146,7 @@ def create_app() -> FastAPI:
         log.info("initializing database at %s", settings.database_url)
         init_db()
         _repair_image_types()
+        _warn_adult_leftovers()
         # Keep the model catalog fresh in the background (skipped under
         # pytest so tests never make network calls).
         import sys

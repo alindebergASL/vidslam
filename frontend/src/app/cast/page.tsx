@@ -8,7 +8,13 @@ import { TrainPanel } from "@/components/TrainPanel";
 import { AssignDialog, ASSET_SLOTS, demoteOtherHeroes, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
-import { adultFeatures, shortModel, useAdultFeatures, useContentModeState } from "@/components/AdultModePanel";
+import {
+  adultFeatures,
+  ContentLoadError,
+  shortModel,
+  useAdultFeatures,
+  useContentModeState,
+} from "@/components/AdultModePanel";
 import { api, Asset, Avatar, ImageOp, Ingredient, Project, StudioJob, Voice, errorText } from "@/lib/api";
 import { UpscaleDialog, removeBgLabel, useOpModels } from "@/components/ImageOps";
 import { usePoll } from "@/lib/usePoll";
@@ -949,11 +955,11 @@ function DetailDrawer({
  * pictures" asks again. Pictures of unticked characters always get it, and
  * so does a prompt that mentions a child. Minors are always refused. Hidden
  * when adult content is turned off for this deployment, and while that is
- * unknown (loading, or the setting couldn't be read).
+ * unknown (loading; a failed read shows only a neutral retry).
  */
 function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   const toast = useToast();
-  const { mode, reload } = useContentModeState();
+  const { mode, failed, reload } = useContentModeState();
   const [busy, setBusy] = useState(false);
   // Why the last tick was refused (the safety check's own words), kept on
   // the card until the next try.
@@ -965,9 +971,10 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   const checkingAdded = allowed && Boolean(mode && (mode.adult_ok_checking ?? []).includes(avatarId));
   usePoll(reload, { enabled: checkingAdded, interval: 4000 });
   // Shown only once the server says this deployment has adult features:
-  // while that is unknown (loading, or the request failed) nothing appears,
-  // so a clean deployment never mentions it.
-  if (!mode || adultFeatures(mode) !== true) return null;
+  // while that is unknown nothing about it appears, so a clean deployment
+  // never mentions it. A failed read offers a retry in neutral words.
+  if (!mode) return failed ? <ContentLoadError onRetry={reload} className="card p-4 mb-4" /> : null;
+  if (adultFeatures(mode) !== true) return null;
   const pictureModel = shortModel(mode.safety_check?.picture_model || "") || "the picture model";
   const planner = shortModel(mode.safety_check?.model || mode.planner) || "the planner";
   // Pictures not checked yet (added since, or the check couldn't run), ones

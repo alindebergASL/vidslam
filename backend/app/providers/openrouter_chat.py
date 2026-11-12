@@ -17,10 +17,37 @@ from .base import CastContext, ChatProvider
 log = logging.getLogger("avs.openrouter.chat")
 
 
+# Rule 7 of the planner's prompt on a clean deployment (ADULT_FEATURES=false):
+# the planner's narration and captions reach the voice and the video, and the
+# picture filters never see them, so the planner must keep them clean itself.
+CLEAN_CONTENT_RULE = """7. **Content**: this app is for a general audience. Keep the script, narration,
+   captions and shot prompts non-sexual and non-explicit: no nudity, sexual acts
+   or sexual language. If the script contains sexual or explicit content, do not
+   reproduce it: leave it out of `cleaned_voice_script`, the captions and the
+   shots, and say what you left out in `content_warning_notes`. Refuse (emit
+   `content_warning_notes` and a minimal shot list flagged with
+   `notes: "blocked"`) if the script contains sexual content involving minors,
+   defamatory or deceptive content, or impersonates a real person.
+"""
+
+# The adult-permissive rule 7 in storyboard_system.md, up to rule 8.
+_CONTENT_RULE = re.compile(r"^7\. \*\*Content\*\*:.*?(?=^8\. )", re.M | re.S)
+
+
 def _load_system_prompt() -> str:
     # Read the prompt from the prompts/ directory packaged with the app.
+    from ..services import content_mode
+
     p = Path(__file__).parent.parent / "prompts" / "storyboard_system.md"
-    return p.read_text(encoding="utf-8")
+    text = p.read_text(encoding="utf-8")
+    if content_mode.features():
+        return text
+    clean, n = _CONTENT_RULE.subn(lambda _m: CLEAN_CONTENT_RULE, text, count=1)
+    if n != 1:  # the prompt file changed shape: the clean rule still wins
+        log.warning("storyboard prompt: content rule not found; adding the clean rule at the end")
+        clean = (f"{text.rstrip()}\n\nThis content rule replaces any other content rule "
+                 f"above:\n{CLEAN_CONTENT_RULE}")
+    return clean
 
 
 def _format_user_payload(project: dict, cast: CastContext) -> str:

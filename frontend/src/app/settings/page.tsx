@@ -1,7 +1,13 @@
 "use client";
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
-import { AdultModePanel, SafetyCheckCard, useAdultFeatures } from "@/components/AdultModePanel";
+import {
+  AdultModePanel,
+  adultFeatures,
+  ContentLoadError,
+  SafetyCheckCard,
+  useContentModeState,
+} from "@/components/AdultModePanel";
 import { ApiKeysPanel } from "@/components/ApiKeysPanel";
 import { ClipCheckPanel } from "@/components/ClipCheckPanel";
 import { ModelsPanel } from "@/components/ModelsPanel";
@@ -28,8 +34,10 @@ function Inner() {
   const [health, setHealth] = useState<Health | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // Adult content on this deployment (null while loading: nothing adult shows yet).
-  const adult = useAdultFeatures();
+  // Adult content on this deployment (null while loading or after a failed
+  // read: nothing adult shows, and a failed read offers a neutral retry).
+  const content = useContentModeState();
+  const adult = adultFeatures(content.mode);
 
   useEffect(() => {
     api.systemInfo().then(setInfo).catch((e) => setError(e.message));
@@ -83,6 +91,13 @@ function Inner() {
         </div>
       )}
       {adult === false && <SafetyCheckCard />}
+      {adult === null && content.failed && (
+        // Every panel that reads this setting tries again.
+        <ContentLoadError
+          onRetry={() => window.dispatchEvent(new Event("content-mode-changed"))}
+          className="card p-4 mb-6"
+        />
+      )}
 
       <div id="models" className="scroll-mt-16">
         <ModelsPanel />

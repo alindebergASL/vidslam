@@ -791,7 +791,13 @@ def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str
     neg = _fit_text(negative, props.get("negativePrompt"), terms=True)
     if neg and "negativePrompt" in props and _allowed(props["negativePrompt"], neg) and len(neg) >= 2:
         task["negativePrompt"] = neg
-    if not _put(task, props, ("safety", "checkContent"), bool(check_content)) and (cast or pictures):
+    has_check = _put(task, props, ("safety", "checkContent"), bool(check_content))
+    if not has_check and not _features():
+        # A clean deployment: every request goes through Runware's check, so
+        # a model without one is never sent anything (refused, final).
+        raise RunwareError(f"{model_air} has no content check, so it can't be used on this deployment",
+                           refused=True, final=True)
+    if not has_check and (cast or pictures):
         # Rule: a Cast member's picture (unless marked "adult content
         # allowed", in adult mode), or any picture with a sexual prompt
         # (in adult mode only when the minors rules want the check), never
@@ -1323,6 +1329,12 @@ def catalog_entries(usable: bool) -> list[dict]:
         if kind is None:
             continue
         model = f"{PREFIX}{a}"
+        if not features and kind not in OP_KIND_OF.values():
+            # A clean deployment: a model whose (known) schema has no content
+            # check can't be used, so it isn't offered.
+            known = sch or schema(model, fetch=False)
+            if known is not None and not has_content_check(known):
+                continue
         open_ = is_open(a, row.get("arch"))
         name = (sch or {}).get("name") or row.get("name") or a
         tag = "open" if open_ else "moderated"
@@ -1399,6 +1411,14 @@ def _op_entry(a: str, model: str, kind: str, name: str, sch: Optional[dict], sug
     else:
         e["notes"], e["price_text"] = "", ""
     return e
+
+
+def has_content_check(sch: Optional[dict]) -> bool:
+    """True when the model's request schema lets us turn on Runware's
+    content check (safety.checkContent)."""
+    if not sch or not sch.get("request"):
+        return False
+    return _allowed(_sub(_props(sch), "safety", "checkContent"), True)
 
 
 def _model_infos(kind: str) -> list[ModelInfo]:

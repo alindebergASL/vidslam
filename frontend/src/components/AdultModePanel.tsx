@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { api, ContentMode } from "@/lib/api";
 import { useToast } from "@/components/Toaster";
@@ -10,16 +10,54 @@ export function shortModel(id: string): string {
   return id.replace(/^~/, "").split("/").pop() || id;
 }
 
-/** One request for every component that mounts at the same time (the
- * Settings page and the Cast page read this setting in several places). */
-let inflight: Promise<ContentMode> | null = null;
-function fetchContentMode(): Promise<ContentMode> {
-  if (!inflight) {
-    inflight = api.getContentMode().finally(() => {
-      inflight = null;
+/** The first read when the page opens is shared: the Settings page and the
+ * Cast page read this setting in several places at once. Every later read
+ * (after a change, a retry or a poll) asks the server again, and becomes the
+ * one a panel opened after it shares, so nobody joins a read sent before a
+ * save. Panels re-reading for the same event (all listeners run together)
+ * share that one new read. */
+let shared: Promise<ContentMode> | null = null;
+let sameEvent: Promise<ContentMode> | null = null;
+function fetchContentMode(fresh: boolean): Promise<ContentMode> {
+  if (fresh && sameEvent) return sameEvent;
+  if (fresh || !shared) {
+    const p: Promise<ContentMode> = api.getContentMode().finally(() => {
+      if (shared === p) shared = null;
     });
+    shared = p;
+    if (fresh) {
+      sameEvent = p;
+      queueMicrotask(() => {
+        if (sameEvent === p) sameEvent = null;
+      });
+    }
   }
-  return inflight;
+  return shared;
+}
+
+/** Reads the setting for one component. `load(false)` on mount joins the
+ * shared first read; `load(true)` always asks again. An answer older than
+ * the one already shown is dropped, so a slow read sent before a save can't
+ * put back what the save changed. */
+function useContentModeLoader(onLoad: (m: ContentMode) => void, onFail: (e: any) => void) {
+  const sent = useRef(0);
+  const shown = useRef(0);
+  const cbs = useRef({ onLoad, onFail });
+  cbs.current = { onLoad, onFail };
+  return useCallback((fresh: boolean) => {
+    const n = ++sent.current;
+    fetchContentMode(fresh).then(
+      (m) => {
+        if (n < shown.current) return;
+        shown.current = n;
+        cbs.current.onLoad(m);
+      },
+      (e) => {
+        if (n < shown.current) return;
+        cbs.current.onFail(e);
+      }
+    );
+  }, []);
 }
 
 /**
@@ -35,18 +73,21 @@ export function AdultModePanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = () => {
-    setError(null);
-    fetchContentMode()
-      .then(setMode)
-      .catch((e) => setError(e.message || "Couldn't load the adult content setting"));
-  };
+  const read = useContentModeLoader(
+    (m) => {
+      setMode(m);
+      setError(null);
+    },
+    (e) => setError(e?.message || "Couldn't load the adult content setting")
+  );
+  const load = () => read(true);
   useEffect(() => {
-    load();
+    read(false);
     // The planner changed in Models (or the switch elsewhere): re-read.
-    window.addEventListener("content-mode-changed", load);
-    return () => window.removeEventListener("content-mode-changed", load);
-  }, []);
+    const again = () => read(true);
+    window.addEventListener("content-mode-changed", again);
+    return () => window.removeEventListener("content-mode-changed", again);
+  }, [read]);
 
   const toggle = async () => {
     if (!mode || busy) return;
@@ -292,24 +333,37 @@ function WhereTextGoes({ mode }: { mode: ContentMode }) {
   );
 }
 
+/** The content settings couldn't be read. Neutral words on purpose: a clean
+ * deployment (no adult content) can fail to load too. */
+export function ContentLoadError({ onRetry, className }: { onRetry: () => void; className?: string }) {
+  return (
+    <div className={clsx("text-xs text-ink-400", className)} role="status" data-testid="content-load-error">
+      Couldn&rsquo;t load these settings.{" "}
+      <button type="button" className="underline" onClick={onRetry}>
+        Retry
+      </button>
+    </div>
+  );
+}
+
 /** The Adult mode setting, kept current when the switch (or a Cast mark) is
  * changed on the page. A failed refetch keeps the last good value. */
 export function useContentModeState(): { mode: ContentMode | null; failed: boolean; reload: () => void } {
   const [mode, setMode] = useState<ContentMode | null>(null);
   const [failed, setFailed] = useState(false);
-  const reload = () => {
-    fetchContentMode()
-      .then((m) => {
-        setMode(m);
-        setFailed(false);
-      })
-      .catch(() => setFailed(true));
-  };
+  const read = useContentModeLoader(
+    (m) => {
+      setMode(m);
+      setFailed(false);
+    },
+    () => setFailed(true)
+  );
+  const reload = useCallback(() => read(true), [read]);
   useEffect(() => {
-    reload();
+    read(false);
     window.addEventListener("content-mode-changed", reload);
     return () => window.removeEventListener("content-mode-changed", reload);
-  }, []);
+  }, [read, reload]);
   return { mode, failed, reload };
 }
 
@@ -321,7 +375,8 @@ export function useContentMode(): ContentMode | null {
 /**
  * Whether this deployment has adult content at all (ADULT_FEATURES): true or
  * false once known, null while loading or when the setting can't be read.
- * Show adult settings and hints only when it's true, so nothing flashes.
+ * Show adult settings and hints only when it's true, so nothing flashes; hide
+ * shared controls (the API key switches, say) only when it's false.
  */
 export function useAdultFeatures(): boolean | null {
   const { mode } = useContentModeState();

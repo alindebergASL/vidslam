@@ -445,3 +445,227 @@ def test_live_provider_model_lists_hide_adult_models_on_a_clean_deployment(auth_
     finally:
         monkeypatch.delenv("ADULT_FEATURES")
         _reset()
+
+
+_PERMISSIVE = ("adult and mature themes", "do not\n   refuse, soften or censor", "soften or censor")
+
+
+def _sent_storyboard_system(monkeypatch) -> str:
+    """The system prompt the real planner sends, captured from the request."""
+    from app.providers.base import CastContext
+    from app.providers.mock_chat import MockChatProvider
+    from app.providers.openrouter_chat import OpenRouterChatProvider
+
+    from .test_models_catalog import OR
+
+    _real(monkeypatch)
+    plan = MockChatProvider().generate_storyboard(
+        project={"title": "t", "mode": "reel_montage", "original_script": "Hello world.",
+                 "target_duration_seconds": 10}, cast=CastContext()).model_dump(mode="json")
+    with respx.mock:
+        route = respx.post(f"{OR}/chat/completions").mock(return_value=httpx.Response(200, json={
+            "choices": [{"message": {"content": json.dumps(plan)}}]}))
+        OpenRouterChatProvider(model="vendor/plain-chat", json_mode=False).generate_storyboard(
+            project={"title": "t"}, cast=CastContext())
+    return json.loads(route.calls[0].request.content)["messages"][0]["content"]
+
+
+def test_storyboard_planner_gets_a_clean_content_rule_on_a_clean_deployment(monkeypatch):
+    """The planner's narration and captions reach the voice and the video
+    without passing a picture filter, so a clean deployment must not tell it
+    adult themes are allowed."""
+    from app.providers import openrouter_chat
+
+    monkeypatch.delenv("ADULT_FEATURES", raising=False)
+    _reset()
+    default = _sent_storyboard_system(monkeypatch)
+    raw = (openrouter_chat.Path(openrouter_chat.__file__).parent.parent / "prompts"
+           / "storyboard_system.md").read_text(encoding="utf-8")
+    assert default == raw  # default: unchanged
+    assert "adult and mature themes between adults are allowed" in default
+
+    _clean(monkeypatch)
+    clean = _sent_storyboard_system(monkeypatch)
+    assert not any(p in clean for p in _PERMISSIVE)
+    assert "general audience" in clean and "non-explicit" in clean
+    assert "content_warning_notes" in clean and "sexual content involving minors" in clean
+    # Only rule 7 changes; the rules around it are kept.
+    assert clean.count("7. **Content**") == 1 and "8. **Duration**" in clean
+    assert clean.replace(openrouter_chat.CLEAN_CONTENT_RULE, "") == openrouter_chat._CONTENT_RULE.sub("", raw)
+
+
+def test_clean_content_rule_still_applies_if_the_prompt_file_changes_shape(monkeypatch):
+    from app.providers import openrouter_chat
+
+    _clean(monkeypatch)
+    monkeypatch.setattr(openrouter_chat.Path, "read_text", lambda self, encoding=None: "Plan it.\n")
+    out = openrouter_chat._load_system_prompt()
+    assert out.startswith("Plan it.") and openrouter_chat.CLEAN_CONTENT_RULE in out
+
+
+def test_other_chat_prompts_carry_no_adult_permissive_rule():
+    """Enhance, hook ideas and scene rewrites never told the model adult
+    content is allowed; keep it that way (the minors classifier's scope line
+    is a classifier instruction, not a writing rule)."""
+    from app.providers import openrouter_chat as oc
+
+    texts = [oc.HOOK_IDEAS_SYSTEM, oc.SCENE_REWRITE_SYSTEM, oc._ENHANCE_COMMON, *oc.ENHANCE_GUIDES.values()]
+    for t in texts:
+        low = t.lower()
+        assert "are allowed" not in low and "is allowed" not in low and "censor" not in low
+
+
+def _no_check_model(monkeypatch, air_id: str):
+    return _fake_model(monkeypatch, air_id, {
+        "type": "object", "additionalProperties": False, "required": ["taskType", "taskUUID", "model"],
+        "properties": {**_CORE, "duration": {"type": "integer", "enum": [5]}}},
+        modes=[{"id": "text"}], caps=["text-to-image", "text-to-video"])
+
+
+def test_runware_model_without_a_content_check_is_refused_and_hidden(client, monkeypatch):
+    import copy
+
+    from app.providers import runware
+    from app.providers.runware import RunwareError, RunwareImageProvider
+
+    monkeypatch.setenv("MOCK_PROVIDERS", "false")
+    monkeypatch.setenv("RUNWARE_API_KEY", "rw-test-abcdefgh1234")
+    monkeypatch.delenv("ADULT_FEATURES", raising=False)
+    _reset()
+    model = _no_check_model(monkeypatch, "test:nocheck@1")
+    # A curated model whose schema has no content check.
+    b = runware.bundle()
+    stripped = copy.deepcopy(b["schemas"]["runware:107@1"])
+    stripped["request"]["properties"].pop("safety", None)
+    monkeypatch.setitem(b["schemas"], "runware:107@1", stripped)
+    # Default: as before (a text-only request goes out without the field).
+    assert "safety" not in runware.build_image_task(model, "a quiet street at dusk", [])
+    assert "safety" not in runware.build_video_task(model, "a quiet street at dusk", [])[0]
+    assert "runware/runware:107@1" in {e["id"] for e in runware.catalog_entries(True)}
+    _clean(monkeypatch)
+    for build in (lambda: runware.build_image_task(model, "a quiet street at dusk", []),
+                  lambda: runware.build_video_task(model, "a quiet street at dusk", [])):
+        with pytest.raises(RunwareError) as e:
+            build()
+        assert e.value.refused and e.value.final and "no content check" in str(e.value)
+    # Nothing is sent (or paid for).
+    with respx.mock(assert_all_called=False) as router:
+        post = router.post(url__regex=r".*").mock(return_value=httpx.Response(500))
+        with pytest.raises(RunwareError):
+            RunwareImageProvider().generate(model=model, prompt="a quiet street at dusk", references=[])
+    assert not post.called
+    # Left out of the pickers; models with the check and picture tools stay.
+    ids = {e["id"] for e in runware.catalog_entries(True)}
+    assert "runware/runware:107@1" not in ids
+    assert {"runware/runware:106@1", "runware/runware:112@5"} <= ids
+
+
+# ---------- review follow-ups ----------
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_switches_take_only_real_true_false_or_null(auth_client, monkeypatch, clean):
+    """0 and 1 are not booleans: refused (422) in both modes, so a 1 can never
+    slip past a lock that checks for a real true."""
+    from app.services import content_mode, provider_keys
+
+    if clean:
+        _clean(monkeypatch)
+    else:
+        monkeypatch.delenv("ADULT_FEATURES", raising=False)
+        _reset()
+    avatar_id, _ = _maya()
+    for bad in (1, 0, 1.0, "true", [], {}):
+        r = auth_client.put("/api/settings/content", json={"adult": bad})
+        assert r.status_code == 422, (bad, r.text)
+        r = auth_client.put(f"/api/settings/content/avatars/{avatar_id}", json={"adult_ok": bad})
+        assert r.status_code == 422, (bad, r.text)
+        for name, opt in (("runware", "check_content"), ("sogni", "safe_filter")):
+            r = auth_client.put(f"/api/settings/keys/{name}/options", json={opt: bad})
+            assert r.status_code == 422, (name, bad, r.text)
+        r = auth_client.put("/api/settings/keys/runware/enabled", json={"enabled": bad})
+        assert r.status_code == 422, (bad, r.text)
+    from app.services.model_registry import get_setting
+
+    assert content_mode.explicit() is None and not content_mode.adult_ok_avatars()
+    assert provider_keys.explicit_enabled("runware") is None
+    for name in ("runware", "sogni"):
+        assert not get_setting(provider_keys.OPTIONS_PREFIX + name)  # nothing saved
+    # The real values still work.
+    assert auth_client.put("/api/settings/content", json={"adult": False}).status_code == 200
+    assert auth_client.put("/api/settings/content", json={"adult": None}).status_code == 200
+    for v in (True, None):
+        assert auth_client.put("/api/settings/keys/runware/options", json={"check_content": v}).status_code == 200
+        assert auth_client.put("/api/settings/keys/sogni/options", json={"safe_filter": v}).status_code == 200
+
+
+ADULT_TEXT = (
+    {"id": "deepseek/deepseek-v4-flash", "name": "DeepSeek: V4 Flash", "description": "A fast model.", **_CHAT},
+    {"id": "deepseek/deepseek-v4-pro", "name": "DeepSeek: V4 Pro", "description": "A strong model.", **_CHAT},
+)
+
+
+@respx.mock
+def test_adult_text_models_cant_be_the_planner_on_a_clean_deployment(auth_client, monkeypatch):
+    """ADULT_TEXT_MODEL and ADULT_TEXT_FALLBACK_MODEL don't say "uncensored",
+    but on a clean deployment they are adult-only all the same."""
+    from app.services import model_registry
+    from app.services.provider_keys import ProviderUnavailable
+
+    from .test_models_catalog import MODELS
+
+    _real(monkeypatch)
+    _mock_sources(models={"data": MODELS["data"] + list(ADULT_TEXT)})
+    auth_client.post("/api/models/refresh")
+    ids = {m["id"] for m in ADULT_TEXT}
+    chat = {e["id"] for e in auth_client.get("/api/models/catalog?kind=chat").json()["entries"]}
+    assert ids <= chat  # adult features on: listed and pickable, as today
+    assert auth_client.put("/api/models/active", json={"kind": "chat", "model": ADULT_TEXT[0]["id"]}).status_code == 200
+    assert model_registry.active_model("chat") == ADULT_TEXT[0]["id"]
+    _clean(monkeypatch)
+    chat = {e["id"] for e in auth_client.get("/api/models/catalog?kind=chat").json()["entries"]}
+    assert not ids & chat and "openai/gpt-4o-mini" in chat
+    assert model_registry.active_model("chat") == model_registry.default_model("chat")
+    for model in ids:
+        for body in ({}, {"allow_unlisted": True}):
+            r = auth_client.put("/api/models/active", json={"kind": "chat", "model": model, **body})
+            assert r.status_code in (409, 422), r.text
+        with pytest.raises(ProviderUnavailable, match="turned off for this deployment"):
+            model_registry.require("chat", model)
+    # The same model with an OpenRouter variant suffix or other capitals
+    # routes to it too, so it is refused the same way.
+    for model in ("deepseek/deepseek-v4-flash:nitro", "deepseek/deepseek-v4-pro:floor",
+                  "DeepSeek/DeepSeek-V4-Flash"):
+        r = auth_client.put("/api/models/active", json={"kind": "chat", "model": model, "allow_unlisted": True})
+        assert r.status_code in (409, 422), (model, r.text)
+        assert model_registry.adult_only(model)
+    assert not model_registry.adult_only("openai/gpt-4o-mini:nitro")
+    # Empty settings name no model.
+    monkeypatch.setenv("ADULT_TEXT_FALLBACK_MODEL", "")
+    _reset()
+    from app.services import content_mode
+
+    assert content_mode.adult_text_ids() == {"deepseek/deepseek-v4-flash"}
+    assert not model_registry.adult_only("")
+
+
+@pytest.mark.parametrize("clean", [False, True])
+def test_startup_warns_when_a_clean_deployment_reuses_an_adult_database(auth_client, monkeypatch, caplog, clean):
+    from app import main
+    from app.services import content_mode
+
+    if clean:
+        _clean(monkeypatch)
+    caplog.set_level("WARNING", logger="avs.app")
+    main._warn_adult_leftovers()
+    assert "empty database" not in caplog.text  # nothing saved yet: no warning
+    monkeypatch.delenv("ADULT_FEATURES", raising=False)
+    _reset()
+    content_mode.set_adult_mode(True)
+    if clean:
+        _clean(monkeypatch)
+    main._warn_adult_leftovers()
+    assert ("empty database" in caplog.text) is clean
+    # A broken database is a warning too, never a crash.
+    monkeypatch.setattr(main, "SessionLocal", lambda: (_ for _ in ()).throw(RuntimeError("db down")))
+    main._warn_adult_leftovers()
