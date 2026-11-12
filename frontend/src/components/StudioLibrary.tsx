@@ -36,9 +36,11 @@ export function editorFor(m: ModelOption | undefined, intent: PictureIntent | nu
   return count > e.max_refs && e.over_max ? e.over_max : e;
 }
 
-/** "about $0.03 per image" on this editor with `count` reference pictures. */
+/** This editor's price with `count` reference pictures, as Spend counts it:
+ *  "about $0.07 per image", or "free (Free Spark)" for a Sogni editor on Free Spark. */
 export function editorPriceText(e: SogniEditor, count: number): string {
-  return `about ${usd(e.usd + e.usd_per_ref * Math.max(count - 1, 0))} per image`;
+  const total = e.usd + e.usd_per_ref * Math.max(count - 1, 0);
+  return total > 0 ? `about ${usd(total)} per image` : e.price_text || "free";
 }
 
 /** Each Sogni editor you can get once, picked through a model that runs as it (its own model first). */

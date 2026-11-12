@@ -796,16 +796,20 @@ def editor_for(model: str, intent: str, n_refs: int = 1) -> Optional[EditModel]:
 
 
 def _editor_info(model: str, e: EditModel) -> dict:
-    from ..services.prices import money
+    """An editor for the pickers, priced as Spend will count it (as the
+    picture models are): a Sogni-native editor runs on Free Spark, so it's
+    free unless SOGNI_COUNT_FREE_SPARK is on; Premium Spark editors (GPT
+    Image, Seedream) cost their list price."""
+    from ..services.prices import sogni_image_text
 
     sel = selector(model)
-    usd = edit_cost_usd(e.selector, 1)
-    shown = money(usd) if usd else ""
+    usd = edit_spend_usd(e.selector, 1)
     return {"id": e.selector, "name": e.name,
             # The picked model's own edit version (not a default it falls back to).
             "own": e.selector in (_EDIT_TWIN.get(sel), sel),
-            "price_text": f"about {shown} per image" if shown else "",
-            "usd": usd, "usd_per_ref": round(e.spark_per_ref * SPARK_USD, 6), "max_refs": e.max_refs}
+            "price_text": sogni_image_text(usd),
+            # Counted USD for one picture, and for each further one (0 on Free Spark).
+            "usd": usd, "usd_per_ref": round(edit_spend_usd(e.selector, 2) - usd, 6), "max_refs": e.max_refs}
 
 
 def with_pictures(model: str) -> Optional[dict]:

@@ -399,19 +399,34 @@ def test_each_picture_model_says_which_editor_it_runs_as(edit_env):
     ident = chroma["identity"]
     assert (ident["id"], ident["name"], ident["own"], ident["max_refs"]) == (
         "krea-identity-edit", "Krea 2 Identity Edit", False, 2)
-    assert ident["price_text"] == "about $0.03 per image" and ident["usd"] == pytest.approx(6.49 * 0.005)
+    # Priced as Spend counts it, like the picture models: Sogni's own editors
+    # run on Free Spark, so they're free (and so is each further picture).
+    assert (ident["price_text"], ident["usd"], ident["usd_per_ref"]) == ("free (Free Spark)", 0.0, 0.0)
     assert ident["over_max"]["id"] == "flux-3-klein" and ident["over_max"]["own"] is False
+    assert ident["over_max"]["price_text"] == "free (Free Spark)"
     assert chroma["guide"]["id"] == "flux-3-klein" and chroma["guide"]["over_max"] is None
+    # Premium Spark editors cost their list price.
     seedream = sogni.with_pictures("sogni/seedream-5-0-pro-uncensored")
     for intent in ("identity", "guide"):
         s = seedream[intent]
         assert (s["id"], s["name"], s["own"], s["max_refs"], s["over_max"]) == (
             "seedream-5-0-pro-uncensored", "Seedream 5.0 Pro (uncensored) edit", True, 10, None)
-        assert s["usd"] == pytest.approx(13.5 * 0.005)
+        assert s["price_text"] == "about $0.07 per image"
+        assert s["usd"] == pytest.approx(13.5 * 0.005) and s["usd_per_ref"] == pytest.approx(0.9 * 0.005)
+    gpt = sogni.with_pictures("sogni/gpt-image-2.6-sunburst")["guide"]
+    assert gpt["usd"] == pytest.approx(sogni.edit_cost_usd("gpt-image-2.6-sunburst")) and gpt["usd"] > 0
+    assert gpt["price_text"].startswith("about $") and gpt["price_text"].endswith(" per image")
     beast = sogni.with_pictures("sogni/dark-beast-krea2")["identity"]
     assert (beast["name"], beast["own"]) == ("Dark Beast Krea 2 Identity Edit", True)
     assert sogni.with_pictures("sogni/flux-3-klein")["guide"]["own"] is True
     assert sogni.with_pictures("sogni/krea-2-turbo")["identity"]["own"] is True
+    # Free Spark counted (bought Spark pays): Sogni's own editors show their list price.
+    edit_env(SOGNI_COUNT_FREE_SPARK="true")
+    ident = sogni.with_pictures("sogni/chroma-v46-flash")["identity"]
+    assert ident["price_text"] == "about $0.03 per image" and ident["usd"] == pytest.approx(6.49 * 0.005)
+    assert ident["usd_per_ref"] == pytest.approx(3.9 * 0.005)
+    assert sogni.with_pictures("sogni/seedream-5-0-pro-uncensored")["guide"]["usd"] == pytest.approx(13.5 * 0.005)
+    edit_env(SOGNI_COUNT_FREE_SPARK="false")
     # Edits switched off: the pictures are ignored, so no editor.
     edit_env(SOGNI_EDIT_REFERENCES="false")
     assert sogni.with_pictures("sogni/krea-2-turbo") is None
@@ -448,6 +463,9 @@ def test_the_studio_image_model_list_says_which_editor_runs(auth_client, monkeyp
     assert models["sogni/dark-beast-krea2"]["with_pictures"]["identity"]["id"] == "dark-beast-krea2-identity-edit"
     seedream = models["sogni/seedream-5-0-pro-uncensored"]["with_pictures"]
     assert seedream["identity"]["id"] == seedream["guide"]["id"] == "seedream-5-0-pro-uncensored"
+    # Each editor at the price Spend will count, as the models themselves are.
+    assert chroma["with_pictures"]["identity"]["price_text"] == "free (Free Spark)"
+    assert seedream["guide"]["price_text"] == "about $0.07 per image"
     # The other fields are as before; other providers' models get no editor.
     assert {"id", "name", "description", "price_text"} <= set(chroma)
     assert all("with_pictures" not in m for i, m in models.items() if not i.startswith("sogni/"))

@@ -525,8 +525,9 @@ export type SogniEditor = {
   name: string;
   /** The model's own edit version (not a default it falls back to). */
   own: boolean;
+  /** One picture as Spend counts it: "free (Free Spark)" for a Sogni editor on Free Spark. */
   price_text: string;
-  /** One picture; each further picture adds usd_per_ref. */
+  /** USD Spend counts for one picture (0 on Free Spark); each further picture adds usd_per_ref. */
   usd: number;
   usd_per_ref: number;
   max_refs: number;
