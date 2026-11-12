@@ -58,7 +58,12 @@ services:
       context: ./backend
     # Come back after a reboot or crash (postgres/redis already do).
     restart: unless-stopped
-    volumes:
+    # Only the data folder. The base file also mounts ./backend over /app
+    # (live reload in development); in production that would let a
+    # `git pull` change the code the running containers import before they
+    # are rebuilt, so old and new code mix until the restart. Production
+    # runs the code baked into the image (Dockerfile: COPY . /app).
+    volumes: !override
       - ./data:/data
     # Loopback only: host nginx proxies to 127.0.0.1:8000, but nothing
     # outside the host can reach the backend directly.
@@ -78,7 +83,8 @@ services:
     build:
       context: ./backend
     restart: unless-stopped
-    volumes:
+    # Only the data folder (see backend): the code comes from the image.
+    volumes: !override
       - ./data:/data
     environment:
       QUEUE_MODE: required
