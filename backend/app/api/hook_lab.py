@@ -543,6 +543,8 @@ def delete_variant(variant_id: int, delete_render: bool = False, db: Session = D
         db.get(models.Render, v.base_render_id).audio_path if v.base_render_id else "") else []
     if render is not None:
         files += [render.final_video_path, render.thumbnail_path]
+        if render.final_video_path:  # its own copy of the music bed (pipeline.keep_music)
+            files += [str(p) for p in Path(render.final_video_path).parent.glob(f"render_{render.id}_music.*")]
         (db.query(models.HookVariant).filter(models.HookVariant.render_id == render.id)
          .update({"render_id": None}, synchronize_session=False))
         # Only failed uploads are left (a published one refused above).

@@ -89,6 +89,7 @@ from datetime import datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import TYPE_CHECKING, Optional  # noqa: E402
 
+from sqlalchemy import or_, select  # noqa: E402
 from sqlalchemy import update as sa_update  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
@@ -260,12 +261,44 @@ def base_settings(db: Session, render: models.Render) -> dict:
             plan = StoryboardPlan.model_validate(project.generated_plan_json or {})
         except Exception:  # noqa: BLE001
             raise HookLabError("This version's storyboard can't be read any more. Re-compose it first.") from None
-        return compose_settings(db, project, plan)
+        look = compose_settings(db, project, plan)
+        # Its music was not recorded either, and the project's music file
+        # keeps its name when music is made or uploaded again: refuse when
+        # that file is newer than the render, or when the project still
+        # names a music file that is gone.
+        if project.music_upload_path and not look["music_path"]:
+            raise HookLabError("The music this version was made with is gone, so another opening of it "
+                               "wouldn't match. Re-compose this version first.")
+        if look["music_path"] and _newer_than(render, Path(look["music_path"])):
+            raise HookLabError("The project's music was replaced after this version was made, so another "
+                               "opening of it wouldn't match. Re-compose this version first.")
+        return look
     for key, what in (("music_path", "music"), ("logo_path", "logo")):
         if look.get(key) and not Path(str(look[key])).is_file():
             raise HookLabError(f"The {what} this version was made with is gone, so another opening of it "
                                "wouldn't match. Re-compose this version first.")
+    if look.get("music_path") and not _same_music(render, look):
+        raise HookLabError("The project's music was replaced after this version was made, so another "
+                           "opening of it wouldn't match. Re-compose this version first.")
     return dict(look)
+
+
+def _same_music(render: models.Render, look: dict) -> bool:
+    """The music file is still the one the render was made with: its
+    checksum, recorded with the render's own copy (pipeline.keep_music).
+    A render from before that: the file is not newer than the render."""
+    from .pipeline import file_sha256
+
+    path = Path(str(look["music_path"]))
+    if look.get("music_sha256"):
+        return file_sha256(path) == look["music_sha256"]
+    return not _newer_than(render, path)
+
+
+def _newer_than(render: models.Render, path: Path) -> bool:
+    """The file was written after the render was made."""
+    made = render.created_at
+    return made is not None and datetime.utcfromtimestamp(path.stat().st_mtime) > made
 
 
 def _clip_starts(clips: list["ComposeClip"], comp: Optional[dict] = None) -> list[tuple[float, float]]:
@@ -504,12 +537,38 @@ def raw_hook_path(db: Session, project: models.VideoProject, variant: models.Hoo
     return storage.render_subdir(project.id) / f"hook_raw_{variant.id}_{fp[:12]}.m4a"
 
 
+def voice_ref(db: Session, project: models.VideoProject, variant: models.HookVariant) -> str:
+    """The spend ledger ref of the opening's voice (one per raw voice file)."""
+    return f"hook_voice:{variant.id}:{_raw_fingerprint(db, project, variant.hook_text)[:12]}"
+
+
+def claim_voice_spend(db: Session, project: models.VideoProject, variant: models.HookVariant,
+                      render: models.Render) -> int:
+    """Charge the opening's voice to `render`, its make round: the voice may
+    have been paid by Listen (project spend only, no render) or by an
+    earlier make round that failed, and is reused without another charge,
+    so what the opening cost (spend on its render) includes it, and the
+    base video's cost in Results no longer does. Never one of another
+    opening's renders."""
+    if is_original(db, variant, db.get(models.Render, variant.base_render_id)):
+        return 0
+    S, R = models.SpendEntry, models.Render
+    own = select(R.id).where(R.hook_variant_id == variant.id, R.id != render.id)
+    res = db.execute(sa_update(S)
+                     .where(S.ref == voice_ref(db, project, variant), S.project_id == project.id,
+                            or_(S.render_id.is_(None), S.render_id.in_(own)))
+                     .values(render_id=render.id)
+                     .execution_options(synchronize_session=False))
+    db.commit()
+    return res.rowcount
+
+
 def synth_hook(db: Session, project: models.VideoProject, variant: models.HookVariant) -> tuple[Path, bool]:
     """TTS of the new opening only, with the project's voice (the guarded
     provider runs the safety check on it). Reused when the same text was
     already spoken with the same voice (False = paid now)."""
     from ..providers import get_tts
-    from . import fingerprints
+    from . import fingerprints, spend
     from .pipeline import _log_provider_call, _pname
 
     path = raw_hook_path(db, project, variant)
@@ -518,7 +577,10 @@ def synth_hook(db: Session, project: models.VideoProject, variant: models.HookVa
     tts = get_tts()
     voice_id = fingerprints.tts_voice_id(db, project)
     try:
-        data = tts.synthesize(text=variant.hook_text.strip(), voice_id=voice_id)
+        # Tagged with the voice it makes, so whichever make round of this
+        # opening uses it is charged for it (claim_voice_spend).
+        with spend.scope(ref=voice_ref(db, project, variant)):
+            data = tts.synthesize(text=variant.hook_text.strip(), voice_id=voice_id)
     except Exception as e:  # noqa: BLE001
         _log_provider_call(db, project_id=project.id, provider=_pname(tts), endpoint="tts.synthesize",
                            request_summary={"chars": len(variant.hook_text), "hook_variant": variant.id},
@@ -928,6 +990,7 @@ def _make_one(db: Session, variant: models.HookVariant) -> None:
         except HookTooLong as e:
             _fail(db, variant, str(e))
             return
+        claim_voice_spend(db, project, variant, render)
         db.refresh(variant)
         db.refresh(render)
         if variant.status != "making" or render.status != "generating_audio":
@@ -1137,6 +1200,7 @@ def sweep(db: Session, *, grace_seconds: float = 120.0, now: Optional[datetime] 
     out = {"composed": 0, "failed": 0, "requeued": 0}
     moved: set[int] = set()  # queued in this sweep already
     V = models.HookVariant
+    out["failed"] += _sweep_orphan_claims(db, cutoff, now)
     for variant in (db.query(V).filter(V.status == "making", V.updated_at <= cutoff, V.render_id.isnot(None))
                     .order_by(V.id).limit(50).all()):
         render = db.get(models.Render, variant.render_id)
@@ -1195,6 +1259,40 @@ def sweep(db: Session, *, grace_seconds: float = 120.0, now: Optional[datetime] 
         except Exception:  # noqa: BLE001
             log.exception("re-queueing the compose of hook variant %s failed", vid)
     return out
+
+
+ORPHANED = "Stopped before it was made (its job was lost); make it again"
+
+
+def _sweep_orphan_claims(db: Session, cutoff: datetime, now: datetime) -> int:
+    """Openings claimed "making" by Make whose job never reached them (its
+    queue entry was lost, or its worker died mid-batch): no render yet. The
+    Make job holds its project "generating" from the claim until it has
+    gone through every opening, and the render sweeper fails a project
+    whose queue entry is gone (sweepers.sweep_renders). So an opening with
+    no render whose project is no longer "generating" has no job left to
+    make it: it fails, so it can be changed and made again."""
+    from . import events
+
+    V, P = models.HookVariant, models.VideoProject
+    failed = 0
+    rows = (db.query(V).join(P, P.id == V.project_id)
+            .filter(V.status == "making", V.render_id.is_(None), V.updated_at <= cutoff,
+                    P.status != "generating")
+            .order_by(V.id).limit(50).all())
+    for variant in rows:
+        res = db.execute(sa_update(V)
+                         .where(V.id == variant.id, V.status == "making", V.render_id.is_(None),
+                                V.updated_at == variant.updated_at)
+                         .values(status="failed", error=ORPHANED, updated_at=now))
+        if res.rowcount != 1:
+            db.rollback()
+            continue
+        db.refresh(variant)
+        events.hook_variant_event(db, variant, db.get(P, variant.project_id), "failed", error=ORPHANED)
+        db.commit()
+        failed += 1
+    return failed
 
 
 def cancel(db: Session, variant: models.HookVariant) -> None:

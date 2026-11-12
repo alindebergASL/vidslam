@@ -993,8 +993,16 @@ def test_a_one_sentence_script_swaps_the_whole_voiceover(auth_client, tmp_path):
     made = _create(auth_client, pid, b["render_id"], [{"hook_text": "Wait, watch this one.", "style": "custom"}],
                    window=b["audio_seconds"])
     vid = made["variants"][0]["id"]
+    from app.services import hook_lab
+
+    db = _db()
+    try:  # not left over from another test's project with the same ids
+        hook_lab.raw_hook_path(db, db.get(models.VideoProject, pid), db.get(models.HookVariant, vid)).unlink(
+            missing_ok=True)
+    finally:
+        db.close()
     r = auth_client.post(f"/api/hook-variants/{vid}/preview-audio")
-    assert r.status_code == 200 and r.json()["fits"], r.text
+    assert r.status_code == 200 and r.json()["fits"] and r.json()["cost"] > 0, r.text
     # Only the new line: nothing of the original is joined after it.
     assert r.json()["duration_seconds"] == pytest.approx(b["audio_seconds"], abs=0.1)
     raw = hook_lab.raw_hook_path(_db(), _get(models.VideoProject, pid), _get(models.HookVariant, vid))
@@ -1134,3 +1142,189 @@ def test_hook_tests_count_a_video_uploaded_twice_once(auth_client):
     assert labels == ["A", "B"]
     b = t["entries"][1]
     assert b["publish_job_id"] == 3 and b["uploads"] == 2
+
+
+# ---------- review fixes: music, lost Make jobs, Listen spend ----------
+
+
+def _sha(path) -> str:
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def test_an_opening_keeps_the_music_its_base_was_made_with(auth_client, tmp_path):
+    """New music after the base was made replaces music.<ext> in place: the
+    base keeps its own copy, and an opening of it is made with that one."""
+    from app import models
+    from app.services import hook_lab
+
+    pid = _rendered(auth_client)
+    first = _tone(tmp_path / "first.m4a", 6.0)
+    with first.open("rb") as f:
+        r = auth_client.post(f"/api/projects/{pid}/music", files={"file": ("m.m4a", f, "audio/mp4")})
+    assert r.status_code == 200, r.text
+    assert auth_client.post(f"/api/projects/{pid}/generate-video", params={"force": "true"}).status_code == 202
+    base = _renders(pid)[-1]
+    assert base.status == "completed"
+    original = _sha(first)
+    look = base.composition_json["settings"]
+    assert look["music_path"] and _sha(look["music_path"]) == original
+    # Music made again: the same file name, other sound.
+    second = _voice(tmp_path / "second.m4a", [("tone", 2.0), ("gap", 1.0), ("tone", 3.0)])
+    with second.open("rb") as f:
+        r = auth_client.post(f"/api/projects/{pid}/music", files={"file": ("m.m4a", f, "audio/mp4")})
+    assert r.status_code == 200, r.text
+    assert _sha(_get(models.VideoProject, pid).music_upload_path) != original
+    made = _create(auth_client, pid, base.id, [{"hook_text": "Why stop now?", "style": "question"}])
+    assert _make(auth_client, pid, [made["variants"][0]["id"]]).status_code == 202
+    vr = _renders(pid)[-1]
+    assert vr.hook_variant_id and vr.status == "completed", vr.error
+    assert _sha(vr.composition_json["settings"]["music_path"]) == original
+    # The base's own copy changed after all: refused before anything is paid.
+    Path(look["music_path"]).write_bytes(second.read_bytes())
+    db = _db()
+    try:
+        with pytest.raises(hook_lab.HookLabError, match="music was replaced"):
+            hook_lab.base_settings(db, db.get(models.Render, base.id))
+    finally:
+        db.close()
+
+
+def test_an_unrecorded_base_refuses_music_changed_after_it(auth_client, tmp_path):
+    """A render from before its look was recorded is composed with the
+    project's current music: refused when that file was replaced after
+    the render, or is gone."""
+    from app import models
+    from app.services import hook_lab
+
+    pid = _rendered(auth_client)
+    first = _tone(tmp_path / "first.m4a", 6.0)
+    with first.open("rb") as f:
+        r = auth_client.post(f"/api/projects/{pid}/music", files={"file": ("m.m4a", f, "audio/mp4")})
+    assert r.status_code == 200, r.text
+    assert auth_client.post(f"/api/projects/{pid}/generate-video", params={"force": "true"}).status_code == 202
+    base_id = _renders(pid)[-1].id
+    db = _db()
+    try:
+        db.query(models.Render).filter_by(id=base_id).update(
+            {"composition_json": None, "created_at": datetime.utcnow() + timedelta(seconds=5)},
+            synchronize_session=False)
+        db.commit()
+        # The music it was made with, unchanged: its look is the project's.
+        look = hook_lab.base_settings(db, db.get(models.Render, base_id))
+        assert look["music_path"] == _get(models.VideoProject, pid).music_upload_path
+        # Music uploaded again after the render: same file name, other sound.
+        db.query(models.Render).filter_by(id=base_id).update(
+            {"created_at": datetime.utcnow() - timedelta(minutes=1)}, synchronize_session=False)
+        db.commit()
+        second = _voice(tmp_path / "second.m4a", [("tone", 2.0), ("gap", 1.0), ("tone", 3.0)])
+        with second.open("rb") as f:
+            r = auth_client.post(f"/api/projects/{pid}/music", files={"file": ("m.m4a", f, "audio/mp4")})
+        assert r.status_code == 200, r.text
+        db.expire_all()
+        with pytest.raises(hook_lab.HookLabError, match="music was replaced"):
+            hook_lab.base_settings(db, db.get(models.Render, base_id))
+        # The music file is gone although the project still names it.
+        Path(_get(models.VideoProject, pid).music_upload_path).unlink()
+        with pytest.raises(hook_lab.HookLabError, match="music this version was made with is gone"):
+            hook_lab.base_settings(db, db.get(models.Render, base_id))
+    finally:
+        db.close()
+
+
+def test_openings_a_lost_make_job_never_reached_fail(auth_client):
+    """Make claims every opening before queueing its job; one the job never
+    reached (lost queue entry, worker died mid-batch) has no render. Once
+    the project is no longer held for that job, the sweeper fails it."""
+    from app import models
+    from app.services import hook_lab
+
+    pid, base_id = _base(auth_client)
+    made = _create(auth_client, pid, base_id, [{"hook_text": "Why stop now?", "style": "question"},
+                                               {"hook_text": "What if you stopped?", "style": "question"}])
+    a, b = (v["id"] for v in made["variants"])
+    old = datetime.utcnow() - timedelta(minutes=10)
+    db = _db()
+    try:
+        for vid in (a, b):
+            db.query(models.HookVariant).filter_by(id=vid).update(
+                {"status": "making", "render_id": None, "updated_at": old}, synchronize_session=False)
+        project = db.get(models.VideoProject, pid)
+        project.status = "generating"  # the job still holds it (queued, or running)
+        db.commit()
+        hook_lab.sweep(db)
+        assert {db.get(models.HookVariant, v).status for v in (a, b)} == {"making"}
+        project = db.get(models.VideoProject, pid)
+        project.status = "failed"  # the render sweeper gave up on the lost job
+        db.commit()
+        db.query(models.HookVariant).filter(models.HookVariant.id.in_((a, b))).update(
+            {"updated_at": old}, synchronize_session=False)
+        db.commit()
+        out = hook_lab.sweep(db)
+        assert out["failed"] == 2
+        for vid in (a, b):
+            v = db.get(models.HookVariant, vid)
+            db.refresh(v)
+            assert v.status == "failed" and "make it again" in v.error
+        assert db.query(models.Event).filter_by(entity_type="hook_variant", entity_id=a, status="failed").count() == 1
+    finally:
+        db.close()
+    # Editable again.
+    r = auth_client.patch(f"/api/hook-variants/{a}", json={"hook_text": "Why not stop?"})
+    assert r.status_code == 200, r.text
+
+
+def test_the_voice_listen_paid_for_is_charged_to_the_opening(auth_client, monkeypatch):
+    """Listen pays for the opening's voice with only the project to charge
+    it to; Make reuses it. The opening's cost includes it, the base video's
+    cost in Results doesn't."""
+    from app import models, providers
+    from app.services import publishing, spend
+
+    real = providers.get_tts()
+
+    class PaidTTS:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def synthesize(self, **kw):
+            spend.record_rate_card("elevenlabs", "tts", "voice", 0.05)
+            return real.synthesize(**kw)
+
+    monkeypatch.setattr(providers, "get_tts", lambda: PaidTTS())
+    pid, base_id = _base(auth_client)
+    made = _create(auth_client, pid, base_id, [{"hook_text": "Why stop now?", "style": "question"}])
+    vid = made["variants"][0]["id"]
+    from app.services import hook_lab
+
+    db = _db()
+    try:  # not left over from another test's project with the same ids
+        hook_lab.raw_hook_path(db, db.get(models.VideoProject, pid), db.get(models.HookVariant, vid)).unlink(
+            missing_ok=True)
+    finally:
+        db.close()
+    r = auth_client.post(f"/api/hook-variants/{vid}/preview-audio")
+    assert r.status_code == 200 and r.json()["fits"] and r.json()["cost"] > 0, r.text
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    vr = _renders(pid)[-1]
+    assert vr.hook_variant_id == vid and vr.status == "completed", vr.error
+    db = _db()
+    try:
+        entries = db.query(models.SpendEntry).filter_by(project_id=pid, kind="tts").all()
+        assert len(entries) == 1  # paid once, by Listen
+        assert entries[0].render_id == vr.id
+        assert publishing.variant_render_costs(db, [pid])[vr.id][1] == 0.05
+        assert db.get(models.Render, vr.id).actual_cost == 0.05
+        # The base video's cost in Results: the project's spend less its openings'.
+        total, _ = publishing.project_costs(db, [pid])[pid]
+        assert total == 0.05  # the mock providers record nothing else
+    finally:
+        db.close()
+    # What Results shows for the base video: 0 (the voice is the opening's).
+    db = _db()
+    try:
+        others = sum(c for p, c, _ in publishing.variant_render_costs(db, [pid]).values() if p == pid)
+        assert round(total - others, 4) == 0.0
+    finally:
+        db.close()

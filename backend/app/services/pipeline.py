@@ -1797,6 +1797,7 @@ def _compose(
 
     look = settings if settings is not None else compose_settings(db, project, plan)
     project_dir = storage.render_subdir(project.id)
+    look = keep_music(look, project_dir, render.id)
     work = render_files.scratch_dir(project_dir, render.id)
     used = [clip_seconds(c) for c in clips]
     try:
@@ -1825,6 +1826,8 @@ def _compose(
         render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
     except BaseException:
         render_files.drop_scratch(project_dir, render.id)
+        for own in project_dir.glob(f"render_{render.id}_music.*"):  # its copy (keep_music)
+            own.unlink(missing_ok=True)
         raise
     if script is None and plan is None:
         raise ValueError("a compose without a plan must say its script")
@@ -1858,6 +1861,40 @@ def _compose(
         render.hook_variant_id = hook_variant_id
     db.commit()
     return outputs
+
+
+def file_sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def keep_music(look: dict, project_dir: Path, render_id: int) -> dict:
+    """`look` with its music bed pinned to this render: the project's
+    music file keeps its name (music.<ext>) when music is made or uploaded
+    again, so the render keeps its own copy
+    (`render_<id>_music.<ext>`, a hard link when the disk allows it) and
+    its checksum. Another opening of this render is composed with that
+    copy, never with whatever music the project has by then. (The logo
+    needs nothing: each upload is a new file.)"""
+    import os
+    import shutil
+
+    src = Path(look.get("music_path") or "") if look.get("music_path") else None
+    if src is None or not src.is_file():
+        return look
+    dst = project_dir / f"render_{render_id}_music{src.suffix}"
+    if src != dst:
+        dst.unlink(missing_ok=True)
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+    return {**look, "music_path": str(dst), "music_sha256": file_sha256(dst)}
 
 
 def compose_settings(db: Session, project: models.VideoProject, plan: Optional[StoryboardPlan]) -> dict:
