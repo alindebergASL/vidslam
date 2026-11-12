@@ -155,15 +155,19 @@ export function AdultModePanel() {
 
       {mode?.safety_check && (
         <p className="mt-3 text-xs text-ink-300" data-testid="safety-check-line">
+          {/* The sentence comes from the server (safety_check.note): what waits
+              while the check can't run depends on the mode. */}
           {mode.safety_check.available ? (
             <>
-              Safety check: <b>{shortModel(mode.safety_check.model)}</b> checks prompts for minors before
-              they&rsquo;re sent (about $0.0005 per new prompt).
+              Safety check (<b>{shortModel(mode.safety_check.model)}</b>):{" "}
+              {mode.safety_check.note ||
+                "It checks prompts for minors before they're sent (about $0.0005 per new prompt)."}
             </>
           ) : (
             <span className="text-amber-200">
-              Safety check: <b>{shortModel(mode.safety_check.model) || "the planner"}</b> can&rsquo;t run right now,
-              so sexual prompts are paused until it can. Check the planner in{" "}
+              Safety check (<b>{shortModel(mode.safety_check.model) || "the planner"}</b>):{" "}
+              {mode.safety_check.note || "It can't run right now, so sexual prompts are paused until it can."} Check
+              the planner in{" "}
               <a href="/settings#models" className="underline">
                 Settings → Models
               </a>
@@ -209,6 +213,10 @@ function WhereTextGoes({ mode }: { mode: ContentMode }) {
             </li>
           </>
         )}
+        <li>
+          Ticking a Cast character &ldquo;Adult content allowed&rdquo; sends its name, description, persona and look
+          to <b>{checker}</b> through OpenRouter. So does each later change to that text while it&rsquo;s ticked.
+        </li>
         <li>Prompts, scripts and pictures go to the picture, video, lip-sync or voice provider you pick.</li>
         <li>
           The safety check&rsquo;s verdicts stay in this app&rsquo;s database: a fingerprint of the text (not the

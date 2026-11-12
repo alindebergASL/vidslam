@@ -4,8 +4,9 @@ On:
 - text work (storyboard planning, ✨ Enhance, ambient scene rewrites) uses
   ADULT_TEXT_MODEL (DeepSeek V4 Flash: it rewrote and planned the owner's
   adult prompts where the planner refused or toned them down, Nov 2026);
-- picture/video filters follow their own settings: Runware's content check
-  option, SOGNI_SAFE_CONTENT_FILTER, vendor safety knobs at their loosest.
+- picture/video filters follow their switches in Settings → API keys
+  (Runware's content check, Sogni's safe filter); Runware's vendor safety
+  settings are loosened where a model offers them.
 
 Off (the default):
 - text work uses the planner chosen in Settings → Models;
