@@ -51,9 +51,16 @@ def _adult(on: bool) -> None:
 def test_a_card_with_an_age_under_18_cannot_be_ticked(auth_client, kw):
     aid = _avatar(auth_client, **kw)
     r = _tick(auth_client, aid)
-    assert r.status_code == 422 and r.json()["detail"] == content_mode.DESCRIBED_AS_MINOR
+    detail = r.json()["detail"]
+    assert r.status_code == 422 and detail.startswith("The card mentions an age under 18, a child or a school (")
+    assert "Edit card" in detail and "described as a minor" not in detail
     assert aid not in _ticked()
     assert mock_chat.MINOR_CALLS == []  # the word filter answered: no AI call
+
+
+def test_a_refused_tick_quotes_the_words():
+    detail = content_mode.tick_refusal(("words", "Dress: 4"))
+    assert '("Dress: 4")' in detail
 
 
 @pytest.mark.parametrize("description", ["her father's daughter, 29", "a stepdaughter who runs the family bakery",
@@ -70,16 +77,52 @@ def test_the_ai_check_can_refuse_a_tick_and_remembers_it(auth_client):
     aid = _avatar(auth_client, description="a petite gamer")
     mock_chat.MINOR_REPLY = {"minor": True, "reason": "Looks under 18."}
     r = _tick(auth_client, aid)
-    assert r.status_code == 422 and r.json()["detail"] == minor_check.CHARACTER_REFUSED
+    detail = r.json()["detail"]
+    assert r.status_code == 422 and detail.startswith(minor_check.CHARACTER_REFUSED)
+    assert "It said: Looks under 18." in detail and "Safety check memory" in detail
     mock_chat.MINOR_REPLY = None
-    assert _tick(auth_client, aid).status_code == 422  # remembered: not asked again
+    r = _tick(auth_client, aid)  # remembered: not asked again, and it still says why
+    assert r.status_code == 422 and "It said: Looks under 18." in r.json()["detail"]
     assert len(mock_chat.MINOR_CALLS) == 1
     assert aid not in _ticked()
 
 
 def test_the_mock_check_reads_a_young_look(auth_client):
     aid = _avatar(auth_client, visual_identity="looks very young, school uniform")
-    assert _tick(auth_client, aid).json()["detail"] == minor_check.CHARACTER_REFUSED
+    assert _tick(auth_client, aid).json()["detail"].startswith(minor_check.CHARACTER_REFUSED)
+
+
+def test_a_model_that_declines_to_judge_a_card_is_a_no_with_its_own_message(auth_client):
+    from app.providers.openrouter_chat import ModelDeclined
+
+    aid = _avatar(auth_client, description="a painter in her thirties")
+    mock_chat.MINOR_REPLY = ModelDeclined("declined")
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and r.json()["detail"] == minor_check.CHARACTER_DECLINED
+    assert "different planner" in r.json()["detail"] and "Try again later" not in r.json()["detail"]
+    mock_chat.MINOR_REPLY = None
+    assert _tick(auth_client, aid).status_code == 200  # never remembered
+
+
+def test_a_card_longer_than_the_check_reads_is_never_ticked(auth_client):
+    """A long description can't push the look out of what the check reads:
+    the card isn't judged on a part of it."""
+    bio = "Anna is an accountant who loves hiking, cooking and long walks by the sea. " * 120
+    look = "petite and flat-chested, pigtails, braces on her teeth, round baby face, looks very young"
+    aid = _avatar(auth_client, description=bio)
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:  # saved outside the look check, as an old card would be
+        db.get(models.Avatar, aid).visual_identity = look
+        db.commit()
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and "too long for the safety check" in r.json()["detail"]
+    assert mock_chat.MINOR_CALLS == [] and aid not in _ticked()
+    # The look comes first in what the check reads.
+    card = minor_check.character_card(type("A", (), {"name": "Anna", "description": "bio", "persona": "p",
+                                                     "visual_identity": look})())
+    assert card.splitlines()[1] == f"Look: {look}"
 
 
 @pytest.mark.parametrize("reply", [RuntimeError("HTTP 500"), {"verdict": "maybe"}, {"minor": "no"}])
@@ -145,18 +188,22 @@ def test_the_planner_gets_its_own_question_about_the_card(auth_client, monkeypat
         _reply('```json\n{"minor": false, "reason": "An adult."}\n```'),
         _reply("I'm sorry, I can't help with that."),
     ])
-    assert _tick(auth_client, aid).json()["detail"] == minor_check.CHARACTER_REFUSED
+    assert _tick(auth_client, aid).json()["detail"].startswith(minor_check.CHARACTER_REFUSED)
     assert _tick(auth_client, bob).status_code == 200
     body = json.loads(route.calls[0].request.content)
     assert body["model"] == "acme/planner-1" and body["temperature"] == 0
-    assert body["messages"][0]["content"] == minor_check.CHARACTER_SYSTEM
+    system = body["messages"][0]["content"]
+    from datetime import date
+
+    assert system == minor_check.character_system() and f"Today is {date.today().isoformat()}." in system
+    assert "other people's ages" in system and "past" in system
     text = body["messages"][1]["content"][0]["text"]
     assert "Name: Mia" in text and "Description: a petite gamer" in text and "Persona: shy" in text
     with SessionLocal() as db:
         db.get(models.Avatar, bob).persona = "gruff"
         db.commit()
     r = _tick(auth_client, bob)  # a new card: asked again, and the planner declines
-    assert r.status_code == 422 and r.json()["detail"] == minor_check.CHARACTER_UNAVAILABLE
+    assert r.status_code == 422 and r.json()["detail"] == minor_check.CHARACTER_DECLINED
     with SessionLocal() as db:
         assert "safety check" in [e.note for e in db.query(models.SpendEntry).all()]
 
@@ -169,7 +216,8 @@ def test_an_edit_that_names_a_minor_drops_the_tick_and_says_so(auth_client):
     assert _tick(auth_client, aid).status_code == 200
     r = auth_client.patch(f"/api/avatars/{aid}", json={"description": "a painter, 15"})
     assert r.status_code == 200, r.text
-    assert r.json()["adult_ok_notice"] == "Adult content is no longer allowed for Mia: the new text describes a minor."
+    assert r.json()["adult_ok_notice"] == ("Adult content is no longer allowed for Mia: the card now mentions an "
+                                           'age under 18, a child or a school ("a painter, 15").')
     assert r.json()["description"] == "a painter, 15"
     assert aid not in _ticked()
 
@@ -222,6 +270,168 @@ def test_the_word_filter_at_render_time_ignores_an_old_tick_on_a_bare_age(auth_c
     content_mode.set_avatar_adult_ok(aid, True)  # an old tick
     with SessionLocal() as db:
         assert content_mode.describes_minor(db.get(models.Avatar, aid))
+    assert aid not in _ticked()
+
+
+def _old_tick(aid: int) -> None:
+    """A tick row as it was saved before ticks kept the card they checked."""
+    from app.services.model_registry import put_setting
+
+    put_setting(f"{content_mode.ADULT_OK_PREFIX}{aid}", {"enabled": True, "at": "2026-11-01T00:00:00+00:00"})
+
+
+def test_ticks_made_before_the_ai_check_never_hold(auth_client):
+    """An old tick on a card the new checks would refuse ("looks very young")
+    is not honoured: the Cast card shows it as needing a new tick."""
+    aid = _avatar(auth_client, visual_identity="petite, pigtails, braces on her teeth, looks very young")
+    _old_tick(aid)
+    assert aid not in _ticked()
+    body = auth_client.get("/api/settings/content").json()
+    assert aid not in body["adult_ok_avatars"] and aid in body["adult_ok_stale"]
+    # A voice change doesn't claim the text changed.
+    r = auth_client.patch(f"/api/avatars/{aid}", json={"elevenlabs_voice_id": "v1"})
+    assert r.status_code == 200 and r.json()["adult_ok_notice"] is None
+    # Ticking again runs the checks.
+    assert _tick(auth_client, aid).json()["detail"].startswith(minor_check.CHARACTER_REFUSED)
+
+
+def test_a_new_check_policy_needs_a_new_tick(auth_client, monkeypatch):
+    aid = _avatar(auth_client, description="a painter in her thirties")
+    assert _tick(auth_client, aid).status_code == 200 and aid in _ticked()
+    monkeypatch.setattr(minor_check, "CHARACTER_POLICY", "character-next")
+    assert aid not in _ticked()
+
+
+def test_an_edit_that_lands_after_the_tick_was_checked_drops_it(auth_client, monkeypatch):
+    """The race: the tick checks card A while an edit (which saw no tick yet)
+    saves card B. The tick keeps A's hash, so it doesn't hold for B."""
+    from app.api import content as content_api
+
+    aid = _avatar(auth_client, description="a painter in her thirties")
+    real = content_api._check_tick
+
+    def edit_after_the_reread(avatar_id):
+        out = real(avatar_id)
+        r = auth_client.patch(f"/api/avatars/{avatar_id}",
+                              json={"visual_identity": "petite, pigtails, braces on her teeth, looks very young"})
+        assert r.status_code == 200 and r.json()["adult_ok_notice"] is None  # not ticked yet when it ran
+        return out
+
+    monkeypatch.setattr(content_api, "_check_tick", edit_after_the_reread)
+    assert _tick(auth_client, aid).status_code == 200
+    assert aid not in _ticked()
+    assert aid in auth_client.get("/api/settings/content").json()["adult_ok_stale"]
+
+
+def test_an_edit_that_passes_moves_the_tick_to_the_new_text(auth_client):
+    aid = _avatar(auth_client, description="a painter in her thirties")
+    _tick(auth_client, aid)
+    r = auth_client.patch(f"/api/avatars/{aid}", json={"description": "a sculptor in her forties"})
+    assert r.json()["adult_ok_notice"] is None and aid in _ticked()
+    assert _tick(auth_client, aid, False).status_code == 200 and aid not in _ticked()
+
+
+# ---------- the pictures on a ticked card ----------
+
+
+def _upload(client, aid: int, name: str = "h.png") -> int:
+    """A picture on the card (a different one for each name: a verdict is
+    kept per file)."""
+    from .conftest import make_png_bytes
+
+    shade = sum(map(ord, name)) % 200
+    png = make_png_bytes((256, 256), (shade, 30, 90))
+    r = client.post(f"/api/avatars/{aid}/assets", files={"file": (name, png, "image/png")},
+                    data={"asset_type": "hero", "rights_confirmed": "true"})
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def _covered(asset_id: int) -> bool:
+    from app import models
+    from app.db import SessionLocal
+    from app.services.pipeline import _exempt_asset
+
+    with SessionLocal() as db:
+        return _exempt_asset(db.get(models.Asset, asset_id), content_mode.adult_ok_avatars())
+
+
+def test_a_tick_looks_at_every_picture_on_the_card(auth_client):
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    first, logo = _upload(auth_client, aid), _upload(auth_client, aid, "logo.png")
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        db.get(models.Asset, logo).asset_type = "logo"
+        db.commit()
+    assert _tick(auth_client, aid).status_code == 200
+    assert mock_chat.PICTURE_CALLS == [first]  # not the logo
+    assert _covered(first) and not _covered(logo)
+
+
+def test_a_picture_that_looks_under_18_refuses_the_tick(auth_client):
+    """The text says an adult; the picture doesn't. The tick is refused, and
+    a tick the character already had comes off."""
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    pic = _upload(auth_client, aid, "anna.png")
+    mock_chat.PICTURE_REPLY = {"minor": True, "reason": "A child."}
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and '("anna.png")' in r.json()["detail"] and "It said: A child." in r.json()["detail"]
+    assert aid not in _ticked() and not _covered(pic)
+    mock_chat.PICTURE_REPLY = None
+    assert _tick(auth_client, aid).status_code == 422  # remembered for that file
+
+
+def test_a_picture_added_after_the_tick_keeps_the_filter_until_it_is_checked(auth_client):
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    old = _upload(auth_client, aid)
+    assert _tick(auth_client, aid).status_code == 200 and _covered(old)
+    new = _upload(auth_client, aid, "later.png")
+    assert not _covered(new)
+    assert auth_client.get("/api/settings/content").json()["adult_ok_unchecked"] == {str(aid): 1}
+    # Checking again looks only at the new picture, and a young one takes the tick off.
+    calls = list(mock_chat.PICTURE_CALLS)
+    mock_chat.PICTURE_REPLY = {"minor": True, "reason": "A child."}
+    assert _tick(auth_client, aid).status_code == 422
+    assert mock_chat.PICTURE_CALLS == [*calls, new]
+    assert aid not in _ticked()
+
+
+def test_checking_new_pictures_covers_them(auth_client):
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    _tick(auth_client, aid)
+    new = _upload(auth_client, aid, "new.png")
+    assert not _covered(new)
+    assert _tick(auth_client, aid).status_code == 200
+    assert _covered(new) and auth_client.get("/api/settings/content").json()["adult_ok_unchecked"] == {}
+
+
+@pytest.mark.parametrize("reply", [RuntimeError("HTTP 500"), "declined"])
+def test_a_tick_needs_the_picture_check_to_run(auth_client, reply):
+    from app.providers.openrouter_chat import ModelDeclined
+
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    _upload(auth_client, aid, "anna.png")
+    mock_chat.PICTURE_REPLY = ModelDeclined("no") if reply == "declined" else reply
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and aid not in _ticked()
+    want = minor_check.PICTURE_DECLINED.split("(")[0] if reply == "declined" else minor_check.PICTURE_UNAVAILABLE
+    assert r.json()["detail"].startswith(want)
+
+
+@respx.mock
+def test_a_real_planner_sees_each_picture_downscaled(auth_client, monkeypatch):
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    _upload(auth_client, aid)
+    _real_planner(monkeypatch)
+    route = respx.post(f"{OR}/chat/completions").mock(side_effect=[
+        _reply('{"minor": false, "reason": "An adult."}'), _reply('{"minor": false, "reason": "An adult."}')])
+    assert _tick(auth_client, aid).status_code == 200
+    picture = json.loads(route.calls[1].request.content)
+    assert picture["messages"][0]["content"] == minor_check.PICTURE_SYSTEM
+    parts = picture["messages"][1]["content"]
+    assert parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
 # ---------- safety check memory ----------
@@ -295,7 +505,8 @@ def test_adult_mode_pauses_suggestive_prompts_when_the_check_cant_run(client, pr
             minor_check.check_generation(prompt, kind=kind)
         assert str(e.value) == minor_check.UNAVAILABLE
     minor_check.check_generation(prompt, kind="script")  # a voice script: no picture, as before
-    minor_check.check_generation("a mountain lake at dawn", kind="image")  # not sexual: goes ahead
+    with pytest.raises(safety.UnsafePromptError):  # every picture waits in adult mode now
+        minor_check.check_generation("a mountain lake at dawn", kind="image")
     _adult(False)
     minor_check.check_generation(prompt, kind="image")  # provider filters on: goes ahead, as before
 
@@ -322,7 +533,7 @@ def test_the_settings_line_says_what_waits(auth_client, monkeypatch):
     assert "sexual prompts are paused" in note and "suggestive" not in note
     _adult(True)
     note = auth_client.get("/api/settings/content").json()["safety_check"]["note"]
-    assert "suggestive" in note and "Adult content allowed" in note
+    assert "no pictures, clips or lip-syncs" in note and "Adult content allowed" in note
 
 
 def test_old_photo_in_an_avoid_list_doesnt_refuse_a_plan(client):
@@ -341,6 +552,36 @@ def test_old_photo_in_an_avoid_list_doesnt_refuse_a_plan(client):
         pipeline._check_plan(plan)
 
 
+def test_a_plan_is_refused_on_its_avoid_list_only_by_the_ai_check(client):
+    """No refusal on the words alone ("wrinkled sheets", "men in background",
+    "a woman, one hand on her hip"); a list that steers young gets the AI
+    check, which refuses it, and which must run."""
+    from app.schemas.storyboard import ShotPlan, StoryboardPlan
+    from app.services import pipeline
+
+    shot = dict(shot_type="b_roll", duration_seconds=3, reference_strategy="input_references",
+                recommended_asset_types=[], recommended_cast_roles=[], caption_text="", camera_direction="")
+
+    def plan(prompt, negative):
+        return StoryboardPlan(title="t", cleaned_voice_script="Hello.", estimated_duration_seconds=6,
+                              content_warning_notes="", disclosure_text="", end_card_text="", caption_chunks=[],
+                              shots=[ShotPlan(order=1, visual_prompt=prompt, negative_prompt=negative, **shot)])
+
+    for prompt, negative in (("nude woman lying on a bed", "wrinkled sheets, blurry"),
+                             ("sexy girl, 25, in lingerie on a bed", "men in background, crowds"),
+                             ("a woman, one hand on her hip, in lingerie", "blurry")):
+        pipeline._check_plan(plan(prompt, negative))
+    young = plan("nude woman, petite, flat chest, smooth skin", "older looking skin, 21 year old")
+    with pytest.raises(safety.UnsafePromptError) as e:
+        pipeline._check_plan(young)
+    assert str(e.value) == minor_check.REFUSED  # the AI check said no, not the words
+    mock_chat.MINOR_REPLY = RuntimeError("HTTP 500")
+    minor_check.reset_cache()
+    with pytest.raises(safety.UnsafePromptError) as e:
+        pipeline._check_plan(plan("nude woman, petite", "adult, mature"))
+    assert str(e.value) == minor_check.UNAVAILABLE
+
+
 @respx.mock
 def test_a_real_planner_error_on_the_card_is_never_a_yes(auth_client, monkeypatch):
     aid = _avatar(auth_client, description="a painter in her thirties")
@@ -348,3 +589,14 @@ def test_a_real_planner_error_on_the_card_is_never_a_yes(auth_client, monkeypatc
     respx.post(f"{OR}/chat/completions").mock(return_value=httpx.Response(500, json={}))
     assert _tick(auth_client, aid).json()["detail"] == minor_check.CHARACTER_UNAVAILABLE
     assert aid not in _ticked()
+
+
+def test_pictures_past_the_limit_are_checked_on_the_next_try(auth_client, monkeypatch):
+    monkeypatch.setattr(minor_check, "PICTURE_LIMIT", 1)
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    a, b = _upload(auth_client, aid, "a.png"), _upload(auth_client, aid, "b.png")
+    assert _tick(auth_client, aid).status_code == 200
+    assert [_covered(a), _covered(b)] == [False, True]  # the newest first
+    assert auth_client.get("/api/settings/content").json()["adult_ok_unchecked"] == {str(aid): 1}
+    assert _tick(auth_client, aid).status_code == 200
+    assert _covered(a) and _covered(b)

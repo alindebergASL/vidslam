@@ -70,8 +70,11 @@ def update_avatar(
         _check_look(changes.get("visual_identity", a.visual_identity), changes.get("description", a.description))
     # A character marked "adult content allowed" whose text changes is
     # checked again (word filter, then the AI check). If it fails, or the
-    # check can't run, the mark comes off before the new text is saved.
+    # check can't run, the mark comes off before the new text is saved. If
+    # it passes, the mark moves to the new text once it's saved (a tick
+    # holds only for the text that was checked: content_mode).
     notice = None
+    moved: Optional[tuple[str, str]] = None
     card = {f: changes.get(f, getattr(a, f)) or "" for f in content_mode.CARD_FIELDS}
     if (any(card[f] != (getattr(a, f) or "") for f in card)
             and avatar_id in content_mode.adult_ok_avatars()):
@@ -79,14 +82,14 @@ def update_avatar(
         if problem:
             content_mode.set_avatar_adult_ok(avatar_id, False)
             notice = content_mode.untick_notice(card["name"], problem)
+        else:
+            moved = (content_mode.card_hash(a), content_mode.card_hash(SimpleNamespace(**card)))
     for k, v in changes.items():
         setattr(a, k, v)
     db.commit()
     db.refresh(a)
-    if avatar_id in content_mode.adult_ok_avatars() and content_mode.describes_minor(a):
-        # Marked while this edit was saved: the word filter still has the last say.
-        content_mode.set_avatar_adult_ok(avatar_id, False)
-        notice = content_mode.untick_notice(a.name, "words")
+    if moved:
+        content_mode.move_tick(avatar_id, *moved)
     out = AvatarEditOut.model_validate(a)
     out.adult_ok_notice = notice
     return out

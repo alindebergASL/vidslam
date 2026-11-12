@@ -274,7 +274,7 @@ def test_refs_carry_the_mark_and_only_adult_mode_honours_it(auth_client):
     try:
         (ref,) = _asset_refs(db, [asset_id])
         assert ref.role == "character" and ref.adult_ok is False
-        content_mode.set_avatar_adult_ok(avatar_id, True)
+        _tick_now(avatar_id)
         (ref,) = _asset_refs(db, [asset_id])
         assert ref.adult_ok is True
     finally:
@@ -374,6 +374,19 @@ def _avatar(name="Maya", **text):
         db.close()
 
 
+def _tick_now(avatar_id):
+    """A tick as the API leaves it once its checks pass: the card as it is
+    now, and every picture on it now (pictures added later aren't covered)."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import content_mode
+
+    with SessionLocal() as db:
+        a = db.get(models.Avatar, avatar_id)
+        card, pictures = content_mode.card_hash(a), [x.id for x in content_mode.tick_pictures(a)]
+    content_mode.set_avatar_adult_ok(avatar_id, True, card=card, assets=pictures)
+
+
 def _asset(avatar_id, *, source="upload", job=None, asset_type="hero"):
     from app import models
     from app.db import SessionLocal
@@ -419,10 +432,10 @@ def _exempt_ids(asset_ids):
 def test_a_character_described_as_a_minor_cannot_be_marked(auth_client):
     kid = _avatar("Lily", description="a nine-year-old girl")
     r = auth_client.put(f"/api/settings/content/avatars/{kid}", json={"adult_ok": True})
-    assert r.status_code == 422 and "minor" in r.json()["detail"]
+    assert r.status_code == 422 and "age under 18" in r.json()["detail"]
     maya = _avatar("Maya", description="a painter in her thirties")
-    assert auth_client.put(f"/api/settings/content/avatars/{maya}", json={"adult_ok": True}).status_code == 200
     pic = _asset(maya)
+    assert auth_client.put(f"/api/settings/content/avatars/{maya}", json={"adult_ok": True}).status_code == 200
     assert _exempt_ids([pic]) == [True]
     r = auth_client.patch(f"/api/avatars/{maya}", json={"description": "a teenage girl"})
     assert r.status_code == 200, r.text  # not sexual: saved, but the mark goes
@@ -441,17 +454,15 @@ def test_deleting_a_character_clears_its_mark(auth_client):
     assert auth_client.put("/api/settings/content/avatars/987654", json={"adult_ok": False}).status_code == 200
 
 
-def test_every_picture_on_a_marked_card_counts_however_it_was_made(auth_client):
-    """The tick covers every picture kept on the card: uploaded, made from
-    the character's own pictures, from someone else's, from a picture
-    deleted since, or from a Studio result. Logos and other characters'
-    pictures never count."""
+def test_every_checked_picture_on_a_marked_card_counts_however_it_was_made(auth_client):
+    """The tick covers the pictures on the card the check looked at:
+    uploaded, made from the character's own pictures, from someone else's,
+    from a picture deleted since, or from a Studio result. Logos, other
+    characters' pictures and a picture added after the tick never count."""
     from app import models
     from app.db import SessionLocal
-    from app.services import content_mode
 
     maya, sam = _avatar("Maya"), _avatar("Sam")
-    content_mode.set_avatar_adult_ok(maya, True)
     uploaded = _asset(maya)
     hero = _asset(maya, source="generated", job=_job(maya))  # text only
     chained = _asset(maya, source="generated", job=_job(maya, refs=[hero]))
@@ -469,8 +480,11 @@ def test_every_picture_on_a_marked_card_counts_however_it_was_made(auth_client):
     finally:
         db.close()
     logo = _asset(maya, asset_type="logo")
+    _tick_now(maya)
     assert _exempt_ids([uploaded, hero, chained, from_sam, from_gone, from_studio]) == [True] * 6
     assert _exempt_ids([sam_pic, logo]) == [False, False]
+    later = _asset(maya, source="generated", job=_job(maya))
+    assert _exempt_ids([later]) == [False]  # not checked yet
 
 
 def test_a_marked_character_whose_text_now_names_a_minor_never_counts(auth_client):
@@ -481,8 +495,8 @@ def test_a_marked_character_whose_text_now_names_a_minor_never_counts(auth_clien
     from app.services import content_mode
 
     maya = _avatar("Maya", description="a painter in her thirties")
-    content_mode.set_avatar_adult_ok(maya, True)
     pic = _asset(maya)
+    _tick_now(maya)
     assert _exempt_ids([pic]) == [True]
     db = SessionLocal()
     try:
@@ -490,7 +504,8 @@ def test_a_marked_character_whose_text_now_names_a_minor_never_counts(auth_clien
         db.commit()
     finally:
         db.close()
-    assert maya in content_mode.adult_ok_avatars()  # still marked
+    assert maya not in content_mode.adult_ok_avatars()  # the row is still there, but it doesn't hold
+    assert maya in content_mode.status()["adult_ok_stale"]
     assert _exempt_ids([pic]) == [False]
 
 
@@ -499,16 +514,16 @@ def test_animating_a_cast_picture_keeps_it_a_cast_picture(auth_client):
     character's likeness, so an unmarked character keeps the filter."""
     from app import models
     from app.db import SessionLocal
-    from app.services import content_mode
     from app.services.pipeline import studio_first_frame
 
     maya, sam = _avatar("Maya"), _avatar("Sam")
-    content_mode.set_avatar_adult_ok(maya, True)
+    cases = [(owner, role, want, _asset(owner, asset_type=kind))
+             for owner, kind, role, want in ((maya, "hero", "character", True), (sam, "hero", "character", False),
+                                             (maya, "logo", "scene", False))]
+    _tick_now(maya)
     db = SessionLocal()
     try:
-        for owner, kind, role, want in ((maya, "hero", "character", True), (sam, "hero", "character", False),
-                                        (maya, "logo", "scene", False)):
-            pic = _asset(owner, asset_type=kind)
+        for owner, role, want, pic in cases:
             job = db.get(models.AssetGenerationJob, _job(owner, first_frame_asset_id=pic))
             ref = studio_first_frame(db, job)
             assert (ref.frame_type, ref.role, ref.adult_ok) == ("first_frame", role, want)
@@ -534,12 +549,13 @@ def test_sogni_video_filter_follows_the_cast_pictures_only(auth_client, monkeypa
         return httpx.Response(201, json={"status": "success", "data": {"workflow": {"workflowId": "wf", "status": "queued"}}})
 
     maya, sam = _avatar("Maya"), _avatar("Sam")
-    content_mode.set_avatar_adult_ok(maya, True)
+    pics = {owner: _asset(owner) for owner in (maya, sam)}
+    _tick_now(maya)
     db = SessionLocal()
     try:
         first = {}
         for owner in (maya, sam):
-            job = db.get(models.AssetGenerationJob, _job(owner, first_frame_asset_id=_asset(owner)))
+            job = db.get(models.AssetGenerationJob, _job(owner, first_frame_asset_id=pics[owner]))
             first[owner] = studio_first_frame(db, job)
     finally:
         db.close()
@@ -582,10 +598,8 @@ def test_a_cutout_or_upscale_on_a_marked_card_counts_whatever_its_source(auth_cl
     card count like any other picture there, whatever they were made from."""
     from app import models
     from app.db import SessionLocal
-    from app.services import content_mode
 
     maya, sam = _avatar("Maya"), _avatar("Sam")
-    content_mode.set_avatar_adult_ok(maya, True)
     own, sam_pic = _asset(maya), _asset(sam)
 
     def op_job(owner=maya, **source):
@@ -605,6 +619,7 @@ def test_a_cutout_or_upscale_on_a_marked_card_counts_whatever_its_source(auth_cl
     from_studio = _asset(maya, source="generated", job=op_job(source_job_id=_job(sam)))
     no_source = _asset(maya, source="generated", job=op_job())
     on_sams_card = _asset(sam, source="generated", job=op_job(sam, source_asset_id=own))
+    _tick_now(maya)
     assert _exempt_ids([from_own, from_sam, from_studio, no_source]) == [True] * 4
     assert _exempt_ids([on_sams_card]) == [False]  # Sam isn't marked
 
@@ -668,15 +683,18 @@ def test_animating_a_cutout_or_upscale_of_a_cast_picture_keeps_it_theirs(auth_cl
     from app.services.pipeline import studio_first_frame
 
     maya, sam = _avatar("Maya"), _avatar("Sam")
-    content_mode.set_avatar_adult_ok(maya, True)
+    maya_pic = _asset(maya)
+    _tick_now(maya)
     up_sam = _op_job(sam, tmp_path, source_asset_id=_asset(sam))
     cut_of_up = _op_job(sam, tmp_path, operation="remove_background", source_job_id=up_sam)
-    up_maya = _op_job(maya, tmp_path, source_asset_id=_asset(maya))
+    up_maya = _op_job(maya, tmp_path, source_asset_id=maya_pic)
+    up_unchecked = _op_job(maya, tmp_path, source_asset_id=_asset(maya))  # a picture added after the tick
     source_gone = _op_job(sam, tmp_path)  # its Cast picture was deleted since
     logo = _op_job(sam, tmp_path, source_asset_id=_asset(sam, asset_type="logo"))
     made = _op_job(sam, tmp_path, operation="")  # a new Studio picture
     cases = ((up_sam, "character", False), (cut_of_up, "character", False), (up_maya, "character", True),
-             (source_gone, "character", False), (logo, "scene", False), (made, "scene", False))
+             (source_gone, "character", False), (logo, "scene", False), (made, "scene", False),
+             (up_unchecked, "character", False))
     db = SessionLocal()
     try:
         frames = []
@@ -689,7 +707,7 @@ def test_animating_a_cutout_or_upscale_of_a_cast_picture_keeps_it_theirs(auth_cl
     finally:
         db.close()
     content_mode.set_adult_mode(True)
-    assert _sogni_video_filters(monkeypatch, frames) == [True, True, False, True, False, False]
+    assert _sogni_video_filters(monkeypatch, frames) == [True, True, False, True, False, False, True]
 
 
 def test_an_ambient_loop_made_from_a_cast_picture_keeps_that_characters_filter(auth_client, monkeypatch, tmp_path):
@@ -706,7 +724,6 @@ def test_an_ambient_loop_made_from_a_cast_picture_keeps_that_characters_filter(a
     from .test_ambient import SHORT
 
     maya, sam = _avatar("Maya"), _avatar("Sam")
-    content_mode.set_avatar_adult_ok(maya, True)
 
     def cast_picture(avatar_id):
         up = auth_client.post(f"/api/avatars/{avatar_id}/assets",
@@ -715,6 +732,7 @@ def test_an_ambient_loop_made_from_a_cast_picture_keeps_that_characters_filter(a
         return up["id"] if "id" in up else up["assets"][0]["id"]
 
     sam_pic, maya_pic = cast_picture(sam), cast_picture(maya)
+    _tick_now(maya)
     sent: list = []  # the reference pictures of every clip and still
     for cls, name in ((mock_video.MockVideoProvider, "submit"), (mock_image.MockImageProvider, "generate")):
         def spy(self, real=getattr(cls, name), **kw):
@@ -753,10 +771,14 @@ def test_an_ambient_loop_made_from_a_cast_picture_keeps_that_characters_filter(a
         assert not any(r.cast_picture or r.adult_ok for r in refs)
 
     # Ticking Sam afterwards applies to the next clip sent.
-    content_mode.set_avatar_adult_ok(sam, True)
+    _tick_now(sam)
     db = SessionLocal()
     try:
-        assert ambient._picture_mark(db, db.get(models.VideoProject, sid)) == {"cast_picture": True, "adult_ok": True}
+        project = db.get(models.VideoProject, sid)
+        assert ambient._picture_mark(db, project) == {"cast_picture": True, "adult_ok": True}
+        # A record from before ticks covered pictures one by one: the filter stays on.
+        project.ambient_config_json = {**project.ambient_config_json, "_picture_cast": {"avatar_id": sam}}
+        assert ambient._picture_mark(db, project) == {"cast_picture": True, "adult_ok": False}
     finally:
         db.close()
     content_mode.set_avatar_adult_ok(sam, False)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -230,18 +232,16 @@ def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
     return refs
 
 
-def _exempt_asset(asset: Optional[models.Asset], marked: set[int]) -> bool:
+def _exempt_asset(asset: Optional[models.Asset], marked: Mapping[int, AbstractSet[int]]) -> bool:
     """Whether a Cast picture counts as its marked character ("adult content
-    allowed"): any non-logo picture on a marked character's card, as long
-    as the character's own text names no minor. How the picture was made
-    doesn't matter (uploaded, generated, a cutout or upscale, from any
-    picture, even one deleted since): the tick covers every picture the
-    owner keeps on that card."""
-    if asset is None or asset.owner_kind != "avatar" or asset.asset_type == "logo" or asset.avatar_id not in marked:
+    allowed"): a non-logo picture on a marked character's card that the
+    safety check looked at when the character was ticked (`marked` is
+    content_mode.adult_ok_avatars(): only ticks that still hold, each with
+    the pictures checked). How the picture was made doesn't matter. One
+    added to the card since keeps the filter until it is checked."""
+    if asset is None or asset.owner_kind != "avatar" or asset.asset_type == "logo" or asset.avatar_id is None:
         return False
-    from .content_mode import describes_minor
-
-    return asset.avatar is not None and not describes_minor(asset.avatar)
+    return asset.id in marked.get(asset.avatar_id, ())
 
 
 def cast_avatar_of(asset: Optional[models.Asset]) -> Optional[int]:
@@ -252,39 +252,38 @@ def cast_avatar_of(asset: Optional[models.Asset]) -> Optional[int]:
     return int(asset.avatar_id)
 
 
-def avatar_adult_ok(db: Session, avatar_id: int, marked: set[int]) -> bool:
-    """Whether a Cast character's pictures skip the forced content filter:
-    marked "adult content allowed" and its own text names no minor (as
-    _exempt_asset, for a picture that is no longer on the card)."""
-    if avatar_id not in marked:
-        return False
-    from .content_mode import describes_minor
-
-    avatar = db.get(models.Avatar, avatar_id)
-    return avatar is not None and not describes_minor(avatar)
+def avatar_adult_ok(avatar_id: Optional[int], asset_id: Optional[int],
+                    marked: Mapping[int, AbstractSet[int]]) -> bool:
+    """Whether a copy of a Cast picture (a cutout, an upscale, an ambient
+    scene's picture) skips the forced content filter: the picture it was
+    made from is one the tick covers (as _exempt_asset). Not when that
+    picture isn't known or was deleted since."""
+    return avatar_id is not None and asset_id is not None and asset_id in marked.get(avatar_id, ())
 
 
-def studio_cast_avatar(db: Session, job: Optional[models.AssetGenerationJob]) -> Optional[int]:
-    """The Cast character a Studio picture shows when it is only a cutout
-    or upscale of one of their pictures (followed back through each
-    operation to the picture it started from), else None: a picture made
-    in Studio is a new picture, not the character's. When the starting
-    picture was deleted since, the operation's owner (copied from its
-    source when it was made) says whose it was."""
+def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob]) -> tuple[Optional[int], Optional[int]]:
+    """(the Cast character a Studio picture shows, the card picture it was
+    made from) when it is only a cutout or upscale of one of their pictures
+    (followed back through each operation to the picture it started from),
+    else (None, None): a picture made in Studio is a new picture, not the
+    character's. When the starting picture was deleted since, the
+    operation's owner (copied from its source when it was made) says whose
+    it was, and the picture is None."""
     seen: set[int] = set()
     while job is not None and job.operation and job.id not in seen:
         seen.add(job.id)
         if job.source_asset_id:
             asset = db.get(models.Asset, job.source_asset_id)
             if asset is not None:
-                return cast_avatar_of(asset)
+                avatar_id = cast_avatar_of(asset)
+                return avatar_id, (int(asset.id) if avatar_id is not None else None)
         elif job.source_job_id:
             src = db.get(models.AssetGenerationJob, job.source_job_id)
             if src is not None:
                 job = src
                 continue
-        return int(job.owner_id) if job.owner_kind == "avatar" and job.owner_id is not None else None
-    return None
+        return (int(job.owner_id) if job.owner_kind == "avatar" and job.owner_id is not None else None), None
+    return None, None
 
 
 # ---------- public entry points ----------
@@ -294,17 +293,18 @@ def _check_plan(plan: StoryboardPlan) -> None:
     """The planner's own output gets the minors checks too (in adult mode a
     permissive model plans): every shot prompt, with its avoid list, and
     the spoken script."""
-    from .safety import UnsafePromptError, check_prompt, check_script, steers_young
+    from .safety import check_prompt, check_script
 
     check_script(plan.cleaned_voice_script or "")
     check_script(plan.hook or "")  # normally the script's first sentence (the schema sees to it)
     for shot in plan.shots:
         check_prompt(shot.visual_prompt or "")
-        if steers_young(shot.visual_prompt or "", shot.negative_prompt or ""):
-            raise UnsafePromptError(
-                "This plan was refused: a shot's avoid list removes signs of adulthood from a sexual prompt.")
     # The AI safety check, once per distinct shot prompt (fills its cache,
     # so the clip calls later are hits), and on the script when it's sexual.
+    # An avoid list that removes signs of adulthood (steers_young) always
+    # gets the AI check, which sees the avoid list, and is refused when the
+    # check can't run: no refusal on the words alone ("wrinkled sheets",
+    # "men in background").
     from .minor_check import check_generation
 
     seen: set[tuple[str, str]] = set()
@@ -2423,11 +2423,11 @@ def studio_first_frame(db: Session, job: models.AssetGenerationJob) -> Optional[
 
         # A cutout or upscale of a Cast picture is still that character's
         # picture (a newly made Studio picture isn't).
-        avatar_id = studio_cast_avatar(db, src)
+        avatar_id, source_id = studio_cast_source(db, src)
         return ImageRef(url=public_media.publish(storage.reference_copy(Path(src.result_path))),
                         role="scene" if avatar_id is None else "character",
                         name="first frame", frame_type="first_frame",
-                        adult_ok=avatar_id is not None and avatar_adult_ok(db, avatar_id, adult_ok_avatars()))
+                        adult_ok=avatar_adult_ok(avatar_id, source_id, adult_ok_avatars()))
     if job.first_frame_asset_id:
         asset = db.get(models.Asset, job.first_frame_asset_id)
         if asset is None or not (asset.mime_type or "").startswith("image/"):

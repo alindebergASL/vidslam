@@ -328,3 +328,57 @@ def test_the_hook_ideas_instructions_say_how_to_refuse_in_json():
     from app.providers.openrouter_chat import HOOK_IDEAS_SYSTEM
 
     assert '"refusal"' in HOOK_IDEAS_SYSTEM and "REFUSED_MINOR" in HOOK_IDEAS_SYSTEM
+
+
+# ---------- uneven speech: every join inside the first sentence (review) ----------
+
+
+_RATE = ("Rate her outfit out of twenty: fifteen, and tonight she strips naked for you on 0800 4455 6677 "
+         "8899 1122 3344! Follow for more.")
+
+
+def test_every_join_in_the_first_sentence_is_checked_without_the_openings_punctuation(auth_client):
+    """The window is estimated from even pacing, but digits and pauses move
+    the real pickup. "Her age?" heard before "fifteen, and tonight she strips
+    naked" is refused wherever in the first sentence the window is."""
+    from app.services import safety
+
+    pid, base_id = _spliced_base(auth_client, _RATE)
+    with pytest.raises(safety.UnsafeScriptError):
+        safety.check_script("Her age fifteen, and tonight she strips naked for you")
+    safety.check_script("Her age? fifteen, and tonight she strips naked for you")  # what the old join read
+    for word in ("outfit", "twenty", "fifteen"):
+        r = _post(auth_client, pid, base_id, "Her age?", _window_at(base_id, word))
+        assert r.status_code == 422 and "minor" in r.json()["detail"], (word, r.text)
+    # At the end of the first sentence none of it is heard: fine.
+    assert _post(auth_client, pid, base_id, "Her age?").status_code == 201
+
+
+def test_the_ai_check_sees_every_join_in_the_first_sentence(auth_client, monkeypatch):
+    from app.providers import mock_chat
+
+    seen: list[str] = []
+
+    def judge(self, text):
+        seen.append(text)
+        bad = "braces and tonight she slips into a bikini" in text
+        return {"minor_sexual": bad, "reason": "probe"}
+
+    monkeypatch.setattr(mock_chat.MockChatProvider, "classify_minor", judge)
+    script = "My wife is thirty and tonight she slips into a bikini for you! Follow for more."
+    pid, base_id = _spliced_base(auth_client, script)
+    # The window says "thirty"; the voiceover may really pick up at "tonight".
+    r = _post(auth_client, pid, base_id, "She still wears braces and", _window_at(base_id, "thirty"))
+    assert r.status_code == 422 and "minor" in r.json()["detail"]
+    joins = [t for t in seen if "may be heard joined" in t]
+    assert joins and any("\n1. She still wears braces and My wife" in t for t in joins)
+
+
+def test_heard_joins_fit_what_the_check_reads():
+    from app.services import hook_lab, minor_check
+
+    script = ("word " * 400).strip() + ". Follow for more."
+    rest_at = script.index("Follow")
+    texts = hook_lab.heard_joins("Hi there", script, hook_lab.word_starts(script, rest_at), rest_at)
+    assert len(texts) > 1 and all(len(t) <= minor_check.JUDGE_WINDOW for t in texts)
+    assert sum(t.count("\n") for t in texts) == 400  # every join, once

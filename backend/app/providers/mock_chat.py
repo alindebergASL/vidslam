@@ -39,6 +39,11 @@ VISION_CALLS: list[tuple[str, int]] = []
 MINOR_REPLY: dict | BaseException | None = None
 # Every mock safety-check call (the text sent), for tests.
 MINOR_CALLS: list[str] = []
+# The mock picture check (Cast pictures before a tick): the asset ids it
+# was asked about, and a reply tests can set ({"minor": bool, "reason"} or
+# an exception). None: every picture is an adult.
+PICTURE_CALLS: list[int] = []
+PICTURE_REPLY = None
 
 # Signs of a child's look or setting that, with undressing or anything
 # sexual, mean a minor in a sexual context even with no minor word.
@@ -49,16 +54,20 @@ _YOUNG_CUES = re.compile(
 _UNDRESS = re.compile(
     r"\b(?:takes? off|taking off|took off|removes? (?:her|his)|removing (?:her|his)|strips?|stripping|"
     r"undress\w*|in (?:her|his) underwear|on (?:the|her|his) bed|in bed)\b", re.I)
-# How services/minor_check.py marks the avoid list in the text it sends.
-AVOID_MARK = "\n\nAvoid list (negative prompt): "
+# How services/minor_check.py lays out the text it sends: the avoid list
+# first (so a long prompt can't push it out of view), then the prompt.
+AVOID_MARK = "Avoid list (negative prompt): "
+PROMPT_MARK = "Prompt: "
 
 
 def mock_minor_verdict(text: str) -> dict:
     """The rules the mock safety check applies (deterministic)."""
     from ..services.safety import is_sexual, mentions_minor, steers_young
 
-    prompt, _, negative = text.partition(AVOID_MARK)
-    prompt = prompt.removeprefix("Prompt: ")
+    negative = ""
+    if text.startswith(AVOID_MARK):
+        negative, _, text = text[len(AVOID_MARK):].partition("\n\n" + PROMPT_MARK)
+    prompt = text.removeprefix(PROMPT_MARK)
     if mentions_minor(prompt) and is_sexual(prompt):
         return {"minor_sexual": True, "reason": "A minor in a sexual context."}
     if _YOUNG_CUES.search(prompt) and (is_sexual(prompt) or _UNDRESS.search(prompt)):

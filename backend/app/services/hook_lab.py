@@ -223,6 +223,12 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
        could make it read as being about someone else). The word filter
        also sees the joins near the guess, since the words aren't timed: a
        phrase can form only across the join ("she is" + "sixteen tips").
+       Each join is also read without the punctuation at the end of the
+       opening, which a listener doesn't hear ("Her age?" + "fifteen, and").
+    3. When the voiceover may pick up inside the original first sentence,
+       speech is too uneven to trust the guess: the safety check sees the
+       opening joined at every word of that sentence (heard_joins), a few
+       at a time.
     Raises UnsafeScriptError."""
     from . import minor_check
     from .renderer import _probe_duration
@@ -244,14 +250,58 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     except HookLabError:
         end_of_first = None
     best, near = heard_cuts(script, float(window), total, end_of_first)
-    for cut in near:
-        check_script(f"{hook} {script[cut:]}")
     rest = rest_of_script(script)
-    if rest and best == len(script) - len(rest):
+    rest_at = len(script) - len(rest) if rest else len(script)
+    inside = (window < end_of_first - 0.05) if end_of_first else best < rest_at
+    cuts = sorted(set(near) | (set(word_starts(script, rest_at)) if inside else set()))
+    bare = _HOOK_END.sub("", hook) or hook
+    for cut in cuts:
+        check_script(f"{hook} {script[cut:]}")
+        check_script(f"{bare} {script[cut:].lstrip(_PUNCT)}")
+    if rest and best == rest_at:
         heard = replace_first_sentence(script, hook)  # the usual join: checked already
     else:
         heard = f"{hook} {script[best:]}"
     minor_check.check_generation(heard, kind="script")
+    if inside:
+        for text in heard_joins(hook, script, [c for c in cuts if c < rest_at], rest_at):
+            minor_check.check_generation(text, kind="script")
+
+
+_PUNCT = " \t.,;:!?…-–—\"'“”‘’()"
+_HOOK_END = re.compile(r"[\s.,;:!?…\-–—\"'“”‘’()]+$")
+# How much of the script after the first sentence each join shows.
+_JOIN_TAIL = 160
+
+
+def word_starts(script: str, upto: int) -> list[int]:
+    """The offsets of the words that start before `upto`."""
+    return [m.start() for m in re.finditer(r"\S+", script) if m.start() < upto]
+
+
+def heard_joins(hook: str, script: str, cuts: list[int], rest_at: int) -> list[str]:
+    """The opening joined to the original at each cut inside the first
+    sentence, as numbered lines, packed into texts the safety check reads
+    whole (minor_check.JUDGE_WINDOW). Each line runs to a little past the
+    first sentence; the rest of the script was checked with the opening
+    already (heard_checks, step 1)."""
+    from .minor_check import JUDGE_WINDOW
+
+    head = "The opening may be heard joined to the original voiceover at any of these points:"
+    tail = script[rest_at:rest_at + _JOIN_TAIL]
+    lines = [f"{i}. {hook} {script[c:rest_at]}{tail}".strip() for i, c in enumerate(cuts, 1)]
+    texts: list[str] = []
+    room = JUDGE_WINDOW - 200
+    cur = head
+    for line in lines:
+        line = line[:room - len(head) - 1]
+        if len(cur) + 1 + len(line) > room and cur != head:
+            texts.append(cur)
+            cur = head
+        cur += "\n" + line
+    if cur != head:
+        texts.append(cur)
+    return texts
 
 
 def heard_cuts(script: str, window: float, total: float,

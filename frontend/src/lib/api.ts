@@ -689,8 +689,12 @@ export type ContentMode = {
   planner: string;
   /** The model that checks prompts for minors before they're sent. */
   safety_check?: { model: string; available: boolean; note?: string };
-  /** Cast characters marked "adult content allowed" (fictional, or the person consented). */
+  /** Cast characters marked "adult content allowed" (fictional, or the person consented), whose tick holds. */
   adult_ok_avatars?: number[];
+  /** Ticked characters' pictures added since the check, by character id: they keep the filter until checked. */
+  adult_ok_unchecked?: Record<string, number>;
+  /** Ticks that no longer hold (the card changed, or it was ticked before the current check): tick again. */
+  adult_ok_stale?: number[];
 };
 
 /** What the AI safety check remembers (Settings → Adult content). */

@@ -691,6 +691,16 @@ function DetailDrawer({
         </div>
 
         {kind === "avatar" && (
+          <CardTextEditor
+            avatar={entity as Avatar}
+            onSaved={(updated) => {
+              setEntity(updated);
+              onChange();
+            }}
+          />
+        )}
+
+        {kind === "avatar" && (
           <div className="card p-4 mb-4 space-y-3">
             <div className="label">Voice</div>
             <div className="flex items-center gap-2">
@@ -918,12 +928,14 @@ function DetailDrawer({
 
 /**
  * "Adult content allowed" for one Cast character: an adult (18+), fictional
- * or a real adult who consented. While Adult mode is on, every picture on a
- * ticked character's card skips the content filter that's forced on for Cast
- * pictures (Sogni's safe filter, Runware's content check), however it was
- * made, and follows the filter settings like any other picture. Pictures of
- * unticked characters always get it, and so does a prompt that mentions a
- * child. Minors are always refused.
+ * or a real adult who consented. Ticking runs the safety check on the card's
+ * text and on each picture on it. While Adult mode is on, the pictures the
+ * check looked at skip the content filter that's forced on for Cast pictures
+ * (Sogni's safe filter, Runware's content check), however they were made,
+ * and follow the filter settings like any other picture. A picture added
+ * later keeps the filter until it is checked ("Check new pictures").
+ * Pictures of unticked characters always get it, and so does a prompt that
+ * mentions a child. Minors are always refused.
  */
 function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   const toast = useToast();
@@ -944,12 +956,34 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
     ) : null;
   }
   const allowed = (mode.adult_ok_avatars ?? []).includes(avatarId);
+  // Pictures added since the tick (they keep the filter until checked), and
+  // a tick that no longer holds (the card changed, or the check is newer).
+  const unchecked = mode.adult_ok_unchecked?.[String(avatarId)] ?? 0;
+  const stale = !allowed && (mode.adult_ok_stale ?? []).includes(avatarId);
+
+  const recheck = async () => {
+    setBusy(true);
+    setChecking(true);
+    setRefusal(null);
+    try {
+      await api.setAvatarAdultOk(avatarId, true);
+      toast.success(`${name}: new pictures checked`);
+    } catch (err) {
+      const why = errorText(err, "Couldn't check the new pictures");
+      setRefusal(why);
+      toast.error(why);
+    } finally {
+      window.dispatchEvent(new Event("content-mode-changed"));
+      setBusy(false);
+      setChecking(false);
+    }
+  };
 
   const toggle = async (next: boolean) => {
     if (
       next &&
       !window.confirm(
-        `Allow adult content with ${name}'s pictures?\n\nConfirm that ${name} is an adult (18 or older), either fictional or a real adult who has consented, and that the pictures you put on ${name}'s card show ${name}. The safety check reads ${name}'s card first and refuses if it describes someone under 18.\n\nWhile Adult mode is on, every picture on ${name}'s card then skips the filter that's forced on for Cast pictures (Sogni's safe filter, Runware's content check), however it was made (uploaded, made in Studio, upscaled or cut out). It follows your Sogni and Runware filter settings, like any other picture. Pictures of characters that aren't ticked always get the filter, and so does a prompt that mentions a child. Prompts involving minors are always refused.`
+        `Allow adult content with ${name}'s pictures?\n\nConfirm that ${name} is an adult (18 or older), either fictional or a real adult who has consented, and that the pictures you put on ${name}'s card show ${name}. The safety check reads ${name}'s card and looks at each picture on it first, and refuses if either shows someone under 18.\n\nWhile Adult mode is on, the pictures it looked at then skip the filter that's forced on for Cast pictures (Sogni's safe filter, Runware's content check), however they were made (uploaded, made in Studio, upscaled or cut out). A picture you add later keeps the filter until it is checked. It follows your Sogni and Runware filter settings, like any other picture. Pictures of characters that aren't ticked always get the filter, and so does a prompt that mentions a child. Prompts involving minors are always refused.`
       )
     )
       return;
@@ -984,21 +1018,151 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
           <span className="font-medium">Adult content allowed</span>
           {checking && <span className="ml-2 text-xs text-ink-400">Checking…</span>}
           <span className="block text-xs text-ink-400">
-            {name} is an adult (18+), fictional or a real adult who consented. While Adult mode is on, every picture
-            on {name}&rsquo;s card skips the filter that&rsquo;s forced on for Cast pictures (Sogni&rsquo;s safe
-            filter, Runware&rsquo;s content check), however it was made, and follows your filter settings like any
-            other picture. Pictures of characters that aren&rsquo;t ticked always get the filter, and so does a
-            prompt that mentions a child.
+            {name} is an adult (18+), fictional or a real adult who consented. While Adult mode is on, the pictures
+            on {name}&rsquo;s card that the safety check looked at skip the filter that&rsquo;s forced on for Cast
+            pictures (Sogni&rsquo;s safe filter, Runware&rsquo;s content check), however they were made, and follow
+            your filter settings like any other picture. A picture added later keeps the filter until it is
+            checked. Pictures of characters that aren&rsquo;t ticked always get the filter, and so does a prompt
+            that mentions a child.
             {mode.adult ? "" : " Adult mode is off, so this has no effect right now."} Prompts involving minors are
             always refused.
           </span>
         </span>
       </label>
-      {refusal && !allowed && (
+      {allowed && unchecked > 0 && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-amber-200" role="status">
+          <span>
+            {unchecked === 1 ? "1 picture was" : `${unchecked} pictures were`} added since the check. They keep the
+            filter until they&rsquo;re checked.
+          </span>
+          <button type="button" className="btn-ghost text-xs" disabled={busy} onClick={recheck}>
+            Check new pictures
+          </button>
+        </div>
+      )}
+      {stale && (
         <p className="text-xs text-amber-200" role="status">
-          {refusal}
+          This tick no longer applies: the card changed, or it was ticked before the current safety check. Tick it
+          again to check the card and its pictures.
         </p>
       )}
+      {refusal && (
+        <p className="text-xs text-amber-200" role="status">
+          {refusal}{" "}
+          {/remembered/i.test(refusal) && (
+            <Link href="/settings#adult" className="underline">
+              Open Safety check memory
+            </Link>
+          )}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The card's own text (name, description, persona, look). The safety check
+ * reads it before a tick, and again when a ticked card is edited, so the
+ * owner can reword a card the check misread instead of making it again.
+ */
+function CardTextEditor({ avatar, onSaved }: { avatar: Avatar; onSaved: (a: Avatar) => void }) {
+  const toast = useToast();
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [draft, setDraft] = useState({
+    name: avatar.name,
+    description: avatar.description,
+    persona: avatar.persona,
+    visual_identity: avatar.visual_identity,
+  });
+  useEffect(() => {
+    if (!open)
+      setDraft({
+        name: avatar.name,
+        description: avatar.description,
+        persona: avatar.persona,
+        visual_identity: avatar.visual_identity,
+      });
+  }, [avatar, open]);
+
+  const save = async () => {
+    if (!draft.name.trim()) {
+      toast.error("The name can't be empty");
+      return;
+    }
+    setBusy(true);
+    try {
+      const updated = await api.updateAvatar(avatar.id, draft);
+      onSaved(updated);
+      setOpen(false);
+      if (updated.adult_ok_notice) {
+        toast.error(updated.adult_ok_notice);
+      } else {
+        toast.success("Card saved");
+      }
+      window.dispatchEvent(new Event("content-mode-changed"));
+    } catch (err) {
+      toast.error(errorText(err, "Couldn't save the card"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <div className="card p-4 mb-4 flex items-start justify-between gap-3">
+        <div className="min-w-0 text-xs text-ink-400">
+          <div className="label mb-1">Card</div>
+          <div className="line-clamp-2">{avatar.description || "No description yet."}</div>
+        </div>
+        <button type="button" className="btn-ghost text-xs shrink-0" onClick={() => setOpen(true)}>
+          Edit card
+        </button>
+      </div>
+    );
+  }
+  const field = (key: keyof typeof draft, label: string, rows: number) => (
+    <div>
+      <label className="label" htmlFor={`card-${key}`}>
+        {label}
+      </label>
+      {rows === 1 ? (
+        <input
+          id={`card-${key}`}
+          className="input"
+          value={draft[key]}
+          onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
+        />
+      ) : (
+        <textarea
+          id={`card-${key}`}
+          className="input"
+          rows={rows}
+          value={draft[key]}
+          onChange={(e) => setDraft({ ...draft, [key]: e.target.value })}
+        />
+      )}
+    </div>
+  );
+  return (
+    <div className="card p-4 mb-4 space-y-3">
+      <div className="label mb-0">Card</div>
+      {field("name", "Name", 1)}
+      {field("visual_identity", "Look", 2)}
+      {field("persona", "Persona", 2)}
+      {field("description", "Description", 3)}
+      <p className="text-xs text-ink-400">
+        If this character is ticked &ldquo;Adult content allowed&rdquo;, the safety check reads the new text when you
+        save. The tick comes off if it reads as someone under 18.
+      </p>
+      <div className="flex gap-2">
+        <button type="button" className="btn-primary text-xs" disabled={busy} onClick={save}>
+          {busy ? "Saving…" : "Save card"}
+        </button>
+        <button type="button" className="btn-ghost text-xs" disabled={busy} onClick={() => setOpen(false)}>
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

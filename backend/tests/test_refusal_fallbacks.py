@@ -62,6 +62,14 @@ OUTAGES = [
     "unexpected image response shape: keys=[]",
     "child process exited with code 1",
     "submit failed: ReadTimeout",
+    # "safety" and "moderation" naming a service or a setting, not a refusal
+    "OpenRouter image 503: Moderation service temporarily unavailable",
+    "OpenRouter image 504: moderation timed out",
+    "Sogni workflow failed: safety checker failed to load (CUDA OOM)",
+    "Runware error 400 unsupportedParameter: The parameter 'safety.checkContent' is not supported for this model",
+    "Runware error 400 invalidParameter: safety.mode must be one of fast, full",
+    "OpenRouter image 400: Input validation error: 'safety_tolerance' must be an integer",
+    "OpenRouter image 500: content policy service crashed",
 ]
 
 
@@ -71,6 +79,23 @@ def test_refusal_texts_are_refusals(text):
 
     assert is_refusal_text(text)
     assert is_content_refusal(RuntimeError(text))
+
+
+def test_a_server_error_or_rate_limit_is_never_a_refusal():
+    from app.providers.refusals import is_content_refusal
+
+    class Err(RuntimeError):
+        def __init__(self, text, status):
+            super().__init__(text)
+            self.status = status
+
+    for status in (500, 503, 504, 408, 429):
+        assert not is_content_refusal(Err("moderation flagged by the safety system", status))
+    assert is_content_refusal(Err("Your request was rejected by the safety system", 400))
+    request = httpx.Request("POST", "https://x.test")
+    outage = httpx.HTTPStatusError("safety system rejected: upstream", request=request,
+                                   response=httpx.Response(502, request=request))
+    assert not is_content_refusal(outage)
 
 
 @pytest.mark.parametrize("text", OUTAGES)

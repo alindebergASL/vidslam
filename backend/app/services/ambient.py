@@ -1007,19 +1007,22 @@ def _invalidate_loop(project: models.VideoProject) -> None:
 
 
 # Whose Cast picture the scene's own picture is, recorded when it is set:
-# {"avatar_id": id}, or {"avatar_id": None} for any other picture.
+# {"avatar_id": id, "asset_id": the card picture it is a copy of}, or
+# {"avatar_id": None} for any other picture.
 _PICTURE_CAST_KEY = "_picture_cast"
 
 
 def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: str, *,
-                discard_loop: bool = False, cast_avatar: Optional[int] = None) -> models.VideoProject:
-    """`cast_avatar`: the picture is this Cast character's (picture_from)."""
+                discard_loop: bool = False, cast_avatar: Optional[int] = None,
+                cast_asset: Optional[int] = None) -> models.VideoProject:
+    """`cast_avatar`: the picture is this Cast character's (picture_from),
+    a copy of their card picture `cast_asset` (None when that isn't known)."""
     png = _crop_to_aspect(raw, project.aspect_ratio)
     _check_discard(db, project, discard_loop)
     picture_path(project).write_bytes(png)
     _invalidate_loop(project)
     _set_state(project, "picture_origin", origin)
-    _set_state(project, _PICTURE_CAST_KEY, {"avatar_id": cast_avatar})
+    _set_state(project, _PICTURE_CAST_KEY, {"avatar_id": cast_avatar, "asset_id": cast_asset})
     db.commit()
     db.refresh(project)
     return project
@@ -1056,7 +1059,12 @@ def _picture_mark(db: Session, project: models.VideoProject) -> dict:
     from .content_mode import adult_ok_avatars
     from .pipeline import avatar_adult_ok
 
-    return {"cast_picture": True, "adult_ok": avatar_adult_ok(db, int(rec["avatar_id"]), adult_ok_avatars())}
+    # Only a copy of a card picture the tick covers (recorded since the
+    # tick began to cover pictures one by one; an older record keeps the
+    # filter: choose the picture again).
+    asset_id = rec.get("asset_id")
+    return {"cast_picture": True, "adult_ok": avatar_adult_ok(
+        int(rec["avatar_id"]), int(asset_id) if isinstance(asset_id, int) else None, adult_ok_avatars())}
 
 
 def still_prompt(cfg: AmbientConfig) -> str:
@@ -1103,21 +1111,23 @@ def picture_from(db: Session, project: models.VideoProject, *, asset_id: Optiona
     """A Cast character's picture (or a cutout or upscale of one) is
     recorded as theirs, so the loop made from it keeps their content
     filter unless they're ticked "adult content allowed"."""
-    from .pipeline import cast_avatar_of, studio_cast_avatar
+    from .pipeline import cast_avatar_of, studio_cast_source
 
     if asset_id is not None:
         asset = db.get(models.Asset, asset_id)
         if asset is None or not asset.file_path or not Path(asset.file_path).exists():
             raise LookupError("asset not found")
+        cast = cast_avatar_of(asset)
         return set_picture(db, project, Path(asset.file_path).read_bytes(), "asset", discard_loop=discard_loop,
-                           cast_avatar=cast_avatar_of(asset))
+                           cast_avatar=cast, cast_asset=asset.id if cast is not None else None)
     if studio_job_id is not None:
         job = db.get(models.AssetGenerationJob, studio_job_id)
         if (job is None or job.output_kind != "image" or job.status not in ("completed", "saved")
                 or not job.result_path or not Path(job.result_path).exists()):
             raise LookupError("studio image not found")
+        cast, source = studio_cast_source(db, job)
         return set_picture(db, project, Path(job.result_path).read_bytes(), "studio",
-                           discard_loop=discard_loop, cast_avatar=studio_cast_avatar(db, job))
+                           discard_loop=discard_loop, cast_avatar=cast, cast_asset=source)
     raise PictureError("give asset_id or studio_job_id")
 
 

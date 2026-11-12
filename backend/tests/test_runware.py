@@ -335,7 +335,12 @@ def test_storyboard_shot_end_to_end(client, live, monkeypatch):
             return _answer({"taskType": "videoInference", "taskUUID": t["taskUUID"], "status": "success",
                             "videoURL": VID_URL, "cost": 0.3})
 
+        from .test_minor_check import OR, _reply
+
         with respx.mock() as router:
+            # Adult mode: the safety check must answer before any clip is sent.
+            router.post(f"{OR}/chat/completions").mock(
+                return_value=_reply('{"minor_sexual": false, "reason": "waves"}'))
             post = router.post(API).mock(side_effect=_respond(answer))
             job = pipeline.submit_shot_clip(db, project, shot, after="none", references=[])
             assert (job.provider, job.uses_webhook) == ("runware", False)

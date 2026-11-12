@@ -22,6 +22,14 @@ firewall page), "explicit" on its own and "child" (a crashed child process).
 So are bare words a provider may echo from an adult prompt ("nude",
 "sexual"): vendors that refuse for them also say "flagged", "explicit
 content" or "moderation".
+
+"safety" and "moderation" alone name a service as often as a refusal
+("Moderation service temporarily unavailable", "safety checker failed to
+load", "the parameter 'safety.checkContent' is not supported"). They count
+only next to a refusal word ("rejected by the safety system", "flagged",
+"IMAGE_SAFETY", "safety_review_required"), and never in a text that says
+something broke or was asked wrongly. A server error, a timeout or a rate
+limit (5xx, 408, 429) is never a refusal.
 """
 from __future__ import annotations
 
@@ -29,8 +37,8 @@ import re
 
 _REFUSAL_TEXT = re.compile(
     r"""
-      (?<![a-z])safety(?![a-z])                 # "safety system", "SAFETY", "safety_review_required"
-    | moderation | moderated
+      image[ _-]?safety                         # Google's "IMAGE_SAFETY"
+    | safety[ _-]?(?:review|system|filter|block|violation|reject)
     | (?<![a-z])nsfw(?![a-z])
     | content[ _-]?(?:polic|filter|violation|guideline|rule|standard|moderation)
     | (?:usage|acceptable[ _-]use)[ _-]?polic
@@ -54,13 +62,47 @@ _REFUSAL_TEXT = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+# "safety" or "moderation" on their own: a refusal only with a refusal word.
+_WEAK = re.compile(r"(?<![a-z])safety(?![a-z])|moderation|moderated", re.I)
+_REFUSAL_WORD = re.compile(r"flagged|blocked|rejected|refus\w*|violat\w*|review|denied|disallowed|not\s+allowed|"
+                           r"detected|triggered|filtered|unsafe|stopped", re.I)
+# Something broke, or the request was asked wrongly.
+_BROKEN = re.compile(r"service|unavailable|timed?\s*out|timeout|failed\s+to\s+load|out\s+of\s+memory|"
+                     r"(?<![a-z])oom(?![a-z])|cuda|parameter|not\s+supported|unsupported|must\s+be|"
+                     r"validation\s+error|invalid|unreachable|connect", re.I)
+# The HTTP status our provider errors start with ("OpenRouter image 503:",
+# "video submit 504:", "avatar submit 500:", "Runware error 500 …").
+_STATUS = re.compile(r"\b(?:OpenRouter\s+\w+|video\s+submit|avatar\s+submit|Runware\s+error|Sogni)\s+(\d{3})\b",
+                     re.I)
+
+
+def _outage_status(status: object) -> bool:
+    return isinstance(status, int) and (status >= 500 or status in (408, 429))
 
 
 def is_refusal_text(text: str) -> bool:
     """Whether an error message says the request was refused for its
     content (see the module note). Used where only the text is kept, such
     as a failed video job's error."""
-    return bool(text) and _REFUSAL_TEXT.search(str(text)) is not None
+    text = str(text or "")
+    if not text:
+        return False
+    m = _STATUS.search(text[:80])
+    if m and _outage_status(int(m.group(1))):
+        return False
+    if _REFUSAL_TEXT.search(text):
+        return True
+    return bool(_WEAK.search(text) and _REFUSAL_WORD.search(text) and not _BROKEN.search(text))
+
+
+def _status_of(e: BaseException) -> object:
+    status = getattr(e, "status", None)
+    if not isinstance(status, int):
+        status = getattr(e, "status_code", None)
+    if not isinstance(status, int):
+        response = getattr(e, "response", None)
+        status = getattr(response, "status_code", None)
+    return status
 
 
 def is_content_refusal(exc: BaseException) -> bool:
@@ -74,7 +116,7 @@ def is_content_refusal(exc: BaseException) -> bool:
         seen.add(id(e))
         if isinstance(e, UnsafeScriptError) or getattr(e, "refused", False) is True:
             return True
-        if is_refusal_text(str(e)):
+        if not _outage_status(_status_of(e)) and is_refusal_text(str(e)):
             return True
         e = e.__cause__
     return False

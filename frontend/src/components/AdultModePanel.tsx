@@ -128,9 +128,10 @@ export function AdultModePanel() {
                 (Google, Kling, Wan…) stay moderated by their vendor.
               </li>
               <li>
-                Every picture on the card of a Cast character ticked &ldquo;Adult content allowed&rdquo; follows
-                these settings like any other picture, however it was made (uploaded, made in Studio, upscaled or
-                cut out).
+                The pictures on the card of a Cast character ticked &ldquo;Adult content allowed&rdquo; that the
+                safety check looked at follow these settings like any other picture, however they were made
+                (uploaded, made in Studio, upscaled or cut out). A picture added later keeps the filter until it is
+                checked.
               </li>
             </>
           ) : (
@@ -214,13 +215,14 @@ function WhereTextGoes({ mode }: { mode: ContentMode }) {
           </>
         )}
         <li>
-          Ticking a Cast character &ldquo;Adult content allowed&rdquo; sends its name, description, persona and look
-          to <b>{checker}</b> through OpenRouter. So does each later change to that text while it&rsquo;s ticked.
+          Ticking a Cast character &ldquo;Adult content allowed&rdquo; sends its name, description, persona and look,
+          and a small copy of each picture on its card, to <b>{checker}</b> through OpenRouter. So does each later
+          change to that text while it&rsquo;s ticked, and &ldquo;Check new pictures&rdquo;.
         </li>
         <li>Prompts, scripts and pictures go to the picture, video, lip-sync or voice provider you pick.</li>
         <li>
-          The safety check&rsquo;s verdicts stay in this app&rsquo;s database: a fingerprint of the text (not the
-          text itself), the verdict, its reason and which model gave it.
+          The safety check&rsquo;s verdicts stay in this app&rsquo;s database: a fingerprint of the text or picture
+          (not the text or picture itself), the verdict, its reason and which model gave it.
         </li>
       </ul>
     </div>
