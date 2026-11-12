@@ -6,7 +6,7 @@ committed: an upload (api/assets.py), a Studio result saved to the card
 (pipeline.save_studio_result_as_asset: single and bulk saves, a character
 sheet's views, a cutout or upscale saved back to its slot), a logo moved
 to a picture slot, and a file whose type the startup repair corrected to a
-picture. If the character's tick holds, a job on the default queue
+picture. If the character's tick holds, a job at the front of the default queue
 (check_cast_pictures_job, one waiting per character: workers/queue.py
 enqueue_once) asks the picture model (minor_check.check_pictures) about
 the pictures on the card that the tick doesn't cover and that it hasn't
@@ -56,15 +56,17 @@ def picture_added(avatar_id: Optional[int], asset=None) -> None:  # noqa: ANN001
 
 
 def queue_check(avatar_id: int) -> str:
-    """Queue the check (at most one waiting per character). Returns the
-    job id, "" when it couldn't be queued (the pictures keep the filter;
-    "Check new pictures" on the Cast card checks them)."""
+    """Queue the check (at most one waiting per character), ahead of the
+    renders waiting on the default queue: it takes seconds, and the pictures
+    keep the filter until it's done. Returns the job id, "" when it couldn't
+    be queued (the pictures keep the filter; "Check new pictures" on the
+    Cast card checks them)."""
     from ..workers import jobs
     from ..workers.queue import enqueue_once
 
     _set_checking(avatar_id)
     try:
-        job_id = enqueue_once(jobs.check_cast_pictures_job, int(avatar_id), key=job_key(avatar_id))
+        job_id = enqueue_once(jobs.check_cast_pictures_job, int(avatar_id), key=job_key(avatar_id), at_front=True)
     except Exception as e:  # noqa: BLE001
         log.warning("picture check for cast character %s not queued (%s)", avatar_id, e)
         job_id = ""
@@ -103,6 +105,12 @@ def _run(avatar_id: int) -> str:
     if not todo:
         return "nothing"
     seen = minor_check.check_pictures(card.name, todo)
+    if seen["verdict"] != "minor":
+        # A check racing this one (a tick, or the same file on another card)
+        # may have found a picture on the card under 18 meanwhile.
+        late = minor_check.refused_picture(pictures)
+        if late is not None:
+            seen = {**seen, "verdict": "minor", **late}
     if seen["verdict"] == "minor":
         _untick(avatar_id, card.name, seen)
         return "minor"

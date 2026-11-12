@@ -417,7 +417,8 @@ def test_checking_new_pictures_covers_them(auth_client, monkeypatch):
     assert _covered(new) and auth_client.get("/api/settings/content").json()["adult_ok_unchecked"] == {}
 
 
-@pytest.mark.parametrize("reply", [RuntimeError("HTTP 500"), {"minor": "no"}])
+@pytest.mark.parametrize("reply", [RuntimeError("HTTP 500"), {"minor": "no"},
+                                   {"minor": None, "reason": "no picture"}])
 def test_a_tick_needs_the_picture_check_to_run(auth_client, reply):
     """Pause everything: no answer from the picture model is a no."""
     aid = _avatar(auth_client, description="Anna, 34, accountant")
@@ -478,6 +479,9 @@ def test_the_picture_model_judges_pictures_and_the_planner_the_card(auth_client,
     assert picture["messages"][0]["content"] == minor_check.PICTURE_SYSTEM
     parts = picture["messages"][1]["content"]
     assert parts[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    # The picture alone: no name or other text the owner wrote (the verdict is kept for the file).
+    assert parts[0]["text"] == minor_check.PICTURE_QUESTION and "Mia" not in json.dumps(picture)
+    assert "no picture came with this message" in minor_check.PICTURE_SYSTEM
     # The verdict is kept for the picture model that gave it.
     from app import models
     from app.db import SessionLocal
@@ -728,3 +732,182 @@ def test_pictures_past_the_limit_are_checked_on_the_next_try(auth_client, monkey
     assert auth_client.get("/api/settings/content").json()["adult_ok_unchecked"] == {str(aid): 1}
     assert _tick(auth_client, aid).status_code == 200
     assert _covered(a) and _covered(b)
+
+
+# ---------- review fixes: refusals naming a child, races, mock verdicts, models without images ----------
+
+
+CHILD_REFUSAL = "I'm sorry, but I can't help with this image because it appears to show a child."
+
+
+def test_a_picture_refusal_that_names_a_child_refuses_the_tick(auth_client):
+    """A refusal from the picture model that names a minor is its verdict:
+    under 18 (remembered), never a decline that lets the tick through."""
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    kid = _upload(auth_client, aid, "kid.png")
+    mock_chat.PICTURE_REPLY = CHILD_REFUSAL
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and '("kid.png")' in r.json()["detail"]
+    assert "appears to show a child" in r.json()["detail"] and aid not in _ticked() and not _covered(kid)
+    mock_chat.PICTURE_REPLY = None
+    assert _tick(auth_client, aid).status_code == 422  # remembered for that file
+
+
+def test_a_picture_refusal_that_names_no_minor_is_a_decline(auth_client):
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    shy = _upload(auth_client, aid, "shy.png")
+    mock_chat.PICTURE_REPLY = "I'm sorry, but I can't help with that."
+    r = _tick(auth_client, aid)
+    assert r.status_code == 200 and "wouldn't judge 1 picture" in r.json()["notice"]
+    assert aid in _ticked() and not _covered(shy)
+
+
+@respx.mock
+def test_a_real_picture_models_refusal_that_names_a_child_is_under_18(auth_client, monkeypatch):
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    kid = _upload(auth_client, aid, "kid.png")
+    _real_planner(monkeypatch)
+    respx.post(f"{OR}/chat/completions").mock(side_effect=[
+        _reply('{"minor": false, "reason": "An adult."}'), _reply(CHILD_REFUSAL)])
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and '("kid.png")' in r.json()["detail"]
+    assert aid not in _ticked() and not _covered(kid)
+
+
+def _racing(monkeypatch, aid: int, target: int, *, untick: bool = True) -> None:
+    """While a tick checks the card, the automatic check of an added picture
+    (`target`) finds it under 18: it stores the refusal and takes the tick
+    off with a notice."""
+    real = minor_check._classify_picture
+
+    def racing(asset):  # noqa: ANN001
+        out = real(asset)
+        if int(asset.id) == target:
+            minor_check._store(minor_check.picture_hash(asset), "minor_sexual", out[2], "A child.")
+            if untick:
+                content_mode.set_avatar_adult_ok(aid, False, notice="the automatic check took it off")
+        return out
+
+    monkeypatch.setattr(minor_check, "_classify_picture", racing)
+
+
+def test_check_new_pictures_racing_the_automatic_check_cant_cover_a_picture_under_18(auth_client, monkeypatch):
+    _no_auto_check(monkeypatch)
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    first = _upload(auth_client, aid, "first.png")
+    assert _tick(auth_client, aid).status_code == 200
+    p = _upload(auth_client, aid, "p.png")
+    _racing(monkeypatch, aid, p)  # this check asked about p too, and got "adult"
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and '("p.png")' in r.json()["detail"] and "It said: A child." in r.json()["detail"]
+    assert aid not in _ticked() and not _covered(p) and not _covered(first)
+
+
+def test_a_refusal_stored_after_the_pictures_were_checked_still_refuses_the_tick(auth_client, monkeypatch):
+    """Two ticks at once, or the same file on two cards: the other check's
+    refusal lands after this one judged the picture adult, before it ticks."""
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    p = _upload(auth_client, aid, "p.png")
+    real = minor_check.check_pictures
+
+    def refused_after(name, assets):  # noqa: ANN001
+        out = real(name, assets)
+        minor_check._store(minor_check.picture_hash(next(a for a in assets if a.id == p)), "minor_sexual",
+                           minor_check._picture_identity(), "A child.")
+        return out
+
+    monkeypatch.setattr(minor_check, "check_pictures", refused_after)
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and '("p.png")' in r.json()["detail"]
+    assert content_mode.tick_row(aid) is None and not _covered(p)
+
+
+def test_an_untick_that_lands_while_the_tick_is_checked_wins(auth_client, monkeypatch):
+    _no_auto_check(monkeypatch)
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    first = _upload(auth_client, aid, "first.png")
+    assert _tick(auth_client, aid).status_code == 200
+    _upload(auth_client, aid, "p.png")
+    real = minor_check.refused_picture
+
+    def unticked_meanwhile(assets):  # noqa: ANN001
+        out = real(assets)
+        content_mode.set_avatar_adult_ok(aid, False, notice="the automatic check took it off")
+        return out
+
+    monkeypatch.setattr(minor_check, "refused_picture", unticked_meanwhile)
+    r = _tick(auth_client, aid)
+    assert r.status_code == 409 and r.json()["detail"] == content_mode.TICK_CHANGED
+    assert content_mode.tick_row(aid) is None and not _covered(first)
+    s = auth_client.get("/api/settings/content").json()
+    assert s["adult_ok_notices"] == {str(aid): "the automatic check took it off"}  # the card still says why
+
+
+def test_a_check_of_new_pictures_merging_meanwhile_doesnt_stop_a_tick(auth_client, monkeypatch):
+    _no_auto_check(monkeypatch)
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    first = _upload(auth_client, aid, "first.png")
+    assert _tick(auth_client, aid).status_code == 200
+    new = _upload(auth_client, aid, "new.png")
+    real = minor_check.refused_picture
+
+    def merged_meanwhile(assets):  # noqa: ANN001
+        content_mode.merge_tick(aid, content_mode.tick_row(aid), covered=[new])
+        return real(assets)
+
+    monkeypatch.setattr(minor_check, "refused_picture", merged_meanwhile)
+    assert _tick(auth_client, aid).status_code == 200 and _covered(first) and _covered(new)
+
+
+def test_mock_verdicts_never_count_outside_mock_mode(auth_client, monkeypatch):
+    """No OpenRouter key outside mock mode: the mock check isn't a check, so
+    its remembered "ok"s (from a time in mock mode) don't count, for the
+    card nor for its pictures. A real refusal still does."""
+    from app import config, models
+    from app.db import SessionLocal
+
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    pic = _upload(auth_client, aid, "a.png")
+    assert _tick(auth_client, aid).status_code == 200  # mock "ok"s for the card and the picture
+    assert _tick(auth_client, aid, False).status_code == 200
+    monkeypatch.setenv("MOCK_PROVIDERS", "false")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    config.get_settings.cache_clear()
+    minor_check.reset_cache()
+    calls = (len(mock_chat.MINOR_CALLS), len(mock_chat.PICTURE_CALLS))
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and r.json()["detail"] == minor_check.CHARACTER_UNAVAILABLE
+    assert aid not in _ticked() and not _covered(pic)
+    with SessionLocal() as db:
+        pictures = db.query(models.Asset).all()
+        assert minor_check.check_pictures("Anna", pictures)["verdict"] == "unavailable"
+        assert minor_check.cached(minor_check.picture_hash(pictures[0]), judge=minor_check._picture_identity) is None
+        minor_check._store(minor_check.picture_hash(pictures[0]), "minor_sexual", "deepseek/deepseek-v4.1-flash",
+                           "A child.")
+        assert minor_check.check_pictures("Anna", pictures)["verdict"] == "minor"
+    assert (len(mock_chat.MINOR_CALLS), len(mock_chat.PICTURE_CALLS)) == calls  # nothing was asked
+    # Prompts likewise: a mock "ok" doesn't count without a key.
+    key = minor_check.text_hash("a portrait of a woman")
+    minor_check._store(key, "ok", minor_check.MOCK_PREFIX + minor_check.check_model(), "")
+    minor_check.reset_cache()
+    assert minor_check.cached(key) is None
+
+
+@respx.mock
+def test_a_picture_model_that_doesnt_take_images_is_never_asked(auth_client, monkeypatch):
+    from app.services import inspector
+
+    aid = _avatar(auth_client, description="Anna, 34, accountant")
+    pic = _upload(auth_client, aid)
+    _real_planner(monkeypatch)
+    monkeypatch.setattr(inspector, "is_vision", lambda model: model != "deepseek/deepseek-v4.1-flash")
+    route = respx.post(f"{OR}/chat/completions").mock(return_value=_reply('{"minor": false, "reason": "An adult."}'))
+    r = _tick(auth_client, aid)
+    assert r.status_code == 422 and r.json()["detail"] == minor_check.PICTURE_NOT_VISION.format(
+        model="deepseek-v4.1-flash")
+    assert len(route.calls) == 1 and aid not in _ticked() and not _covered(pic)  # only the card was asked
+    check = auth_client.get("/api/settings/content").json()["safety_check"]
+    assert check["picture_available"] is False
+    # Not listed in the catalog (or not polled yet): OpenRouter decides.
+    monkeypatch.setattr(inspector, "is_vision", lambda model: None)
+    assert auth_client.get("/api/settings/content").json()["safety_check"]["picture_available"] is True

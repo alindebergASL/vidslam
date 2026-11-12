@@ -1068,15 +1068,17 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
       </label>
       {allowed && checkingAdded && unchecked > 0 && (
         <p className="text-xs text-ink-300" role="status">
-          Checking {unchecked === 1 ? "1 new picture" : `${unchecked} new pictures`} with {pictureModel}… Until
-          it&rsquo;s done they keep the filter.
+          Checking {unchecked === 1 ? "1 new picture" : `${unchecked} new pictures`} with {pictureModel}… It may wait
+          for a render that&rsquo;s running. Until it&rsquo;s done {unchecked === 1 ? "it keeps" : "they keep"} the
+          filter.
         </p>
       )}
       {allowed && !checkingAdded && unchecked > 0 && (
         <div className="flex flex-wrap items-center gap-2 text-xs text-amber-200" role="status">
           <span>
             {unchecked === 1 ? "1 picture hasn't" : `${unchecked} pictures haven't`} been checked yet (the picture
-            check couldn&rsquo;t run, or there were too many at once). {unchecked === 1 ? "It keeps" : "They keep"}{" "}
+            check couldn&rsquo;t run or hasn&rsquo;t started, or there were too many at once).{" "}
+            {unchecked === 1 ? "It keeps" : "They keep"}{" "}
             the filter until {unchecked === 1 ? "it's" : "they're"} checked.
           </span>
           <button type="button" className="btn-ghost text-xs" disabled={busy} onClick={recheck}>
@@ -1115,8 +1117,8 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
       )}
       {stale && (
         <p className="text-xs text-amber-200" role="status">
-          This tick no longer applies: the card changed, or it was ticked before the current safety check. Tick it
-          again to check the card and its pictures.
+          This tick no longer applies: the card changed, a picture on it was found to show someone under 18, or it
+          was ticked before the current safety check. Tick it again to check the card and its pictures.
         </p>
       )}
       {refusal && (

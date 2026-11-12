@@ -86,7 +86,9 @@ def text_model() -> str:
 # ids judged adult], "declined": [picture ids the picture model wouldn't
 # judge]}. It holds only while the card is still the text that was checked
 # (the hash includes minor_check.CHARACTER_POLICY, so a new policy needs a
-# new tick), and covers only the pictures judged adult: a declined one, or
+# new tick) and no picture on the card has a remembered under-18 verdict
+# (a check that raced the tick, or the same file judged on another card),
+# and covers only the pictures judged adult: a declined one, or
 # one added later, gets the filter until it is checked. A picture added to a
 # ticked card is checked on its own (services/cast_pictures.py); "Check new
 # pictures" on the Cast card (a tick again) asks about every picture not
@@ -97,7 +99,9 @@ ADULT_OK_PREFIX = "content.adult_ok.avatar."  # + id → the row above
 # until the owner ticks or unticks): + id → {"text", "at"}.
 NOTICE_PREFIX = "content.adult_ok.notice."
 # A check of added pictures is queued or running: + id → {"at": iso}
-# (services/cast_pictures.py). Older than CHECKING_TTL: it died.
+# (services/cast_pictures.py). Older than CHECKING_TTL, it still counts
+# while its job is waiting or running (it can wait for a render that's
+# running on the default queue); otherwise it died.
 CHECKING_PREFIX = "content.adult_ok.checking."
 CHECKING_TTL_SECONDS = 15 * 60
 
@@ -135,11 +139,14 @@ def card_hash(avatar) -> str:  # noqa: ANN001 — models.Avatar or a copy of its
 
 def _holding(rows: dict[int, dict]) -> tuple[dict[int, frozenset[int]], set[int]]:
     """(the ticks that hold: {id: checked picture ids}, ids whose tick no
-    longer holds). See the note above."""
+    longer holds). See the note above. A tick never holds while a picture on
+    the card has a remembered under-18 verdict (a check that raced the tick,
+    or the same file judged on another card): ticking again says why."""
     if not rows:
         return {}, set()
     from .. import models
     from ..db import SessionLocal
+    from .minor_check import picture_hash, refused_hashes
 
     held: dict[int, frozenset[int]] = {}
     try:
@@ -147,12 +154,17 @@ def _holding(rows: dict[int, dict]) -> tuple[dict[int, frozenset[int]], set[int]
     except Exception:  # noqa: BLE001
         return {}, set(rows)
     try:
+        keys: dict[int, set[str]] = {}
         for a in db.query(models.Avatar).filter(models.Avatar.id.in_(list(rows))).all():
             rec = rows[a.id]
             card = rec.get("card")
             if isinstance(card, str) and card == card_hash(a) and not describes_minor(a):
                 ids = rec.get("assets") if isinstance(rec.get("assets"), list) else []
                 held[a.id] = frozenset(int(i) for i in ids if isinstance(i, int))
+                keys[a.id] = {picture_hash(x) for x in tick_pictures(a)}
+        refused = refused_hashes(set().union(*keys.values())) if keys else set()
+        for aid in [aid for aid, ks in keys.items() if ks & refused]:
+            held.pop(aid, None)
     except Exception:  # noqa: BLE001 — unreadable: nobody is exempt
         return {}, set(rows)
     finally:
@@ -322,6 +334,60 @@ def set_avatar_adult_ok(avatar_id: int, value: bool, *, card: Optional[str] = No
     return status()
 
 
+TICK_CHANGED = ("Adult content for this character changed while its pictures were being checked (a check of new "
+                "pictures finished, or it was ticked or unticked elsewhere). Try again.")
+
+
+def _tick_id(rec: Optional[dict]) -> Optional[tuple]:
+    """Which tick a row is (card hash and time; None: not ticked). A check of
+    added pictures merging what it found (merge_tick) keeps it."""
+    if not (isinstance(rec, dict) and rec.get("enabled") is True):
+        return None
+    return rec.get("card"), rec.get("at")
+
+
+def tick_if_unchanged(avatar_id: int, before: Optional[dict], *, card: str, assets: Iterable[int] = (),
+                      declined: Iterable[int] = ()) -> bool:
+    """Tick, as set_avatar_adult_ok, only while the tick row is still the
+    one read before the checks ran (`before`, None when there was none):
+    an untick that landed meanwhile (a check of an added picture found
+    someone under 18), a tick from elsewhere or an edit wins. Compare-and-set
+    under a row lock on Postgres. Clears the notice. True when written."""
+    from sqlalchemy.exc import IntegrityError
+
+    from .. import models
+    from ..db import SessionLocal
+    from .model_registry import put_setting
+
+    key = f"{ADULT_OK_PREFIX}{int(avatar_id)}"
+    ids = {int(a) for a in assets}
+    value = {"enabled": True, "at": datetime.now(timezone.utc).isoformat(), "card": card,
+             "assets": sorted(ids), "declined": sorted({int(a) for a in declined} - ids)}
+    db = SessionLocal()
+    try:
+        row = (db.query(models.AppSetting).filter(models.AppSetting.key == key)
+               .with_for_update().one_or_none())
+        if _tick_id(row.value if row is not None else None) != _tick_id(before):
+            db.rollback()
+            return False
+        if row is None:
+            db.add(models.AppSetting(key=key, value=value))
+        else:
+            row.value = value
+        db.commit()
+    except IntegrityError:  # ticked by another request between the read and the insert
+        db.rollback()
+        return False
+    finally:
+        db.close()
+    try:
+        put_setting(f"{NOTICE_PREFIX}{int(avatar_id)}", None)
+    except Exception as e:  # noqa: BLE001 — a note on a card, never a failed tick
+        log.warning("cast character %s: notice not cleared (%s)", avatar_id, type(e).__name__)
+    log.info("cast character %s: adult content allowed", avatar_id)
+    return True
+
+
 def move_tick(avatar_id: int, old_card: str, new_card: str) -> bool:
     """An edit whose new text passed the checks: the tick now holds for the
     new text, with the same pictures. Only when the tick is still the one
@@ -427,8 +493,9 @@ def _tick_status() -> dict:
     wouldn't judge, which keep the filter}), "adult_ok_checking" (ids whose
     added pictures are being checked now), "adult_ok_notices" ({id: why a
     check of an added picture took the tick off}) and "adult_ok_stale"
-    (ticks that no longer hold: the card changed outside the app, or it was
-    ticked before the current check; tick again)."""
+    (ticks that no longer hold: the card changed outside the app, a picture
+    on it has a remembered under-18 verdict, or it was ticked before the
+    current check; tick again)."""
     rows = _tick_rows()
     held, stale = _holding(rows)
     unchecked: dict[str, int] = {}
@@ -461,7 +528,7 @@ def _tick_status() -> dict:
                         fresh = (now - datetime.fromisoformat(str(r.value.get("at")))).total_seconds()
                     except (ValueError, TypeError):
                         continue
-                    if fresh < CHECKING_TTL_SECONDS:
+                    if fresh < CHECKING_TTL_SECONDS or _check_queued(int(tail)):
                         checking.append(int(tail))
                 elif r.key == f"{NOTICE_PREFIX}{tail}" and int(tail) not in held and r.value.get("text"):
                     notices[tail] = str(r.value["text"])
@@ -471,6 +538,18 @@ def _tick_status() -> dict:
         pass
     return {"adult_ok_avatars": sorted(held), "adult_ok_unchecked": unchecked, "adult_ok_declined": declined,
             "adult_ok_checking": sorted(checking), "adult_ok_notices": notices, "adult_ok_stale": sorted(stale)}
+
+
+def _check_queued(avatar_id: int) -> bool:
+    """Whether the automatic check of this character's added pictures is
+    still waiting or running in the job queue."""
+    from ..workers.queue import keyed_state
+    from .cast_pictures import job_key
+
+    try:
+        return keyed_state(job_key(avatar_id)) == "alive"
+    except Exception:  # noqa: BLE001 — a status line
+        return False
 
 
 def _safety_check() -> dict:

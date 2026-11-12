@@ -187,6 +187,98 @@ def test_a_deleted_picture_or_an_untick_meanwhile_leaves_nothing_behind(auth_cli
     assert cast_pictures.run(aid) == "unticked"
 
 
+CHILD_REFUSAL = "I'm sorry, but I can't help with this image because it appears to show a child."
+PLAIN_REFUSAL = "I'm sorry, but I can't help with that."
+
+
+def test_a_refusal_that_names_a_child_takes_the_tick_off(auth_client):
+    """A picture model that refuses because the picture shows a child has
+    judged it under 18: never a plain decline that leaves the tick on."""
+    aid, first = _ticked_anna(auth_client)
+    mock_chat.PICTURE_REPLY = CHILD_REFUSAL
+    young = _upload(auth_client, aid, "young.png")
+    _drain()
+    assert aid not in _ticked() and not _covered(young) and not _covered(first)
+    notice = _status(auth_client)["adult_ok_notices"][str(aid)]
+    assert '("young.png")' in notice and "appears to show a child" in notice
+    assert _status(auth_client)["adult_ok_declined"] == {}
+
+
+def test_a_refusal_that_names_no_minor_is_a_decline(auth_client):
+    aid, first = _ticked_anna(auth_client)
+    mock_chat.PICTURE_REPLY = PLAIN_REFUSAL
+    shy = _upload(auth_client, aid, "shy.png")
+    _drain()
+    assert aid in _ticked() and _covered(first) and not _covered(shy)
+    assert _status(auth_client)["adult_ok_declined"] == {str(aid): [{"id": shy, "name": "shy.png"}]}
+
+
+def test_a_refusal_found_meanwhile_beats_the_jobs_yes(auth_client, monkeypatch):
+    """The job judged the new picture adult, but a check racing it (a tick,
+    or the same file on another card) stored "under 18" first: the refusal
+    stands, and the tick comes off."""
+    aid, first = _ticked_anna(auth_client)
+    monkeypatch.setattr(cast_pictures, "queue_check", lambda avatar_id: "")
+    new = _upload(auth_client, aid, "new.png")
+    real = minor_check._classify_picture
+
+    def refused_meanwhile(asset):  # noqa: ANN001
+        out = real(asset)
+        minor_check._store(minor_check.picture_hash(asset), "minor_sexual", out[2], "A child.")
+        return out
+
+    monkeypatch.setattr(minor_check, "_classify_picture", refused_meanwhile)
+    assert cast_pictures.run(aid) == "minor"
+    assert aid not in _ticked() and not _covered(new) and not _covered(first)
+    assert "It said: A child." in _status(auth_client)["adult_ok_notices"][str(aid)]
+
+
+def test_a_covered_file_found_under_18_on_another_card_ends_the_tick(auth_client, monkeypatch):
+    """The same file on two cards, judged on both at once: card A's check
+    stores "under 18" after card B's covered it. B's tick stops holding at
+    once (nothing of B's skips the filter), and ticking B again says why."""
+    from app import models
+    from app.db import SessionLocal
+
+    monkeypatch.setattr(cast_pictures, "queue_check", lambda avatar_id: "")
+    b, first = _ticked_anna(auth_client)
+    shared = _upload(auth_client, b, "shared.png")
+    assert _tick(auth_client, b).status_code == 200 and _covered(shared)
+    a = _avatar(auth_client, "Bea", description="Bea, 30, nurse")
+    on_a = _upload(auth_client, a, "shared.png")  # the same bytes
+    with SessionLocal() as db:  # card A's check, which asked before B's "ok" was stored
+        pic = db.get(models.Asset, on_a)
+        minor_check._store(minor_check.picture_hash(pic), "minor_sexual", minor_check._picture_identity(),
+                           "A child.")
+    assert b not in _ticked() and not _covered(shared) and not _covered(first)
+    assert _status(auth_client)["adult_ok_stale"] == [b]
+    r = _tick(auth_client, b)
+    assert r.status_code == 422 and '"shared.png"' in r.json()["detail"]
+    assert content_mode.tick_row(b) is None
+
+
+def test_the_job_rereads_refusals_before_it_merges(auth_client, monkeypatch):
+    aid, first = _ticked_anna(auth_client)
+    monkeypatch.setattr(cast_pictures, "queue_check", lambda avatar_id: "")
+    _upload(auth_client, aid, "new.png")
+    real = minor_check.check_pictures
+
+    def first_refused_meanwhile(name, assets):  # noqa: ANN001
+        out = real(name, assets)
+        from app import models
+        from app.db import SessionLocal
+
+        with SessionLocal() as db:
+            minor_check._store(minor_check.picture_hash(db.get(models.Asset, first)), "minor_sexual",
+                               minor_check._picture_identity(), "A child.")
+        return out
+
+    monkeypatch.setattr(minor_check, "check_pictures", first_refused_meanwhile)
+    assert cast_pictures.run(aid) == "minor"
+    assert content_mode.tick_row(aid) is None
+    assert '("first.png")' in _status(auth_client)["adult_ok_notices"][str(aid)]
+
+
 # ---------- what queues it ----------
 
 
@@ -293,38 +385,108 @@ def test_a_file_the_startup_repair_makes_a_picture_queues_the_check(auth_client,
 
 
 class _FakeRQ:
+    """RQ's queue as enqueue_once uses it. Job ids go through RQ's own check
+    (Job.fetch and enqueue raise ValueError for an id RQ won't take)."""
+
     def __init__(self) -> None:
         self.jobs: dict[str, str] = {}
         self.enqueued: list[str] = []
+        self.at_front: list[bool] = []
 
-    def enqueue(self, func, *args, job_id, **kw):  # noqa: ANN001
+    def enqueue(self, func, *args, job_id, at_front=False, **kw):  # noqa: ANN001
+        from rq.job import validate_job_id
+
+        validate_job_id(job_id)
         self.jobs[job_id] = "queued"
         self.enqueued.append(job_id)
+        self.at_front.append(at_front)
         return type("Job", (), {"id": job_id})()
+
+    def status(self, job_id: str):  # noqa: ANN201
+        from rq.job import validate_job_id
+
+        validate_job_id(job_id)
+        return self.jobs.get(job_id)
+
+
+def _fake_rq(monkeypatch) -> _FakeRQ:
+    rq = _FakeRQ()
+    monkeypatch.setattr(queue, "_try_redis_queue", lambda: rq)
+    monkeypatch.setattr(queue, "_keyed_status", rq.status)
+    monkeypatch.setattr(queue, "_drop_keyed", lambda job_id: rq.jobs.pop(job_id, None))
+    monkeypatch.setattr(queue, "queue_entry_state", lambda job_id: "alive" if rq.status(job_id) in (
+        "queued", "started", "deferred", "scheduled") else "gone")
+    return rq
+
+
+def test_the_job_ids_are_ones_rq_takes():
+    from rq.job import validate_job_id
+
+    for job_id in queue.keyed_job_ids(cast_pictures.job_key(12)):
+        validate_job_id(job_id)  # RQ 3 refuses "cast-pictures-12.next"
+    with pytest.raises(ValueError):
+        queue.keyed_job_ids("cast.pictures")
 
 
 def test_one_check_waits_per_character_with_redis(auth_client, monkeypatch):
-    rq = _FakeRQ()
-    monkeypatch.setattr(queue, "_try_redis_queue", lambda: rq)
-    monkeypatch.setattr(queue, "_keyed_status", lambda job_id: rq.jobs.get(job_id))
-    monkeypatch.setattr(queue, "_drop_keyed", lambda job_id: rq.jobs.pop(job_id, None))
+    rq = _fake_rq(monkeypatch)
     aid, _ = _ticked_anna(auth_client)
     key = cast_pictures.job_key(aid)
+    following = f"{key}-next"
     for i in range(5):
         _upload(auth_client, aid, f"p{i}.png")
     assert rq.enqueued == [key]  # one waiting job sees all five
+    assert rq.at_front == [True]  # ahead of the renders waiting on the default queue
     assert _status(auth_client)["adult_ok_checking"] == [aid]
     rq.jobs[key] = "started"  # it may have read the card before the next one
     _upload(auth_client, aid, "q1.png")
     _upload(auth_client, aid, "q2.png")
-    assert rq.enqueued == [key, f"{key}.next"]
-    rq.jobs[f"{key}.next"] = "started"
+    assert rq.enqueued == [key, following]
+    assert _status(auth_client)["adult_ok_checking"] == [aid]
+    rq.jobs[following] = "started"
     _upload(auth_client, aid, "q3.png")
-    assert rq.enqueued == [key, f"{key}.next"]  # two under way: not queued again
+    assert rq.enqueued == [key, following]  # two under way: not queued again
     rq.jobs[key] = "finished"
     _upload(auth_client, aid, "q4.png")
-    assert rq.enqueued == [key, f"{key}.next", key]  # a finished id is used again
+    assert rq.enqueued == [key, following, key]  # a finished id is used again
     assert len(mock_chat.PICTURE_CALLS) == 1  # nothing ran in the requests
+
+
+def test_a_check_still_waiting_in_the_queue_keeps_saying_checking(auth_client, monkeypatch):
+    """A check can wait for a render running on the default queue: past
+    CHECKING_TTL it still says "checking" while its job is waiting or
+    running, and stops once the job is gone."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.services.model_registry import put_setting
+
+    rq = _fake_rq(monkeypatch)
+    aid, _ = _ticked_anna(auth_client)
+    key = cast_pictures.job_key(aid)
+    _upload(auth_client, aid, "new.png")
+    old = datetime.now(timezone.utc) - timedelta(seconds=content_mode.CHECKING_TTL_SECONDS + 60)
+    put_setting(f"{content_mode.CHECKING_PREFIX}{aid}", {"at": old.isoformat()})
+    assert _status(auth_client)["adult_ok_checking"] == [aid]  # still queued
+    rq.jobs[key] = "started"
+    assert _status(auth_client)["adult_ok_checking"] == [aid]  # running
+    rq.jobs[key] = "failed"
+    assert _status(auth_client)["adult_ok_checking"] == []  # it died: the card offers the button
+
+
+def test_without_redis_a_waiting_check_keeps_saying_checking(auth_client, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from app.services.model_registry import put_setting
+
+    monkeypatch.setattr(queue, "_run_in_background", lambda func, *a, **kw: None)
+    monkeypatch.setattr(queue, "_bg_waiting", set())
+    aid, _ = _ticked_anna(auth_client)
+    _upload(auth_client, aid, "new.png")
+    old = datetime.now(timezone.utc) - timedelta(seconds=content_mode.CHECKING_TTL_SECONDS + 60)
+    put_setting(f"{content_mode.CHECKING_PREFIX}{aid}", {"at": old.isoformat()})
+    assert _status(auth_client)["adult_ok_checking"] == [aid]
+    queue._bg_waiting.clear()
+    assert _status(auth_client)["adult_ok_checking"] == []
 
 
 def test_one_check_waits_per_character_without_redis(auth_client, monkeypatch):
