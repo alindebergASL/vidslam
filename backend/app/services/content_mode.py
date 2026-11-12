@@ -75,7 +75,9 @@ def text_model() -> str:
 # Cast characters marked "adult content allowed": an adult (18+), fictional
 # or a real adult who consented. In adult mode every picture on their card
 # (not a logo) skips the forced content filter, however it was made
-# (pipeline._exempt_asset).
+# (pipeline._exempt_asset). A mark needs the character's own text to pass
+# the minors word filter and the AI check (adult_ok_problem); an edit that
+# fails either takes it off.
 # One row per character, so marking two at once can't overwrite each other.
 ADULT_OK_PREFIX = "content.adult_ok.avatar."  # + id → {"enabled": true, "at": iso}
 
@@ -103,12 +105,50 @@ def adult_ok_avatars() -> set[int]:
     return out
 
 
-def describes_minor(avatar) -> bool:  # noqa: ANN001 — models.Avatar
-    """The character's own text names a child or a minor's age: never marked."""
-    from .safety import mentions_minor
+CARD_FIELDS = ("name", "description", "persona", "visual_identity")
 
-    text = " ".join(str(getattr(avatar, f, "") or "") for f in ("name", "description", "persona", "visual_identity"))
-    return mentions_minor(text)
+
+def describes_minor(avatar) -> bool:  # noqa: ANN001 — models.Avatar
+    """The character's own text names a minor (word filter, so it's cheap
+    enough for every render): never marked, and a mark is ignored."""
+    from .safety import character_minor
+
+    return character_minor(*(str(getattr(avatar, f, "") or "") for f in CARD_FIELDS))
+
+
+# Why a character can't be ticked, or lost its tick on an edit.
+DESCRIBED_AS_MINOR = "This character is described as a minor, so adult content can't be allowed."
+_UNTICKED = {
+    "words": "the new text describes a minor.",
+    "minor": "the safety check thinks the new text describes someone under 18.",
+    "unavailable": "the safety check couldn't run on the new text. Tick it again once it can.",
+}
+
+
+def adult_ok_problem(avatar) -> Optional[str]:  # noqa: ANN001 — models.Avatar or a copy of its fields
+    """Why this character can't be marked "adult content allowed", or None.
+    "words": its own text names a minor (describes_minor). "minor": the AI
+    check thinks it's, or would be shown as, under 18. "unavailable": the AI
+    check couldn't run, which never counts as a yes."""
+    if describes_minor(avatar):
+        return "words"
+    from .minor_check import character_card, check_character
+
+    verdict = check_character(character_card(avatar))
+    return None if verdict == "ok" else verdict
+
+
+def tick_refusal(problem: str) -> str:
+    """The message for a refused tick (adult_ok_problem's answer)."""
+    from .minor_check import CHARACTER_REFUSED, CHARACTER_UNAVAILABLE
+
+    return {"minor": CHARACTER_REFUSED, "unavailable": CHARACTER_UNAVAILABLE}.get(problem, DESCRIBED_AS_MINOR)
+
+
+def untick_notice(name: str, problem: str) -> str:
+    """The message when an edit takes the tick off (adult_ok_problem's answer)."""
+    why = _UNTICKED.get(problem, _UNTICKED["words"])
+    return f"Adult content is no longer allowed for {name or 'this character'}: {why}"
 
 
 def set_avatar_adult_ok(avatar_id: int, value: bool) -> dict:
@@ -169,4 +209,5 @@ def _safety_check() -> dict:
     except Exception:  # noqa: BLE001 — a status line, never a failed page
         from .model_registry import active_model
 
-        return {"model": active_model("chat"), "available": False}
+        return {"model": active_model("chat"), "available": False,
+                "note": "It can't run right now, so sexual prompts are paused until it can."}
