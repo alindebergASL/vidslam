@@ -649,7 +649,7 @@ class EditModel:
     max_refs: int
     premium: bool = False
     identity: bool = False  # made for keeping a person's likeness
-    naming: str = "picture"  # how a prompt names the pictures: picture | ordinal | context
+    naming: str = "picture"  # how a prompt names the pictures: picture | ordinal | context | image
 
 
 # Documented prices where Sogni lists them (FLUX.3 Klein 2.19 / 3.45 / 4.88
@@ -667,8 +667,16 @@ _EDITS: tuple[EditModel, ...] = (
     EditModel("gpt-image-2.5-flare", "GPT Image 2.5 Flare edit", 20.0, 17.0, 16, premium=True),
     EditModel("gpt-image-2.6-sunburst", "GPT Image 2.6 Sunburst edit", 30.0, 17.0, 16, premium=True),
     EditModel("gpt-image-2.6-flare", "GPT Image 2.6 Flare edit", 20.0, 17.0, 16, premium=True),
+    # Sogni's model page: 1-10 reference pictures, named "Image 1", "Image 2"
+    # in the order sent; 13.5 Spark up to 1536x1536, 0.9 per further picture.
+    # Live 2026-11-12: edit_image kept a reference's exact place (12.8 Spark).
+    EditModel("seedream-5-0-pro-uncensored", "Seedream 5.0 Pro (uncensored) edit", 13.5, 0.9, 10, premium=True,
+              naming="image"),
 )
 _EDIT_INFO = {m.selector: m for m in _EDITS}
+# Editors Sogni takes on edit_image but leaves out of its published list
+# (the protocol's enum lags its models): offered as well.
+_UNLISTED_EDITS = ("seedream-5-0-pro-uncensored",)
 # A picked image model's own edit version. Identity twins only keep a
 # likeness; for a place or a guide picture they give way to the scene default.
 _EDIT_TWIN = {
@@ -677,6 +685,7 @@ _EDIT_TWIN = {
     "gpt-image-2": "gpt-image-2", "gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare": "gpt-image-2.5-flare", "gpt-image-2.6-sunburst": "gpt-image-2.6-sunburst",
     "gpt-image-2.6-flare": "gpt-image-2.6-flare",
+    "seedream-5-0-pro-uncensored": "seedream-5-0-pro-uncensored",
 }
 INTENTS = ("same_place", "identity", "guide")
 
@@ -690,11 +699,12 @@ class EditRoute:
 
 
 def edit_models() -> tuple[EditModel, ...]:
-    """The edit models Sogni lists (synced), else our table."""
+    """The edit models Sogni lists (synced) plus the ones it takes unlisted,
+    else our table."""
     sels = listed()["tools"].get(EDIT_TOOL) or []
     if not sels:
         return _EDITS
-    return tuple(_EDIT_INFO.get(s) or _generic_edit(s) for s in dict.fromkeys(sels))
+    return tuple(_EDIT_INFO.get(s) or _generic_edit(s) for s in dict.fromkeys([*sels, *_UNLISTED_EDITS]))
 
 
 def _generic_edit(sel: str) -> EditModel:
@@ -850,6 +860,8 @@ def _picture_name(i: int, naming: str) -> str:
         return f"the {words[i]} image" if i < len(words) else f"image {i + 1}"
     if naming == "context":
         return f"context_image_{i}"
+    if naming == "image":
+        return f"Image {i + 1}"
     return f"picture {i + 1}"
 
 
