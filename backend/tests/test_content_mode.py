@@ -301,19 +301,24 @@ def test_sogni_filter_for_marked_and_unmarked_cast_pictures(auth_client, monkeyp
         return httpx.Response(201, json={"status": "success", "data": {"workflow": {"workflowId": "wf", "status": "queued"}}})
 
     media = [{"kind": "image", "url": "https://x.test/maya.png"}]
-    with respx.mock() as router:
-        router.post(SOGNI_WF).mock(side_effect=started)
-        start = SogniClient().start
-        start(title="t", tool="edit_image", arguments={"prompt": "a nude portrait by the window"},
-              media_references=media, cast=False, exempt=True)  # marked character
-        start(title="t", tool="edit_image", arguments={"prompt": "a nude portrait by the window"},
-              media_references=media, cast=True)  # unmarked character
-        start(title="t", tool="edit_image", arguments={"prompt": "a nude portrait by the window"},
-              media_references=media)  # some other picture: who is in it is unknown
+    nude = {"prompt": "a nude portrait by the window"}
+
+    def run_all(start):
+        start(title="t", tool="edit_image", arguments=nude, media_references=media)  # marked character
+        start(title="t", tool="edit_image", arguments=nude, media_references=media, cast=True)  # unmarked
+        start(title="t", tool="edit_image", arguments=nude, media_references=media)  # a scene or Studio result
+        start(title="t", tool="edit_image", arguments={"prompt": "her portrait with the kids at the beach"},
+              media_references=media)  # a child mentioned: on, marked or not
         with pytest.raises(UnsafePromptError):  # minors: refused, marked or not
             start(title="t", tool="edit_image", arguments={"prompt": "a nude teenage girl"},
-                  media_references=media, exempt=True)
-    assert [b["safe_content_filter"] for b in bodies] == [False, True, True]
+                  media_references=media)
+
+    with respx.mock() as router:
+        router.post(SOGNI_WF).mock(side_effect=started)
+        run_all(SogniClient().start)
+        content_mode.set_adult_mode(False)
+        run_all(SogniClient().start)
+    assert [b["safe_content_filter"] for b in bodies] == [False, True, False, True] + [True] * 4
     _reset()
 
 
@@ -335,15 +340,20 @@ def test_runware_check_for_marked_and_unmarked_cast_pictures(client, monkeypatch
     unmarked = ImageRef(url="https://x.test/real.png", role="character", name="Sam")
     prompt = "a nude portrait by the window"
 
-    def checked(refs):
-        return runware.build_image_task(model, prompt, refs)["safety"]["checkContent"]
+    def checked(refs, text=prompt):
+        return runware.build_image_task(model, text, refs)["safety"]["checkContent"]
 
-    assert checked([marked]) is True  # adult mode off: always checked
+    cases = ([marked], [unmarked], [marked, unmarked], [marked, _ref()], [_ref()])
+    # Adult mode off: always checked.
+    assert [checked(refs) for refs in cases] == [True] * 5
     content_mode.set_adult_mode(True)
-    assert checked([marked]) is False
-    assert checked([unmarked]) is True
-    assert checked([marked, unmarked]) is True
-    assert checked([marked, _ref()]) is True  # a scene picture: who is in it is unknown
+    # On: only a picture of an unmarked character turns it on; a scene
+    # picture with a sexual prompt no longer does.
+    assert [checked(refs) for refs in cases] == [False, True, True, False, False]
+    assert checked([marked], "her portrait with the kids in the park") is True  # a child mentioned
+    assert runware._pictures_need_check([_ref()], prompt) is False
+    content_mode.set_adult_mode(False)
+    assert runware._pictures_need_check([_ref()], prompt) is True
     _reset()
 
 
@@ -431,20 +441,62 @@ def test_deleting_a_character_clears_its_mark(auth_client):
     assert auth_client.put("/api/settings/content/avatars/987654", json={"adult_ok": False}).status_code == 200
 
 
-def test_only_pictures_of_the_character_itself_count(auth_client):
+def test_every_picture_on_a_marked_card_counts_however_it_was_made(auth_client):
+    """The tick covers every picture kept on the card: uploaded, made from
+    the character's own pictures, from someone else's, from a picture
+    deleted since, or from a Studio result. Logos and other characters'
+    pictures never count."""
+    from app import models
+    from app.db import SessionLocal
     from app.services import content_mode
 
     maya, sam = _avatar("Maya"), _avatar("Sam")
     content_mode.set_avatar_adult_ok(maya, True)
-    hero = _asset(maya, source="generated", job=_job(maya))  # text only: Maya herself
+    uploaded = _asset(maya)
+    hero = _asset(maya, source="generated", job=_job(maya))  # text only
     chained = _asset(maya, source="generated", job=_job(maya, refs=[hero]))
     sam_pic = _asset(sam)
-    laundered = _asset(maya, source="generated", job=_job(maya, refs=[sam_pic]))  # made from Sam's photo
+    from_sam = _asset(maya, source="generated", job=_job(maya, refs=[sam_pic]))  # another character's picture
+    gone = _asset(maya)
+    from_gone = _asset(maya, source="generated", job=_job(maya, refs=[gone]))
+    db = SessionLocal()
+    try:
+        studio_job = db.get(models.AssetGenerationJob, _job(maya))
+        studio_job.first_frame_job_id = _job(sam)  # made from a Studio result
+        db.delete(db.get(models.Asset, gone))  # the source picture was deleted
+        db.commit()
+        from_studio = _asset(maya, source="generated", job=studio_job.id)
+    finally:
+        db.close()
     logo = _asset(maya, asset_type="logo")
-    assert _exempt_ids([hero, chained, laundered, sam_pic, logo]) == [True, True, False, False, False]
+    assert _exempt_ids([uploaded, hero, chained, from_sam, from_gone, from_studio]) == [True] * 6
+    assert _exempt_ids([sam_pic, logo]) == [False, False]
 
 
-def test_animating_a_marked_characters_picture_is_exempt(auth_client):
+def test_a_marked_character_whose_text_now_names_a_minor_never_counts(auth_client):
+    """Even if the mark survives an edit made outside the API, a character
+    whose own text names a minor gets no exemption."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import content_mode
+
+    maya = _avatar("Maya", description="a painter in her thirties")
+    content_mode.set_avatar_adult_ok(maya, True)
+    pic = _asset(maya)
+    assert _exempt_ids([pic]) == [True]
+    db = SessionLocal()
+    try:
+        db.get(models.Avatar, maya).description = "a 15-year-old girl"
+        db.commit()
+    finally:
+        db.close()
+    assert maya in content_mode.adult_ok_avatars()  # still marked
+    assert _exempt_ids([pic]) == [False]
+
+
+def test_animating_a_cast_picture_keeps_it_a_cast_picture(auth_client):
+    """"Animate this" on a Cast picture: the first frame is that
+    character's likeness, so an unmarked character keeps the filter."""
     from app import models
     from app.db import SessionLocal
     from app.services import content_mode
@@ -454,45 +506,80 @@ def test_animating_a_marked_characters_picture_is_exempt(auth_client):
     content_mode.set_avatar_adult_ok(maya, True)
     db = SessionLocal()
     try:
-        for owner, want in ((maya, True), (sam, False)):
-            pic = _asset(owner)
+        for owner, kind, role, want in ((maya, "hero", "character", True), (sam, "hero", "character", False),
+                                        (maya, "logo", "scene", False)):
+            pic = _asset(owner, asset_type=kind)
             job = db.get(models.AssetGenerationJob, _job(owner, first_frame_asset_id=pic))
             ref = studio_first_frame(db, job)
-            assert ref.frame_type == "first_frame" and ref.adult_ok is want
+            assert (ref.frame_type, ref.role, ref.adult_ok) == ("first_frame", role, want)
     finally:
         db.close()
 
 
-def test_sogni_video_with_a_marked_and_another_picture_keeps_the_filter(auth_client, monkeypatch):
+def test_sogni_video_filter_follows_the_cast_pictures_only(auth_client, monkeypatch):
+    from app import models
+    from app.db import SessionLocal
     from app.providers.base import ImageRef
     from app.providers.sogni import SogniVideoProvider
     from app.services import content_mode
+    from app.services.pipeline import studio_first_frame
 
     monkeypatch.setenv("SOGNI_API_KEY", "sk-test-123456789")
     monkeypatch.setenv("MOCK_PROVIDERS", "false")
     _reset()
-    content_mode.set_adult_mode(True)
     bodies = []
 
     def started(request):
         bodies.append(json.loads(request.content))
         return httpx.Response(201, json={"status": "success", "data": {"workflow": {"workflowId": "wf", "status": "queued"}}})
 
+    maya, sam = _avatar("Maya"), _avatar("Sam")
+    content_mode.set_avatar_adult_ok(maya, True)
+    db = SessionLocal()
+    try:
+        first = {}
+        for owner in (maya, sam):
+            job = db.get(models.AssetGenerationJob, _job(owner, first_frame_asset_id=_asset(owner)))
+            first[owner] = studio_first_frame(db, job)
+    finally:
+        db.close()
     marked = ImageRef(url="https://x.test/maya.png", role="character", name="Maya", adult_ok=True)
+    unmarked = ImageRef(url="https://x.test/sam.png", role="character", name="Sam")
     scene = ImageRef(url="https://x.test/room.png", role="scene", name="room")
+    studio_result = ImageRef(url="https://x.test/result.png", role="scene", name="first frame",
+                             frame_type="first_frame")
+    loose = ([marked], [marked, scene], [scene], [unmarked], [marked, unmarked])
+    frames = ([first[maya]], [first[sam]], [studio_result])
+    nude = "a nude portrait by the window"
+
+    def submit_all():
+        for refs in loose:
+            SogniVideoProvider().submit(model="sogni/minimax-h3-r2v", prompt=nude, references=refs,
+                                        duration_seconds=5)
+        for refs in frames:
+            SogniVideoProvider().submit(model="sogni/wan3.0-video", prompt=nude, references=refs,
+                                        duration_seconds=10, reference_strategy="frame_images")
+        SogniVideoProvider().submit(model="sogni/wan3.0-video", prompt="she waves at the kids", references=frames[0],
+                                    duration_seconds=10, reference_strategy="frame_images")
+
     with respx.mock() as router:
         router.post(SOGNI_WF).mock(side_effect=started)
-        for refs in ([marked], [marked, scene]):
-            SogniVideoProvider().submit(model="sogni/minimax-h3-r2v", prompt="a nude portrait by the window",
-                                        references=refs, duration_seconds=5)
-    assert [b["safe_content_filter"] for b in bodies] == [False, True]
+        content_mode.set_adult_mode(True)
+        submit_all()
+        content_mode.set_adult_mode(False)
+        submit_all()
+    assert all(b.get("media_references") for b in bodies)
+    on = [b["safe_content_filter"] for b in bodies[:9]]
+    assert on == [False, False, False, True, True,  # loose: only an unmarked character turns it on
+                  False, True, False,  # first frames: marked Cast, unmarked Cast, a Studio result
+                  True]  # a child mentioned
+    assert [b["safe_content_filter"] for b in bodies[9:]] == [True] * 9  # adult mode off
     _reset()
 
 
-def test_a_cutout_or_upscale_counts_only_as_its_source_picture(auth_client):
+def test_a_cutout_or_upscale_on_a_marked_card_counts_whatever_its_source(auth_client):
     """Remove background / upscale results saved to a marked character's
-    card count only when their source is one of that character's counted
-    Cast pictures, never a Studio result (made from anyone's photo)."""
+    card count like any other picture there, whatever they were made from."""
     from app import models
     from app.db import SessionLocal
     from app.services import content_mode
@@ -501,10 +588,10 @@ def test_a_cutout_or_upscale_counts_only_as_its_source_picture(auth_client):
     content_mode.set_avatar_adult_ok(maya, True)
     own, sam_pic = _asset(maya), _asset(sam)
 
-    def op_job(**source):
+    def op_job(owner=maya, **source):
         db = SessionLocal()
         try:
-            j = models.AssetGenerationJob(owner_kind="avatar", owner_id=maya, output_kind="image", prompt="",
+            j = models.AssetGenerationJob(owner_kind="avatar", owner_id=owner, output_kind="image", prompt="",
                                           status="saved", operation="upscale", options_json={"factor": 2},
                                           **source)
             db.add(j)
@@ -517,4 +604,6 @@ def test_a_cutout_or_upscale_counts_only_as_its_source_picture(auth_client):
     from_sam = _asset(maya, source="generated", job=op_job(source_asset_id=sam_pic))
     from_studio = _asset(maya, source="generated", job=op_job(source_job_id=_job(sam)))
     no_source = _asset(maya, source="generated", job=op_job())
-    assert _exempt_ids([from_own, from_sam, from_studio, no_source]) == [True, False, False, False]
+    on_sams_card = _asset(sam, source="generated", job=op_job(sam, source_asset_id=own))
+    assert _exempt_ids([from_own, from_sam, from_studio, no_source]) == [True] * 4
+    assert _exempt_ids([on_sams_card]) == [False]  # Sam isn't marked

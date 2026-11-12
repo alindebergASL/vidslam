@@ -768,8 +768,9 @@ def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str
     if neg and "negativePrompt" in props and _allowed(props["negativePrompt"], neg) and len(neg) >= 2:
         task["negativePrompt"] = neg
     if not _put(task, props, ("safety", "checkContent"), bool(check_content)) and (cast or pictures):
-        # Rule: a Cast member's picture, or any picture with a sexual
-        # prompt, never goes out without the check.
+        # Rule: a Cast member's picture (unless marked "adult content
+        # allowed", in adult mode), or outside adult mode any picture with
+        # a sexual prompt, never goes out without the check.
         if cast:
             raise RunwareError(f"{model_air} has no content check, so it can't be sent pictures of your Cast")
         raise RunwareError(f"{model_air} has no content check, so it can't be sent a picture with a "
@@ -1194,13 +1195,14 @@ def _content_check(explicit: Optional[bool], cast: bool, sent: str, negative: st
 
 
 def _pictures_need_check(used: list[ImageRef], sent: str) -> bool:
-    """A sexual prompt sent with any reference picture (not only a Cast
-    member's) always goes through Runware's content check: nobody has
-    checked who is in the picture. Pictures of a Cast character marked
-    "adult content allowed" (adult mode) are the exception."""
+    """Outside adult mode, a sexual prompt sent with any reference picture
+    (not only a Cast member's) always goes through Runware's content
+    check, and a model without one is refused. In adult mode this rule
+    is off: only a picture of a Cast character not marked "adult content
+    allowed" forces the check (`cast`), with the minors rules."""
     from ..services.safety import is_sexual
 
-    return any(not _exempt(r) for r in used) and is_sexual(sent)
+    return bool(used) and not _adult_mode() and is_sexual(sent)
 
 
 def _exempt(ref: ImageRef) -> bool:

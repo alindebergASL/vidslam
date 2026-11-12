@@ -291,7 +291,7 @@ def test_unwrap_gives_the_adapter(client):
 # ---------- the picture rule ----------
 
 
-def test_runware_forces_content_check_for_sexual_prompt_with_any_picture(client, monkeypatch):
+def test_runware_forces_content_check_for_sexual_prompt_with_any_picture_outside_adult_mode(client, monkeypatch):
     from app.providers import runware
     from app.providers.base import ImageRef
 
@@ -300,6 +300,9 @@ def test_runware_forces_content_check_for_sexual_prompt_with_any_picture(client,
     assert runware._pictures_need_check([ref], ADULT_SEXUAL)
     assert not runware._pictures_need_check([], ADULT_SEXUAL)
     assert not runware._pictures_need_check([ref], PLAIN)
+    _adult(True)  # adult mode: only an unmarked Cast picture forces it (`cast`)
+    assert not runware._pictures_need_check([ref], ADULT_SEXUAL)
+    _adult(False)
     sch = {"request": {"properties": {"positivePrompt": {"type": "string"}, "safety": {
         "type": "object", "properties": {"checkContent": {"type": "boolean"}}}}}}
     tasks = runware._bases(sch, "imageInference", "m:1@1", ADULT_SEXUAL, "", True, False, pictures=True)
@@ -311,7 +314,7 @@ def test_runware_forces_content_check_for_sexual_prompt_with_any_picture(client,
     runware._bases(no_switch, "imageInference", "m:1@1", PLAIN, "", False, False)  # no picture rule: fine
 
 
-def test_sogni_safe_filter_on_for_sexual_prompt_with_any_picture(client, monkeypatch):
+def test_sogni_safe_filter_off_for_sexual_prompt_with_a_non_cast_picture_in_adult_mode(client, monkeypatch):
     from app import config
     from app.providers.sogni import SogniClient
     from app.services import provider_keys
@@ -334,7 +337,12 @@ def test_sogni_safe_filter_on_for_sexual_prompt_with_any_picture(client, monkeyp
                             media_references=media)
         SogniClient().start(title="t", tool="generate_image", arguments={"prompt": ADULT_SEXUAL})
         SogniClient().start(title="t", tool="generate_image", arguments={"prompt": PLAIN}, media_references=media)
-    assert [b["safe_content_filter"] for b in bodies] == [True, False, False]
+        SogniClient().start(title="t", tool="generate_image", arguments={"prompt": ADULT_SEXUAL},
+                            media_references=media, cast=True)  # an unmarked Cast picture
+        _adult(False)
+        SogniClient().start(title="t", tool="generate_image", arguments={"prompt": ADULT_SEXUAL},
+                            media_references=media)
+    assert [b["safe_content_filter"] for b in bodies] == [False, False, False, True, True]
 
 
 # ---------- early 422s ----------

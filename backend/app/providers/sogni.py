@@ -928,26 +928,24 @@ class SogniClient:
 
     def start(self, *, title: str, tool: str, arguments: dict,
               media_references: Optional[list[dict]] = None, cast: bool = False,
-              negative: str = "", exempt: bool = False) -> dict:
+              negative: str = "") -> dict:
         """Start a one-step workflow; returns the workflow snapshot. One fresh
         Idempotency-Key per call, reused only when retrying this same start
         (network errors, 429 within the wait cap, 5xx).
 
-        A prompt sexualising minors is refused before it's sent; Sogni's safe
-        filter is on outside adult mode, and always for a Cast member's
-        picture (`cast`), a prompt mentioning a child or a minor's age, or a
-        sexual prompt whose avoid list (`negative`) removes signs of
-        adulthood. `exempt`: every picture sent is of a Cast character
-        marked "adult content allowed" (adult mode; content_mode.exempt)."""
-        from ..services.safety import check_prompt, is_sexual, mentions_minor, steers_young
+        A prompt sexualising minors is refused before it's sent. Sogni's safe
+        filter is on outside adult mode. In adult mode it is on only for a
+        picture of a Cast character not marked "adult content allowed"
+        (`cast`; content_mode.exempt), a prompt mentioning a child or a
+        minor's age, or a sexual prompt whose avoid list (`negative`)
+        removes signs of adulthood. Any other picture (a marked character, a
+        scene, a Studio result) follows SOGNI_SAFE_CONTENT_FILTER."""
+        from ..services.safety import check_prompt, mentions_minor, steers_young
 
         prompt = str(arguments.get("prompt") or "")
         negative = negative or str(arguments.get("negativePrompt") or "")
         check_prompt(prompt)
-        # Any reference picture with a sexual prompt: nobody has checked
-        # who is in the picture, so the safe filter is on.
-        pictures = bool(media_references) and is_sexual(prompt) and not exempt
-        guarded = cast or pictures or mentions_minor(prompt) or steers_young(prompt, negative)
+        guarded = cast or mentions_minor(prompt) or steers_young(prompt, negative)
         body: dict = {
             "input": {"title": title[:120] or "vidslam", "steps": [
                 {"id": STEP_ID, "toolName": tool, "arguments": arguments},
@@ -1195,7 +1193,6 @@ class SogniImageProvider(ImageProvider):
         self.last_route = route
         wf = self.client.start(title=prompt[:80], tool=EDIT_TOOL, arguments=args, media_references=media,
                                cast=any(r.role == "character" and not _exempt(r) for r in route.refs),
-                               exempt=bool(route.refs) and all(_exempt(r) for r in route.refs),
                                negative=negative_prompt)
         wf = self._wait(wf)
         url = self.client.artifact_url(wf, "image")
@@ -1333,7 +1330,6 @@ class SogniVideoProvider(VideoProvider):
         sent = {m["url"] for m in media}
         wf = self.client.start(title=prompt[:80], tool=tool, arguments=args, media_references=media or None,
                                cast=any(r.role == "character" and r.url in sent and not _exempt(r) for r in refs),
-                               exempt=bool(sent) and all(_exempt(r) for r in refs if r.url in sent),
                                negative=negative_prompt)
         wid = str(wf["workflowId"])
         return SubmittedJob(provider="sogni", model=model, job_id=wid,
