@@ -32,6 +32,7 @@ import {
   editorFor,
   editorPriceText,
   jobPictures,
+  liveReferenceIds,
   pictureIntent,
   ranOnText,
   sheetSlot,
@@ -535,7 +536,8 @@ function Studio() {
     const editor = editorFor(m, intent, count);
     const priceText = editor ? editorPriceText(editor, count) : m?.price_text;
     if (!priceText) return "";
-    const withRefs = job.output_kind === "image" && (job.reference_asset_ids || []).length > 0;
+    // Deleted reference pictures aren't sent: with none left it runs without any.
+    const withRefs = job.output_kind === "image" && liveReferenceIds(job).length > 0;
     if (priceText === "free" || (!job.operation && modelPrice(priceText, withRefs) === 0)) return "free";
     // An upscale is priced by its source's size (the catalog price is for
     // 1 MP), so it shows the server's estimate for this picture, and no
@@ -1665,10 +1667,13 @@ function PromptBar({
   const total =
     unitPrice === null ? null : outputKind === "image" ? unitPrice * variations : unitPrice * (clipSeconds / 5);
   const aboutText = total === null ? "" : total === 0 ? "Free" : `About ${usd(total)}`;
+  // An editor is sent at most max_refs of the pictures.
+  const unsent =
+    pickedEditor && refCount > pickedEditor.max_refs ? ` · uses ${pickedEditor.max_refs} of your ${refCount} pictures` : "";
   const priceTitle = pickedPrice
     ? `${pickedEditor ? `${pickedEditor.name} (Sogni)` : pickedModel?.name}: ${pickedPrice}${
         outputKind === "image" && variations > 1 ? ` × ${variations}` : ""
-      }`
+      }${unsent}`
     : undefined;
 
   // Fill the bar from Remix or a preset.

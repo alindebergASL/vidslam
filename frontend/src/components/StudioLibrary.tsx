@@ -37,9 +37,11 @@ export function editorFor(m: ModelOption | undefined, intent: PictureIntent | nu
 }
 
 /** This editor's price with `count` reference pictures, as Spend counts it:
- *  "about $0.07 per image", or "free (Free Spark)" for a Sogni editor on Free Spark. */
+ *  "about $0.07 per image", or "free (Free Spark)" for a Sogni editor on Free Spark.
+ *  It's sent at most max_refs of them, and only those are counted. */
 export function editorPriceText(e: SogniEditor, count: number): string {
-  const total = e.usd + e.usd_per_ref * Math.max(count - 1, 0);
+  const sent = Math.max(Math.min(count, e.max_refs), 1);
+  const total = e.usd + e.usd_per_ref * (sent - 1);
   return total > 0 ? `about ${usd(total)} per image` : e.price_text || "free";
 }
 
@@ -59,15 +61,19 @@ export function editorChoices(
   return Array.from(out.values());
 }
 
+/** A Studio job's reference pictures that are still there (deleted ones aren't sent). */
+export function liveReferenceIds(job: Pick<StudioJob, "reference_asset_ids" | "missing_reference_ids">): number[] {
+  const missing = new Set(job.missing_reference_ids || []);
+  return (job.reference_asset_ids || []).filter((id) => !missing.has(id));
+}
+
 /** What a Studio picture job's reference pictures are for, and how many are
  *  still there (deleted ones aren't sent); no intent for clips and operations. */
 export function jobPictures(
   job: Pick<StudioJob, "output_kind" | "operation" | "ref_intent" | "reference_asset_ids" | "missing_reference_ids">
 ): { intent: PictureIntent | null; count: number } {
   const intent = job.output_kind === "image" && !job.operation ? job.ref_intent ?? null : null;
-  const missing = new Set(job.missing_reference_ids || []);
-  const count = intent ? (job.reference_asset_ids || []).filter((id) => !missing.has(id)).length : 0;
-  return { intent, count };
+  return { intent, count: intent ? liveReferenceIds(job).length : 0 };
 }
 
 /** "Ran on Krea 2 Identity Edit (Sogni)" when a Sogni editor made it, not the

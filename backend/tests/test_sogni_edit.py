@@ -432,6 +432,30 @@ def test_each_picture_model_says_which_editor_it_runs_as(edit_env):
     assert sogni.with_pictures("sogni/krea-2-turbo") is None
 
 
+def test_an_editor_is_sent_and_charged_for_at_most_max_refs_pictures(edit_env):
+    """Studio prices an editor at usd + usd_per_ref × (n − 1) with n at most
+    max_refs: past that the editor is sent, and Spend counts, only max_refs."""
+    from app.providers import sogni
+
+    def check(model, intent, n):
+        info = sogni.with_pictures(model)[intent]
+        e = info["over_max"] if n > info["max_refs"] and info["over_max"] else info
+        role = "character" if intent == "identity" else "scene"
+        route = sogni.edit_route(model, [_ref(role)] * n, intent, warn=False)
+        sent = min(n, e["max_refs"])
+        assert (route.model.selector, len(route.refs)) == (e["id"], sent), model
+        assert sogni.edit_spend_usd(e["id"], len(route.refs)) == pytest.approx(e["usd"] + e["usd_per_ref"] * (sent - 1))
+        return sent
+
+    # Premium editors have no larger one to move to: 10 and 16 pictures are sent.
+    assert check("sogni/seedream-5-0-pro-uncensored", "guide", 12) == 10
+    assert check("sogni/gpt-image-2", "guide", 20) == 16
+    # Krea takes 2, so 12 go to Klein, which takes 10.
+    edit_env(SOGNI_COUNT_FREE_SPARK="true")
+    assert check("sogni/krea-2-turbo", "identity", 12) == 10
+    assert check("sogni/krea-2-turbo", "identity", 2) == 2
+
+
 def test_a_missing_default_editor_is_logged_for_pictures_not_for_the_pickers(edit_env, caplog):
     from app.providers import sogni
 
