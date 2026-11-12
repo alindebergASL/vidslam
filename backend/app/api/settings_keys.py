@@ -96,6 +96,11 @@ async def put_options(name: str, request: Request) -> dict:
     if not isinstance(body, dict) or not body or any(
             k not in allowed or v not in (True, False, None) for k, v in body.items()):
         raise HTTPException(422, f"body must be JSON with options {sorted(allowed) or '(none)'}: true | false | null")
+    if body.get("check_content") is False or body.get("safe_filter") is False:
+        from ..services import content_mode
+
+        if not content_mode.features():
+            raise HTTPException(403, "Adult content is turned off for this deployment.")
     row: dict = {}
     for k, v in body.items():
         row = provider_keys.set_option(name, k, v)

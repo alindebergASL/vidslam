@@ -8,7 +8,7 @@ import { TrainPanel } from "@/components/TrainPanel";
 import { AssignDialog, ASSET_SLOTS, demoteOtherHeroes, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
-import { shortModel, useContentModeState } from "@/components/AdultModePanel";
+import { adultFeatures, shortModel, useAdultFeatures, useContentModeState } from "@/components/AdultModePanel";
 import { api, Asset, Avatar, ImageOp, Ingredient, Project, StudioJob, Voice, errorText } from "@/lib/api";
 import { UpscaleDialog, removeBgLabel, useOpModels } from "@/components/ImageOps";
 import { usePoll } from "@/lib/usePoll";
@@ -947,11 +947,13 @@ function DetailDrawer({
  * later is checked automatically (it keeps the filter until it is); one the
  * picture model won't judge keeps the filter and is listed here. "Check new
  * pictures" asks again. Pictures of unticked characters always get it, and
- * so does a prompt that mentions a child. Minors are always refused.
+ * so does a prompt that mentions a child. Minors are always refused. Hidden
+ * when adult content is turned off for this deployment, and while that is
+ * unknown (loading, or the setting couldn't be read).
  */
 function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   const toast = useToast();
-  const { mode, failed, reload } = useContentModeState();
+  const { mode, reload } = useContentModeState();
   const [busy, setBusy] = useState(false);
   // Why the last tick was refused (the safety check's own words), kept on
   // the card until the next try.
@@ -962,16 +964,10 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   // Pictures added since are checked on the server: re-read until it's done.
   const checkingAdded = allowed && Boolean(mode && (mode.adult_ok_checking ?? []).includes(avatarId));
   usePoll(reload, { enabled: checkingAdded, interval: 4000 });
-  if (!mode) {
-    return failed ? (
-      <div className="card p-4 mb-4 text-xs text-ink-400">
-        Couldn&rsquo;t load the adult content setting.{" "}
-        <button type="button" className="underline" onClick={reload}>
-          Retry
-        </button>
-      </div>
-    ) : null;
-  }
+  // Shown only once the server says this deployment has adult features:
+  // while that is unknown (loading, or the request failed) nothing appears,
+  // so a clean deployment never mentions it.
+  if (!mode || adultFeatures(mode) !== true) return null;
   const pictureModel = shortModel(mode.safety_check?.picture_model || "") || "the picture model";
   const planner = shortModel(mode.safety_check?.model || mode.planner) || "the planner";
   // Pictures not checked yet (added since, or the check couldn't run), ones
@@ -1144,6 +1140,8 @@ function CardTextEditor({ avatar, onSaved }: { avatar: Avatar; onSaved: (a: Avat
   const toast = useToast();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Adult content on this deployment (null while unknown: no tick hint).
+  const features = useAdultFeatures();
   const [draft, setDraft] = useState({
     name: avatar.name,
     description: avatar.description,
@@ -1226,10 +1224,12 @@ function CardTextEditor({ avatar, onSaved }: { avatar: Avatar; onSaved: (a: Avat
       {field("visual_identity", "Look", 2)}
       {field("persona", "Persona", 2)}
       {field("description", "Description", 3)}
-      <p className="text-xs text-ink-400">
-        If this character is ticked &ldquo;Adult content allowed&rdquo;, the safety check reads the new text when you
-        save. The tick comes off if it reads as someone under 18.
-      </p>
+      {features === true && (
+        <p className="text-xs text-ink-400">
+          If this character is ticked &ldquo;Adult content allowed&rdquo;, the safety check reads the new text when
+          you save. The tick comes off if it reads as someone under 18.
+        </p>
+      )}
       <div className="flex gap-2">
         <button type="button" className="btn-primary text-xs" disabled={busy} onClick={save}>
           {busy ? "Saving…" : "Save card"}

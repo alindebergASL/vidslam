@@ -1,7 +1,7 @@
 "use client";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { api, ApiKeyStatus, ApiKeyTestResult } from "@/lib/api";
-import { useContentMode } from "@/components/AdultModePanel";
+import { adultFeatures, useContentMode } from "@/components/AdultModePanel";
 
 // Settings → API keys. Keys are write-only from the browser: the server
 // returns presence, source and the last 4 characters, never the value. The
@@ -53,6 +53,8 @@ export function ApiKeysPanel() {
   const [mock, setMock] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const contentMode = useContentMode();
+  // Adult content on this deployment (null while loading: no filter switch shown yet).
+  const features = adultFeatures(contentMode);
 
   const load = useCallback(async () => {
     try {
@@ -108,7 +110,13 @@ export function ApiKeysPanel() {
       {keys && (
         <ul className="space-y-3">
           {keys.map((k) => (
-            <KeyRow key={k.name} row={k} onChange={replace} adult={contentMode?.adult ?? null} />
+            <KeyRow
+              key={k.name}
+              row={k}
+              onChange={replace}
+              adult={contentMode?.adult ?? null}
+              features={features}
+            />
           ))}
         </ul>
       )}
@@ -120,11 +128,14 @@ function KeyRow({
   row,
   onChange,
   adult,
+  features,
 }: {
   row: ApiKeyStatus;
   onChange: (r: ApiKeyStatus) => void;
   /** Adult mode (null: unknown). Off forces the content check and safe filter on. */
   adult: boolean | null;
+  /** Adult content on this deployment (null: unknown). Not true: no content check switch. */
+  features: boolean | null;
 }) {
   const uid = useId();
   const inputId = `${uid}-input`;
@@ -292,7 +303,13 @@ function KeyRow({
           )}
         </div>
       </div>
-      {row.options && contentOption && (
+      {features === false && (row.name === "runware" || row.name === "sogni") && (
+        <p className="mt-2 text-[11px] text-ink-300">
+          {row.label} {row.name === "runware" ? "content check" : "safe filter"}: always on. Prompts involving
+          minors are always refused.
+        </p>
+      )}
+      {features === true && row.options && contentOption && (
         <label className="mt-2 flex items-start gap-2 text-[11px] text-ink-300">
           <input
             type="checkbox"

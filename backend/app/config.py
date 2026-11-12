@@ -75,6 +75,11 @@ class Settings(BaseSettings):
     # off, the planner above and the filters on. See services/content_mode.py. DeepSeek V4 Flash
     # rewrote and planned the owner's adult prompts where the planner refused
     # or toned them down; V4 Pro is Enhance's fallback when Flash declines.
+    # False = a clean deployment: adult mode stays off whatever ADULT_MODE or
+    # Settings say, every content filter is on, uncensored models are hidden
+    # and the Adult content settings disappear. True (the default) changes
+    # nothing.
+    adult_features: bool = True
     adult_mode: bool = False
     adult_text_model: str = "deepseek/deepseek-v4-flash"
     adult_text_fallback_model: str = "deepseek/deepseek-v4-pro"

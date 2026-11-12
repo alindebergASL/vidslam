@@ -1,6 +1,6 @@
 """Adult mode (Settings → Adult content), see services/content_mode.py.
 
-GET /api/settings/content   {"adult", "default", "explicit", "text_model", "planner",
+GET /api/settings/content   {"available", "adult", "default", "explicit", "text_model", "planner",
                              "safety_check": {"model", "available", "note", "picture_model",
                              "picture_available"}, "adult_ok_avatars",
                              "adult_ok_unchecked": {id: pictures not checked yet},
@@ -21,6 +21,11 @@ PUT /api/settings/content/avatars/{id}   {"adult_ok": true | false} → same (+ 
                              it was checked (an untick by a racing check wins).
 GET /api/settings/content/safety-memory   {"refusals", "oks"}: verdicts the AI check remembers
 POST /api/settings/content/safety-memory/clear-refusals   → {"cleared", "refusals", "oks"}
+
+"available" is false on a clean deployment (ADULT_FEATURES=false): adult
+mode and every tick read as off, the adult_ok_* fields are empty, and
+turning adult mode on or ticking a character is refused there (403). The
+safety-memory endpoints stay: they belong to the minors check.
 """
 from __future__ import annotations
 
@@ -36,6 +41,8 @@ from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
+TURNED_OFF = "Adult content is turned off for this deployment."
+
 
 @router.get("")
 def get_content_mode() -> dict:
@@ -50,6 +57,8 @@ async def put_content_mode(request: Request) -> dict:
         body = None
     if not isinstance(body, dict) or "adult" not in body or body["adult"] not in (True, False, None):
         raise HTTPException(422, 'body must be JSON: {"adult": true | false | null}')
+    if body["adult"] is True and not content_mode.features():
+        raise HTTPException(403, TURNED_OFF)
     return content_mode.set_adult_mode(body["adult"])
 
 
@@ -61,6 +70,8 @@ async def put_avatar_adult_ok(avatar_id: int, request: Request) -> dict:
         body = None
     if not isinstance(body, dict) or body.get("adult_ok") is not True and body.get("adult_ok") is not False:
         raise HTTPException(422, 'body must be JSON: {"adult_ok": true | false}')
+    if body["adult_ok"] and not content_mode.features():
+        raise HTTPException(403, TURNED_OFF)
     if not body["adult_ok"]:
         return content_mode.set_avatar_adult_ok(avatar_id, False)  # clearing always works
     before, card, pictures, declined = await run_in_threadpool(_check_tick, avatar_id)

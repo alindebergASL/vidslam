@@ -68,6 +68,12 @@ def _adult_mode() -> bool:
     return adult_mode()
 
 
+def _features() -> bool:
+    from ..services.content_mode import features
+
+    return features()
+
+
 def _forces_filter(ref: ImageRef) -> bool:
     from ..services.content_mode import forces_filter
 
@@ -533,15 +539,43 @@ def _model_tables() -> tuple:
 
 
 def image_models() -> tuple[ImageModel, ...]:
-    """Every image model Sogni accepts on generate_image, Next-Gen first."""
-    return _model_tables()[0]
+    """Every image model Sogni accepts on generate_image, Next-Gen first
+    (without the uncensored ones on a clean deployment)."""
+    images = _model_tables()[0]
+    if _features():
+        return images
+    return tuple(m for m in images if not adult_only(m.selector))
 
 
 def video_models() -> tuple[VideoModel, ...]:
     """Every video model on generate_video or animate_photo. Which tool
     lists it decides whether it takes an exact first frame (animate_photo)
     and whether it works from text alone (generate_video)."""
-    return _model_tables()[1]
+    videos = _model_tables()[1]
+    if _features():
+        return videos
+    return tuple(m for m in videos if not adult_only(m.selector))
+
+
+# Words in a selector that mark an adult-only model, for ones Sogni lists
+# that we have no notes for yet.
+_ADULT_WORDS = ("uncensored", "spicy", "nsfw")
+
+
+def adult_only(model: str) -> bool:
+    """A model Sogni tags uncensored (or whose name says so), or the edit
+    version of one. Hidden and refused when ADULT_FEATURES=false."""
+    sel = selector(model)
+    if any(w in sel.lower() for w in _ADULT_WORDS):
+        return True
+    images, videos = _model_tables()[:2]
+    marked = {m.selector for m in (*_IMAGES, *_VIDEOS, *images, *videos) if m.uncensored}
+    return sel in marked or any(_EDIT_TWIN.get(m) == sel for m in marked)
+
+
+def hidden(model: str) -> bool:
+    """Turned off for this deployment (ADULT_FEATURES=false, adult-only)."""
+    return not _features() and adult_only(model)
 
 
 def video_frames(m: VideoModel) -> str:
@@ -715,9 +749,11 @@ def edit_models() -> tuple[EditModel, ...]:
     """The edit models Sogni lists (synced) plus the ones it takes unlisted,
     else our table."""
     sels = listed()["tools"].get(EDIT_TOOL) or []
-    if not sels:
-        return _EDITS
-    return tuple(_EDIT_INFO.get(s) or _generic_edit(s) for s in dict.fromkeys([*sels, *_UNLISTED_EDITS]))
+    edits = _EDITS if not sels else tuple(
+        _EDIT_INFO.get(s) or _generic_edit(s) for s in dict.fromkeys([*sels, *_UNLISTED_EDITS]))
+    if _features():
+        return edits
+    return tuple(e for e in edits if not adult_only(e.selector))  # a clean deployment
 
 
 def _generic_edit(sel: str) -> EditModel:
@@ -1018,7 +1054,7 @@ class SogniClient:
         (network errors, 429 within the wait cap, 5xx).
 
         A prompt sexualising minors is refused before it's sent. Sogni's safe
-        filter is on outside adult mode. In adult mode it is always on for a
+        filter is on outside adult mode (always, with ADULT_FEATURES=false). In adult mode it is always on for a
         picture of a Cast character not marked "adult content allowed"
         (`cast`; content_mode.forces_filter, which also counts a Cast
         picture used as an ambient scene's picture or as a first frame), a

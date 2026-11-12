@@ -101,8 +101,12 @@ def _refused_message(e: "prompting.EnhanceRefused") -> str:
         return "The rewrite was refused by the minors check, so your text is unchanged."
     if e.adult:
         return f"The text model ({e.model}) declined to rewrite this prompt, so yours is unchanged."
-    return (f"The planner ({e.model}) declined to rewrite this prompt, so yours is unchanged. "
-            "For adult prompts, turn on Adult mode in Settings.")
+    from ..services import content_mode
+
+    declined = f"The planner ({e.model}) declined to rewrite this prompt, so yours is unchanged."
+    if not content_mode.features():  # a clean deployment: no adult mode to point to
+        return declined
+    return declined + " For adult prompts, turn on Adult mode in Settings."
 
 
 @router.post("/enhance", response_model=EnhanceOut,

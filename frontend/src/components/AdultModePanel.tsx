@@ -10,6 +10,18 @@ export function shortModel(id: string): string {
   return id.replace(/^~/, "").split("/").pop() || id;
 }
 
+/** One request for every component that mounts at the same time (the
+ * Settings page and the Cast page read this setting in several places). */
+let inflight: Promise<ContentMode> | null = null;
+function fetchContentMode(): Promise<ContentMode> {
+  if (!inflight) {
+    inflight = api.getContentMode().finally(() => {
+      inflight = null;
+    });
+  }
+  return inflight;
+}
+
 /**
  * Settings → Adult content: one switch. On, text work (storyboard planning,
  * ✨ Enhance, ambient scene rewrites) uses the adult text model and the
@@ -25,8 +37,7 @@ export function AdultModePanel() {
 
   const load = () => {
     setError(null);
-    api
-      .getContentMode()
+    fetchContentMode()
       .then(setMode)
       .catch((e) => setError(e.message || "Couldn't load the adult content setting"));
   };
@@ -65,6 +76,8 @@ export function AdultModePanel() {
   };
 
   const on = Boolean(mode?.adult);
+  // Turned off for this deployment: the page shows SafetyCheckCard instead.
+  if (mode?.available === false) return null;
   return (
     <section className="card p-4 mb-6" aria-labelledby="adult-heading">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -155,29 +168,7 @@ export function AdultModePanel() {
 
       {mode && <WhereTextGoes mode={mode} />}
 
-      {mode?.safety_check && (
-        <p className="mt-3 text-xs text-ink-300" data-testid="safety-check-line">
-          {/* The sentence comes from the server (safety_check.note): what waits
-              while the check can't run depends on the mode. */}
-          {mode.safety_check.available ? (
-            <>
-              Safety check (<b>{shortModel(mode.safety_check.model)}</b>):{" "}
-              {mode.safety_check.note ||
-                "It checks prompts for minors before they're sent (about $0.0005 per new prompt)."}
-            </>
-          ) : (
-            <span className="text-amber-200">
-              Safety check (<b>{shortModel(mode.safety_check.model) || "the planner"}</b>):{" "}
-              {mode.safety_check.note || "It can't run right now, so sexual prompts are paused until it can."} Check
-              the planner in{" "}
-              <a href="/settings#models" className="underline">
-                Settings → Models
-              </a>
-              .
-            </span>
-          )}
-        </p>
-      )}
+      {mode?.safety_check && <SafetyCheckLine check={mode.safety_check} />}
       {mode?.safety_check?.picture_model !== undefined && (
         <p className="mt-1 text-xs text-ink-300" data-testid="picture-check-line">
           {mode.safety_check.picture_available === false ? (
@@ -198,6 +189,53 @@ export function AdultModePanel() {
           )}
         </p>
       )}
+      <SafetyMemory />
+    </section>
+  );
+}
+
+/** Whether the planner can check prompts for minors right now. The sentence
+ * comes from the server (safety_check.note): what waits while the check
+ * can't run depends on the mode (and on this deployment). */
+function SafetyCheckLine({ check }: { check: { model: string; available: boolean; note?: string } }) {
+  return (
+    <p className="mt-3 text-xs text-ink-300" data-testid="safety-check-line">
+      {check.available ? (
+        <>
+          Safety check (<b>{shortModel(check.model)}</b>):{" "}
+          {check.note || "It checks prompts for minors before they're sent (about $0.0005 per new prompt)."}
+        </>
+      ) : (
+        <span className="text-amber-200">
+          Safety check (<b>{shortModel(check.model) || "the planner"}</b>):{" "}
+          {check.note || "It can't run right now, so sexual prompts are paused until it can."} Check the planner in{" "}
+          <a href="/settings#models" className="underline">
+            Settings → Models
+          </a>
+          .
+        </span>
+      )}
+    </p>
+  );
+}
+
+/**
+ * Settings when adult content is turned off for this deployment: no switch,
+ * just whether the minors check can run and the refusals it remembers.
+ */
+export function SafetyCheckCard() {
+  const { mode } = useContentModeState();
+  if (!mode?.safety_check) return null;
+  return (
+    <section className="card p-4 mb-6" aria-labelledby="safety-heading">
+      <h2 id="safety-heading" className="text-lg font-medium">
+        Safety
+      </h2>
+      <p className="text-xs text-ink-400">
+        Runware&rsquo;s content check and Sogni&rsquo;s safe filter are always on, and prompts that sexualise minors
+        are refused.
+      </p>
+      <SafetyCheckLine check={mode.safety_check} />
       <SafetyMemory />
     </section>
   );
@@ -260,8 +298,7 @@ export function useContentModeState(): { mode: ContentMode | null; failed: boole
   const [mode, setMode] = useState<ContentMode | null>(null);
   const [failed, setFailed] = useState(false);
   const reload = () => {
-    api
-      .getContentMode()
+    fetchContentMode()
       .then((m) => {
         setMode(m);
         setFailed(false);
@@ -279,4 +316,19 @@ export function useContentModeState(): { mode: ContentMode | null; failed: boole
 /** The current Adult mode setting (null while loading or unavailable). */
 export function useContentMode(): ContentMode | null {
   return useContentModeState().mode;
+}
+
+/**
+ * Whether this deployment has adult content at all (ADULT_FEATURES): true or
+ * false once known, null while loading or when the setting can't be read.
+ * Show adult settings and hints only when it's true, so nothing flashes.
+ */
+export function useAdultFeatures(): boolean | null {
+  const { mode } = useContentModeState();
+  return adultFeatures(mode);
+}
+
+/** The same, for a component that already reads the setting. */
+export function adultFeatures(mode: ContentMode | null): boolean | null {
+  return mode ? mode.available !== false : null;
 }
