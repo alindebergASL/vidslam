@@ -371,7 +371,26 @@ export type Render = {
   actual_cost: number;
   created_at: string;
   updated_at: string;
+  /** Set when this render is another opening (hook lab) of a base render. */
+  hook_variant_id?: number | null;
+  /** A variant's base render (known while it is still being made). */
+  hook_base_render_id?: number | null;
+  /** What the render was put together from (null: composed before this was recorded). */
+  composition_json?: Record<string, any> | null;
+  /** The project's one version numbering: completed base renders 1, 2, 3…; a variant has its base's number. */
+  version?: number | null;
+  /** "Version 3", "Version 3 · opening B", "Failed attempt", "In progress". */
+  version_label?: string;
 };
+
+/** The label to show for a render, whatever the backend sent. */
+export function renderLabel(r: Pick<Render, "status" | "version" | "version_label">): string {
+  if (r.version_label) return r.version_label;
+  if (r.version != null) return `Version ${r.version}`;
+  if (r.status === "failed") return "Failed attempt";
+  if (r.status === "cancelled") return "Cancelled attempt";
+  return r.status === "completed" ? "Version" : "In progress";
+}
 
 export type Project = {
   id: number;
@@ -978,6 +997,8 @@ export type PublishOverviewItem = {
   id: number;
   render_id: number;
   render_version: number | null;
+  /** "Version 3" / "Version 3 · opening B" ("" when unknown). */
+  render_version_label?: string;
   project_id: number;
   project_title: string;
   project_kind: ProjectKind;
@@ -1016,6 +1037,7 @@ export type PublishOverviewPage = {
 export type NotPostedItem = {
   render_id: number;
   render_version: number | null;
+  render_version_label?: string;
   project_id: number;
   project_title: string;
   project_kind: ProjectKind;
@@ -1036,12 +1058,22 @@ export type PublishRefreshResult = {
   skipped: number;
 };
 
-export type ResultsGroupBy = "type" | "preset" | "time_weather" | "length" | "character" | "model" | "aspect";
+export type ResultsGroupBy = "type" | "preset" | "time_weather" | "length" | "character" | "model" | "aspect" | "hook";
 
 export type ResultRow = {
   publish_job_id: number;
   render_id: number;
   render_version: number | null;
+  render_version_label?: string;
+  /** "project": the project's spend (without its other openings); "render": an opening's own spend. */
+  cost_scope?: "project" | "render";
+  hook_variant_id?: number | null;
+  hook_base_render_id?: number | null;
+  /** "A" for the original opening, "B", "C"… for the hook lab's. */
+  hook_label?: string;
+  hook_style_key?: string;
+  hook_style?: string;
+  hook_text?: string;
   project_id: number;
   project_title: string;
   project_kind: ProjectKind;
@@ -1103,6 +1135,192 @@ export type ResultsOut = {
   group_by: ResultsGroupBy;
   group_label: string;
   groups: ResultGroup[];
+  /** Base videos with other openings on YouTube, compared at equal age. */
+  hook_tests?: HookTest[];
+};
+
+export type HookTestEntry = {
+  hook_label: string;
+  hook_style: string;
+  hook_style_key: string;
+  hook_text: string;
+  is_base: boolean;
+  hook_variant_id: number | null;
+  render_id: number;
+  render_version_label: string;
+  publish_job_id: number;
+  title: string;
+  external_url: string;
+  thumbnail_url: string | null;
+  published_at: string;
+  age_days: number;
+  views: number | null;
+  likes: number | null;
+  views_at_equal_age: number | null;
+  views_per_day_equal_age: number | null;
+  likes_per_1k_views: number | null;
+  cost_usd: number;
+  cost_scope: "project" | "render";
+  cost_is_estimate: boolean;
+  /** How many times this video was uploaded (one entry stands for them all). */
+  uploads?: number;
+};
+
+export type HookTest = {
+  base_render_id: number;
+  project_id: number;
+  project_title: string;
+  project_url: string;
+  base_version_label: string;
+  equal_age_days: number | null;
+  ready: boolean;
+  verdict: string;
+  leader: string | null;
+  entries: HookTestEntry[];
+};
+
+// ---------- hook lab (other openings) ----------
+
+export type HookStyle = "question" | "bold_claim" | "stat" | "story" | "contrarian" | "custom" | "original";
+export type Shot1Source = "keep" | "take" | "new" | "lipsync";
+export type HookVariantStatus = "draft" | "making" | "ready" | "composing" | "completed" | "failed";
+
+export type HookVariant = {
+  id: number;
+  project_id: number;
+  base_render_id: number;
+  label: string;
+  style: HookStyle | string;
+  style_label: string;
+  hook_text: string;
+  window_seconds: number;
+  shot1_source: Shot1Source;
+  shot1_take_id: number | null;
+  shot1_prompt: string;
+  status: HookVariantStatus | string;
+  error: string;
+  render_id: number | null;
+  render_status: string | null;
+  version_label: string;
+  video_url: string | null;
+  thumbnail_url: string | null;
+  cost_estimate: number;
+  /** Finished renders only. */
+  actual_cost: number | null;
+  audio_url: string | null;
+  /** A guess from the text length, before any audio is made. */
+  estimated_seconds: number;
+  fits: boolean;
+  overflow_seconds: number;
+  published: boolean;
+  publish_jobs: { id: number; status: string; external_url: string }[];
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type HookShot1 = {
+  shot_id: number | null;
+  shot_order: number;
+  shot_type: string;
+  seconds: number;
+  take_id: number | null;
+  lipsynced: boolean;
+  prompt: string;
+  clip_url: string | null;
+  takes: Take[];
+  can_redo_talking_head: boolean;
+  single_shot: boolean;
+};
+
+export type HookBase = {
+  render_id: number;
+  version: number | null;
+  version_label: string;
+  created_at: string | null;
+  video_url: string;
+  thumbnail_url: string | null;
+  duration_seconds: number | null;
+  audio_seconds: number;
+  hook_text: string;
+  script: string;
+  /** Where the original opening ends (snapped to a pause). */
+  window_seconds: number | null;
+  opening_audio_url: string | null;
+  reusable: boolean;
+  reuse_error: string;
+  /** How many more openings this version can get (live ones count, labels run out at Z). */
+  room: number;
+  max_per_base: number;
+  shot1: HookShot1 | null;
+  published: boolean;
+  publish_jobs: { id: number; status: string; external_url: string }[];
+  variants: HookVariant[];
+};
+
+export type HookLab = {
+  project_id: number;
+  bases: HookBase[];
+  styles: { key: string; label: string }[];
+  max_per_request: number;
+  suggest_cost_estimate: number;
+  tts_cost_per_1k_chars: number;
+  youtube_note: string;
+};
+
+export type HookSuggestion = {
+  style: string;
+  style_label: string;
+  text: string;
+  estimated_seconds: number;
+  fits: boolean;
+  overflow_seconds: number;
+};
+
+export type HookPlanRow = {
+  id: number;
+  label: string;
+  ok: boolean;
+  error: string;
+  tts_cost: number;
+  shot1: { source: Shot1Source; seconds: number; cost: number; lipsync: boolean } | null;
+  extra_lipsync: { index: number; shot_id: number; shot_order: number; start: number; seconds: number; cost: number; reason: string }[];
+  needed: number[];
+  total: number;
+  notes: string[];
+  warnings: string[];
+  lipsync_available: boolean;
+  /** Known (from Listen) to be this much too long for the original's time; Make refuses it. */
+  too_long_seconds: number;
+};
+
+export type HookPlan = {
+  variants: HookPlanRow[];
+  count: number;
+  total: number;
+  currency: string;
+  is_estimate: boolean;
+  summary: string;
+};
+
+export type HookVariantSpec = {
+  hook_text: string;
+  style?: string;
+  shot1_source?: Shot1Source;
+  shot1_take_id?: number | null;
+  shot1_prompt?: string;
+};
+
+export type HookPreviewAudio = {
+  url: string;
+  fits: boolean;
+  overflow_seconds: number;
+  message: string;
+  cost: number;
+  reused?: boolean;
+  hook_seconds?: number | null;
+  tempo?: number | null;
+  window_seconds: number;
+  duration_seconds?: number;
 };
 
 export type StatsRefreshOut = {
@@ -1228,7 +1446,8 @@ export type AppEventKind =
   | "studio_job"
   | "training"
   | "publish"
-  | "budget";
+  | "budget"
+  | "hook_lab";
 
 export type AppEventStatus = "started" | "progress" | "completed" | "failed" | "cancelled";
 
@@ -1397,7 +1616,59 @@ export const api = {
     ),
 
   // publishing
-  publishMeta: (projectId: number) => req<PublishMeta>(`/api/projects/${projectId}/publish-meta`),
+  publishMeta: (projectId: number, renderId?: number | null) =>
+    req<PublishMeta>(
+      `/api/projects/${projectId}/publish-meta${renderId ? `?render_id=${renderId}` : ""}`
+    ),
+
+  // hook lab (other openings of a finished video)
+  hookLab: (projectId: number) => req<HookLab>(`/api/projects/${projectId}/hook-lab`),
+  hookSuggest: (projectId: number, baseRenderId: number, n = 3) =>
+    req<{
+      base_render_id: number;
+      original: { text: string; window_seconds: number | null };
+      suggestions: HookSuggestion[];
+      cost_estimate: number;
+    }>(`/api/projects/${projectId}/hook-lab/suggest`, {
+      method: "POST",
+      body: JSON.stringify({ base_render_id: baseRenderId, n }),
+    }),
+  hookCreateVariants: (
+    projectId: number,
+    body: { base_render_id: number; window_seconds?: number | null; variants: HookVariantSpec[] }
+  ) =>
+    req<{ variants: HookVariant[]; plan: HookPlan }>(`/api/projects/${projectId}/hook-lab/variants`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  hookPlan: (projectId: number, variantIds: number[]) =>
+    req<HookPlan>(`/api/projects/${projectId}/hook-lab/plan`, {
+      method: "POST",
+      body: JSON.stringify({ variant_ids: variantIds }),
+    }),
+  hookMake: (projectId: number, variantIds: number[]) =>
+    req<{ project_id: number; job_id: string; status: string; variant_ids: number[]; plan: HookPlan }>(
+      `/api/projects/${projectId}/hook-lab/make`,
+      { method: "POST", body: JSON.stringify({ variant_ids: variantIds }) }
+    ),
+  hookVariant: (id: number) => req<HookVariant>(`/api/hook-variants/${id}`),
+  hookPatchVariant: (
+    id: number,
+    body: Partial<HookVariantSpec> & { window_seconds?: number }
+  ) =>
+    req<HookVariant & { plan: HookPlanRow }>(`/api/hook-variants/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  hookDeleteVariant: (id: number, deleteRender = false) =>
+    req<{ id: number; deleted: boolean; render_kept: boolean; render_id: number | null }>(
+      `/api/hook-variants/${id}${deleteRender ? "?delete_render=true" : ""}`,
+      { method: "DELETE" }
+    ),
+  hookCancelVariant: (id: number) =>
+    req<HookVariant>(`/api/hook-variants/${id}/cancel`, { method: "POST" }),
+  hookPreviewAudio: (id: number) =>
+    req<HookPreviewAudio>(`/api/hook-variants/${id}/preview-audio`, { method: "POST" }),
   youtubeStatus: () => req<YouTubeStatus>("/api/youtube/status"),
   youtubeConnectUrl: () => req<{ url: string }>("/api/youtube/connect"),
   youtubeDisconnect: () => req<YouTubeStatus>("/api/youtube/disconnect", { method: "POST" }),
@@ -1766,6 +2037,8 @@ export const api = {
     id: number,
     body: {
       cleaned_voice_script?: string;
+      /** The opening line: a changed one replaces the script's first sentence. */
+      hook?: string;
       end_card_text?: string;
       disclosure_text?: string;
       resync_captions?: boolean;
@@ -1824,6 +2097,8 @@ export const api = {
     req<{
       project_id: number;
       project_status: string;
+      // Held by the hook lab making other openings (no render of its own).
+      hook_lab_making: boolean;
       latest_render: Render | null;
       shots: Shot[];
     }>(`/api/projects/${id}/status`),

@@ -4,6 +4,8 @@ category and disclosure flags, inside YouTube's documented limits
 no '<' or '>' anywhere)."""
 from __future__ import annotations
 
+from typing import Optional
+
 from .. import models
 
 TITLE_MAX = 100
@@ -58,10 +60,12 @@ def _hours(seconds: int) -> str:
     return f"{max(1, round(seconds / 60))} Minutes"
 
 
-def draft(project: models.VideoProject) -> dict:
+def draft(project: models.VideoProject, render: Optional[models.Render] = None) -> dict:
+    """The draft for `project`; with `render`, for that render (its own
+    script and opening, e.g. a hook-lab variant's)."""
     if project.mode == "ambient_loop":
         return _ambient(project)
-    return _storyboard(project)
+    return _storyboard(project, render)
 
 
 def _ambient(project: models.VideoProject) -> dict:
@@ -106,19 +110,52 @@ def _ambient(project: models.VideoProject) -> dict:
     }
 
 
-def _storyboard(project: models.VideoProject) -> dict:
+def _render_script(project: models.VideoProject, render: Optional[models.Render]) -> tuple[str, str]:
+    """(hook, script) the render was made with: its composition_json when
+    recorded (a variant's own opening), else the project's current plan."""
+    from .hook_lab import plan_hook
+
+    comp = (render.composition_json or {}) if render is not None else {}
     plan = project.generated_plan_json or {}
-    hook = plan.get("hook") or ""
+    if comp.get("script"):
+        script = str(comp["script"])
+        hook = str(comp.get("hook") or "") or plan_hook({"cleaned_voice_script": script})
+        return hook, script
+    if comp.get("spoken_unknown"):
+        # Re-composed over an older voiceover whose words aren't recorded:
+        # the plan's (edited, unspoken) script would describe the wrong words.
+        return "", ""
     script = plan.get("cleaned_voice_script") or project.original_script or ""
+    return plan_hook({**plan, "cleaned_voice_script": script}), script
+
+
+def _storyboard(project: models.VideoProject, render: Optional[models.Render] = None) -> dict:
+    from .hook_lab import first_sentence, rest_of_script
+
+    plan = project.generated_plan_json or {}
+    hook, script = _render_script(project, render)
     disclosure = plan.get("disclosure_text") or project.disclosure_text or "AI-generated video"
-    lines = [hook, "", script]
+    # The hook opens the description once: the script follows without its
+    # first sentence when that sentence is the hook (it usually is).
+    body = script
+    opening = first_sentence(script).strip()
+    if hook and opening in (hook.strip(), hook.strip() + "."):
+        # An opening typed without end punctuation is voiced with a period:
+        # the description shows that sentence, and the body starts after it.
+        hook, body = opening, rest_of_script(script)
+    elif hook and script.strip().startswith(hook.strip()):
+        body = script.strip()[len(hook.strip()):].lstrip(" .!?…").strip()
+    lines = [hook, "", body] if hook else [script]
     if project.cta_text:
         lines += ["", project.cta_text]
     lines += ["", f"{disclosure}."]
+    text = "\n".join(ln for ln in lines if ln is not None)
+    while "\n\n\n" in text:
+        text = text.replace("\n\n\n", "\n\n")
     words = [w.strip(".,!?").lower() for w in (project.title or "").split() if len(w) > 3]
     return {
         "title": _fit_title(project.title or hook or "New video"),
-        "description": _fit_desc("\n".join(ln for ln in lines if ln is not None)),
+        "description": _fit_desc(text),
         "tags": fit_tags(words + ["shorts" if project.aspect_ratio == "9:16" else "video", "ai video"]),
         "category_id": CATEGORY_PEOPLE,
         "contains_synthetic_media": True,

@@ -6,7 +6,7 @@ import { AuthGate } from "@/components/AuthGate";
 import { fmtLocal, PublishStateBadge } from "@/components/PublishState";
 import { useToast } from "@/components/Toaster";
 import { errText, VideoThumb } from "@/components/VideoThumb";
-import { api, ResultGroup, ResultRow, ResultsGroupBy, ResultsOut } from "@/lib/api";
+import { api, HookTest, ResultGroup, ResultRow, ResultsGroupBy, ResultsOut } from "@/lib/api";
 
 export default function ResultsPage() {
   return (
@@ -24,6 +24,7 @@ const GROUP_OPTIONS: { id: ResultsGroupBy; label: string }[] = [
   { id: "character", label: "Main character" },
   { id: "model", label: "Video model" },
   { id: "aspect", label: "Aspect ratio" },
+  { id: "hook", label: "Opening (hook) style" },
 ];
 
 type SortKey =
@@ -236,6 +237,8 @@ function Inner() {
             )}
           </section>
 
+          {(data.hook_tests?.length ?? 0) > 0 && <HookTests tests={data.hook_tests!} />}
+
           <section aria-labelledby="per-video">
             <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
               <h2 id="per-video" className="text-base font-medium">Every video</h2>
@@ -262,7 +265,8 @@ function Inner() {
               </label>
             </div>
             <p className="text-[11px] text-ink-400 mb-2">
-              Cost is what this video cost to make (whole project). “~$” means some of it is an estimate.
+              Cost is what this video cost to make (whole project). For another opening made in the hook lab it
+              is only what that opening cost. “~$” means some of it is an estimate.
             </p>
 
             {/* Desktop table */}
@@ -305,7 +309,7 @@ function Inner() {
                       <td className="px-3 py-2 text-right tabular-nums">{fmtNum(r.likes)}</td>
                       <td className="px-3 py-2 text-right tabular-nums">{fmtNum(r.comments)}</td>
                       <td className="px-3 py-2 text-right tabular-nums">{fmtRate(r.views_per_day)}</td>
-                      <td className="px-3 py-2 text-right tabular-nums" title="What this video cost to make (whole project)">
+                      <td className="px-3 py-2 text-right tabular-nums" title={costHint(r)}>
                         {fmtMoney(r.cost_usd, r.cost_is_estimate)}
                       </td>
                       <td className="px-3 py-2 text-right tabular-nums">
@@ -352,6 +356,92 @@ function Inner() {
   );
 }
 
+function costHint(r: ResultRow): string {
+  return r.cost_scope === "render"
+    ? "What this opening cost to make (the rest of the video was reused)"
+    : "What this video cost to make (whole project)";
+}
+
+/** Each base video with other openings on YouTube, compared at equal age. */
+function HookTests({ tests }: { tests: HookTest[] }) {
+  return (
+    <section aria-labelledby="hook-tests" className="mb-6">
+      <h2 id="hook-tests" className="text-base font-medium">Hook tests</h2>
+      <p className="text-[11px] text-ink-400 mt-0.5 mb-3">
+        The same video with different openings. Views per day are compared at the same age (days since upload),
+        so a video posted earlier doesn&apos;t win just by being older.
+      </p>
+      <div className="space-y-3">
+        {tests.map((t) => (
+          <div key={t.base_render_id} className="card p-4">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <div className="min-w-0">
+                <Link href={t.project_url} className="text-sm font-medium hover:underline">
+                  {t.project_title || "Untitled"}
+                </Link>
+                <span className="text-xs text-ink-400"> · {t.base_version_label}</span>
+              </div>
+              <span className="text-[11px] text-ink-400">
+                {t.equal_age_days != null ? `Compared at ${t.equal_age_days} day${t.equal_age_days === 1 ? "" : "s"} old` : "Not enough numbers yet"}
+              </span>
+            </div>
+            <p
+              className={clsx(
+                "mt-2 text-sm rounded-md px-3 py-2 border",
+                t.ready && t.leader
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                  : "border-ink-700 bg-ink-900/60 text-ink-200"
+              )}
+              role="status"
+            >
+              {t.verdict}
+            </p>
+            <ul className="mt-3 grid grid-cols-1 lg:grid-cols-2 gap-2">
+              {t.entries.map((e) => (
+                <li
+                  key={e.publish_job_id}
+                  className={clsx(
+                    "rounded-lg border px-3 py-2",
+                    t.leader && e.hook_label === t.leader ? "border-emerald-500/40" : "border-ink-800"
+                  )}
+                >
+                  <div className="flex items-start gap-3 min-w-0">
+                    <VideoThumb url={e.thumbnail_url} className="w-16 shrink-0" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="chip text-[10px] py-0.5 font-semibold">{e.hook_label || "?"}</span>
+                        <span className="text-[11px] text-ink-300">{e.hook_style}</span>
+                        {e.external_url && (
+                          <a href={e.external_url} target="_blank" rel="noreferrer" className="text-[11px] text-iris-soft hover:underline">
+                            Open on YouTube
+                          </a>
+                        )}
+                      </div>
+                      <p className="text-xs text-ink-100 mt-1 break-words">“{e.hook_text}”</p>
+                    </div>
+                  </div>
+                  <dl className="grid grid-cols-2 sm:grid-cols-4 gap-x-3 gap-y-1 mt-2 text-xs">
+                    <Stat
+                      label={t.equal_age_days ? `Views/day (day ${t.equal_age_days})` : "Views/day"}
+                      value={fmtRate(e.views_per_day_equal_age)}
+                    />
+                    <Stat label="Views" value={fmtNum(e.views)} />
+                    <Stat label="Likes per 1k views" value={fmtRate(e.likes_per_1k_views)} />
+                    <Stat
+                      label={e.cost_scope === "render" ? "Opening cost" : "Video cost"}
+                      value={fmtMoney(e.cost_usd, e.cost_is_estimate)}
+                    />
+                  </dl>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function Empty({ title, body, action }: { title: string; body: string; action?: React.ReactNode }) {
   return (
     <div className="card p-8 text-center">
@@ -385,7 +475,9 @@ function VideoCell({ r }: { r: ResultRow }) {
         )}
         <div className="text-[11px] text-ink-400 truncate">
           <Link href={r.project_url} className="hover:underline">{r.project_title || "Untitled"}</Link>
-          {r.render_version != null && ` · v${r.render_version}`}
+          {r.render_version_label
+            ? ` · ${r.render_version_label}`
+            : r.render_version != null && ` · Version ${r.render_version}`}
         </div>
         {r.state !== "published" && (
           <PublishStateBadge state={r.state} className="mt-1 text-[10px]" />

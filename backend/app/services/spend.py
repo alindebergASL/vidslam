@@ -150,7 +150,8 @@ def record_video_job(db: Session, job: models.VideoJob) -> None:
     """Called once when a video job completes (webhook or poll)."""
     if job.provider == "mock":
         return
-    kind = "avatar" if job.purpose == "avatar" else "video"
+    # A hook-lab opening's lip-sync is a lip-sync too: its kind and rate.
+    kind = "avatar" if job.purpose in ("avatar", "hook_avatar") else "video"
     ref = f"video_job:{job.id}"
     if db.query(models.SpendEntry.id).filter_by(ref=ref).first():
         return  # already recorded (a retried completion)
@@ -311,6 +312,32 @@ def over_budget(db: Session) -> Optional[str]:
         return (f"Monthly budget of ${b['monthly_usd']:.2f} reached (${spent:.2f} spent this month). "
                 "Raise it in Settings → Spend to keep generating.")
     return None
+
+
+def over_budget_with(db: Session, estimate: float) -> Optional[str]:
+    """A message when this month's spend plus `estimate` (what the paid run
+    about to start should cost) goes past the hard cap, else None."""
+    msg = over_budget(db)
+    if msg:
+        return msg
+    b = get_budget(db)
+    if not b["hard_stop"] or b["monthly_usd"] <= 0 or _all_mocked() or estimate <= 0:
+        return None
+    spent = month_total(db)
+    if spent + estimate > b["monthly_usd"]:
+        left = max(b["monthly_usd"] - spent, 0.0)
+        return (f"This would cost about ${estimate:.2f}, and only ${left:.2f} of the monthly budget of "
+                f"${b['monthly_usd']:.2f} is left (${spent:.2f} spent this month). "
+                "Raise it in Settings → Spend, or make fewer clips.")
+    return None
+
+
+def require_budget_for(db: Session, estimate: float) -> None:
+    """402 when the run about to start would go past the hard cap (the
+    estimate counts, not only what is already spent)."""
+    msg = over_budget_with(db, float(estimate or 0.0))
+    if msg:
+        raise HTTPException(status_code=402, detail=msg)
 
 
 def budget_guard() -> None:

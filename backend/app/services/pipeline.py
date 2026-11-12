@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -21,10 +23,10 @@ from ..providers import (
 from ..providers.base import CastContext, ImageRef
 from ..schemas.storyboard import StoryboardPlan
 from . import alerts, events, fingerprints, render_files, storage, takes
-from .captions import chunks_to_timed
+from .captions import CaptionTiming, chunks_to_timed
 from .model_registry import active_model as _active_model
 from .prompting import effective_negative
-from .renderer import RenderInputs, compose
+from .renderer import RenderInputs, RenderOutputs, compose
 from .safety import UnsafeScriptError
 
 log = logging.getLogger("avs.pipeline")
@@ -167,7 +169,15 @@ def _resolve_references_for_shot(
     db: Session, project: models.VideoProject, shot: models.VideoShot
 ) -> list[ImageRef]:
     """Convert per-shot reference_asset_ids (or fall back to all project cast assets) → ImageRefs."""
-    asset_ids: list[int] = list(shot.reference_asset_ids_json or [])
+    # Shots keep asset-id order (what IN() gave before): a frame_images shot
+    # pins refs[0] as its first frame, and the shot picker shows no order.
+    return _asset_refs(db, reference_asset_ids(project, shot))
+
+
+def reference_asset_ids(project: models.VideoProject, shot: models.VideoShot) -> list[int]:
+    """The asset ids a shot's clip is made with: its own picks, else the
+    first two pictures of each Cast member; sorted."""
+    asset_ids: list = list(shot.reference_asset_ids_json or [])
     if not asset_ids:
         for cm in project.cast_members:
             owner = cm.avatar if cm.member_kind == "avatar" else cm.ingredient
@@ -175,9 +185,7 @@ def _resolve_references_for_shot(
                 continue
             for a in owner.assets[:2]:
                 asset_ids.append(a.id)
-    # Shots keep asset-id order (what IN() gave before): a frame_images shot
-    # pins refs[0] as its first frame, and the shot picker shows no order.
-    return _asset_refs(db, sorted(_asset_ids(asset_ids)))
+    return sorted(_asset_ids(asset_ids))
 
 
 def _asset_ids(raw) -> list[int]:
@@ -288,6 +296,7 @@ def _check_plan(plan: StoryboardPlan) -> None:
     from .safety import UnsafePromptError, check_prompt, check_script, steers_young
 
     check_script(plan.cleaned_voice_script or "")
+    check_script(plan.hook or "")  # normally the script's first sentence (the schema sees to it)
     for shot in plan.shots:
         check_prompt(shot.visual_prompt or "")
         if steers_young(shot.visual_prompt or "", shot.negative_prompt or ""):
@@ -321,18 +330,48 @@ def claim_held(db: Session, project_id: int, claim: str, token: Optional[str] = 
     return True
 
 
+# A hook-lab "Make videos" claim: its token starts with this, then the
+# status the project goes back to, then the random part (dropped once the
+# job takes the claim over). The project page and the sweeper read it, so
+# the claim never ends as "cancelled" or "failed" on a finished video.
+HOOK_CLAIM = "hl:"
+_HOOK_PREVIOUS = ("draft", "planned", "completed", "failed", "cancelled")
+
+
+def hook_claim_token(previous: str) -> str:
+    import secrets
+
+    return f"{HOOK_CLAIM}{previous}:{secrets.token_hex(12)}"
+
+
+def hook_claim_previous(token: Optional[str]) -> Optional[str]:
+    """The status a hook-lab claim goes back to; None when `token` is not
+    a hook-lab claim's."""
+    if not token or not token.startswith(HOOK_CLAIM):
+        return None
+    previous = token[len(HOOK_CLAIM):].split(":", 1)[0]
+    return previous if previous in _HOOK_PREVIOUS else "completed"
+
+
+def claim_marker(token: Optional[str]) -> str:
+    """What claim_token holds once a job took the claim with `token` over."""
+    previous = hook_claim_previous(token)
+    return f"{HOOK_CLAIM}{previous}:" if previous else ""
+
+
 def consume_claim(db: Session, project_id: int, claim: str, token: Optional[str]) -> bool:
     """Take over the claim atomically (conditional UPDATE, not committed:
     the caller commits it together with its first write). After this a
     cancel can no longer release the claim, and a second entry with the
     same token can't start. Without a token (older queue entries) it only
-    checks the status."""
+    checks the status. A hook-lab claim keeps its marker (without the
+    random part), so it is still known as one while its job runs."""
     if not token:
         return claim_held(db, project_id, claim)
     done = (db.query(models.VideoProject)
             .filter(models.VideoProject.id == project_id, models.VideoProject.status == claim,
                     models.VideoProject.claim_token == token)
-            .update({"claim_token": ""}, synchronize_session=False))
+            .update({"claim_token": claim_marker(token)}, synchronize_session=False))
     if done != 1:
         log.info("project %s claim %s was cancelled or replaced; skipping its job", project_id, claim)
         return False
@@ -392,10 +431,17 @@ def generate_plan(
     old_plan = project.generated_plan_json or {}
     if preserve_edits and old_plan:
         # "Keep my edits" keeps what the Voiceover & captions card edits:
-        # the spoken script, the end-card text and the captions.
-        for key in ("cleaned_voice_script", "end_card_text", "caption_chunks"):
+        # the spoken script, its opening line (hook), the end-card text and
+        # the captions.
+        for key in ("cleaned_voice_script", "hook", "end_card_text", "caption_chunks"):
             if key in old_plan:
                 new_plan[key] = old_plan[key]
+        if "cleaned_voice_script" in old_plan and not str(old_plan.get("hook") or "").strip():
+            # A plan from before the hook was stored: its hook is the kept
+            # script's first sentence, not the new planner's.
+            from .hook_lab import first_sentence
+
+            new_plan["hook"] = first_sentence(str(old_plan.get("cleaned_voice_script") or ""))
     project.generated_plan_json = new_plan
     project.status = "planned"
 
@@ -721,6 +767,7 @@ def _after_shot(db: Session, job: models.VideoJob) -> None:
         waiting = [rid for (rid,) in db.query(models.Render.id).filter(
             models.Render.project_id == job.project_id,
             models.Render.status == "generating_shots",
+            models.Render.hook_variant_id.is_(None),
             models.Render.id != (job.render_id or 0))]
         for rid in waiting:
             maybe_compose(db, rid)
@@ -739,8 +786,8 @@ def maybe_compose(db: Session, render_id: int) -> None:
     from ..workers.queue import enqueue
 
     render = db.get(models.Render, render_id)
-    if render is None or render.status != "generating_shots":
-        return
+    if render is None or render.status != "generating_shots" or render.hook_variant_id:
+        return  # a hook-lab variant is composed from its own clips, never the project's
     db.refresh(render)
     project = db.get(models.VideoProject, render.project_id)
     db.refresh(project)
@@ -943,7 +990,8 @@ def precheck_render(db: Session, project: models.VideoProject, plan: StoryboardP
 
 
 def generate_audio(
-    db: Session, project: models.VideoProject, *, plan: StoryboardPlan
+    db: Session, project: models.VideoProject, *, plan: StoryboardPlan,
+    render_id: Optional[int] = None,
 ) -> Optional[Path]:
     """Produce the project's voiceover track. Source is controlled by
     `project.voiceover_source`:
@@ -954,6 +1002,10 @@ def generate_audio(
         the same as silent (providers reject empty text). A failure raises
         VoiceoverFailed: the caller must not go on to pay for clips that
         would end up in a video with no voice.
+
+    The synthesized file is `voice_<render_id>.m4a` (`voice_<fingerprint>.m4a`
+    without a render), never a shared name: an older render's audio_path
+    keeps pointing at the audio it was made with.
     """
     source = (project.voiceover_source or "tts").lower()
     if source == "upload":
@@ -973,7 +1025,9 @@ def generate_audio(
     try:
         audio_bytes = tts.synthesize(text=plan.cleaned_voice_script, voice_id=voice_id)
         out_dir = storage.render_subdir(project.id)
-        audio_path = out_dir / "voice.m4a"
+        name = (f"voice_{render_id}" if render_id
+                else f"voice_{fingerprints.voice_fingerprint(db, project)[:16]}")
+        audio_path = out_dir / f"{name}.m4a"
         audio_path.write_bytes(audio_bytes)
         _log_provider_call(
             db,
@@ -1141,9 +1195,12 @@ class VoiceoverNotSynthesized(ValueError):
 
 
 def _latest_audio_render(db: Session, project_id: int) -> Optional[models.Render]:
-    """The newest render that has a voiceover, if its file is still on disk."""
+    """The newest render that has a voiceover, if its file is still on disk.
+    Hook-lab variants never count: their voiceover is the base one with
+    another opening, never the project's current voiceover."""
     for r in (db.query(models.Render)
-              .filter(models.Render.project_id == project_id, models.Render.audio_path != "")
+              .filter(models.Render.project_id == project_id, models.Render.audio_path != "",
+                      models.Render.hook_variant_id.is_(None))
               .order_by(models.Render.id.desc()).limit(5)):
         if Path(r.audio_path).is_file():
             return r
@@ -1152,16 +1209,40 @@ def _latest_audio_render(db: Session, project_id: int) -> Optional[models.Render
 
 def _reusable_voiceover(db: Session, project: models.VideoProject, fingerprint: str) -> Optional[str]:
     """The voiceover already on disk, when it was made from exactly the
-    current spoken script, voice and voice model. Only the newest one is
-    looked at: each synthesis replaces the project's voice file. A
-    voiceover made with "Make voiceover" (the preview) counts too."""
+    current spoken script, voice and voice model: the preview ("Make
+    voiceover") first, then the newest render (not a hook-lab variant) whose
+    voiceover matches. Each synthesis has its own file, so an older render's
+    voiceover is still the audio it was made with."""
     preview = voiceover_preview_path(project)
     if preview is not None and fingerprint and (project.voiceover_preview_json or {}).get("fingerprint") == fingerprint:
         return str(preview)
-    latest = _latest_audio_render(db, project.id)
-    if latest is not None and fingerprint and latest.voice_fingerprint == fingerprint:
-        return latest.audio_path
+    if not fingerprint:
+        return None
+    for r in (db.query(models.Render)
+              .filter(models.Render.project_id == project.id, models.Render.audio_path != "",
+                      models.Render.voice_fingerprint == fingerprint,
+                      models.Render.hook_variant_id.is_(None))
+              .order_by(models.Render.id.desc()).limit(20)):
+        if Path(r.audio_path).is_file() and not audio_overwritten(db, r):
+            return r.audio_path
     return None
+
+
+def audio_overwritten(db: Session, render: models.Render) -> bool:
+    """The render's voiceover file no longer holds its audio: a newer render
+    (not a hook-lab variant) points at the same file with another
+    fingerprint. Before each synthesis got its own file, every render wrote
+    the shared `voice.m4a`, so only the newest render pointing at it still
+    owns what is in it."""
+    if not render.audio_path:
+        return False
+    newer = (db.query(models.Render.voice_fingerprint)
+             .filter(models.Render.project_id == render.project_id,
+                     models.Render.audio_path == render.audio_path,
+                     models.Render.hook_variant_id.is_(None),
+                     models.Render.id > render.id)
+             .order_by(models.Render.id.desc()).first())
+    return newer is not None and (newer[0] or "") != (render.voice_fingerprint or "")
 
 
 def adopt_unfingerprinted_voiceover(db: Session, project: models.VideoProject) -> bool:
@@ -1176,7 +1257,8 @@ def adopt_unfingerprinted_voiceover(db: Session, project: models.VideoProject) -
     latest = _latest_audio_render(db, project.id)
     if latest is None or latest.voice_fingerprint:
         return False
-    if project.voiceover_upload_path and Path(latest.audio_path) == Path(project.voiceover_upload_path):
+    if (project.voiceover_upload_path and Path(latest.audio_path) == Path(project.voiceover_upload_path)) \
+            or is_voice_copy(Path(latest.audio_path)):
         return False  # that render used the uploaded file, not a synthesized voice
     latest.voice_fingerprint = fingerprints.voice_fingerprint(db, project)
     db.commit()
@@ -1280,7 +1362,8 @@ def busy_reason(db: Session, project: models.VideoProject) -> Optional[str]:
     if (project.status or "draft") not in _IDLE_PROJECT:
         step = "planning" if project.status == "planning" else "making the video"
         return f"Wait until the current step ({step}) finishes."
-    latest = (db.query(models.Render).filter(models.Render.project_id == project.id)
+    latest = (db.query(models.Render).filter(models.Render.project_id == project.id,
+                                              models.Render.hook_variant_id.is_(None))
               .order_by(models.Render.id.desc()).first())
     if latest is not None and latest.status not in _DONE_RENDER:
         return "Wait until the current step (making the video) finishes."
@@ -1291,6 +1374,21 @@ def busy_reason(db: Session, project: models.VideoProject) -> Optional[str]:
                              video_jobs.still_in_progress()).first()) is not None:
         return ("A clip for this project is still being made (and is already paid for). "
                 "Wait until it is back.")
+    return hook_lab_busy(db, project.id)
+
+
+def hook_lab_busy(db: Session, project_id: int) -> Optional[str]:
+    """Why hook-lab work blocks the storyboard: an opening's render or one
+    of its clips is still being made. None when nothing is."""
+    from . import video_jobs
+
+    variant_running = (db.query(models.Render.id)
+                       .filter(models.Render.project_id == project_id, models.Render.hook_variant_id.isnot(None),
+                               models.Render.status.notin_(_DONE_RENDER + ("expired",))).first())
+    if variant_running is not None or video_jobs.pending_for(
+            db, project_id=project_id, purposes=video_jobs.HOOK_PURPOSES) > 0:
+        return ("Other openings (hook lab) are being made for this project and are already paid for. "
+                "Wait until they are back.")
     return None
 
 
@@ -1604,7 +1702,7 @@ def render_project(db: Session, project_id: int, *, claim: Optional[str] = None,
         if fingerprints.voice_source(project) == "tts":
             audio_path = _reusable_voiceover(db, project, voice_fp)
         if audio_path is None:
-            audio_path = generate_audio(db, project, plan=plan)
+            audio_path = generate_audio(db, project, plan=plan, render_id=render.id)
         if audio_path:
             render.audio_path = str(audio_path)
             render.voice_fingerprint = voice_fp
@@ -1682,6 +1780,336 @@ def render_project(db: Session, project_id: int, *, claim: Optional[str] = None,
         raise
 
 
+@dataclass
+class ComposeClip:
+    """One body clip of a compose and where it came from."""
+
+    path: Path
+    # The shot's length: a longer clip is cut to it. None = play it whole.
+    seconds: Optional[float] = None
+    shot_id: Optional[int] = None
+    shot_order: Optional[int] = None
+    shot_type: str = ""
+    take_id: Optional[int] = None
+    fingerprint: str = ""
+    provider_model: str = ""
+    # Plays for exactly `seconds`: held on its last frame when shorter.
+    exact: bool = False
+    # What the shot was made with, as the render recorded it (None: read
+    # the shot row). The hook lab reads these, since a re-plan or a shot
+    # delete can change or remove the row after the render.
+    lipsynced: Optional[bool] = None
+    reference_asset_ids: Optional[list[int]] = None
+    reference_strategy: Optional[str] = None
+    negative_prompt: Optional[str] = None
+
+
+def clip_record(db: Session, project: models.VideoProject, clip: ComposeClip) -> dict:
+    """What `clip`'s shot was made with, for the render's composition_json:
+    whether it is lip-synced, its reference pictures, reference strategy
+    and avoid list. The clip's own record when it has one (a hook-lab
+    opening of a recorded base), else the shot row and take as they are."""
+    shot = db.get(models.VideoShot, clip.shot_id) if clip.shot_id else None
+    if shot is not None and shot.project_id != project.id:
+        shot = None
+    lipsynced = clip.lipsynced
+    if lipsynced is None:
+        lipsynced = False
+        if clip.shot_type == "talking_head":
+            take = db.get(models.ShotTake, clip.take_id) if clip.take_id else None
+            lipsynced = (take.provider if take is not None else (shot.provider if shot else "")) == "lipsync"
+    refs = clip.reference_asset_ids
+    if refs is None:
+        refs = reference_asset_ids(project, shot) if shot is not None else []
+    strategy = clip.reference_strategy
+    if strategy is None:
+        strategy = (shot.reference_strategy if shot else "") or ""
+    negative = clip.negative_prompt
+    if negative is None:
+        negative = (shot.negative_prompt if shot else "") or ""
+    return {"lipsynced": bool(lipsynced), "reference_asset_ids": list(refs),
+            "reference_strategy": strategy, "negative_prompt": negative}
+
+
+def shot_clips(project: models.VideoProject) -> list[ComposeClip]:
+    """The project's current body clips, in order (end cards are drawn by
+    compose). Raises ValueError naming the shots that have no clip on disk."""
+    clips: list[ComposeClip] = []
+    missing: list[int] = []
+    for shot in _body_shots(project):
+        if not shot.clip_path or not Path(shot.clip_path).exists():
+            missing.append(shot.shot_order)
+            continue
+        take = takes.current_take(shot)
+        clips.append(ComposeClip(
+            path=Path(shot.clip_path), seconds=float(shot.duration_seconds or 0) or None,
+            shot_id=shot.id, shot_order=shot.shot_order, shot_type=shot.shot_type or "",
+            take_id=take.id if take is not None else None, fingerprint=shot.clip_fingerprint or "",
+            provider_model=shot.provider_model or ""))
+    if missing:
+        raise ValueError(f"shots not yet generated: {missing}")
+    if not clips:
+        raise ValueError("no shot clips available to recompose")
+    return clips
+
+
+def clip_seconds(clip: ComposeClip) -> float:
+    """How long `clip` plays in the video: its file's length, cut to its
+    shot's length when longer."""
+    from .renderer import _probe_duration
+
+    if clip.exact and clip.seconds:
+        return float(clip.seconds)
+    real = _probe_duration(clip.path) if clip.path.exists() else 0.0
+    if clip.seconds and (not real or real > clip.seconds):
+        return float(clip.seconds)
+    return float(real or clip.seconds or 0.0)
+
+
+def cover_voice(clips: list[ComposeClip], audio: Optional[Path], end_card: float, *,
+                render_id: Optional[int] = None) -> list[ComposeClip]:
+    """`clips` with the last one played longer when the voiceover runs past
+    the body plus the end card: clips are cut to their shots' lengths and
+    the video ends with the picture, so a long voiceover lost its last words
+    (often the call to action). The last clip plays on (its own footage
+    first, then held on its last frame) until the voice has finished."""
+    from dataclasses import replace
+
+    from .renderer import _probe_duration
+
+    if not clips or audio is None or not audio.exists():
+        return clips
+    voice = _probe_duration(audio)
+    short = voice - (sum(clip_seconds(c) for c in clips) + end_card)
+    if short <= 0.05:
+        return clips
+    last = clips[-1]
+    longer = round(clip_seconds(last) + short + 0.05, 3)
+    log.warning("render %s: voiceover runs %.2f s past the clips; the last clip plays on to %.2f s",
+                render_id, short, longer)
+    return [*clips[:-1], replace(last, seconds=longer, exact=True)]
+
+
+def base_captions(plan: StoryboardPlan, body_seconds: float) -> list[CaptionTiming]:
+    """The plan's captions over the video's body (its clips, not the end card)."""
+    return chunks_to_timed(plan.caption_chunks, max(body_seconds, 1.0))
+
+
+def _compose(
+    db: Session, project: models.VideoProject, render: models.Render, clips: list[ComposeClip],
+    audio: Optional[Path], timed: list[CaptionTiming], *, plan: Optional[StoryboardPlan],
+    voice_fingerprint: str = "", hook_window: Optional[float] = None,
+    hook_variant_id: Optional[int] = None, hook_text: Optional[str] = None,
+    script: Optional[str] = None, extra: Optional[dict] = None,
+    settings: Optional[dict] = None,
+) -> RenderOutputs:
+    """Put one storyboard render together: compose `clips` (each cut to its
+    shot length) with `audio`, the captions `timed`, the project's end card,
+    music, brand and disclosure, in the render's own scratch dir
+    (`tmp_<render id>/`, removed afterwards); move the outputs to
+    `render_<id>.mp4/.jpg`; and record what was used on
+    `render.composition_json`. Status, events and cost are the caller's.
+    Used by compose_render, recompose_project and hook-lab variants."""
+    from .hook_lab import first_sentence
+    from .renderer import _probe_duration
+
+    look = settings if settings is not None else compose_settings(db, project, plan)
+    project_dir = storage.render_subdir(project.id)
+    look = keep_music(look, project_dir, render.id)
+    voice = voice_identity(db, project, audio, voice_fingerprint)
+    audio = keep_voice(project, audio, project_dir, render.id)
+    if audio is not None:
+        render.audio_path = str(audio)
+    work = render_files.scratch_dir(project_dir, render.id)
+    clips = cover_voice(clips, audio, END_CARD_SECONDS if look["cta_text"] else 0.0, render_id=render.id)
+    used = [clip_seconds(c) for c in clips]
+    try:
+        outputs = compose(
+            RenderInputs(
+                project_id=project.id,
+                out_dir=work,
+                clip_paths=[c.path for c in clips],
+                clip_seconds=[c.seconds for c in clips],
+                clip_exact=[c.exact for c in clips],
+                audio_path=audio,
+                caption_timings=timed,
+                caption_style=look["caption_style"] or "clean_white",
+                disclosure_text=look["disclosure_text"] or None,
+                cta_text=look["cta_text"] or None,
+                aspect_ratio=look["aspect_ratio"] or project.aspect_ratio,
+                music_path=Path(look["music_path"]) if look["music_path"] else None,
+                music_volume=float(look["music_volume"]),
+                end_card_bg_color=look["end_card_bg_color"],
+                end_card_text_color=look["end_card_text_color"],
+                logo_path=Path(look["logo_path"]) if look["logo_path"] else None,
+                caption_color=look["caption_color"] or None,
+            )
+        )
+        render.render_log = outputs.log
+        render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
+    except BaseException:
+        render_files.drop_scratch(project_dir, render.id)
+        for own in own_copies(project_dir, render.id):  # its copies (keep_music, keep_voice)
+            own.unlink(missing_ok=True)
+        raise
+    if script is None and plan is None:
+        raise ValueError("a compose without a plan must say its script")
+    spoken = plan.cleaned_voice_script if script is None else script
+    final = Path(render.final_video_path)
+    render.composition_json = {
+        "version": 1,
+        "shots": [{
+            "shot_id": c.shot_id, "shot_order": c.shot_order, "shot_type": c.shot_type,
+            "take_id": c.take_id, "clip_path": str(c.path), "fingerprint": c.fingerprint,
+            "provider_model": c.provider_model, "planned_seconds": c.seconds,
+            "seconds": round(u, 3), **clip_record(db, project, c),
+        } for c, u in zip(clips, used, strict=True)],
+        "audio_path": str(audio) if audio else "",
+        "voice_fingerprint": voice_fingerprint,
+        "voice": voice,
+        "captions": [{"start": round(t.start, 3), "end": round(t.end, 3), "text": t.text} for t in timed],
+        "body_seconds": round(sum(used), 3),
+        "end_card_seconds": END_CARD_SECONDS if look["cta_text"] else 0.0,
+        "duration_seconds": round(_probe_duration(final), 3) if final.exists() else None,
+        "aspect_ratio": look["aspect_ratio"] or project.aspect_ratio or "",
+        "avatar_id": project.primary_avatar_id,
+        "script": spoken or "",
+        "hook": (hook_text if hook_text is not None
+                 else (plan.hook if script is None else first_sentence(spoken or ""))),
+        "hook_window_seconds": hook_window,
+        "hook_variant_id": hook_variant_id,
+        "settings": look,
+        **(extra or {}),
+    }
+    if hook_variant_id is not None:
+        render.hook_variant_id = hook_variant_id
+    db.commit()
+    return outputs
+
+
+def file_sha256(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def keep_music(look: dict, project_dir: Path, render_id: int) -> dict:
+    """`look` with its music bed pinned to this render: the project's
+    music file keeps its name (music.<ext>) when music is made or uploaded
+    again, so the render keeps its own copy
+    (`render_<id>_music.<ext>`, a hard link when the disk allows it) and
+    its checksum. Another opening of this render is composed with that
+    copy, never with whatever music the project has by then. (The logo
+    needs nothing: each upload is a new file.)"""
+    import os
+    import shutil
+
+    src = Path(look.get("music_path") or "") if look.get("music_path") else None
+    if src is None or not src.is_file():
+        return look
+    dst = project_dir / f"render_{render_id}_music{src.suffix}"
+    if src != dst:
+        dst.unlink(missing_ok=True)
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+    return {**look, "music_path": str(dst), "music_sha256": file_sha256(dst)}
+
+
+_VOICE_COPY = re.compile(r"render_\d+_voice\.\w+")
+
+
+def own_copies(project_dir: Path, render_id: int) -> list[Path]:
+    """The render's own copies of its music bed and uploaded voiceover
+    (keep_music, keep_voice): removed with the render's files."""
+    return [*project_dir.glob(f"render_{render_id}_music.*"), *project_dir.glob(f"render_{render_id}_voice.*")]
+
+
+def is_voice_copy(path: Path) -> bool:
+    """A render's own copy of an uploaded voiceover (keep_voice)."""
+    return bool(_VOICE_COPY.fullmatch(path.name))
+
+
+def keep_voice(project: models.VideoProject, audio: Optional[Path], project_dir: Path,
+               render_id: int) -> Optional[Path]:
+    """`audio`, pinned to this render when it is an uploaded voiceover: the
+    upload keeps its name (voiceover.<ext>) when a new one is uploaded, so
+    the render keeps its own copy (`render_<id>_voice.<ext>`, a hard link
+    when the disk allows it), like keep_music does for the music. A
+    synthesized voiceover needs nothing: each synthesis is a new file."""
+    import os
+    import shutil
+
+    if audio is None or not audio.is_file():
+        return audio
+    upload = Path(project.voiceover_upload_path) if project.voiceover_upload_path else None
+    if audio != upload and not is_voice_copy(audio):
+        return audio
+    dst = project_dir / f"render_{render_id}_voice{audio.suffix}"
+    if audio != dst:
+        dst.unlink(missing_ok=True)
+        try:
+            os.link(audio, dst)
+        except OSError:
+            shutil.copy2(audio, dst)
+    return dst
+
+
+def voice_identity(db: Session, project: models.VideoProject, audio: Optional[Path], voice_fp: str) -> dict:
+    """What a render's voiceover was spoken with, recorded in its
+    composition_json["voice"]: {"source": "upload"} for an uploaded
+    recording, {"source": "tts", voice_id, default_voice, model, options}
+    for a synthesized one, {"source": "silent"} without one. {} when it
+    isn't known (an older voiceover from a render that didn't record it)."""
+    if audio is None:
+        return {"source": "silent"}
+    upload = Path(project.voiceover_upload_path) if project.voiceover_upload_path else None
+    if audio == upload or is_voice_copy(audio):
+        return {"source": "upload"}
+    if voice_fp and fingerprints.voice_source(project) == "tts" \
+            and voice_fp == fingerprints.voice_fingerprint(db, project):
+        return {"source": "tts", **fingerprints.tts_identity(db, project)}
+    # An older voiceover kept under the clips: what the render that made it recorded.
+    R = models.Render
+    q = (db.query(R).filter(R.project_id == project.id, R.audio_path == str(audio),
+                            R.hook_variant_id.is_(None), R.composition_json.isnot(None))
+         .order_by(R.id.desc()))
+    if voice_fp:
+        q = q.filter(R.voice_fingerprint == voice_fp)
+    for r in q.limit(20):
+        voice = (r.composition_json or {}).get("voice")
+        if voice:
+            return dict(voice)
+    return {}
+
+
+def compose_settings(db: Session, project: models.VideoProject, plan: Optional[StoryboardPlan]) -> dict:
+    """The project's compose look right now (CTA, captions, music, brand,
+    disclosure), as recorded in composition_json["settings"]: a hook-lab
+    variant is composed with its base render's, so only its opening differs."""
+    brand = _brand_kit_for(db, project)
+    music = _music_path_if_any(project)
+    logo = Path(brand.logo_path) if brand and brand.logo_path and Path(brand.logo_path).exists() else None
+    disclosure = _disclosure_for(project, plan, brand) if plan is not None else None
+    return {
+        "cta_text": project.cta_text or "",
+        "caption_style": project.caption_style or "clean_white",
+        "disclosure_text": disclosure or "",
+        "aspect_ratio": project.aspect_ratio or "",
+        "music_path": str(music) if music else "",
+        "music_volume": float(project.music_volume or 0.25),
+        "end_card_bg_color": brand.end_card_bg_color if brand else "#0E0E12",
+        "end_card_text_color": brand.end_card_text_color if brand else "#FFFFFF",
+        "logo_path": str(logo) if logo else "",
+        "caption_color": (brand.primary_color if brand else "") or "",
+    }
+
+
 def compose_render(db: Session, render_id: int) -> models.Render:
     """FFmpeg composition for a storyboard render whose clips are all in
     (called once by maybe_compose)."""
@@ -1690,33 +2118,10 @@ def compose_render(db: Session, render_id: int) -> models.Render:
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
     try:
         _check_cancel(db, render)
-        clip_paths = [Path(s.clip_path) for s in _body_shots(project)]
-        body_duration = sum(s.duration_seconds for s in _body_shots(project))
-        timed = chunks_to_timed(plan.caption_chunks, max(body_duration, 1.0))
-        brand = _brand_kit_for(db, project)
-        outputs = compose(
-            RenderInputs(
-                project_id=project.id,
-                out_dir=storage.render_subdir(project.id),
-                clip_paths=clip_paths,
-                audio_path=Path(render.audio_path) if render.audio_path else None,
-                caption_timings=timed,
-                caption_style=project.caption_style or "clean_white",
-                disclosure_text=_disclosure_for(project, plan, brand),
-                cta_text=project.cta_text or None,
-                aspect_ratio=project.aspect_ratio,
-                music_path=_music_path_if_any(project),
-                music_volume=float(project.music_volume or 0.25),
-                end_card_bg_color=(brand.end_card_bg_color if brand else "#0E0E12"),
-                end_card_text_color=(brand.end_card_text_color if brand else "#FFFFFF"),
-                logo_path=(
-                    Path(brand.logo_path) if brand and brand.logo_path and Path(brand.logo_path).exists() else None
-                ),
-                caption_color=(brand.primary_color if brand else None),
-            )
-        )
-        render.render_log = outputs.log
-        render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
+        clips = shot_clips(project)
+        timed = base_captions(plan, sum(clip_seconds(c) for c in clips))
+        _compose(db, project, render, clips, Path(render.audio_path) if render.audio_path else None,
+                 timed, plan=plan, voice_fingerprint=render.voice_fingerprint or "")
         render.status = "completed"
         project.status = "completed"
         events.render_event(db, render, project, "completed")
@@ -1825,7 +2230,7 @@ def _latest_completed_audio(db: Session, project_id: int) -> Optional[Path]:
     """Find the audio file from the latest render that has one, if it still exists on disk."""
     rows = (
         db.query(models.Render)
-        .filter(models.Render.project_id == project_id)
+        .filter(models.Render.project_id == project_id, models.Render.hook_variant_id.is_(None))
         .order_by(models.Render.created_at.desc())
         .all()
     )
@@ -1843,7 +2248,9 @@ def _recompose_voiceover(db: Session, project: models.VideoProject) -> tuple[Opt
     captions match what is said. The last render's voiceover instead when the
     lip-synced clips were all cut from that one (nothing was re-rolled
     against the new voiceover yet): swapping it would put every one of them
-    out of step."""
+    out of step. An uploaded voiceover is the upload file itself: each
+    render plays its own copy of it (keep_voice), so a newly uploaded
+    recording is found there, never under an older render."""
     old_audio = _latest_completed_audio(db, project.id)
     source_render = _latest_audio_render(db, project.id)
     # Same voiceover file as before: keep knowing what it was made from.
@@ -1851,7 +2258,13 @@ def _recompose_voiceover(db: Session, project: models.VideoProject) -> tuple[Opt
               if source_render is not None and old_audio and source_render.audio_path == str(old_audio)
               else "")
     voice_fp = fingerprints.voice_fingerprint(db, project)
-    current = _reusable_voiceover(db, project, voice_fp) if voice_fp else None
+    if fingerprints.voice_source(project) == "upload":
+        current = project.voiceover_upload_path if voice_fp != old_fp else None
+        if current is not None and old_audio is not None and Path(current) == old_audio:
+            # An older render played the upload file itself: it holds the new recording now.
+            return old_audio, voice_fp
+    else:
+        current = _reusable_voiceover(db, project, voice_fp) if voice_fp else None
     if current is None or (old_audio is not None and Path(current) == old_audio):
         return old_audio, old_fp
     clips = _lipsynced_clips(project)
@@ -1859,6 +2272,30 @@ def _recompose_voiceover(db: Session, project: models.VideoProject) -> tuple[Opt
             and not any(_clip_follows_voice(db, project, s, voice_fp) for s in clips)):
         return old_audio, old_fp
     return Path(current), voice_fp
+
+
+def _spoken_texts(db: Session, project: models.VideoProject, audio: Optional[Path],
+                  audio_fp: str) -> Optional[dict]:
+    """{script, hook_text} to record for a recompose whose voiceover is not
+    the current script's (the edited script has not been voiced yet, so the
+    old voiceover is kept): what that audio says, from the render that made
+    it, or empty so readers don't take the unspoken plan text for it. None
+    when the audio is the current script's (the plan's text is right)."""
+    if audio is None or fingerprints.voice_source(project) != "tts":
+        return None
+    if audio_fp and audio_fp == fingerprints.voice_fingerprint(db, project):
+        return None
+    R = models.Render
+    q = (db.query(R).filter(R.project_id == project.id, R.audio_path == str(audio),
+                            R.hook_variant_id.is_(None), R.composition_json.isnot(None))
+         .order_by(R.id.desc()))
+    if audio_fp:
+        q = q.filter(R.voice_fingerprint == audio_fp)
+    for r in q.limit(20):
+        comp = r.composition_json or {}
+        if comp.get("script"):
+            return {"script": str(comp["script"]), "hook_text": str(comp.get("hook") or "")}
+    return {"script": "", "hook_text": "", "extra": {"spoken_unknown": True}}
 
 
 def recompose_project(db: Session, project_id: int) -> models.Render:
@@ -1876,22 +2313,14 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
 
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
 
-    missing: list[int] = []
-    clip_paths: list[Path] = []
-    for shot in project.shots:
-        if shot.shot_type == "end_card":
-            continue
-        if not shot.clip_path or not Path(shot.clip_path).exists():
-            missing.append(shot.shot_order)
-            continue
-        clip_paths.append(Path(shot.clip_path))
-    if missing or not clip_paths:
-        error = f"shots not yet generated: {missing}" if missing else "no shot clips available to recompose"
+    try:
+        clips = shot_clips(project)
+    except ValueError:
         if project.status == "generating":
             # Claimed by Retry (or a re-roll's recompose): don't leave it spinning.
             project.status = "failed"
             db.commit()
-        raise ValueError(error)
+        raise
 
     audio, audio_fp = _recompose_voiceover(db, project)
 
@@ -1908,36 +2337,11 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
     db.refresh(render)
 
     try:
-        body_duration = sum(
-            s.duration_seconds for s in project.shots if s.shot_type != "end_card"
-        )
-        timed = chunks_to_timed(plan.caption_chunks, max(body_duration, 1.0))
+        timed = base_captions(plan, sum(clip_seconds(c) for c in clips))
         _check_cancel(db, render)
-        brand = _brand_kit_for(db, project)
-        out_dir = storage.render_subdir(project.id)
-        outputs = compose(
-            RenderInputs(
-                project_id=project.id,
-                out_dir=out_dir,
-                clip_paths=clip_paths,
-                audio_path=audio,
-                caption_timings=timed,
-                caption_style=project.caption_style or "clean_white",
-                disclosure_text=_disclosure_for(project, plan, brand),
-                cta_text=project.cta_text or None,
-                aspect_ratio=project.aspect_ratio,
-                music_path=_music_path_if_any(project),
-                music_volume=float(project.music_volume or 0.25),
-                end_card_bg_color=(brand.end_card_bg_color if brand else "#0E0E12"),
-                end_card_text_color=(brand.end_card_text_color if brand else "#FFFFFF"),
-                logo_path=(
-                    Path(brand.logo_path) if brand and brand.logo_path and Path(brand.logo_path).exists() else None
-                ),
-                caption_color=(brand.primary_color if brand else None),
-            )
-        )
-        render.render_log = outputs.log
-        render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
+        spoken = _spoken_texts(db, project, audio, audio_fp)
+        _compose(db, project, render, clips, audio, timed, plan=plan, voice_fingerprint=audio_fp,
+                 **(spoken or {}))
         render.status = "completed"
         project.status = "completed"
         events.render_event(db, render, project, "completed")

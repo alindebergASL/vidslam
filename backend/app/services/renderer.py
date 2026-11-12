@@ -32,6 +32,15 @@ class RenderInputs:
     end_card_text_color: str = "#FFFFFF"
     logo_path: Optional[Path] = None
     caption_color: Optional[str] = None
+    # Per clip, the most it may play (its shot's length): providers round a
+    # clip's length up to what the model supports, and a longer clip would
+    # push every later shot out of step with the voice and captions. None
+    # (or a missing entry) = play the whole clip. Shorter clips are kept.
+    clip_seconds: list[Optional[float]] = field(default_factory=list)
+    # Per clip, True = play it for exactly its clip_seconds: a shorter clip
+    # holds its last frame to that length (a hook-lab replacement clip must
+    # fill its slot, or every later clip slides against the voiceover).
+    clip_exact: list[bool] = field(default_factory=list)
 
 
 @dataclass
@@ -109,12 +118,19 @@ def fit_vf(width: int, height: int, size: Optional[tuple[int, int]] = None, *, f
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
 
 
-def _normalize_clip(src: Path, dst: Path, width: int, height: int) -> str:
-    """Re-encode a clip to a uniform size/fps/codec so they can be concatenated."""
+def _normalize_clip(src: Path, dst: Path, width: int, height: int,
+                    max_seconds: Optional[float] = None, *, exact: bool = False) -> str:
+    """Re-encode a clip to a uniform size/fps/codec so they can be
+    concatenated, cut to `max_seconds` when it is longer (`exact`: and held
+    on its last frame up to `max_seconds` when it is shorter)."""
     vf = f"{fit_vf(width, height, _probe_size(src))},setsar=1,fps={FPS}"
+    if exact and max_seconds and max_seconds > 0:
+        vf += f",tpad=stop_mode=clone:stop_duration={max_seconds:.3f}"
+    limit = ["-t", f"{max_seconds:.3f}"] if max_seconds and max_seconds > 0 else []
     cmd = [
         "ffmpeg", "-y", "-i", str(src),
         "-vf", vf,
+        *limit,
         "-an",
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
         "-r", str(FPS),
@@ -307,6 +323,13 @@ def _mux_audio_captions_overlays(
         ]
     else:
         cmd += ["-an"]
+    # The padded voice (apad) never ends, so -shortest alone decides where
+    # the file stops, and newer FFmpeg releases overshoot it by up to a
+    # second or two of audio buffered past the last frame. Cap the output at
+    # the picture's own length so every version ends with the video.
+    video_seconds = _probe_duration(silent_in)
+    if video_seconds > 0:
+        cmd += ["-t", f"{video_seconds:.3f}"]
     cmd += [str(out)]
 
     rc, log = _run(cmd)
@@ -1252,7 +1275,9 @@ def compose(inputs: RenderInputs) -> RenderOutputs:
     normalized: list[Path] = []
     for i, clip in enumerate(inputs.clip_paths):
         norm = inputs.out_dir / f"norm_{i:02d}.mp4"
-        log_parts.append(_normalize_clip(clip, norm, width, height))
+        limit = inputs.clip_seconds[i] if i < len(inputs.clip_seconds) else None
+        exact = bool(inputs.clip_exact[i]) if i < len(inputs.clip_exact) else False
+        log_parts.append(_normalize_clip(clip, norm, width, height, limit, exact=exact))
         normalized.append(norm)
 
     # 2. Optional end card.

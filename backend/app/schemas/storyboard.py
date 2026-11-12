@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ReferenceStrategy = Literal["frame_images", "input_references", "static_motion"]
 ShotType = Literal["hero", "b_roll", "talking_head", "end_card", "transition"]
@@ -31,9 +31,23 @@ class ShotPlan(BaseModel):
 class StoryboardPlan(BaseModel):
     title: str
     cleaned_voice_script: str
+    # The exact first sentence of cleaned_voice_script, written to stop the
+    # scroll. Plans made before it was stored get it derived from the script.
+    hook: str = ""
     estimated_duration_seconds: float
     content_warning_notes: str = ""
     disclosure_text: str = "AI-generated virtual creator"
     end_card_text: str = ""
     caption_chunks: list[CaptionChunk] = Field(default_factory=list)
     shots: list[ShotPlan] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _derive_hook(self) -> "StoryboardPlan":
+        # Always the script's own first sentence: a planner's hook that
+        # says something else is never voiced, so it is not kept (and it
+        # would skip the script's safety checks).
+        from ..services.hook_lab import first_sentence
+
+        script = (self.cleaned_voice_script or "").strip()
+        self.hook = first_sentence(script) if script else ""
+        return self

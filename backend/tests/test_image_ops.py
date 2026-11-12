@@ -115,7 +115,7 @@ def test_migration_0010_adds_operation_columns_with_defaults(tmp_path, monkeypat
         row = conn.execute(text("SELECT operation, source_job_id, source_asset_id, options_json "
                                 "FROM asset_generation_jobs")).one()
         assert tuple(row) == ("", None, None, None)
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0010"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0011"
         diff = compare_metadata(MigrationContext.configure(conn), dbmod.Base.metadata)
     assert diff == [], diff  # same as `alembic check`
     command.downgrade(dbmod._alembic_config(), "0009")

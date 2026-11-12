@@ -19,7 +19,7 @@ from ..services import content_mode, provider_gate, render_files
 from ..services.preflight import run_preflight
 from ..services.ratelimit import rate_limit
 from ..services.safety import UnsafeScriptError, check_script, validate_script
-from ..services.spend import budget_guard
+from ..services.spend import budget_guard, require_budget_for
 from ..workers.jobs import (
     generate_plan_job,
     generate_video_job,
@@ -38,19 +38,25 @@ _IDLE = ("draft", "planned", "completed", "failed", "cancelled")
 _DONE_RENDER = ("completed", "failed", "cancelled", "expired")
 
 
-def claim_project(db: Session, project: models.VideoProject, to: str, busy: str) -> tuple[str, str]:
+def claim_project(db: Session, project: models.VideoProject, to: str, busy: str,
+                  *, hook_lab: bool = False) -> tuple[str, str]:
     """Move the project to `to` ("generating" / "planning") before its job is
     queued, atomically and only from an idle state with no render running,
     so a double-click or a second tab can't queue a second paid run (409
     `busy`), and the editor keeps polling while the job waits for a worker.
     Returns the previous status (for release_project) and the claim's
-    unique token, which the queued job must consume before it does anything."""
+    unique token, which the queued job must consume before it does anything.
+    `hook_lab`: a hook-lab "Make videos" claim; its token says so and holds
+    the previous status (pipeline.hook_claim_token)."""
+    from ..services.pipeline import hook_claim_token
+
     latest = (db.query(models.Render.status).filter(models.Render.project_id == project.id)
               .order_by(models.Render.id.desc()).first())
     if latest is not None and latest[0] not in _DONE_RENDER:
         raise HTTPException(409, busy)
     previous = project.status or "draft"
-    token = uuid.uuid4().hex
+    previous = previous if previous in _IDLE else "draft"
+    token = hook_claim_token(previous) if hook_lab else uuid.uuid4().hex
     claimed = (db.query(models.VideoProject)
                .filter(models.VideoProject.id == project.id, models.VideoProject.status.in_(_IDLE))
                .update({"status": to, "claim_token": token, "updated_at": datetime.utcnow()},
@@ -59,7 +65,7 @@ def claim_project(db: Session, project: models.VideoProject, to: str, busy: str)
     if not claimed:
         raise HTTPException(409, busy)
     db.refresh(project)
-    return (previous if previous in _IDLE else "draft"), token
+    return previous, token
 
 
 def release_project(db: Session, project_id: int, claimed: str, previous: str, token: str) -> None:
@@ -208,6 +214,10 @@ def generate_video(
         result = run_preflight(db, project)
         if not result["ok"]:
             raise HTTPException(422, detail={"preflight": result})
+    from ..services.pipeline import render_plan as _render_plan
+
+    # The reuse-aware estimate counts against the cap, not only what is spent.
+    require_budget_for(db, _render_plan(db, project)["total"])
     job_id = _enqueue_claimed(db, project, "generating", "Already making this video",
                               generate_video_job, project_id)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
@@ -220,8 +230,24 @@ def recompose_video(project_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(404, "project not found")
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
-    job_id = enqueue(recompose_project_job, project_id)
+    # Claimed like Generate: 409 while a render, a re-roll or another compose
+    # of this project (a hook-lab variant too) is running, so two composes
+    # never run at once.
+    _refuse_while_composing(db, project)
+    job_id = _enqueue_claimed(db, project, "generating", "Already making this video",
+                              recompose_project_job, project_id)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
+
+
+def _refuse_while_composing(db: Session, project: models.VideoProject) -> None:
+    """409 when any render of the project (not only the newest) is still
+    being put together, e.g. a hook-lab variant composing next to it."""
+    running = (db.query(models.Render.id)
+               .filter(models.Render.project_id == project.id,
+                       models.Render.status.in_(("rendering", "composing")))
+               .first())
+    if running is not None:
+        raise HTTPException(409, "Already making this video")
 
 
 @router.post("/projects/{project_id}/cancel")
@@ -245,12 +271,18 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(404, "project not found")
     latest = (
         db.query(models.Render)
-        .filter(models.Render.project_id == project_id)
+        # Hook-lab variants have their own progress (hook lab, events).
+        .filter(models.Render.project_id == project_id, models.Render.hook_variant_id.is_(None))
         .order_by(models.Render.created_at.desc())
         .first()
     )
     from ..services import video_jobs
+    from ..services.pipeline import hook_claim_previous
 
+    if project.status == "generating" and hook_claim_previous(project.claim_token):
+        # Held by the hook lab's "Make videos": its openings are stopped
+        # there, one by one; this never cancels the finished video.
+        raise HTTPException(409, "Other openings are being made for this video. Stop them in the hook lab.")
     if latest is None or latest.status in _DONE_RENDER:
         # Claimed (Generate / Retry / plan) but its job hasn't made a render
         # yet: still queued, or it stopped before it could. Give the claim
@@ -285,12 +317,15 @@ def _release_waiting_claim(db: Session, project: models.VideoProject) -> bool:
     if was not in ("generating", "planning"):
         return False
     from ..services import events
+    from ..services.pipeline import HOOK_CLAIM
 
     # Only while no worker has taken the claim over (its token is still
     # set): after that the job owns it and cancel goes through its render.
+    # Never a hook-lab claim (the project's finished video stays as it is).
     done = (db.query(models.VideoProject)
             .filter(models.VideoProject.id == project.id, models.VideoProject.status == was,
-                    models.VideoProject.claim_token != "")
+                    models.VideoProject.claim_token != "",
+                    ~models.VideoProject.claim_token.startswith(HOOK_CLAIM))
             .update({"status": "cancelled", "claim_token": "", "updated_at": datetime.utcnow()},
                     synchronize_session=False))
     if done != 1:
@@ -358,7 +393,8 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     )
     latest = (
         db.query(models.Render)
-        .filter(models.Render.project_id == project_id)
+        # Hook-lab variants have their own progress (hook lab, events).
+        .filter(models.Render.project_id == project_id, models.Render.hook_variant_id.is_(None))
         .order_by(models.Render.created_at.desc())
         .first()
     )
@@ -372,6 +408,7 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     else:
         voiceover, voiceover_cost = plan["voiceover"], plan["voiceover_cost"]
         provider_gate.require_project(db, project)  # only the shots it resubmits
+        require_budget_for(db, plan["total"])
         job_id = _enqueue_claimed(db, project, "generating", busy, generate_video_job, project_id)
         action = "resume"
     return {
@@ -415,6 +452,16 @@ def _refuse_stale_voice_reroll(db: Session, project: models.VideoProject, shots:
     )
 
 
+def _refuse_while_hook_lab(db: Session, project_id: int) -> None:
+    """409 while other openings are being made: a re-roll's recompose would
+    otherwise race them for the project."""
+    from ..services.pipeline import hook_lab_busy
+
+    reason = hook_lab_busy(db, project_id)
+    if reason:
+        raise HTTPException(409, reason)
+
+
 class BulkRegenIn(BaseModel):
     shot_ids: list[int]
 
@@ -430,6 +477,7 @@ def regenerate_shots_bulk(
     targets = [sid for sid in body.shot_ids if sid in valid]
     if not targets:
         raise HTTPException(422, "no regenerable shots in the selection")
+    _refuse_while_hook_lab(db, project_id)
     _refuse_stale_voice_reroll(db, project, [s for s in project.shots if s.id in set(targets)])
     provider_gate.require_project(db, project, shot_ids=set(targets))
     job_id = enqueue(regenerate_shots_bulk_job, project_id, targets)
@@ -448,14 +496,19 @@ def project_status(project_id: int, db: Session = Depends(get_db)) -> ProjectSta
         raise HTTPException(404, "project not found")
     latest = (
         db.query(models.Render)
-        .filter(models.Render.project_id == project_id)
+        # Hook-lab variants have their own progress (hook lab, events).
+        .filter(models.Render.project_id == project_id, models.Render.hook_variant_id.is_(None))
         .order_by(models.Render.created_at.desc())
         .first()
     )
+    from ..services.pipeline import hook_claim_previous
+
     return ProjectStatusOut(
         project_id=project.id,
         project_status=project.status,
-        latest_render=RenderOut.model_validate(latest) if latest else None,
+        # Held by the hook lab's "Make videos", not by a render of its own.
+        hook_lab_making=project.status == "generating" and hook_claim_previous(project.claim_token) is not None,
+        latest_render=render_out(db, latest) if latest else None,
         shots=[ShotOut.model_validate(s) for s in project.shots],
     )
 
@@ -470,6 +523,7 @@ def regenerate_shot(
     shot = db.get(models.VideoShot, shot_id)
     if shot is None or shot.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
+    _refuse_while_hook_lab(db, project_id)
     _refuse_stale_voice_reroll(db, shot.project, [shot], recompose=recompose)
     provider_gate.require_model("video", shot.model_override or None, db)
     job_id = enqueue(regenerate_shot_job, project_id, shot_id, recompose)
@@ -492,16 +546,35 @@ def shot_clip(project_id: int, shot_id: int, db: Session = Depends(get_db)) -> F
     return FileResponse(shot.clip_path, media_type="video/mp4")
 
 
+def render_outs(db: Session, renders: list[models.Render]) -> list[RenderOut]:
+    """Renders with their version number and label ("Version 3 · opening B",
+    "Failed attempt"): the same numbering everywhere."""
+    from ..services import render_versions
+
+    info = render_versions.describe(db, renders)
+    vids = {r.hook_variant_id for r in renders if r.hook_variant_id}
+    bases = dict(db.query(models.HookVariant.id, models.HookVariant.base_render_id)
+                 .filter(models.HookVariant.id.in_(vids)).all()) if vids else {}
+    return [RenderOut.model_validate(r).model_copy(update={
+        "version": info[r.id]["version"], "version_label": info[r.id]["version_label"],
+        "hook_base_render_id": bases.get(r.hook_variant_id) if r.hook_variant_id else None})
+        for r in renders]
+
+
+def render_out(db: Session, render: models.Render) -> RenderOut:
+    return render_outs(db, [render])[0]
+
+
 @router.get("/projects/{project_id}/renders", response_model=list[RenderOut])
-def list_renders(project_id: int, db: Session = Depends(get_db)) -> list[models.Render]:
+def list_renders(project_id: int, db: Session = Depends(get_db)) -> list[RenderOut]:
     if db.get(models.VideoProject, project_id) is None:
         raise HTTPException(404, "project not found")
-    return (
+    return render_outs(db, (
         db.query(models.Render)
         .filter(models.Render.project_id == project_id)
         .order_by(models.Render.created_at.desc())
         .all()
-    )
+    ))
 
 
 @router.get("/projects/{project_id}/renders/export")
@@ -520,14 +593,19 @@ def export_renders(project_id: int, db: Session = Depends(get_db)) -> StreamingR
     completed = [r for r in renders if r.final_video_path and Path(r.final_video_path).exists()]
     if not completed:
         raise HTTPException(404, "no completed renders to export")
+    from ..services import render_versions
+
+    info = render_versions.describe(db, completed)
 
     slug = slugify(project.title or f"project-{project_id}") or f"project-{project_id}"
     buf = io.BytesIO()
-    total = len(completed)
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
-        for idx, r in enumerate(completed):
-            version = total - idx  # newest = highest version number
-            base = f"{slug}_v{version}"
+        for r in completed:
+            # The same number the render page and Publishing show.
+            v = info[r.id]
+            base = f"{slug}_v{v['version'] or r.id}"
+            if v["opening"]:
+                base += f"_opening_{slugify(v['opening'])}"
             zf.write(r.final_video_path, arcname=f"{base}.mp4")
             if r.thumbnail_path and Path(r.thumbnail_path).exists():
                 zf.write(r.thumbnail_path, arcname=f"{base}.jpg")
@@ -563,11 +641,11 @@ def recent_renders(limit: int = 12, db: Session = Depends(get_db)) -> list[dict]
 
 
 @router.get("/renders/{render_id}", response_model=RenderOut)
-def get_render(render_id: int, db: Session = Depends(get_db)) -> models.Render:
+def get_render(render_id: int, db: Session = Depends(get_db)) -> RenderOut:
     r = db.get(models.Render, render_id)
     if r is None:
         raise HTTPException(404, "render not found")
-    return r
+    return render_out(db, r)
 
 
 @router.get("/renders/{render_id}/download")

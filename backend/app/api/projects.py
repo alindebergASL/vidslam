@@ -257,14 +257,18 @@ def edit_plan(
         raise HTTPException(409, "generate a storyboard plan first")
 
     plan = StoryboardPlan.model_validate(project.generated_plan_json)
-    if body.cleaned_voice_script is not None and body.cleaned_voice_script != plan.cleaned_voice_script:
+    script = _edited_script(plan, body)
+    if script is not None and script != plan.cleaned_voice_script:
         from ..services.minor_check import check_or_422
 
-        check_or_422(body.cleaned_voice_script, kind="script")  # it is voiced and lip-synced
+        check_or_422(script, kind="script")  # it is voiced and lip-synced
         refuse_while_busy(db, project, "The spoken script")  # the voiceover is made from it
         _adopt_old_voiceover(db, project)
-    if body.cleaned_voice_script is not None:
-        plan.cleaned_voice_script = body.cleaned_voice_script
+    if script is not None:
+        from ..services.hook_lab import first_sentence
+
+        plan.cleaned_voice_script = script
+        plan.hook = first_sentence(script)
     if body.end_card_text is not None:
         plan.end_card_text = body.end_card_text
         project.cta_text = body.end_card_text  # keep the project's end card in sync
@@ -278,6 +282,20 @@ def edit_plan(
     db.commit()
     db.refresh(project)
     return project
+
+
+def _edited_script(plan: StoryboardPlan, body: PlanEditIn) -> Optional[str]:
+    """The spoken script after this edit (None: unchanged). A hook that
+    differs from the stored one and from the script's opening line
+    replaces that line; otherwise the script is taken as sent."""
+    from ..services.hook_lab import first_sentence, replace_first_sentence
+
+    script = body.cleaned_voice_script
+    hook = (body.hook or "").strip() if body.hook is not None else None
+    base = script if script is not None else plan.cleaned_voice_script
+    if hook and hook != plan.hook and hook != first_sentence(base or ""):
+        return replace_first_sentence(base or "", hook)
+    return script
 
 
 class ReorderIn(BaseModel):
@@ -344,6 +362,11 @@ def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
             synchronize_session=False)
     db.query(models.VideoJob).filter(models.VideoJob.project_id == project_id).delete(
         synchronize_session=False)
+    # Hook-lab variants point at the renders and the renders back at them.
+    db.query(models.Render).filter(models.Render.project_id == project_id).update(
+        {"hook_variant_id": None}, synchronize_session=False)
+    db.query(models.HookVariant).filter(models.HookVariant.project_id == project_id).delete(
+        synchronize_session=False)
     # Provider logs are an audit trail: keep them, detach from the project.
     db.query(models.ProviderLog).filter(models.ProviderLog.project_id == project_id).update(
         {"project_id": None}, synchronize_session=False)
@@ -360,14 +383,21 @@ def delete_project(project_id: int, db: Session = Depends(get_db)) -> None:
 
 
 @router.get("/projects/{project_id}/publish-meta")
-def publish_meta(project_id: int, db: Session = Depends(get_db)) -> dict:
-    """Draft YouTube title / description / tags / flags for this project."""
+def publish_meta(project_id: int, render_id: Optional[int] = None, db: Session = Depends(get_db)) -> dict:
+    """Draft YouTube title / description / tags / flags for this project,
+    or (`render_id`) for one of its renders: that render's own script and
+    opening (a hook-lab variant's hook)."""
     from ..services import publish_meta as pm
 
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
-    return pm.draft(project)
+    render = None
+    if render_id is not None:
+        render = db.get(models.Render, render_id)
+        if render is None or render.project_id != project.id:
+            raise HTTPException(404, "render not found in project")
+    return pm.draft(project, render)
 
 
 # ---------- add / duplicate / delete a shot ----------
@@ -523,7 +553,7 @@ def delete_shot(project_id: int, shot_id: int, db: Session = Depends(get_db)) ->
         paths.add(shot.clip_path)
     project.shots.remove(shot)  # its takes go with it (cascade)
     db.flush()
-    discarded = sum(1 for p in paths if takes_svc.remove_file(db, p))
+    discarded = sum(1 for p in paths if takes_svc.remove_file(db, p, project_id=project.id))
     _renumber(project)
     resynced = _resync_captions(project) if shot.shot_type != "end_card" else False
     db.commit()
@@ -622,4 +652,8 @@ def delete_take(project_id: int, shot_id: int, take_id: int, db: Session = Depen
     take = _take_of(shot, take_id)
     if shot.clip_path and take.clip_path == shot.clip_path:
         raise HTTPException(409, "This is the clip the shot uses now. Pick another take first.")
+    take_ids, paths = takes_svc.in_use(db, project_id)
+    if take.id in take_ids or (take.clip_path and take.clip_path in paths):
+        raise HTTPException(409, "Another opening (hook lab) uses this take, so it is kept. Remove that "
+                                 "opening first.")
     takes_svc.delete(db, shot, take)

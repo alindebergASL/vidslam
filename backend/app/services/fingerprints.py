@@ -52,6 +52,21 @@ def tts_voice_id(db: Session, project: models.VideoProject) -> str:
     return (avatar.elevenlabs_voice_id if avatar else "") or ""
 
 
+def tts_identity(db: Session, project: models.VideoProject) -> dict:
+    """The voice the TTS speaks with right now: voice, voice model and its
+    options (not the script). JSON-plain, so it compares equal to a copy
+    stored in a render's composition_json."""
+    from . import model_registry as reg
+
+    voice_id = tts_voice_id(db, project)
+    return json.loads(json.dumps({
+        "voice_id": voice_id,
+        "default_voice": "" if voice_id else get_settings().elevenlabs_default_voice_id,
+        "model": reg.active_model("tts") or "",
+        "options": reg.active_options("tts") or {},
+    }, sort_keys=True, ensure_ascii=False, default=str))
+
+
 def voice_fingerprint(db: Session, project: models.VideoProject) -> str:
     """What the project's voiceover would be made from right now.
     "" for a silent project (there is no voiceover to compare)."""

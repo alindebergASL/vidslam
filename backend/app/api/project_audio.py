@@ -54,6 +54,9 @@ def _save_audio(file: UploadFile, *, project_id: int, kind: str) -> Path:
                 stale.unlink()
             except OSError:
                 pass
+    # A new file, never the old one rewritten: a render's own copy of the
+    # music (a hard link to it, pipeline.keep_music) must keep its sound.
+    path.unlink(missing_ok=True)
     path.write_bytes(raw)
     return path
 

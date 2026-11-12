@@ -277,6 +277,32 @@ def recompose_after_regen_job(project_id: int) -> None:
         db.close()
 
 
+def make_hook_variants_job(project_id: int, variant_ids: list[int], claim: str = "", claim_token: str = "",
+                           previous: str = "completed") -> None:
+    """Hook lab "Make videos": the variants' audio and clips (paid), each
+    composed when its parts are in. `claim`/`claim_token`: the project
+    claim the API made; `previous`: the status it goes back to."""
+    from ..services import hook_lab
+
+    db = SessionLocal()
+    try:
+        with spend.scope(project_id=project_id), provider_keys.continuing():  # checked when queued
+            hook_lab.make_variants(db, project_id, variant_ids, claim=claim or None,
+                                   claim_token=claim_token or None, previous=previous)
+    finally:
+        db.close()
+
+
+def compose_hook_variant_job(variant_id: int) -> None:
+    from ..services import hook_lab
+
+    db = SessionLocal()
+    try:
+        hook_lab.compose_variant(db, variant_id)
+    finally:
+        db.close()
+
+
 def inspect_take_job(take_id: int) -> None:
     """The automatic clip check of a take that just landed (advisory: it
     never touches the render)."""
