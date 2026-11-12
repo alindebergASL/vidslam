@@ -193,18 +193,33 @@ def _with_costs(db: Session, jobs: list[models.AssetGenerationJob]) -> list[Stud
             for ref, total, est in rows:
                 prev_total, prev_est = costs.get(owner[ref], (0.0, False))
                 costs[owner[ref]] = (prev_total + float(total or 0.0), prev_est or bool(est))
-    # Reference pictures deleted since the job was made (Remix drops them).
+    # Reference pictures deleted since the job was made (Remix drops them),
+    # and what the others are (for ref_intent).
     wanted = {i for j in jobs for i in _ref_ids(j)}
-    existing = ({a for (a,) in db.query(models.Asset.id).filter(models.Asset.id.in_(wanted))}
-                if wanted else set())
+    found = ({a: (kind, atype) for a, kind, atype in db.query(
+        models.Asset.id, models.Asset.owner_kind, models.Asset.asset_type).filter(models.Asset.id.in_(wanted))}
+             if wanted else {})
     out = []
     for j in jobs:
         o = StudioJobOut.model_validate(j)
         if j.id in costs:
             o.cost_usd, o.cost_is_estimate = costs[j.id]
-        o.missing_reference_ids = [i for i in _ref_ids(j) if i not in existing]
+        ids = _ref_ids(j)
+        o.missing_reference_ids = [i for i in ids if i not in found]
+        if j.output_kind == "image" and not j.operation:
+            o.ref_intent = _ref_intent([found[i] for i in ids if i in found])
         out.append(o)
     return out
+
+
+def _ref_intent(pictures: list[tuple]) -> Optional[str]:
+    """What a picture's reference pictures (owner kind, asset type) are for
+    when Sogni picks an editor, as sogni.reference_intent decides from
+    pipeline._asset_refs' roles: a Cast character's picture, not its logo,
+    keeps a likeness ("identity"); any other picture guides ("guide")."""
+    if not pictures:
+        return None
+    return "identity" if any(kind == "avatar" and atype != "logo" for kind, atype in pictures) else "guide"
 
 
 def _ref_ids(j: models.AssetGenerationJob) -> list[int]:

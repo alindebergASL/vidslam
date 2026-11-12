@@ -507,7 +507,35 @@ export type StudioJob = {
   source_asset_id?: number | null;
   /** Operation options: {} for removal, {factor: 2|4} for upscale. */
   options?: { factor?: number } & Record<string, unknown>;
+  /** A Sogni picture made from reference pictures runs on one of Sogni's
+   *  editors: the one that really ran (name and id); null = the picked model ran. */
+  ran_on_name?: string | null;
+  ran_on_editor?: string | null;
+  /** What the reference pictures are for when Sogni picks an editor:
+   *  "identity" = one is a Cast character's picture; null = no references. */
+  ref_intent?: PictureIntent | null;
 };
+
+/** What reference pictures are for when Sogni picks an editor. */
+export type PictureIntent = "identity" | "guide";
+
+/** A Sogni editor: what a Sogni picture model runs as when it gets reference pictures. */
+export type SogniEditor = {
+  id: string;
+  name: string;
+  /** The model's own edit version (not a default it falls back to). */
+  own: boolean;
+  price_text: string;
+  /** One picture; each further picture adds usd_per_ref. */
+  usd: number;
+  usd_per_ref: number;
+  max_refs: number;
+  /** The editor used instead with more than max_refs pictures. */
+  over_max?: SogniEditor | null;
+};
+
+/** Per intent, the editor a Sogni model runs as; null = it doesn't go to an editor. */
+export type WithPictures = { identity: SogniEditor | null; guide: SogniEditor | null };
 
 export type ImageOp = "remove_background" | "upscale";
 
@@ -1466,9 +1494,10 @@ export const api = {
   videoModels: () => req<VideoModelOption[]>(
     "/api/providers/openrouter/video-models"
   ),
-  imageModels: () => req<{ id: string; name: string; description: string; price_text?: string }[]>(
-    "/api/providers/openrouter/image-models"
-  ),
+  imageModels: () =>
+    req<{ id: string; name: string; description: string; price_text?: string; with_pictures?: WithPictures | null }[]>(
+      "/api/providers/openrouter/image-models"
+    ),
   voices: () => req<Voice[]>("/api/providers/elevenlabs/voices"),
   captionStyles: () => req<string[]>("/api/providers/caption-styles"),
   healthCheck: () =>

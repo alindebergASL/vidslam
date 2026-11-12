@@ -1981,13 +1981,32 @@ def _studio_job_deleted(db: Session, job_id: int) -> bool:
     return status is None or status == STUDIO_DELETED
 
 
+def _ran_on(image) -> Optional[dict]:
+    """The Sogni editor the provider's last picture really ran on (reference
+    pictures go to Sogni's edit_image), else None: other providers have no
+    last_route."""
+    from ..providers import sogni as _sogni
+
+    return _sogni.ran_on(getattr(image, "last_route", None)) if image is not None else None
+
+
+def _options_with_ran_on(options: Optional[dict], ran_on: Optional[dict]) -> dict:
+    """A job's options with "ran_on" set (or dropped); the rest (an
+    upscale's factor) stays as it is."""
+    out = {k: v for k, v in dict(options or {}).items() if k != "ran_on"}
+    if ran_on:
+        out["ran_on"] = ran_on
+    return out
+
+
 def _finish_studio_image(db: Session, job: models.AssetGenerationJob, data: bytes, *,
-                         sized: bool = False) -> models.AssetGenerationJob:
+                         sized: bool = False, ran_on: Optional[dict] = None) -> models.AssetGenerationJob:
     """Store a finished picture for a Studio job and complete it. Deleted
     in Studio while the provider worked: the picture is dropped (it was
     still billed). The write is conditional too, so a delete or cancel in
     between can't be undone by this result. `sized` also records the
-    picture's real size (operation results: cutouts and upscales)."""
+    picture's real size (operation results: cutouts and upscales);
+    `ran_on`, the Sogni editor that really made it (options["ran_on"])."""
     if _studio_job_deleted(db, job.id):
         db.rollback()
         return job
@@ -1997,6 +2016,8 @@ def _finish_studio_image(db: Session, job: models.AssetGenerationJob, data: byte
               "provider": job.provider, "provider_model": job.provider_model}
     if sized and w and h:
         values.update(result_width=w, result_height=h)
+    if ran_on or "ran_on" in (job.options_json or {}):
+        values["options_json"] = _options_with_ran_on(job.options_json, ran_on)
     done = db.query(models.AssetGenerationJob).filter(
         models.AssetGenerationJob.id == job.id,
         models.AssetGenerationJob.status.in_(STUDIO_RUNNING),
@@ -2047,6 +2068,7 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
     if moved != 1:
         log.info("studio job %s is %s; not starting it", job_id, job.status)
         return job
+    image = None
     try:
         if job.operation:
             return _run_studio_operation(db, job)
@@ -2076,7 +2098,7 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             # Deleted in Studio while the provider worked: drop the image
             # (it was still billed). The write below is conditional too, so
             # a delete in between can't be undone by this result.
-            return _finish_studio_image(db, job, data)
+            return _finish_studio_image(db, job, data, ran_on=_ran_on(image))
         else:  # video_clip — async: completes via webhook / sweeper
             from . import video_jobs
 
@@ -2126,12 +2148,17 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
         return job
     except Exception as e:  # noqa: BLE001
         db.rollback()
+        values: dict = {"status": "failed", "error": str(e)[:500]}
+        # A failed Sogni edit says which editor it was tried on.
+        ran_on = _ran_on(image)
+        if ran_on:
+            values["options_json"] = _options_with_ran_on(job.options_json, ran_on)
         # Only a job still running gets the failure; a deleted (or
         # cancelled) one keeps its state.
         failed = db.query(models.AssetGenerationJob).filter(
             models.AssetGenerationJob.id == job_id,
             models.AssetGenerationJob.status.in_(STUDIO_RUNNING),
-        ).update({"status": "failed", "error": str(e)[:500]}, synchronize_session=False)
+        ).update(values, synchronize_session=False)
         if failed:
             row = db.get(models.AssetGenerationJob, job_id)
             if row is not None:

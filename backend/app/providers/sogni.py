@@ -771,6 +771,56 @@ def can_use_references(model: str) -> bool:
     return takes_source_image(model) or edit_route(model, probe, "same_place") is not None
 
 
+def editor_for(model: str, intent: str, n_refs: int = 1) -> Optional[EditModel]:
+    """The Sogni editor a sogni/ picture model really runs as with `n_refs`
+    reference pictures: intent "identity" when one is a Cast character's
+    picture, else "guide". None when the model takes the pictures itself
+    or ignores them (as generate() decides)."""
+    if not is_sogni(model) or n_refs < 1 or takes_source_image(model):
+        return None
+    probe = [ImageRef(url="https://example.invalid/x.png", role="character" if intent == "identity" else "scene")]
+    route = edit_route(model, probe * n_refs, intent)
+    return route.model if route is not None else None
+
+
+def _editor_info(model: str, e: EditModel) -> dict:
+    from ..services.prices import money
+
+    sel = selector(model)
+    usd = edit_cost_usd(e.selector, 1)
+    shown = money(usd) if usd else ""
+    return {"id": e.selector, "name": e.name,
+            # The picked model's own edit version (not a default it falls back to).
+            "own": e.selector in (_EDIT_TWIN.get(sel), sel),
+            "price_text": f"about {shown} per image" if shown else "",
+            "usd": usd, "usd_per_ref": round(e.spark_per_ref * SPARK_USD, 6), "max_refs": e.max_refs}
+
+
+def with_pictures(model: str) -> Optional[dict]:
+    """For the pickers: the editor a sogni/ picture model runs as with
+    reference pictures, for a Cast character ("identity") and for any
+    other picture ("guide"). Each has "over_max": the editor used instead
+    when there are more pictures than that one takes. None when the model
+    doesn't go to an editor."""
+    out: dict = {}
+    for intent in ("identity", "guide"):
+        e = editor_for(model, intent)
+        more = editor_for(model, intent, e.max_refs + 1) if e is not None else None
+        out[intent] = None if e is None else {
+            **_editor_info(model, e),
+            "over_max": _editor_info(model, more) if more is not None and more.selector != e.selector else None,
+        }
+    return out if any(out.values()) else None
+
+
+def ran_on(route: Optional[EditRoute]) -> Optional[dict]:
+    """What a picture made from reference pictures really ran on: the
+    editor, not the picked model (Studio shows it on the result)."""
+    if not isinstance(route, EditRoute):
+        return None
+    return {"provider": "sogni", "tool": EDIT_TOOL, "model": route.model.selector, "name": route.model.name}
+
+
 def _edit_model(edit_selector: str) -> Optional[EditModel]:
     return _EDIT_INFO.get(edit_selector) or next((e for e in edit_models() if e.selector == edit_selector), None)
 

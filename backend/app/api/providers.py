@@ -163,7 +163,13 @@ def image_models(db: Session = Depends(get_db)) -> list[dict]:
     """
     # Custom adapters surface first since users almost always want their
     # own model over the base when they've trained one.
-    return _trained_lora_entries(db, "image") + _merged("image", lambda: get_image().list_models())
+    entries = _trained_lora_entries(db, "image") + _merged("image", lambda: get_image().list_models())
+    # A Sogni model given reference pictures runs on one of Sogni's editors:
+    # `with_pictures` says which, so Studio can show and pick it.
+    from ..providers import sogni
+
+    return [{**e, "with_pictures": sogni.with_pictures(e["id"])} if sogni.is_sogni(e["id"]) else e
+            for e in entries]
 
 
 @router.get("/caption-styles")

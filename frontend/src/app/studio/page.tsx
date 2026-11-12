@@ -25,8 +25,13 @@ import {
   BulkSaveDialog,
   CharacterSheetDialog,
   ModelOption,
+  ModelOptions,
   ModelPickerDialog,
   costText,
+  editorFor,
+  editorPriceText,
+  pictureIntent,
+  ranOnText,
   sheetSlot,
   studioStatusLabel,
 } from "@/components/StudioLibrary";
@@ -1220,6 +1225,7 @@ function TileCard({
   const statusText = job ? studioStatusLabel(job) : tile.status || "";
   const checker = mayBeTransparent(tile);
   const fromText = job ? sourceChipText(job) : null;
+  const ranOn = job ? ranOnText(job) : null;
   // Landscape and square pictures are shown whole (not cropped to the
   // portrait tile); known sizes decide at once, others once loaded.
   const knownW = job?.result_width || tile.asset?.width || 0;
@@ -1480,6 +1486,14 @@ function TileCard({
               {job.label}
             </div>
           )}
+          {ranOn && !selectMode && (
+            <div
+              className="chip text-[10px] py-0.5 bg-ink-900/85 truncate max-w-full"
+              title={`Picked ${job?.provider_model}. With the reference pictures, Sogni made it with ${job?.ran_on_name}.`}
+            >
+              {ranOn}
+            </div>
+          )}
           {fromText && !selectMode && (
             <button
               type="button"
@@ -1574,6 +1588,9 @@ function PromptBar({
   const frameModels = useMemo(() => videoModels.filter((m) => m.first_frame), [videoModels]);
   const currentModels: ModelOption[] =
     outputKind === "image" ? imageModels : startsFromPicture ? frameModels : videoModels;
+  // With reference pictures a Sogni picture model runs on one of Sogni's editors.
+  const refIntent = outputKind === "image" ? pictureIntent(selectedAssets) : null;
+  const refCount = refIntent ? selectedAssets.length : 0;
   useEffect(() => {
     // Reset to default when switching output kind so we don't carry a video
     // model into an image generation request; a starting picture keeps the
@@ -1588,12 +1605,16 @@ function PromptBar({
   // "About $0.08" next to Generate: the picked model's rough price, times
   // the variations (images) or scaled to the clip length (priced per 5 s).
   const pickedModel = currentModels.find((m) => m.id === model);
-  const unitPrice = priceFromText(pickedModel?.price_text);
+  const pickedEditor = editorFor(pickedModel, refIntent, refCount);
+  const pickedPrice = pickedEditor ? editorPriceText(pickedEditor, refCount) : pickedModel?.price_text;
+  const unitPrice = priceFromText(pickedPrice);
   const total =
     unitPrice === null ? null : outputKind === "image" ? unitPrice * variations : unitPrice * (clipSeconds / 5);
   const aboutText = total === null ? "" : total === 0 ? "Free" : `About ${usd(total)}`;
-  const priceTitle = pickedModel?.price_text
-    ? `${pickedModel.name}: ${pickedModel.price_text}${outputKind === "image" && variations > 1 ? ` × ${variations}` : ""}`
+  const priceTitle = pickedPrice
+    ? `${pickedEditor ? `${pickedEditor.name} (Sogni)` : pickedModel?.name}: ${pickedPrice}${
+        outputKind === "image" && variations > 1 ? ` × ${variations}` : ""
+      }`
     : undefined;
 
   // Fill the bar from Remix or a preset.
@@ -1740,6 +1761,9 @@ function PromptBar({
                 {a.owner_kind === "avatar" ? "Char" : "Scene"} #{a.id} · {a.asset_type}
               </span>
             ))}
+            {pickedEditor && (
+              <span className="text-ink-400 self-center">With these pictures, Sogni runs {pickedEditor.name}.</span>
+            )}
           </div>
         )}
 
@@ -1861,12 +1885,7 @@ function PromptBar({
               title="Provider model"
               aria-label="Provider model"
             >
-              {currentModels.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name || m.id}
-                  {m.price_text ? ` · ${m.price_text}` : ""}
-                </option>
-              ))}
+              <ModelOptions models={currentModels} intent={refIntent} count={refCount} />
             </select>
           )}
           <select

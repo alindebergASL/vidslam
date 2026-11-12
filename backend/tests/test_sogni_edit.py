@@ -360,3 +360,143 @@ def test_review_round_two_edges(client, monkeypatch):
         assert [(r.role, r.name) for r in pipeline._asset_refs(db, [logo.id])] == [("object", "Mia's logo")]
     finally:
         db.close()
+
+
+# ---------- which editor really runs: shown in Studio ----------
+
+
+def test_each_picture_model_says_which_editor_it_runs_as(edit_env):
+    from app.providers import sogni
+
+    def ed(model, intent, n=1):
+        e = sogni.editor_for(model, intent, n)
+        return e and e.selector
+
+    # A Cast character: Krea's identity editor, unless the model has an edit version of its own.
+    for m in ("seedream-5-0-pro-uncensored", "dark-beast-z-turbo", "chroma-v46-flash", "krea-2-turbo", "moss-image"):
+        assert ed(f"sogni/{m}", "identity") == "krea-identity-edit", m
+    assert ed("sogni/dark-beast-krea2", "identity") == "dark-beast-krea2-identity-edit"
+    assert ed("sogni/flux-3-klein", "identity") == "flux-3-klein"
+    assert ed("sogni/qwen-2512", "identity") == "qwen"
+    assert ed("sogni/qwen-2512-lightning", "identity") == "qwen-lightning"
+    assert ed("sogni/gpt-image-2.6-flare", "identity") == "gpt-image-2.6-flare"
+    # Other pictures: an identity editor gives way to FLUX.3 Klein.
+    for m in ("seedream-5-0-pro-uncensored", "krea-2-turbo", "dark-beast-krea2", "chroma-v46-flash"):
+        assert ed(f"sogni/{m}", "guide") == "flux-3-klein", m
+    assert ed("sogni/qwen-2512", "guide") == "qwen"
+    # More pictures than Krea takes (2): Klein.
+    assert ed("sogni/krea-2-turbo", "identity", 3) == "flux-3-klein"
+    # Not a Sogni model, or no pictures: no editor.
+    assert ed("openai/gpt-image-2", "identity") is None and ed("sogni/krea-2-turbo", "identity", 0) is None
+
+    # What the pickers get.
+    seedream = sogni.with_pictures("sogni/seedream-5-0-pro-uncensored")
+    ident = seedream["identity"]
+    assert (ident["id"], ident["name"], ident["own"], ident["max_refs"]) == (
+        "krea-identity-edit", "Krea 2 Identity Edit", False, 2)
+    assert ident["price_text"] == "about $0.03 per image" and ident["usd"] == pytest.approx(6.49 * 0.005)
+    assert ident["over_max"]["id"] == "flux-3-klein" and ident["over_max"]["own"] is False
+    assert seedream["guide"]["id"] == "flux-3-klein" and seedream["guide"]["over_max"] is None
+    beast = sogni.with_pictures("sogni/dark-beast-krea2")["identity"]
+    assert (beast["name"], beast["own"]) == ("Dark Beast Krea 2 Identity Edit", True)
+    assert sogni.with_pictures("sogni/flux-3-klein")["guide"]["own"] is True
+    assert sogni.with_pictures("sogni/krea-2-turbo")["identity"]["own"] is True
+    # Edits switched off: the pictures are ignored, so no editor.
+    edit_env(SOGNI_EDIT_REFERENCES="false")
+    assert sogni.with_pictures("sogni/krea-2-turbo") is None
+
+
+def test_the_studio_image_model_list_says_which_editor_runs(auth_client, monkeypatch):
+    from app import config
+    from app.services import model_catalog, provider_keys
+    from app.services import model_registry as reg
+
+    monkeypatch.setenv("SOGNI_API_KEY", "sk-test-123456789")
+    config.get_settings.cache_clear()
+    provider_keys.invalidate()
+    reg.put_setting(model_catalog.CATALOG_KEY, {"fetched_at": "2026-11-12T00:00:00+00:00", "errors": {},
+                                                "entries": []})
+    models = {m["id"]: m for m in auth_client.get("/api/providers/openrouter/image-models").json()}
+    seedream = models["sogni/seedream-5-0-pro-uncensored"]
+    assert seedream["with_pictures"]["identity"]["name"] == "Krea 2 Identity Edit"
+    assert seedream["with_pictures"]["guide"]["name"] == "FLUX.3 Klein edit"
+    assert models["sogni/dark-beast-krea2"]["with_pictures"]["identity"]["id"] == "dark-beast-krea2-identity-edit"
+    # The other fields are as before; other providers' models get no editor.
+    assert {"id", "name", "description", "price_text"} <= set(seedream)
+    assert all("with_pictures" not in m for i, m in models.items() if not i.startswith("sogni/"))
+    config.get_settings.cache_clear()
+    provider_keys.invalidate()
+
+
+def _studio_job(db, model, *, kind="avatar", options=None):
+    from app import models
+
+    if kind == "avatar":
+        owner = models.Avatar(name="Mia")
+        db.add(owner)
+        db.flush()
+        asset = models.Asset(owner_kind="avatar", avatar_id=owner.id, file_path="/x/mia.png")
+    else:
+        owner = models.Ingredient(name="Cafe", kind="scene")
+        db.add(owner)
+        db.flush()
+        asset = models.Asset(owner_kind="ingredient", ingredient_id=owner.id, file_path="/x/cafe.png")
+    db.add(asset)
+    db.flush()
+    job = models.AssetGenerationJob(owner_kind=kind, owner_id=owner.id, output_kind="image",
+                                    prompt="Reading by the window.", reference_asset_ids_json=[asset.id],
+                                    provider_model=model, options_json=options, status="pending")
+    db.add(job)
+    db.commit()
+    return job.id
+
+
+def test_a_studio_picture_records_the_editor_that_really_ran(auth_client, live_sogni):  # noqa: F811
+    from app.db import SessionLocal
+    from app.services import pipeline
+
+    done = _wf("completed", steps=[{"id": "s1", "artifacts": [{"id": "a", "kind": "image", "url": ART_IMG}]}])
+    with SessionLocal() as db:
+        jid = _studio_job(db, "sogni/seedream-5-0-pro-uncensored", options={"note": "kept"})
+        with respx.mock() as router:
+            start = router.post(WF).mock(return_value=httpx.Response(201, json=done))
+            router.get(ART_IMG).mock(return_value=httpx.Response(200, content=PNG))
+            pipeline.run_studio_job(db, jid)
+    args = json.loads(start.calls[0].request.content)["input"]["steps"][0]
+    assert (args["toolName"], args["arguments"]["model"]) == ("edit_image", "krea-identity-edit")
+    job = auth_client.get(f"/api/studio/jobs/{jid}").json()
+    assert job["status"] == "completed" and job["provider_model"] == "sogni/seedream-5-0-pro-uncensored"
+    assert (job["ran_on_name"], job["ran_on_editor"], job["ref_intent"]) == (
+        "Krea 2 Identity Edit", "krea-identity-edit", "identity")
+    # Merged into the job's options; nothing else there is lost.
+    assert job["options"] == {"note": "kept", "ran_on": {"provider": "sogni", "tool": "edit_image",
+                                                         "model": "krea-identity-edit",
+                                                         "name": "Krea 2 Identity Edit"}}
+
+    # A failed edit says which editor it was tried on.
+    from app.providers.sogni import SogniError
+
+    with SessionLocal() as db:
+        jid = _studio_job(db, "sogni/krea-2-turbo", kind="ingredient")
+        with respx.mock() as router:
+            router.post(WF).mock(return_value=httpx.Response(201, json=_wf("failed", error={"message": "nope"})))
+            with pytest.raises(SogniError):
+                pipeline.run_studio_job(db, jid)
+    job = auth_client.get(f"/api/studio/jobs/{jid}").json()
+    assert job["status"] == "failed" and job["ref_intent"] == "guide"
+    assert (job["ran_on_name"], job["ran_on_editor"]) == ("FLUX.3 Klein edit", "flux-3-klein")
+
+
+def test_a_picture_without_an_edit_records_nothing(auth_client):
+    from app.services import pipeline
+
+    # Mock pictures (and every non-Sogni provider) have no editor; a stale
+    # "ran_on" from an earlier run is dropped, an upscale's factor stays.
+    assert pipeline._options_with_ran_on({"factor": 2, "ran_on": {"name": "x"}}, None) == {"factor": 2}
+    assert pipeline._options_with_ran_on(None, {"name": "y"}) == {"ran_on": {"name": "y"}}
+    aid = auth_client.post("/api/avatars", json={"name": "N"}).json()["id"]
+    job = auth_client.post("/api/studio/generate-image", json={
+        "owner_kind": "avatar", "owner_id": aid, "prompt": "N on a rooftop", "reference_asset_ids": []}).json()
+    job = auth_client.get(f"/api/studio/jobs/{job['id']}").json()
+    assert job["status"] == "completed" and job["options"] == {}
+    assert (job["ran_on_name"], job["ran_on_editor"], job["ref_intent"]) == (None, None, None)
