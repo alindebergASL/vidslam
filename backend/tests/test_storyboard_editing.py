@@ -115,12 +115,14 @@ def test_preview_says_when_the_voice_is_longer_than_the_video(auth_client, monke
     real = mock_tts.MockTTSProvider.synthesize
 
     def long(self, *, text, voice_id, settings=None):
-        return real(self, text=text, voice_id=voice_id, settings={"duration": shots + 6})
+        return real(self, text=text, voice_id=voice_id, settings={"duration": shots + 9})
 
     monkeypatch.setattr(mock_tts.MockTTSProvider, "synthesize", long)
     body = auth_client.post(f"/api/projects/{pid}/voiceover/preview").json()
-    assert body["fit"] == "too_long" and body["difference_seconds"] > 5
-    assert "longer than the video: the end will be cut" in body["fit_text"]
+    assert body["fit"] == "too_long" and body["difference_seconds"] > 8
+    # 9 s past the shots is past the hold's cap with or without an end card.
+    assert "the last shot is held for 4 s more at most, then the last" in body["fit_text"]
+    assert "of the voice are cut" in body["fit_text"]
 
 
 def test_fit_verdicts():
@@ -134,7 +136,15 @@ def test_fit_verdicts():
     assert voiceover_fit(p, 10.2)["fit"] == "fits"
     over = voiceover_fit(p, 11.5)
     assert over["fit"] == "too_long" and "runs over the end card" in over["fit_text"]
-    assert "the end will be cut" in voiceover_fit(p, 14)["fit_text"]
+    # Past the end card, the last shot is held on so the voice can finish...
+    held = voiceover_fit(p, 14)
+    assert held["fit"] == "too_long"
+    assert held["fit_text"] == "about 4 s longer than the shots: the last shot is held for about 1.5 s more so the voice can finish"
+    # ...for VOICE_HOLD_MAX_SECONDS at most: a longer voice is cut, and it says so.
+    cut = voiceover_fit(p, 30)
+    assert cut["fit"] == "too_long" and "cut" in cut["fit_text"]
+    assert cut["fit_text"] == ("about 20 s longer than the video: the last shot is held for 4 s more at most, "
+                               "then the last 13.5 s of the voice are cut")
     short = voiceover_fit(p, 7)
     assert short["fit"] == "too_short" and short["fit_text"].startswith("about 3 s shorter")
 

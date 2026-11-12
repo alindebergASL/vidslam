@@ -268,7 +268,13 @@ def base_clips(db: Session, render: models.Render) -> list["ComposeClip"]:
     if shots:
         clips = [ComposeClip(
             path=Path(str(s.get("clip_path") or "")),
-            seconds=float(s["planned_seconds"]) if s.get("planned_seconds") else None,
+            # A clip held on to cover the voiceover plays held again; the
+            # shot's planned length is what a take or a new shot 1 is for.
+            seconds=(float(s["held_seconds"]) if s.get("held_seconds")
+                     else float(s["planned_seconds"]) if s.get("planned_seconds") else None),
+            exact=bool(s.get("held_seconds")),
+            planned_seconds=(float(s["planned_seconds"]) if s.get("held_seconds") and s.get("planned_seconds")
+                             else None),
             shot_id=s.get("shot_id"), shot_order=s.get("shot_order"), shot_type=str(s.get("shot_type") or ""),
             take_id=s.get("take_id"), fingerprint=str(s.get("fingerprint") or ""),
             provider_model=str(s.get("provider_model") or ""),
@@ -651,6 +657,28 @@ def claim_voice_spend(db: Session, project: models.VideoProject, variant: models
     return res.rowcount
 
 
+def claim_clip_spend(db: Session, variant: models.HookVariant, render: models.Render) -> int:
+    """Charge the clips the round took from an earlier try (clips_json
+    "reused") to `render`, its make round, like claim_voice_spend: they
+    were paid for by that try and are not bought again, so what the opening
+    cost includes them, and the earlier round's render no longer does.
+    Never one of another opening's renders. Run when the round starts and
+    again before its cost is settled (a clip still being made then is
+    recorded on its own render when it comes back)."""
+    refs = [f"video_job:{j}" for j in sorted(_reused_ids(variant))]
+    if not refs:
+        return 0
+    S, R = models.SpendEntry, models.Render
+    own = select(R.id).where(R.hook_variant_id == variant.id, R.id != render.id)
+    res = db.execute(sa_update(S)
+                     .where(S.ref.in_(refs), S.project_id == variant.project_id,
+                            or_(S.render_id.is_(None), S.render_id.in_(own)))
+                     .values(render_id=render.id)
+                     .execution_options(synchronize_session=False))
+    db.commit()
+    return res.rowcount
+
+
 def synth_hook(db: Session, project: models.VideoProject, variant: models.HookVariant) -> tuple[Path, bool]:
     """TTS of the new opening only, with the project's voice (the guarded
     provider runs the safety check on it). Reused when the same text was
@@ -892,8 +920,8 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
     shot1 = {"source": variant.shot1_source, "seconds": round(d1, 2), "cost": 0.0, "lipsync": False,
              "reused": False}
     needed: list[int] = []
-    # Clips an earlier make round of this opening finished from the same
-    # inputs ({index: VideoJob id}): used again, not bought again.
+    # Clips an earlier make round of this opening made (or is still making)
+    # from the same inputs ({index: VideoJob id}): used, not bought again.
     reused: dict[str, int] = {}
     voice_fp = audio_fingerprint(db, project, variant, base)
     if variant.shot1_source == "take":
@@ -903,9 +931,12 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
         from .renderer import _probe_duration
 
         length = _probe_duration(Path(take.clip_path))
-        if length and length < d1 - TAKE_SHORT_OK:
+        # A shot 1 held on to cover the voiceover (a one-shot video) holds
+        # the take the same way: it only has to fill the shot's own length.
+        need = min(d1, first.planned_seconds) if first.planned_seconds else d1
+        if length and length < need - TAKE_SHORT_OK:
             raise HookLabError(f"This take is {length:.1f} s, shorter than shot 1 in this version "
-                               f"({d1:.1f} s), so the rest of the video would slide out of step with the "
+                               f"({need:.1f} s), so the rest of the video would slide out of step with the "
                                "voice. Pick another take.", 422)
     elif variant.shot1_source == "new":
         if not (variant.shot1_prompt or "").strip():
@@ -918,7 +949,10 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
             reused["0"] = job.id
             shot1["cost"] = 0.0
             shot1["reused"] = True
-            notes.append("The new shot 1 made in an earlier try is reused: it isn't paid for again.")
+            notes.append("The new shot 1 made in an earlier try is reused: it isn't paid for again."
+                         if job.status == "completed" else
+                         "The new shot 1 asked for in an earlier try is still being made: it is used when it "
+                         "is back and isn't paid for again.")
     elif variant.shot1_source == "lipsync":
         if first.shot_type != "talking_head":
             raise HookLabError("Shot 1 is not a talking head, so there is nothing to lip-sync.", 422)
@@ -934,7 +968,10 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
             reused["0"] = job.id
             shot1["cost"] = 0.0
             shot1["reused"] = True
-            notes.append("Shot 1's lip-sync made in an earlier try is reused: it isn't paid for again.")
+            notes.append("Shot 1's lip-sync made in an earlier try is reused: it isn't paid for again."
+                         if job.status == "completed" else
+                         "Shot 1's lip-sync asked for in an earlier try is still being made: it is used when it "
+                         "is back and isn't paid for again.")
         if len(clips) == 1:
             notes.append(f"This video is one talking-head shot, so all of it ({d1:.0f} s) is lip-synced "
                          f"again: about ${shot1['cost']:.2f}.")
@@ -961,8 +998,9 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
         extra.append({"index": i, "shot_id": clip.shot_id, "shot_order": clip.shot_order or i + 1,
                       "start": round(start, 2), "seconds": round(length, 2), "cost": cost,
                       "reused": job is not None,
-                      "reason": ("made in an earlier try and reused" if job is not None
-                                 else "its lips follow the opening, which changes")})
+                      "reason": ("its lips follow the opening, which changes" if job is None
+                                 else "made in an earlier try and reused" if job.status == "completed"
+                                 else "still being made from an earlier try, used when it is back")})
         needed.append(i)
     total = round(tts + shot1["cost"] + sum(e["cost"] for e in extra), 4)
     return {"tts_cost": tts, "shot1": shot1, "extra_lipsync": extra, "needed": needed, "reused": reused,
@@ -972,9 +1010,11 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
 
 def new_shot_seconds(clip: "ComposeClip", used: float) -> float:
     """The length a new shot 1 is asked for (and priced at): the shot's
-    planned length, as its own clip was asked for. It plays for the slot's
-    length either way (cut, or held on its last frame)."""
-    return float(clip.seconds) if clip.seconds else float(max(round(used), 1))
+    planned length, as its own clip was asked for (not the length the last
+    clip was held to). It plays for the slot's length either way (cut, or
+    held on its last frame)."""
+    planned = clip.planned_seconds if clip.planned_seconds is not None else clip.seconds
+    return float(planned) if planned else float(max(round(used), 1))
 
 
 def variant_plan(db: Session, variants: list[models.HookVariant]) -> dict:
@@ -1108,13 +1148,15 @@ def _make_one(db: Session, variant: models.HookVariant) -> None:
     variant.cost_estimate = plan["total"]
     variant.error = ""
     variant.shot1_clip_path = ""
-    # "reused": clips an earlier round of this opening finished from the
-    # same inputs (not bought again; variant_clips counts them).
+    # "reused": clips an earlier round of this opening made, or is still
+    # making, from the same inputs (not bought again; variant_clips counts
+    # them once finished, and _job_variant wakes this round when one is).
     variant.clips_json = {"needed": plan["needed"], "clips": {}, "reused": plan["reused"]}
     if "0" in plan["reused"]:
-        variant.shot1_clip_path = db.get(models.VideoJob, plan["reused"]["0"]).result_path
+        variant.shot1_clip_path = db.get(models.VideoJob, plan["reused"]["0"]).result_path or ""
     events.hook_variant_event(db, variant, project, "started", detail="Making the opening's voice")
     db.commit()
+    claim_clip_spend(db, variant, render)
     with spend.scope(render_id=render.id):
         precheck(db, project, variant, clips, [i for i in plan["needed"] if str(i) not in plan["reused"]])
         try:
@@ -1232,7 +1274,9 @@ def submit_hook_avatar(db: Session, project: models.VideoProject, variant: model
 # paying for them twice, when the same opening asks for the same clip: each
 # hook job stores what it was made from ("inputs" in its context_json), and
 # a finished one of the same opening with the same inputs whose file is
-# still there is reused. Never one of another opening's clips.
+# still there is reused. One still at the provider (already paid for) is
+# taken too: the new round waits for it like for its own clips. Never one
+# of another opening's clips.
 
 
 def _shot_request(db: Session, project: models.VideoProject, variant: models.HookVariant,
@@ -1300,26 +1344,43 @@ def avatar_key(db: Session, project: models.VideoProject, variant: models.HookVa
 
 
 def reusable_clip(db: Session, variant: models.HookVariant, purpose: str, key: str) -> Optional[models.VideoJob]:
-    """A finished clip of this opening (any earlier make round) made from
-    exactly these inputs, whose file is still there; else None."""
+    """A clip of this opening (any earlier make round) made from exactly
+    these inputs: a finished one whose file is still there, else one still
+    being made (already paid for: the new round waits for it as for its
+    own, see _job_variant); else None."""
+    from . import video_jobs
+
     if not variant.id:
         return None
-    for job in (db.query(models.VideoJob)
-                .filter(models.VideoJob.ref_id == variant.id, models.VideoJob.project_id == variant.project_id,
-                        models.VideoJob.purpose == purpose, models.VideoJob.status == "completed")
-                .order_by(models.VideoJob.id.desc())):
+    J = models.VideoJob
+    mine = (J.ref_id == variant.id, J.project_id == variant.project_id, J.purpose == purpose)
+    for job in db.query(J).filter(*mine, J.status == "completed").order_by(J.id.desc()):
         if (job.context_json or {}).get("inputs") == key and job.result_path and Path(job.result_path).is_file():
+            return job
+    for job in db.query(J).filter(*mine, video_jobs.still_in_progress()).order_by(J.id.desc()):
+        if (job.context_json or {}).get("inputs") == key:
             return job
     return None
 
 
+def _reused_ids(variant: models.HookVariant) -> set[int]:
+    """The earlier rounds' clips Make took for the variant's current round."""
+    return {int(j) for j in ((variant.clips_json or {}).get("reused") or {}).values()}
+
+
 def _job_variant(db: Session, job: models.VideoJob) -> Optional[models.HookVariant]:
     """The variant a hook-lab clip is for, when it still waits for it (the
-    same make round: the job's render is the variant's render)."""
+    same make round: the job's render is the variant's render, or a clip
+    of an earlier round still being made that Make took for this one).
+    Before _make_one starts the round (claimed by Make: render_id None),
+    clips_json "reused" is still the previous round's, so it counts for
+    nothing; _make_one sets both together."""
     db.refresh(job)
     variant = db.get(models.HookVariant, job.ref_id)
-    if variant is None or variant.render_id != job.render_id or variant.status != "making":
+    if variant is None or variant.status != "making" or not variant.render_id:
         return None
+    if variant.render_id != job.render_id and job.id not in _reused_ids(variant):
+        return None  # an earlier round's clip the current round didn't take
     return variant
 
 
@@ -1433,8 +1494,10 @@ def sweep(db: Session, *, grace_seconds: float = 120.0, now: Optional[datetime] 
             continue
         if _make_running(db, variant.project_id, now):
             continue  # Make may still be submitting its clips (a slow upload or provider)
+        # This round's clips, and those of an earlier round it took.
+        ours = or_(models.VideoJob.render_id == render.id, models.VideoJob.id.in_(_reused_ids(variant)))
         busy = (db.query(models.VideoJob.id)
-                .filter(models.VideoJob.ref_id == variant.id, models.VideoJob.render_id == render.id,
+                .filter(models.VideoJob.ref_id == variant.id, ours,
                         models.VideoJob.purpose.in_(video_jobs.HOOK_PURPOSES),
                         video_jobs.still_in_progress()).first())
         if busy is not None:
@@ -1444,7 +1507,7 @@ def sweep(db: Session, *, grace_seconds: float = 120.0, now: Optional[datetime] 
             db.refresh(variant)
             if variant.status == "making":
                 failed = (db.query(models.VideoJob)
-                          .filter(models.VideoJob.ref_id == variant.id, models.VideoJob.render_id == render.id,
+                          .filter(models.VideoJob.ref_id == variant.id, ours,
                                   models.VideoJob.purpose.in_(video_jobs.HOOK_PURPOSES),
                                   models.VideoJob.status == "failed")
                           .order_by(models.VideoJob.id.desc()).first())
@@ -1605,7 +1668,7 @@ def compose_variant(db: Session, variant_id: int) -> Optional[models.Render]:
             clips[0] = ComposeClip(path=Path(take.clip_path), seconds=round(slots[0][1], 3), shot_id=c.shot_id,
                                    shot_order=c.shot_order, shot_type=c.shot_type, take_id=take.id,
                                    fingerprint=take.clip_fingerprint or "", provider_model=take.provider_model or "",
-                                   exact=True)
+                                   exact=True, planned_seconds=c.planned_seconds)
             variant.shot1_clip_path = take.clip_path
         made = variant_clips(db, variant) or ((variant.clips_json or {}).get("clips") or {})
         for key, path in made.items():
@@ -1613,7 +1676,7 @@ def compose_variant(db: Session, variant_id: int) -> Optional[models.Render]:
             c = clips[i]
             clips[i] = ComposeClip(path=Path(path), seconds=round(slots[i][1], 3), shot_id=c.shot_id,
                                    shot_order=c.shot_order, shot_type=c.shot_type, take_id=None, fingerprint="",
-                                   provider_model=c.provider_model, exact=True)
+                                   provider_model=c.provider_model, exact=True, planned_seconds=c.planned_seconds)
         render.status = "rendering"
         events.hook_variant_event(db, variant, project, "progress", detail="Putting the video together")
         db.commit()
@@ -1641,6 +1704,7 @@ def compose_variant(db: Session, variant_id: int) -> Optional[models.Render]:
         variant.error = ""
         events.hook_variant_event(db, variant, project, "completed")
         db.commit()
+        claim_clip_spend(db, variant, render)  # an earlier try's clip that came back since Make
         _settle_render_cost(db, render)
         return render
     except Exception as e:  # noqa: BLE001

@@ -47,6 +47,7 @@ function Inner() {
   const [render, setRender] = useState<Render | null>(null);
   // The project is held by the hook lab making other openings.
   const [hookLabMaking, setHookLabMaking] = useState(false);
+  const [hookLabBase, setHookLabBase] = useState<number | null>(null);
   const [castAssets, setCastAssets] = useState<Asset[]>([]);
   const toast = useToast();
   const [preflight, setPreflight] = useState<{
@@ -116,6 +117,7 @@ function Inner() {
       const st = await api.projectStatus(projectId);
       setRender(st.latest_render);
       setHookLabMaking(st.hook_lab_making);
+      setHookLabBase(st.hook_lab_base_render_id ?? null);
       const ca = await api.castAssets(projectId);
       setCastAssets(ca);
       // Fetch a lightweight preflight summary so the editor can surface blockers
@@ -509,7 +511,10 @@ function Inner() {
       {project.status === "generating" && hookLabMaking && (
         <div className="card p-3 mb-6 flex items-center gap-3 text-sm" role="status">
           <span className="flex-1 text-ink-300">Other openings are being made for this video…</span>
-          <Link href={`/projects/${projectId}/hooks`} className="btn-ghost text-xs">
+          <Link
+            href={`/projects/${projectId}/hooks${hookLabBase ? `?base=${hookLabBase}` : ""}`}
+            className="btn-ghost text-xs"
+          >
             See them
           </Link>
         </div>

@@ -501,13 +501,27 @@ def project_status(project_id: int, db: Session = Depends(get_db)) -> ProjectSta
         .order_by(models.Render.created_at.desc())
         .first()
     )
+    from ..services.hook_lab import RUNNING
     from ..services.pipeline import hook_claim_previous
 
+    # Held by the hook lab's "Make videos", not by a render of its own.
+    making = project.status == "generating" and hook_claim_previous(project.claim_token) is not None
+    making_base = None
+    if making:
+        # The version whose openings are being made, so the project page
+        # links the hook lab to it (not to the newest version).
+        making_base = (
+            db.query(models.HookVariant.base_render_id)
+            .filter(models.HookVariant.project_id == project_id, models.HookVariant.status.in_(RUNNING))
+            .order_by(models.HookVariant.updated_at.desc(), models.HookVariant.id.desc())
+            .limit(1)
+            .scalar()
+        )
     return ProjectStatusOut(
         project_id=project.id,
         project_status=project.status,
-        # Held by the hook lab's "Make videos", not by a render of its own.
-        hook_lab_making=project.status == "generating" and hook_claim_previous(project.claim_token) is not None,
+        hook_lab_making=making,
+        hook_lab_base_render_id=making_base,
         latest_render=render_out(db, latest) if latest else None,
         shots=[ShotOut.model_validate(s) for s in project.shots],
     )

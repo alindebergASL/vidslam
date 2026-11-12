@@ -1076,19 +1076,32 @@ def _body_seconds(project: models.VideoProject) -> float:
 
 
 END_CARD_SECONDS = 2.5  # renderer._make_end_card's default length
+# The longest the last shot plays on past its own length (its footage, then
+# its last frame) so a voiceover longer than the video can finish. Enough
+# for a closing sentence (a call to action is 2-4 s spoken); a still picture
+# held much longer reads as a stalled video in a short-form feed, so past
+# this the voice is cut at the end of the video instead.
+VOICE_HOLD_MAX_SECONDS = 4.0
 
 
 def voiceover_fit(project: models.VideoProject, audio_seconds: float) -> dict:
-    """The voiceover's real length against the shots' total time, in plain words."""
+    """The voiceover's real length against the shots' total time, in plain
+    words that say what the render does with it (cover_voice)."""
     shots = round(_body_seconds(project), 2)
     end_card = END_CARD_SECONDS if (project.cta_text or "").strip() else 0.0
     diff = round(audio_seconds - shots, 1)
+    over = audio_seconds - (shots + end_card)  # past the video's planned end
     if audio_seconds > shots + 0.5:
         verdict = "too_long"
-        if audio_seconds <= shots + end_card:
+        if over <= 0.05:
             text = f"about {abs(diff):g} s longer than the shots: it runs over the end card"
+        elif over <= VOICE_HOLD_MAX_SECONDS:
+            text = (f"about {abs(diff):g} s longer than the shots: the last shot is held "
+                    f"for about {max(round(over, 1), 0.1):g} s more so the voice can finish")
         else:
-            text = f"about {abs(diff):g} s longer than the video: the end will be cut"
+            cut = round(over - VOICE_HOLD_MAX_SECONDS, 1)
+            text = (f"about {abs(diff):g} s longer than the video: the last shot is held for "
+                    f"{VOICE_HOLD_MAX_SECONDS:g} s more at most, then the last {cut:g} s of the voice are cut")
     elif audio_seconds < shots - 1.5:
         verdict = "too_short"
         text = f"about {abs(diff):g} s shorter than the video: the last {abs(diff):g} s have no voice"
@@ -1795,6 +1808,9 @@ class ComposeClip:
     provider_model: str = ""
     # Plays for exactly `seconds`: held on its last frame when shorter.
     exact: bool = False
+    # The shot's planned length when `seconds` is longer than it: the last
+    # clip held on to cover the voiceover (cover_voice). None = `seconds`.
+    planned_seconds: Optional[float] = None
     # What the shot was made with, as the render recorded it (None: read
     # the shot row). The hook lab reads these, since a re-plan or a shot
     # delete can change or remove the row after the render.
@@ -1872,7 +1888,10 @@ def cover_voice(clips: list[ComposeClip], audio: Optional[Path], end_card: float
     the body plus the end card: clips are cut to their shots' lengths and
     the video ends with the picture, so a long voiceover lost its last words
     (often the call to action). The last clip plays on (its own footage
-    first, then held on its last frame) until the voice has finished."""
+    first, then held on its last frame) until the voice has finished, for
+    VOICE_HOLD_MAX_SECONDS at most past the shot's planned length (also when
+    the clip comes in already held, which is never shortened): a longer
+    voiceover is cut at the end of the video, as voiceover_fit warns."""
     from dataclasses import replace
 
     from .renderer import _probe_duration
@@ -1880,14 +1899,25 @@ def cover_voice(clips: list[ComposeClip], audio: Optional[Path], end_card: float
     if not clips or audio is None or not audio.exists():
         return clips
     voice = _probe_duration(audio)
-    short = voice - (sum(clip_seconds(c) for c in clips) + end_card)
+    last = clips[-1]
+    now = clip_seconds(last)
+    short = voice - (sum(clip_seconds(c) for c in clips[:-1]) + now + end_card)
     if short <= 0.05:
         return clips
-    last = clips[-1]
-    longer = round(clip_seconds(last) + short + 0.05, 3)
-    log.warning("render %s: voiceover runs %.2f s past the clips; the last clip plays on to %.2f s",
-                render_id, short, longer)
-    return [*clips[:-1], replace(last, seconds=longer, exact=True)]
+    # A clip already held (a hook-lab variant is composed from its base's
+    # clips) plays on from its hold, but the cap counts from the shot's
+    # planned length: never held twice over.
+    limit = (float(last.planned_seconds) if last.planned_seconds is not None else now) + VOICE_HOLD_MAX_SECONDS
+    longer = round(min(now + short + 0.05, limit), 3)
+    cut = now + short - longer
+    log.warning("render %s: voiceover runs %.2f s past the clips; the last clip plays on to %.2f s%s",
+                render_id, short, longer,
+                f" (held {VOICE_HOLD_MAX_SECONDS:g} s at most: the voice's last {cut:.2f} s are cut)"
+                if cut > 0 else "")
+    if longer <= now:
+        return clips
+    planned = last.planned_seconds if last.planned_seconds is not None else last.seconds
+    return [*clips[:-1], replace(last, seconds=longer, exact=True, planned_seconds=planned)]
 
 
 def base_captions(plan: StoryboardPlan, body_seconds: float) -> list[CaptionTiming]:
@@ -1961,7 +1991,11 @@ def _compose(
         "shots": [{
             "shot_id": c.shot_id, "shot_order": c.shot_order, "shot_type": c.shot_type,
             "take_id": c.take_id, "clip_path": str(c.path), "fingerprint": c.fingerprint,
-            "provider_model": c.provider_model, "planned_seconds": c.seconds,
+            "provider_model": c.provider_model,
+            # The shot's own length, and the length the last clip was held
+            # to so the voiceover ends before the picture (None: not held).
+            "planned_seconds": c.planned_seconds if c.planned_seconds is not None else c.seconds,
+            "held_seconds": c.seconds if c.planned_seconds is not None else None,
             "seconds": round(u, 3), **clip_record(db, project, c),
         } for c, u in zip(clips, used, strict=True)],
         "audio_path": str(audio) if audio else "",
