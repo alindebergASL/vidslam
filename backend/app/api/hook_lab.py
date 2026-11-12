@@ -203,7 +203,10 @@ def _shot1(db: Session, project: models.VideoProject, clips: list) -> Optional[d
     talking = first.shot_type == "talking_head"
     return {
         "shot_id": first.shot_id, "shot_order": first.shot_order, "shot_type": first.shot_type,
-        "seconds": first.seconds, "take_id": first.take_id, "lipsynced": hook_lab._lipsynced(db, first),
+        # The shot's planned length (a held last clip plays longer, but a new
+        # shot 1 or a take only has to fill the planned slot).
+        "seconds": first.planned_seconds or first.seconds, "take_id": first.take_id,
+        "lipsynced": hook_lab._lipsynced(db, first),
         "prompt": shot.prompt if shot is not None else "",
         "clip_url": (f"/api/projects/{project.id}/shots/{shot.id}/takes/{first.take_id}/clip"
                      if shot is not None and first.take_id else None),

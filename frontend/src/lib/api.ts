@@ -2124,6 +2124,8 @@ export const api = {
       project_status: string;
       // Held by the hook lab making other openings (no render of its own).
       hook_lab_making: boolean;
+      // The version whose openings are being made (null when unknown).
+      hook_lab_base_render_id?: number | null;
       latest_render: Render | null;
       shots: Shot[];
     }>(`/api/projects/${id}/status`),

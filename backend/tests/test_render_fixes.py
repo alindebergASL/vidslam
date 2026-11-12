@@ -127,8 +127,67 @@ def test_a_voiceover_longer_than_the_clips_is_never_cut_off(auth_client, tmp_pat
         assert r.status == "completed"
         assert _duration(r.final_video_path) >= 9.45
         assert r.composition_json["body_seconds"] >= 9.45
+        # The held clip records its shot's own length apart from the hold.
+        last = r.composition_json["shots"][-1]
+        assert last["planned_seconds"] == pytest.approx(4.0)
+        assert last["held_seconds"] == pytest.approx(last["seconds"], abs=0.01) and last["seconds"] > 5.0
+        assert r.composition_json["shots"][0]["held_seconds"] is None
     finally:
         db.close()
+
+
+def test_the_hold_for_a_long_voiceover_is_capped(auth_client, tmp_path, monkeypatch):
+    """A voiceover far longer than the clips (8 s of picture, 20 s of voice)
+    holds the last clip for VOICE_HOLD_MAX_SECONDS at most, not 12 s of a
+    frozen frame: the rest of the voice is cut at the end, as the fit says."""
+    from app import models
+    from app.services import pipeline
+
+    pid = _rendered(auth_client)
+    voice = tmp_path / "very_long_voice.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=20",
+                    "-c:a", "aac", str(voice)], check=True)
+    monkeypatch.setattr(pipeline, "_recompose_voiceover", lambda db, p: (voice, ""))
+    db = _db()
+    try:
+        p = db.get(models.VideoProject, pid)
+        for s in pipeline._body_shots(p):  # 4 s shots, 5 s clips: 8 s of picture
+            s.duration_seconds = 4.0
+            s.clip_path = str(_clip(tmp_path / f"c_{s.id}.mp4", 5.0))
+        db.commit()
+        r = pipeline.recompose_project(db, pid)
+        assert r.status == "completed"
+        cap = pipeline.VOICE_HOLD_MAX_SECONDS
+        assert r.composition_json["body_seconds"] == pytest.approx(8.0 + cap, abs=0.05)
+        assert _duration(r.final_video_path) == pytest.approx(8.0 + cap, abs=0.2)
+        assert r.composition_json["shots"][-1]["held_seconds"] == pytest.approx(4.0 + cap, abs=0.05)
+    finally:
+        db.close()
+
+
+def test_a_held_clip_is_not_held_again(tmp_path):
+    """cover_voice on clips that already hold the last one (a hook-lab
+    variant is composed from its base's held clips) holds it from the
+    shot's planned length again: never more than VOICE_HOLD_MAX_SECONDS."""
+    from app.services import pipeline
+
+    voice = tmp_path / "long_voice.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=20",
+                    "-c:a", "aac", str(voice)], check=True)
+    clips = [pipeline.ComposeClip(path=_clip(tmp_path / f"c{i}.mp4", 4.0), seconds=4.0) for i in range(2)]
+    cap = pipeline.VOICE_HOLD_MAX_SECONDS
+    once = pipeline.cover_voice(clips, voice, 0.0)
+    assert once[-1].seconds == pytest.approx(4.0 + cap) and once[-1].planned_seconds == 4.0
+    twice = pipeline.cover_voice(once, voice, 0.0)
+    assert twice[-1].seconds == pytest.approx(4.0 + cap) and twice[-1].planned_seconds == 4.0
+    # A held clip that does not reach the cap yet plays on up to it, no further.
+    part = [*clips[:-1], pipeline.ComposeClip(path=clips[-1].path, seconds=5.0, exact=True, planned_seconds=4.0)]
+    assert pipeline.cover_voice(part, voice, 0.0)[-1].seconds == pytest.approx(4.0 + cap)
+    # A shorter voice: the clip keeps the hold it had (the base's timing).
+    short = tmp_path / "short_voice.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=9.5",
+                    "-c:a", "aac", str(short)], check=True)
+    assert pipeline.cover_voice(once, short, 0.0)[-1].seconds == pytest.approx(4.0 + cap)
 
 
 def test_renderer_cuts_only_clips_with_a_limit(tmp_path):
