@@ -60,6 +60,12 @@ def image_price(entry: dict) -> Optional[float]:
 FREE_SPARK = "free (Free Spark)"
 
 
+def sogni_image_text(usd: float) -> str:
+    """One Sogni picture's price as Spend counts it (a picture model's or an
+    editor's): "about $0.15 per image", or "free (Free Spark)" at 0."""
+    return f"about {money(usd)} per image" if usd > 0 else FREE_SPARK
+
+
 def _sogni_price_text(model: str, kind: str) -> str:
     """A Sogni model's price as Spend will count it: Free Spark models are
     free unless SOGNI_COUNT_FREE_SPARK is on. A picture made with reference
@@ -71,11 +77,12 @@ def _sogni_price_text(model: str, kind: str) -> str:
         rate = sogni.video_spend_rate_usd(model)
         return f"about {money(rate * 5)} per 5 s" if rate > 0 else FREE_SPARK
     usd = sogni.image_spend_usd(model)
-    text = f"about {money(usd)} per image" if usd > 0 else FREE_SPARK
-    probe = [sogni.ImageRef(url="https://example.invalid/x.png", role="scene")]
-    route = None if sogni.takes_source_image(model) else sogni.edit_route(model, probe)
-    if route is not None:
-        ref_usd = sogni.edit_spend_usd(route.model.selector, 1)
+    text = sogni_image_text(usd)
+    # The editor a guide or place picture sends it to (with_pictures has
+    # the editor for each kind of picture, which Studio shows once picked).
+    editor = sogni.editor_for(model, "guide")
+    if editor is not None:
+        ref_usd = sogni.edit_spend_usd(editor.selector, 1)
         if (ref_usd > 0) != (usd > 0):
             text += f"; {f'about {money(ref_usd)}' if ref_usd > 0 else 'free'} with reference pictures"
     return text

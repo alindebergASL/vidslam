@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .storyboard import StoryboardPlan
 
@@ -508,11 +508,28 @@ class StudioJobOut(BaseModel):
     source_job_id: Optional[int] = None
     source_asset_id: Optional[int] = None
     options: dict = Field(default_factory=dict, validation_alias=AliasChoices("options", "options_json"))
+    # A Sogni picture made from reference pictures runs on one of Sogni's
+    # editors, not the picked model: the editor that really ran (its name
+    # and id, from options["ran_on"]); null when the picked model ran.
+    ran_on_name: Optional[str] = None
+    ran_on_editor: Optional[str] = None
+    # What the reference pictures are for when Sogni picks an editor:
+    # "identity" when one is a Cast character's picture (not its logo),
+    # else "guide"; null for a picture without references.
+    ref_intent: Optional[Literal["identity", "guide"]] = None
 
     @field_validator("options", mode="before")
     @classmethod
     def _options(cls, v):
         return dict(v or {})
+
+    @model_validator(mode="after")
+    def _ran_on(self):
+        ran = self.options.get("ran_on")
+        if isinstance(ran, dict):
+            self.ran_on_name = self.ran_on_name or str(ran.get("name") or "") or None
+            self.ran_on_editor = self.ran_on_editor or str(ran.get("model") or "") or None
+        return self
 
     @field_validator("operation", mode="before")
     @classmethod

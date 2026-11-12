@@ -649,7 +649,7 @@ class EditModel:
     max_refs: int
     premium: bool = False
     identity: bool = False  # made for keeping a person's likeness
-    naming: str = "picture"  # how a prompt names the pictures: picture | ordinal | context
+    naming: str = "picture"  # how a prompt names the pictures: picture | ordinal | context | image
 
 
 # Documented prices where Sogni lists them (FLUX.3 Klein 2.19 / 3.45 / 4.88
@@ -667,8 +667,16 @@ _EDITS: tuple[EditModel, ...] = (
     EditModel("gpt-image-2.5-flare", "GPT Image 2.5 Flare edit", 20.0, 17.0, 16, premium=True),
     EditModel("gpt-image-2.6-sunburst", "GPT Image 2.6 Sunburst edit", 30.0, 17.0, 16, premium=True),
     EditModel("gpt-image-2.6-flare", "GPT Image 2.6 Flare edit", 20.0, 17.0, 16, premium=True),
+    # Sogni's model page: 1-10 reference pictures, named "Image 1", "Image 2"
+    # in the order sent; 13.5 Spark up to 1536x1536, 0.9 per further picture.
+    # Live 2026-11-12: edit_image kept a reference's exact place (12.8 Spark).
+    EditModel("seedream-5-0-pro-uncensored", "Seedream 5.0 Pro (uncensored) edit", 13.5, 0.9, 10, premium=True,
+              naming="image"),
 )
 _EDIT_INFO = {m.selector: m for m in _EDITS}
+# Editors Sogni takes on edit_image but leaves out of its published list
+# (the protocol's enum lags its models): offered as well.
+_UNLISTED_EDITS = ("seedream-5-0-pro-uncensored",)
 # A picked image model's own edit version. Identity twins only keep a
 # likeness; for a place or a guide picture they give way to the scene default.
 _EDIT_TWIN = {
@@ -677,6 +685,7 @@ _EDIT_TWIN = {
     "gpt-image-2": "gpt-image-2", "gpt-image-2.5-sunburst": "gpt-image-2.5-sunburst",
     "gpt-image-2.5-flare": "gpt-image-2.5-flare", "gpt-image-2.6-sunburst": "gpt-image-2.6-sunburst",
     "gpt-image-2.6-flare": "gpt-image-2.6-flare",
+    "seedream-5-0-pro-uncensored": "seedream-5-0-pro-uncensored",
 }
 INTENTS = ("same_place", "identity", "guide")
 
@@ -690,11 +699,12 @@ class EditRoute:
 
 
 def edit_models() -> tuple[EditModel, ...]:
-    """The edit models Sogni lists (synced), else our table."""
+    """The edit models Sogni lists (synced) plus the ones it takes unlisted,
+    else our table."""
     sels = listed()["tools"].get(EDIT_TOOL) or []
     if not sels:
         return _EDITS
-    return tuple(_EDIT_INFO.get(s) or _generic_edit(s) for s in dict.fromkeys(sels))
+    return tuple(_EDIT_INFO.get(s) or _generic_edit(s) for s in dict.fromkeys([*sels, *_UNLISTED_EDITS]))
 
 
 def _generic_edit(sel: str) -> EditModel:
@@ -716,9 +726,11 @@ def reference_intent(refs: list[ImageRef], intent: str = "") -> str:
     return "guide"
 
 
-def edit_route(model: str, refs: list[ImageRef], intent: str = "") -> Optional[EditRoute]:
+def edit_route(model: str, refs: list[ImageRef], intent: str = "", *, warn: bool = True) -> Optional[EditRoute]:
     """Which edit model makes a picture with these references for `model`
-    (a sogni/ image model), or None when references aren't routed to edits."""
+    (a sogni/ image model), or None when references aren't routed to edits.
+    `warn=False` for a look-up that makes no picture (the pickers): only a
+    real picture logs that a default editor is missing."""
     s = get_settings()
     if not refs or not s.sogni_edit_references:
         return None
@@ -730,7 +742,7 @@ def edit_route(model: str, refs: list[ImageRef], intent: str = "") -> Optional[E
     if twin is not None and twin.identity and intent != "identity":
         twin = None  # an identity editor is for likeness; a place gets the scene editor
     default = selector(s.sogni_identity_edit_model if intent == "identity" else s.sogni_scene_edit_model)
-    if twin is None and default and default not in offered:
+    if warn and twin is None and default and default not in offered:
         log.warning("sogni: edit model %r isn't in Sogni's edit list; using the next default", default)
     choice = twin or offered.get(default)
     if choice is not None and len(refs) > choice.max_refs and not choice.premium:
@@ -771,6 +783,60 @@ def can_use_references(model: str) -> bool:
     return takes_source_image(model) or edit_route(model, probe, "same_place") is not None
 
 
+def editor_for(model: str, intent: str, n_refs: int = 1) -> Optional[EditModel]:
+    """The Sogni editor a sogni/ picture model really runs as with `n_refs`
+    reference pictures: intent "identity" when one is a Cast character's
+    picture, else "guide". None when the model takes the pictures itself
+    or ignores them (as generate() decides)."""
+    if not is_sogni(model) or n_refs < 1 or takes_source_image(model):
+        return None
+    probe = [ImageRef(url="https://example.invalid/x.png", role="character" if intent == "identity" else "scene")]
+    route = edit_route(model, probe * n_refs, intent, warn=False)
+    return route.model if route is not None else None
+
+
+def _editor_info(model: str, e: EditModel) -> dict:
+    """An editor for the pickers, priced as Spend will count it (as the
+    picture models are): a Sogni-native editor runs on Free Spark, so it's
+    free unless SOGNI_COUNT_FREE_SPARK is on; Premium Spark editors (GPT
+    Image, Seedream) cost their list price."""
+    from ..services.prices import sogni_image_text
+
+    sel = selector(model)
+    usd = edit_spend_usd(e.selector, 1)
+    return {"id": e.selector, "name": e.name,
+            # The picked model's own edit version (not a default it falls back to).
+            "own": e.selector in (_EDIT_TWIN.get(sel), sel),
+            "price_text": sogni_image_text(usd),
+            # Counted USD for one picture, and for each further one (0 on Free Spark).
+            "usd": usd, "usd_per_ref": round(edit_spend_usd(e.selector, 2) - usd, 6), "max_refs": e.max_refs}
+
+
+def with_pictures(model: str) -> Optional[dict]:
+    """For the pickers: the editor a sogni/ picture model runs as with
+    reference pictures, for a Cast character ("identity") and for any
+    other picture ("guide"). Each has "over_max": the editor used instead
+    when there are more pictures than that one takes. None when the model
+    doesn't go to an editor."""
+    out: dict = {}
+    for intent in ("identity", "guide"):
+        e = editor_for(model, intent)
+        more = editor_for(model, intent, e.max_refs + 1) if e is not None else None
+        out[intent] = None if e is None else {
+            **_editor_info(model, e),
+            "over_max": _editor_info(model, more) if more is not None and more.selector != e.selector else None,
+        }
+    return out if any(out.values()) else None
+
+
+def ran_on(route: Optional[EditRoute]) -> Optional[dict]:
+    """What a picture made from reference pictures really ran on: the
+    editor, not the picked model (Studio shows it on the result)."""
+    if not isinstance(route, EditRoute):
+        return None
+    return {"provider": "sogni", "tool": EDIT_TOOL, "model": route.model.selector, "name": route.model.name}
+
+
 def _edit_model(edit_selector: str) -> Optional[EditModel]:
     return _EDIT_INFO.get(edit_selector) or next((e for e in edit_models() if e.selector == edit_selector), None)
 
@@ -798,6 +864,8 @@ def _picture_name(i: int, naming: str) -> str:
         return f"the {words[i]} image" if i < len(words) else f"image {i + 1}"
     if naming == "context":
         return f"context_image_{i}"
+    if naming == "image":
+        return f"Image {i + 1}"
     return f"picture {i + 1}"
 
 
@@ -1120,7 +1188,7 @@ class SogniImageProvider(ImageProvider):
     def __init__(self, *, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         self.client = SogniClient(api_key)
         self.model = model or f"{PREFIX}krea-2-turbo"
-        self.last_route: Optional[EditRoute] = None  # the edit used by the last generate(), if any
+        self.last_route: Optional[EditRoute] = None  # the edit Sogni took for the last generate(), if any
 
     def list_models(self) -> list[ModelInfo]:
         return [ModelInfo(id=f"{PREFIX}{m.selector}", name=display_name(m), modality="image",
@@ -1193,10 +1261,12 @@ class SogniImageProvider(ImageProvider):
         if negative_prompt:  # edit_image has no negative prompt
             log.info("sogni %s: edit_image takes no negative prompt; dropped", model)
         media = [{"kind": "image", "url": r.url} for r in route.refs]
-        self.last_route = route
         wf = self.client.start(title=prompt[:80], tool=EDIT_TOOL, arguments=args, media_references=media,
                                cast=any(_forces_filter(r) for r in route.refs),
                                negative=negative_prompt)
+        # Only once Sogni took the workflow: a start that was refused (or
+        # never got there) ran no editor, so nothing says it did.
+        self.last_route = route
         wf = self._wait(wf)
         url = self.client.artifact_url(wf, "image")
         if not url:

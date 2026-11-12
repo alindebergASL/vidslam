@@ -3,7 +3,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import clsx from "clsx";
 import type { Asset, StudioJob } from "@/lib/api";
-import { costText, studioStatusLabel } from "@/components/StudioLibrary";
+import { costText, ranOnText, studioStatusLabel } from "@/components/StudioLibrary";
 import { downloadFile, extFromMime, extFromPath } from "@/lib/download";
 import { useToast } from "@/components/Toaster";
 import { sourceChipText } from "@/components/ImageOps";
@@ -257,6 +257,9 @@ export function StudioViewer({
       details.push("Image");
     }
     if (job.provider_model) details.push(job.provider_model);
+    // Reference pictures sent a Sogni model to one of Sogni's editors.
+    const ranOn = ranOnText(job);
+    if (ranOn) details.push(ranOn);
     if (job.result_width && job.result_height) {
       details.push(`${job.result_width}×${job.result_height} (${nearestAspect(job.result_width, job.result_height)})`);
     } else if (job.aspect_ratio) {

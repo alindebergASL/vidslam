@@ -26,8 +26,15 @@ import {
   BulkSaveDialog,
   CharacterSheetDialog,
   ModelOption,
+  ModelOptions,
   ModelPickerDialog,
   costText,
+  editorFor,
+  editorPriceText,
+  jobPictures,
+  liveReferenceIds,
+  pictureIntent,
+  ranOnText,
   sheetSlot,
   studioStatusLabel,
 } from "@/components/StudioLibrary";
@@ -522,9 +529,16 @@ function Studio() {
       : videoModels;
   const retryPrice = (job: StudioJob): string => {
     const m = modelOptionsFor(job).find((x) => x.id === job.provider_model);
-    if (!m?.price_text) return "";
-    const withRefs = job.output_kind === "image" && (job.reference_asset_ids || []).length > 0;
-    if (m.price_text === "free" || (!job.operation && modelPrice(m.price_text, withRefs) === 0)) return "free";
+    // With reference pictures a Sogni model runs again on its Sogni editor,
+    // at that editor's price (as in Try another model); any other model's
+    // price text may say what it costs with reference pictures.
+    const { intent, count } = jobPictures(job);
+    const editor = editorFor(m, intent, count);
+    const priceText = editor ? editorPriceText(editor, count) : m?.price_text;
+    if (!priceText) return "";
+    // Deleted reference pictures aren't sent: with none left it runs without any.
+    const withRefs = job.output_kind === "image" && liveReferenceIds(job).length > 0;
+    if (priceText === "free" || (!job.operation && modelPrice(priceText, withRefs) === 0)) return "free";
     // An upscale is priced by its source's size (the catalog price is for
     // 1 MP), so it shows the server's estimate for this picture, and no
     // price until that has arrived.
@@ -532,7 +546,7 @@ function Studio() {
       const est = upscaleEstimates[job.id];
       return est === undefined || est === null ? "" : est === 0 ? "free" : `about ${usd(est)}`;
     }
-    const p = job.operation ? priceFromText(m.price_text) : modelPrice(m.price_text, withRefs);
+    const p = job.operation ? priceFromText(priceText) : modelPrice(priceText, withRefs);
     if (p === null) return "";
     // Clips are priced per 5 s in the picker.
     const n = job.output_kind === "video_clip" && !job.operation ? p * ((job.duration_seconds || 5) / 5) : p;
@@ -1263,6 +1277,7 @@ function TileCard({
   const statusText = job ? studioStatusLabel(job) : tile.status || "";
   const checker = mayBeTransparent(tile);
   const fromText = job ? sourceChipText(job) : null;
+  const ranOn = job ? ranOnText(job) : null;
   // Landscape and square pictures are shown whole (not cropped to the
   // portrait tile); known sizes decide at once, others once loaded.
   const knownW = job?.result_width || tile.asset?.width || 0;
@@ -1523,6 +1538,16 @@ function TileCard({
               {job.label}
             </div>
           )}
+          {ranOn && !selectMode && (
+            <div
+              className="chip text-[10px] py-0.5 bg-ink-900/85 truncate max-w-full"
+              title={`Picked ${job?.provider_model}. With the reference pictures, Sogni ${
+                job?.status === "failed" ? "tried it" : "made it"
+              } with ${job?.ran_on_name}.`}
+            >
+              {ranOn}
+            </div>
+          )}
           {fromText && !selectMode && (
             <button
               type="button"
@@ -1617,6 +1642,9 @@ function PromptBar({
   const frameModels = useMemo(() => videoModels.filter((m) => m.first_frame), [videoModels]);
   const currentModels: ModelOption[] =
     outputKind === "image" ? imageModels : startsFromPicture ? frameModels : videoModels;
+  // With reference pictures a Sogni picture model runs on one of Sogni's editors.
+  const refIntent = outputKind === "image" ? pictureIntent(selectedAssets) : null;
+  const refCount = refIntent ? selectedAssets.length : 0;
   useEffect(() => {
     // Reset to default when switching output kind so we don't carry a video
     // model into an image generation request; a starting picture keeps the
@@ -1631,12 +1659,21 @@ function PromptBar({
   // "About $0.08" next to Generate: the picked model's rough price, times
   // the variations (images) or scaled to the clip length (priced per 5 s).
   const pickedModel = currentModels.find((m) => m.id === model);
-  const unitPrice = modelPrice(pickedModel?.price_text, outputKind === "image" && selectedRefs.length > 0);
+  // With reference pictures a Sogni model runs as its Sogni editor, at that
+  // editor's price; any other model's price text may say what it costs with them.
+  const pickedEditor = editorFor(pickedModel, refIntent, refCount);
+  const pickedPrice = pickedEditor ? editorPriceText(pickedEditor, refCount) : pickedModel?.price_text;
+  const unitPrice = modelPrice(pickedPrice, outputKind === "image" && selectedRefs.length > 0);
   const total =
     unitPrice === null ? null : outputKind === "image" ? unitPrice * variations : unitPrice * (clipSeconds / 5);
   const aboutText = total === null ? "" : total === 0 ? "Free" : `About ${usd(total)}`;
-  const priceTitle = pickedModel?.price_text
-    ? `${pickedModel.name}: ${pickedModel.price_text}${outputKind === "image" && variations > 1 ? ` × ${variations}` : ""}`
+  // An editor is sent at most max_refs of the pictures.
+  const unsent =
+    pickedEditor && refCount > pickedEditor.max_refs ? ` · uses ${pickedEditor.max_refs} of your ${refCount} pictures` : "";
+  const priceTitle = pickedPrice
+    ? `${pickedEditor ? `${pickedEditor.name} (Sogni)` : pickedModel?.name}: ${pickedPrice}${
+        outputKind === "image" && variations > 1 ? ` × ${variations}` : ""
+      }${unsent}`
     : undefined;
 
   // Fill the bar from Remix or a preset.
@@ -1783,6 +1820,9 @@ function PromptBar({
                 {a.owner_kind === "avatar" ? "Char" : "Scene"} #{a.id} · {a.asset_type}
               </span>
             ))}
+            {pickedEditor && (
+              <span className="text-ink-400 self-center">With these pictures, Sogni runs {pickedEditor.name}.</span>
+            )}
           </div>
         )}
 
@@ -1904,12 +1944,7 @@ function PromptBar({
               title="Provider model"
               aria-label="Provider model"
             >
-              {currentModels.map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.name || m.id}
-                  {m.price_text ? ` · ${m.price_text}` : ""}
-                </option>
-              ))}
+              <ModelOptions models={currentModels} intent={refIntent} count={refCount} />
             </select>
           )}
           <select
