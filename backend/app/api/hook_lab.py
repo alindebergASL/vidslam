@@ -123,10 +123,11 @@ def _check_spec(spec: VariantSpec | VariantPatch) -> None:
         raise HTTPException(422, f"shot1_source must be one of {', '.join(hook_lab.SOURCES)}")
 
 
-def _check_opening(db: Session, base: models.Render, hook: str) -> None:
-    """The minors check, on the opening alone and inside the script it joins."""
+def _check_opening(db: Session, base: models.Render, hook: str, window: Optional[float]) -> None:
+    """The minors check, on the opening alone, inside the script it joins
+    and with the original voiceover heard after it from `window` on."""
     try:
-        hook_lab.check_opening(db, base, hook)
+        hook_lab.check_opening(db, base, hook, window)
     except hook_lab.HookLabError as e:
         raise _err(e) from e
 
@@ -330,7 +331,15 @@ def create_variants(project_id: int, body: VariantsIn, db: Session = Depends(get
     base = _base(db, project_id, body.base_render_id)
     for spec in body.variants:
         _check_spec(spec)
-        _check_opening(db, base, " ".join(spec.hook_text.split()))
+    if body.window_seconds is not None:
+        window = _check_window(db, base, body.window_seconds)
+    else:
+        try:
+            window = hook_lab.find_hook_window(base)
+        except hook_lab.HookLabError as e:
+            raise _err(e) from e
+    for spec in body.variants:
+        _check_opening(db, base, " ".join(spec.hook_text.split()), window)
     try:
         hook_lab.base_clips(db, base)  # its clips are still there to reuse
     except hook_lab.HookLabError as e:
@@ -339,13 +348,6 @@ def create_variants(project_id: int, body: VariantsIn, db: Session = Depends(get
                                                   models.HookVariant.status != hook_lab.ARCHIVED).count()
     if live + len(body.variants) > hook_lab.MAX_PER_BASE:
         raise HTTPException(409, f"A version can have at most {hook_lab.MAX_PER_BASE} other openings.")
-    if body.window_seconds is not None:
-        window = _check_window(db, base, body.window_seconds)
-    else:
-        try:
-            window = hook_lab.find_hook_window(base)
-        except hook_lab.HookLabError as e:
-            raise _err(e) from e
     made: list[models.HookVariant] = []
     try:
         for spec in body.variants:
@@ -477,18 +479,22 @@ def patch_variant(variant_id: int, body: VariantPatch, db: Session = Depends(get
     base = _base(db, v.project_id, v.base_render_id)
     fields = body.model_fields_set
     audio_changed = False
-    if "hook_text" in fields and body.hook_text is not None:
+    text, window = v.hook_text, v.window_seconds
+    new_text = "hook_text" in fields and body.hook_text is not None
+    new_window = "window_seconds" in fields and body.window_seconds is not None
+    if new_text:
         text = " ".join(body.hook_text.split())
-        _check_opening(db, base, text)
-        audio_changed |= text != v.hook_text
-        v.hook_text = text
+    if new_window:
+        window = _check_window(db, base, body.window_seconds)
+    if new_text or new_window:
+        # Moving the window changes what of the original is heard after the
+        # opening, so that is checked too.
+        _check_opening(db, base, text, window)
+    audio_changed |= text != v.hook_text or window != v.window_seconds
+    v.hook_text, v.window_seconds = text, window
     if "style" in fields and body.style is not None:
         audio_changed |= body.style != v.style and "original" in (body.style, v.style)
         v.style = body.style
-    if "window_seconds" in fields and body.window_seconds is not None:
-        w = _check_window(db, base, body.window_seconds)
-        audio_changed |= w != v.window_seconds
-        v.window_seconds = w
     if "shot1_source" in fields and body.shot1_source is not None:
         v.shot1_source = body.shot1_source
     if "shot1_take_id" in fields:
@@ -604,7 +610,7 @@ def preview_audio(variant_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(409, "This opening is being made or is already made.")
     base = _base(db, v.project_id, v.base_render_id)
     project = db.get(models.VideoProject, v.project_id)
-    _check_opening(db, base, v.hook_text)  # before any voice is made
+    _check_opening(db, base, v.hook_text, v.window_seconds)  # before any voice is made
     cost = 0.0
     if not hook_lab.is_original(db, v, base) and not hook_lab.raw_hook_path(db, project, v).is_file():
         cost = round(hook_lab.tts_cost(v.hook_text), 4)
