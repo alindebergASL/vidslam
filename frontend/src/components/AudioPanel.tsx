@@ -68,6 +68,9 @@ export function AudioPanel({
     try {
       const next = await api.uploadVoiceover(project.id, file);
       onChange(next);
+      // A replacement of the same format keeps the file name and may leave
+      // the project unchanged, so ask for the new file's fit explicitly.
+      setVoiceUploads((n) => n + 1);
     } catch (e: any) {
       toast.error(e.message || "Action failed");
     } finally {
@@ -143,6 +146,7 @@ export function AudioPanel({
   // An uploaded voiceover's length against the shots: a long one is cut at
   // the end of the video, so say so before anything is rendered.
   const [uploadFit, setUploadFit] = useState<VoiceoverFit | null>(null);
+  const [voiceUploads, setVoiceUploads] = useState(0);
   const uploaded = project.voiceover_source === "upload" && !!project.voiceover_upload_path;
   useEffect(() => {
     if (!uploaded) {
@@ -162,7 +166,7 @@ export function AudioPanel({
       live = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project.id, uploaded, voiceoverKey, project.voiceover_upload_path]);
+  }, [project.id, uploaded, voiceoverKey, project.voiceover_upload_path, voiceUploads]);
 
   const tts = project.voiceover_source === "tts";
   const newVoiceoverCost =
