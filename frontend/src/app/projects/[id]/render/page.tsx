@@ -182,6 +182,8 @@ function Inner() {
           <p>
             {render.status === "failed"
               ? `This opening wasn't made${render.error ? `: ${render.error}` : "."}`
+              : render.status === "cancelled"
+              ? "This opening was stopped before it was made."
               : "This opening is still being made."}
           </p>
           <Link

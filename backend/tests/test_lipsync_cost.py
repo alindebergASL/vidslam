@@ -100,6 +100,32 @@ def test_rate_card_fallback_bills_lip_sync_on_its_speech(client):
     assert row["cost_usd"] == pytest.approx(0.23) and row["source"] == "rate_card"
 
 
+def test_a_hook_lab_lip_sync_without_a_reported_cost_is_recorded_as_lip_sync(client):  # client → tables exist
+    """A hook-lab opening's lip-sync (purpose hook_avatar) is recorded under
+    the lip-sync kind at the lip-sync rate, not as video at the video rate."""
+    from app import models
+    from app.config import get_settings
+    from app.db import SessionLocal
+    from app.services import spend
+
+    from .test_spend import _entries
+
+    db = SessionLocal()
+    try:
+        job = models.VideoJob(purpose="hook_avatar", ref_id=1, provider="openrouter", model="heygen/avatar-iv",
+                              provider_job_id="g2", status="completed", context_json={"index": 0, "duration": 3.0})
+        db.add(job)
+        db.commit()
+        spend.record_video_job(db, job)
+        db.commit()
+        ref = f"video_job:{job.id}"
+    finally:
+        db.close()
+    (row,) = [e for e in _entries() if e["ref"] == ref]
+    assert row["kind"] == "avatar"
+    assert row["cost_usd"] == pytest.approx(3.0 * get_settings().cost_avatar_per_second)
+
+
 def test_estimate_follows_the_current_shot_order(auth_client, tmp_path):
     """Review: with a 6 s voiceover, a 5 s hero then a 7 s talking head
     gives the talking head 1 s; moved first, it gets 6 s. The estimate must

@@ -362,7 +362,9 @@ Rules:
 - About as long as the current opening line (within 30% of its word count), one sentence, spoken aloud.
 - Use only facts that are in the script. Add no new claims, numbers, names or promises.
 - Styles: question = asks the viewer something; bold_claim = a confident statement; stat = leads with a number or fact from the script; story = starts a tiny personal moment; contrarian = pushes against a common belief.
-- Plain words, no hashtags, no emojis, no quotes around the text."""
+- Plain words, no hashtags, no emojis, no quotes around the text.
+- Everyone in anything sexual or suggestive is an adult: never mention or hint at an age under 18, childlike traits or school settings in an opening.
+- If the script sexualises a minor or childlike traits, reply with exactly REFUSED_MINOR. If you won't write openings for any other reason, reply with exactly DECLINED: never a partial, safer or different version."""
 
 
 SCENE_REWRITE_SYSTEM = """You turn a short description of a calm place into a description for a realistic photograph, for an image model. Reply with JSON only: {"scene": "...", "light": "...", "camera": "..."}.

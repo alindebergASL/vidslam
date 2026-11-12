@@ -175,7 +175,11 @@ def _fail_stuck_render(db: Session, render: models.Render) -> bool:
     db.refresh(render)
     _drop_scratch(render)
     project = db.get(models.VideoProject, render.project_id)
-    if project is not None and project.status not in ("draft", "planned", "completed", "failed", "cancelled"):
+    from .pipeline import hook_claim_previous
+
+    if project is not None and render.hook_variant_id is not None and hook_claim_previous(project.claim_token):
+        pass  # held by the hook lab: sweep_renders gives it back once its job is gone
+    elif project is not None and project.status not in ("draft", "planned", "completed", "failed", "cancelled"):
         project.status = "failed"  # so Retry works
     events.render_event(db, render, project, "failed", error=STOPPED)
     db.commit()
@@ -229,6 +233,25 @@ def sweep_renders(db: Session, *, now: Optional[datetime] = None) -> dict:
         if queue_entry_state(project.queue_job_id or "") != "gone":
             continue  # still waiting in a busy queue (or Redis didn't answer)
         was = project.status
+        previous = pipeline.hook_claim_previous(project.claim_token)
+        if previous is not None and was == "generating":
+            # The hook lab's "Make videos" job is gone: the project goes back
+            # to what it was (its finished video is untouched), and openings
+            # the job never reached go back to drafts (nothing was paid).
+            res = db.execute(update(P).where(P.id == project.id, P.status == was,
+                                             P.claim_token == project.claim_token,
+                                             P.updated_at == project.updated_at)
+                             .values(status=previous, claim_token="", updated_at=_now()))
+            if res.rowcount != 1:
+                db.rollback()
+                continue
+            (db.query(models.HookVariant)
+             .filter(models.HookVariant.project_id == project.id, models.HookVariant.status == "making",
+                     models.HookVariant.render_id.is_(None))
+             .update({"status": "draft"}, synchronize_session=False))
+            db.commit()
+            out["projects"] += 1
+            continue
         res = db.execute(update(P).where(P.id == project.id, P.status == was,
                                          P.updated_at == project.updated_at)
                          .values(status="failed", claim_token="", updated_at=_now()))

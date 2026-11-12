@@ -43,10 +43,12 @@ def rest_of_script(text: str) -> str:
 
 
 def plan_hook(plan: dict | None) -> str:
-    """The plan's hook: the stored one, else the first sentence of its
-    spoken script (plans made before the hook was stored)."""
+    """The plan's hook: the first sentence of its spoken script (a stored
+    hook that says something else is never voiced, so it is not used);
+    the stored one only when there is no script."""
     plan = plan or {}
-    return str(plan.get("hook") or "").strip() or first_sentence(str(plan.get("cleaned_voice_script") or ""))
+    script = str(plan.get("cleaned_voice_script") or "")
+    return first_sentence(script) if script.strip() else str(plan.get("hook") or "").strip()
 
 
 _ENDS = re.compile(r"""[.!?…]+["'”’»)\]]*$""")
@@ -176,6 +178,27 @@ def base_hook(db: Session, render: models.Render) -> str:
     return plan_hook(project.generated_plan_json if project else None)
 
 
+def opening_script(db: Session, base: models.Render, hook: str) -> str:
+    """The whole spoken script with `hook` as its opening: what is voiced,
+    lip-synced, captioned and published."""
+    return replace_first_sentence(base_script(db, base), hook)
+
+
+def check_opening(db: Session, base: models.Render, hook: str) -> None:
+    """The minors check an opening meets: on its own, and inside the script
+    it joins. The script check only refuses a minor and a sexual word in
+    the same text, so "She just turned 15." passes alone but not in front
+    of an adult script. Raises HookLabError (422) when refused."""
+    from . import minor_check
+    from .safety import UnsafeScriptError
+
+    try:
+        minor_check.check_generation(hook or "", kind="script")
+        minor_check.check_generation(opening_script(db, base, hook), kind="script")
+    except UnsafeScriptError as e:
+        raise HookLabError(f"This opening can't be used: {e}", 422) from None
+
+
 def check_base(db: Session, render: Optional[models.Render], project_id: Optional[int] = None) -> models.Render:
     """The render can be the base of other openings: a finished storyboard
     render (not itself a variant) whose voiceover is on disk."""
@@ -195,9 +218,41 @@ def check_base(db: Session, render: Optional[models.Render], project_id: Optiona
     if audio_overwritten(db, render):
         raise HookLabError("This version's voiceover file was replaced by a later version's, so its "
                            "opening can't be swapped. Use a newer version.")
+    _check_base_voice(db, render, project)
     if not base_hook(db, render):
         raise HookLabError("This version has no spoken script, so it has no opening to swap.")
     return render
+
+
+def _check_base_voice(db: Session, render: models.Render, project: models.VideoProject) -> None:
+    """The new opening is spoken with the project's current voice and joined
+    onto the base voiceover: refused when that can't sound like the rest
+    (an uploaded recording, or the voice changed since the render). A
+    render that didn't record its voice (made before that was recorded)
+    also takes its script from the project's plan, so it must still match
+    the project's current script and voice (its voice fingerprint)."""
+    from . import fingerprints
+    from .pipeline import is_voice_copy
+
+    voice = (render.composition_json or {}).get("voice") or {}
+    upload = Path(project.voiceover_upload_path) if project.voiceover_upload_path else None
+    if voice.get("source") == "upload" or (not voice and (
+            (upload is not None and Path(render.audio_path) == upload) or is_voice_copy(Path(render.audio_path)))):
+        raise HookLabError("This version's voiceover is an uploaded recording, and a new opening can't be "
+                           "spoken in it. Make a version with a generated voice to try other openings.")
+    now = fingerprints.voice_source(project)
+    if voice.get("source") == "tts":
+        made_with = {k: v for k, v in voice.items() if k != "source"}
+        if now != "tts" or made_with != fingerprints.tts_identity(db, project):
+            raise HookLabError("The project's voice changed since this version was made, so a new opening "
+                               "wouldn't sound like the rest. Switch back to the voice it was made with, or "
+                               "make a new version first.")
+        return
+    if voice.get("source"):
+        return  # silent: no voiceover, refused by the caller
+    if now != "tts" or not render.voice_fingerprint \
+            or render.voice_fingerprint != fingerprints.voice_fingerprint(db, project):
+        raise HookLabError("Re-compose this version first: its script or voice changed since it was made.")
 
 
 def base_clips(db: Session, render: models.Render) -> list["ComposeClip"]:
@@ -216,7 +271,15 @@ def base_clips(db: Session, render: models.Render) -> list["ComposeClip"]:
             seconds=float(s["planned_seconds"]) if s.get("planned_seconds") else None,
             shot_id=s.get("shot_id"), shot_order=s.get("shot_order"), shot_type=str(s.get("shot_type") or ""),
             take_id=s.get("take_id"), fingerprint=str(s.get("fingerprint") or ""),
-            provider_model=str(s.get("provider_model") or "")) for s in shots]
+            provider_model=str(s.get("provider_model") or ""),
+            # What each shot was made with (renders from before these were
+            # recorded: None, read from the shot row).
+            lipsynced=bool(s["lipsynced"]) if "lipsynced" in s else None,
+            reference_asset_ids=([int(x) for x in s["reference_asset_ids"] or []]
+                                 if "reference_asset_ids" in s else None),
+            reference_strategy=str(s["reference_strategy"] or "") if "reference_strategy" in s else None,
+            negative_prompt=str(s["negative_prompt"] or "") if "negative_prompt" in s else None,
+        ) for s in shots]
         if all(c.path.is_file() for c in clips):
             return clips
         raise HookLabError("Some clips of this version are gone. Re-compose this version first.")
@@ -316,7 +379,10 @@ def _clip_starts(clips: list["ComposeClip"], comp: Optional[dict] = None) -> lis
 
 
 def _lipsynced(db: Session, clip: "ComposeClip") -> bool:
-    """The clip is a lip-synced talking head (its take or shot says so)."""
+    """The clip is a lip-synced talking head (the render's record, else
+    its take or shot says so)."""
+    if clip.lipsynced is not None:
+        return clip.lipsynced
     if clip.shot_type != "talking_head":
         return False
     if clip.take_id:
@@ -439,8 +505,10 @@ def fit_estimate(text: str, original: str, window: float) -> dict:
 def suggest_hooks(db: Session, project: models.VideoProject, base_render: models.Render, n: int = 3) -> list[dict]:
     """`n` other openings in different styles, from one planner call (spend
     note "hook ideas"; the mock planner answers deterministically): each
-    about as long as the original line, same facts. Raises HookLabError
-    (502) when the answer is refused or can't be used."""
+    about as long as the original line, same facts. Each idea meets the
+    minors check alone and inside the script; refused ones are dropped.
+    Raises HookLabError: 422 when the planner refuses or every idea was
+    refused, 502 when the answer can't be used."""
     from ..providers import get_chat
     from ..providers.openrouter_chat import extract_json
 
@@ -454,6 +522,18 @@ def suggest_hooks(db: Session, project: models.VideoProject, base_render: models
         log.warning("hook ideas failed for project %s: %s", project.id, e)
         raise HookLabError("The planner couldn't suggest openings right now. Try again, or write your own.",
                            502) from e
+    if isinstance(reply, str):
+        from . import content_mode
+        from .prompting import refusal
+
+        why = refusal(reply, script)
+        if why == "minor":
+            raise HookLabError("No openings were suggested: the planner refused this script, as it appears "
+                               "to involve a minor in a sexual context.", 422)
+        if why:
+            hint = "" if content_mode.adult_mode() else " For adult scripts, turn on Adult mode in Settings."
+            raise HookLabError("The planner declined to suggest openings for this script. Write your own "
+                               f"opening.{hint}", 422)
     try:
         data = extract_json(reply) if isinstance(reply, str) else reply
     except Exception:  # noqa: BLE001
@@ -470,6 +550,7 @@ def suggest_hooks(db: Session, project: models.VideoProject, base_render: models
     out: list[dict] = []
     seen: set[str] = {_norm(hook)}
     used_styles: set[str] = set()
+    refused = ""
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -483,12 +564,23 @@ def suggest_hooks(db: Session, project: models.VideoProject, base_render: models
             continue  # far longer or shorter than the opening it replaces
         if style in used_styles and style != "custom":
             continue
+        try:
+            # Alone and inside the script, like an opening the user writes.
+            check_opening(db, base_render, text)
+        except HookLabError as e:
+            refused = str(e).removeprefix("This opening can't be used: ")
+            log.warning("hook idea for project %s refused by the minors check", project.id)
+            continue
         seen.add(_norm(text))
         used_styles.add(style)
         out.append({"style": style, "style_label": STYLE_LABELS[style], "text": text,
                     **fit_estimate(text, hook, window or 0.0)})
         if len(out) >= n:
             break
+    if not out and refused:
+        # Every idea was refused: say so, not "try again" (they would be again).
+        raise HookLabError(f"None of the suggested openings passed the safety check, so none are shown. "
+                           f"Write your own opening. {refused}", 422)
     if not out:
         raise HookLabError("The planner's answer couldn't be used. Try again, or write your own opening.", 502)
     return out
@@ -499,12 +591,8 @@ def suggest_hooks(db: Session, project: models.VideoProject, base_render: models
 
 def _tts_identity(db: Session, project: models.VideoProject) -> dict:
     from . import fingerprints
-    from . import model_registry as reg
 
-    voice_id = fingerprints.tts_voice_id(db, project)
-    return {"voice_id": voice_id,
-            "default_voice": "" if voice_id else get_settings().elevenlabs_default_voice_id,
-            "model": reg.active_model("tts") or "", "options": reg.active_options("tts") or {}}
+    return fingerprints.tts_identity(db, project)
 
 
 def is_original(db: Session, variant: models.HookVariant, base: models.Render) -> bool:
@@ -681,6 +769,8 @@ def make_variant_audio(db: Session, variant: models.HookVariant) -> dict:
         db.commit()
         return {"path": base.audio_path, "fits": True, "overflow_seconds": 0.0, "hook_seconds": window,
                 "tempo": 1.0, "cost": 0.0, "reused": True}
+    # Before any voice is made or reused: the opening inside its script.
+    check_opening(db, base, variant.hook_text or "")
     if variant.audio_fingerprint == fp and variant.audio_path and Path(variant.audio_path).is_file():
         return {"path": variant.audio_path, "fits": True, "overflow_seconds": 0.0, "hook_seconds": None,
                 "tempo": None, "cost": 0.0, "reused": True}
@@ -799,8 +889,13 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
     base_settings(db, base)  # composed with the base's look: refused now, before anything is paid
     first = clips[0]
     d1 = starts[0][1]
-    shot1 = {"source": variant.shot1_source, "seconds": round(d1, 2), "cost": 0.0, "lipsync": False}
+    shot1 = {"source": variant.shot1_source, "seconds": round(d1, 2), "cost": 0.0, "lipsync": False,
+             "reused": False}
     needed: list[int] = []
+    # Clips an earlier make round of this opening finished from the same
+    # inputs ({index: VideoJob id}): used again, not bought again.
+    reused: dict[str, int] = {}
+    voice_fp = audio_fingerprint(db, project, variant, base)
     if variant.shot1_source == "take":
         take = db.get(models.ShotTake, variant.shot1_take_id) if variant.shot1_take_id else None
         if take is None or take.shot_id != first.shot_id or not Path(take.clip_path or "").is_file():
@@ -818,6 +913,12 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
         shot1["seconds"] = new_shot_seconds(first, d1)
         shot1["cost"] = round(shot1["seconds"] * _shot_rate(db, first), 4)
         needed.append(0)
+        job = reusable_clip(db, variant, PURPOSE_SHOT, shot_key(db, project, variant, first))
+        if job is not None:
+            reused["0"] = job.id
+            shot1["cost"] = 0.0
+            shot1["reused"] = True
+            notes.append("The new shot 1 made in an earlier try is reused: it isn't paid for again.")
     elif variant.shot1_source == "lipsync":
         if first.shot_type != "talking_head":
             raise HookLabError("Shot 1 is not a talking head, so there is nothing to lip-sync.", 422)
@@ -826,6 +927,14 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
         shot1["cost"] = round(d1 * rates.cost_avatar_per_second, 4)
         shot1["lipsync"] = True
         needed.append(0)
+        job = reusable_clip(db, variant, PURPOSE_AVATAR,
+                            avatar_key(db, project, variant, 0, first, starts[0][0], d1, voice_fp,
+                                       single=len(clips) == 1))
+        if job is not None:
+            reused["0"] = job.id
+            shot1["cost"] = 0.0
+            shot1["reused"] = True
+            notes.append("Shot 1's lip-sync made in an earlier try is reused: it isn't paid for again.")
         if len(clips) == 1:
             notes.append(f"This video is one talking-head shot, so all of it ({d1:.0f} s) is lip-synced "
                          f"again: about ${shot1['cost']:.2f}.")
@@ -844,13 +953,20 @@ def parts(db: Session, variant: models.HookVariant, *, base: Optional[models.Ren
                             "lip-sync is off now, so its lips won't match.")
             continue
         cost = round(length * rates.cost_avatar_per_second, 4)
+        job = reusable_clip(db, variant, PURPOSE_AVATAR,
+                            avatar_key(db, project, variant, i, clip, start, length, voice_fp))
+        if job is not None:
+            reused[str(i)] = job.id
+            cost = 0.0
         extra.append({"index": i, "shot_id": clip.shot_id, "shot_order": clip.shot_order or i + 1,
                       "start": round(start, 2), "seconds": round(length, 2), "cost": cost,
-                      "reason": "its lips follow the opening, which changes"})
+                      "reused": job is not None,
+                      "reason": ("made in an earlier try and reused" if job is not None
+                                 else "its lips follow the opening, which changes")})
         needed.append(i)
     total = round(tts + shot1["cost"] + sum(e["cost"] for e in extra), 4)
-    return {"tts_cost": tts, "shot1": shot1, "extra_lipsync": extra, "needed": needed, "total": total,
-            "notes": notes, "warnings": warnings, "lipsync_available": lipsync_on,
+    return {"tts_cost": tts, "shot1": shot1, "extra_lipsync": extra, "needed": needed, "reused": reused,
+            "total": total, "notes": notes, "warnings": warnings, "lipsync_available": lipsync_on,
             "too_long_seconds": too_long}
 
 
@@ -871,7 +987,7 @@ def variant_plan(db: Session, variants: list[models.HookVariant]) -> dict:
             rows.append({"id": v.id, "label": v.label, "ok": True, "error": "", **p})
         except HookLabError as e:
             rows.append({"id": v.id, "label": v.label, "ok": False, "error": str(e), "tts_cost": 0.0,
-                         "shot1": None, "extra_lipsync": [], "needed": [], "total": 0.0, "notes": [],
+                         "shot1": None, "extra_lipsync": [], "needed": [], "reused": {}, "total": 0.0, "notes": [],
                          "warnings": [], "lipsync_available": False, "too_long_seconds": 0.0})
     total = round(sum(r["total"] for r in rows), 4)
     n = len(rows)
@@ -897,17 +1013,28 @@ def next_label(db: Session, base_render_id: int) -> str:
 
 
 def precheck(db: Session, project: models.VideoProject, variant: models.HookVariant,
-             clips: list["ComposeClip"]) -> None:
+             clips: list["ComposeClip"], needed: Optional[list[int]] = None) -> None:
     """The safety checks the variant's paid steps will meet, before any of
-    them is paid for (cached: the checks at the providers are then hits)."""
+    them is paid for (cached: the checks at the providers are then hits):
+    the opening, a new shot 1's prompt, and the words and motion of every
+    shot (`needed`) that is lip-synced again, so a refused lip-sync never
+    comes after other clips were paid for."""
     from .minor_check import check_generation
     from .prompting import effective_negative
+    from .safety import check_prompt
 
-    check_generation(variant.hook_text or "", kind="script")
+    check_opening(db, db.get(models.Render, variant.base_render_id), variant.hook_text or "")
     if variant.shot1_source == "new":
-        shot = db.get(models.VideoShot, clips[0].shot_id) if clips[0].shot_id else None
-        check_generation(variant.shot1_prompt or "", effective_negative("video", shot.negative_prompt if shot else ""),
+        check_generation(variant.shot1_prompt or "", effective_negative("video", _negative(db, clips[0])),
                          kind="video")
+    for i in needed or []:
+        if (i == 0 and variant.shot1_source == "new") or i >= len(clips):
+            continue
+        # As GuardedAvatarProvider.submit_avatar checks them.
+        asked = _avatar_request(db, project, variant, i, clips[i], 0.0, 0.0, "", single=len(clips) == 1)
+        if asked["motion"].strip():
+            check_prompt(asked["motion"])
+        check_generation(" ".join(x for x in (asked["motion"], asked["text"]) if x.strip()), kind="lipsync")
 
 
 def _fail(db: Session, variant: models.HookVariant, error: str) -> None:
@@ -930,7 +1057,7 @@ def make_variants(db: Session, project_id: int, variant_ids: list[int], *, claim
     by the API), its own Render, its audio, and its clips; each is composed
     once its parts are in. The project claim is held only while this runs."""
     from . import spend
-    from .pipeline import consume_claim
+    from .pipeline import claim_marker, consume_claim
 
     if claim:
         if not consume_claim(db, project_id, claim, claim_token):
@@ -960,8 +1087,9 @@ def make_variants(db: Session, project_id: int, variant_ids: list[int], *, claim
     finally:
         if claim:
             (db.query(models.VideoProject)
-             .filter(models.VideoProject.id == project_id, models.VideoProject.status == claim)
-             .update({"status": previous}, synchronize_session=False))
+             .filter(models.VideoProject.id == project_id, models.VideoProject.status == claim,
+                     models.VideoProject.claim_token == claim_marker(claim_token))
+             .update({"status": previous, "claim_token": ""}, synchronize_session=False))
             db.commit()
 
 
@@ -980,11 +1108,15 @@ def _make_one(db: Session, variant: models.HookVariant) -> None:
     variant.cost_estimate = plan["total"]
     variant.error = ""
     variant.shot1_clip_path = ""
-    variant.clips_json = {"needed": plan["needed"], "clips": {}}
+    # "reused": clips an earlier round of this opening finished from the
+    # same inputs (not bought again; variant_clips counts them).
+    variant.clips_json = {"needed": plan["needed"], "clips": {}, "reused": plan["reused"]}
+    if "0" in plan["reused"]:
+        variant.shot1_clip_path = db.get(models.VideoJob, plan["reused"]["0"]).result_path
     events.hook_variant_event(db, variant, project, "started", detail="Making the opening's voice")
     db.commit()
     with spend.scope(render_id=render.id):
-        precheck(db, project, variant, clips)
+        precheck(db, project, variant, clips, [i for i in plan["needed"] if str(i) not in plan["reused"]])
         try:
             audio = make_variant_audio(db, variant)
         except HookTooLong as e:
@@ -998,13 +1130,13 @@ def _make_one(db: Session, variant: models.HookVariant) -> None:
         render.audio_path = audio["path"]
         render.voice_fingerprint = variant.audio_fingerprint
         render.status = "generating_shots"
-        if plan["needed"]:
+        todo = [i for i in plan["needed"] if str(i) not in plan["reused"]]
+        if todo:
             events.hook_variant_event(db, variant, project, "progress",
-                                      detail=f"Making {len(plan['needed'])} clip"
-                                             f"{'s' if len(plan['needed']) != 1 else ''}")
+                                      detail=f"Making {len(todo)} clip{'s' if len(todo) != 1 else ''}")
         db.commit()
         starts = _clip_starts(clips, base.composition_json)
-        for i in plan["needed"]:
+        for i in todo:
             db.refresh(variant)
             if variant.status != "making":
                 return  # failed meanwhile (an earlier clip of it failed)
@@ -1030,27 +1162,29 @@ def submit_hook_shot(db: Session, project: models.VideoProject, variant: models.
     VideoShot row is only read (its model, references, avoid list)."""
     from ..providers import get_video, routes_per_model, uses_webhooks
     from . import video_jobs
-    from .model_registry import active_model
-    from .pipeline import _resolve_model, _resolve_references_for_shot, clip_seconds
-    from .prompting import effective_negative
+    from .pipeline import _asset_refs, _resolve_references_for_shot
 
     shot = db.get(models.VideoShot, clip.shot_id) if clip.shot_id else None
-    model = _resolve_model(db, (shot.model_override if shot else "") or active_model("video"))
+    asked = _shot_request(db, project, variant, clip)
+    model, negative, seconds, prompt = asked["model"], asked["negative"], asked["seconds"], asked["prompt"]
     video = get_video(model) if routes_per_model("video", model) else get_video()
-    refs = _resolve_references_for_shot(db, project, shot) if shot is not None else []
-    negative = effective_negative("video", shot.negative_prompt if shot else "")
-    seconds = new_shot_seconds(clip, clip_seconds(clip))  # as parts() priced it
-    prompt = variant.shot1_prompt.strip()
+    if clip.reference_asset_ids is not None:
+        # The pictures the base's shot 1 was made with (its row may have
+        # changed or gone with a re-plan or a shot delete since).
+        refs = _asset_refs(db, clip.reference_asset_ids)
+    else:
+        refs = _resolve_references_for_shot(db, project, shot) if shot is not None else []
 
     def start(callback: Optional[str]):
         return video.submit(model=model, prompt=prompt, references=refs, negative_prompt=negative,
-                            reference_strategy=(shot.reference_strategy if shot else "") or "input_references",
+                            reference_strategy=asked["strategy"],
                             duration_seconds=seconds, settings=_video_settings(project, callback))
 
     return video_jobs.submit(
         db, purpose=PURPOSE_SHOT, ref_id=variant.id, project_id=project.id, render_id=render.id,
         context={"index": 0, "duration": seconds, "aspect": project.aspect_ratio or "",
-                 "model": model}, start=start, webhooks=uses_webhooks(model))
+                 "model": model, "inputs": _key(PURPOSE_SHOT, asked)}, start=start,
+        webhooks=uses_webhooks(model))
 
 
 def submit_hook_avatar(db: Session, project: models.VideoProject, variant: models.HookVariant, index: int,
@@ -1073,15 +1207,9 @@ def submit_hook_avatar(db: Session, project: models.VideoProject, variant: model
     seg = slice_audio(Path(variant.audio_path), out_dir / f"voice_hook_{variant.id}_{index}.m4a",
                       start=start, duration=seconds)
     audio_url = public_media.publish(seg, "m4a")
-    shot = db.get(models.VideoShot, clip.shot_id) if clip.shot_id else None
-    script = base_script(db, db.get(models.Render, variant.base_render_id))
-    if index == 0:
-        # The words this slice says: the new opening (and, for a video that
-        # is one talking-head shot, the rest of the script after it).
-        text = replace_first_sentence(script, variant.hook_text) if single else variant.hook_text
-    else:
-        text = (shot.caption_text if shot else "") or rest_of_script(script)
-    motion = (shot.camera_direction if shot else "") or ""
+    asked = _avatar_request(db, project, variant, index, clip, start, seconds, variant.audio_fingerprint or "",
+                            single=single)
+    text, motion = asked["text"], asked["motion"]
 
     def start_fn(callback: Optional[str]):
         return avatar.submit_avatar(
@@ -1092,8 +1220,97 @@ def submit_hook_avatar(db: Session, project: models.VideoProject, variant: model
     return video_jobs.submit(
         db, purpose=PURPOSE_AVATAR, ref_id=variant.id, project_id=project.id, render_id=render.id,
         context={"index": index, "duration": seconds, "start": round(start, 3),
-                 "aspect": project.aspect_ratio or "", "model": getattr(avatar, "model", "")},
+                 "aspect": project.aspect_ratio or "", "model": getattr(avatar, "model", ""),
+                 "inputs": _key(PURPOSE_AVATAR, asked)},
         start=start_fn)
+
+
+# ---------- clips made in an earlier try ----------
+#
+# A make round that failed (a lip-sync refused, a provider down) may have
+# finished some of its clips already. Make again uses those, instead of
+# paying for them twice, when the same opening asks for the same clip: each
+# hook job stores what it was made from ("inputs" in its context_json), and
+# a finished one of the same opening with the same inputs whose file is
+# still there is reused. Never one of another opening's clips.
+
+
+def _shot_request(db: Session, project: models.VideoProject, variant: models.HookVariant,
+                  clip: "ComposeClip") -> dict:
+    """What a new shot 1 is asked for: the prompt, the video model, the
+    shot's avoid list, its length and the project's shape."""
+    from .model_registry import active_model
+    from .pipeline import _resolve_model, clip_seconds
+    from .prompting import effective_negative
+
+    shot = db.get(models.VideoShot, clip.shot_id) if clip.shot_id else None
+    return {"index": 0, "shot_id": clip.shot_id or 0, "prompt": (variant.shot1_prompt or "").strip(),
+            "model": _resolve_model(db, (shot.model_override if shot else "") or active_model("video")),
+            "negative": effective_negative("video", _negative(db, clip)),
+            "strategy": ((clip.reference_strategy if clip.reference_strategy is not None
+                          else (shot.reference_strategy if shot else "")) or "input_references"),
+            "seconds": new_shot_seconds(clip, clip_seconds(clip)),  # as parts() priced it
+            "aspect": project.aspect_ratio or ""}
+
+
+def _negative(db: Session, clip: "ComposeClip") -> str:
+    """The avoid list shot `clip` was made with (the render's record, else the shot row)."""
+    if clip.negative_prompt is not None:
+        return clip.negative_prompt
+    shot = db.get(models.VideoShot, clip.shot_id) if clip.shot_id else None
+    return (shot.negative_prompt if shot else "") or ""
+
+
+def _avatar_request(db: Session, project: models.VideoProject, variant: models.HookVariant, index: int,
+                    clip: "ComposeClip", start: float, seconds: float, voice_fp: str, *,
+                    single: bool = False) -> dict:
+    """What a lip-sync of shot `index` is made from: the voiceover (its
+    fingerprint) and the slice of it, the words, the face, the motion and
+    the lip-sync model."""
+    from . import model_registry as reg
+    from .pipeline import _hero_portrait
+
+    shot = db.get(models.VideoShot, clip.shot_id) if clip.shot_id else None
+    script = base_script(db, db.get(models.Render, variant.base_render_id))
+    if index == 0:
+        # The words this slice says: the new opening (and, for a video that
+        # is one talking-head shot, the rest of the script after it).
+        text = replace_first_sentence(script, variant.hook_text) if single else variant.hook_text
+    else:
+        text = (shot.caption_text if shot else "") or rest_of_script(script)
+    portrait = _hero_portrait(db, project)
+    return {"index": index, "shot_id": clip.shot_id or 0, "audio": voice_fp, "start": round(float(start), 3),
+            "seconds": round(float(seconds), 3), "text": text,
+            "motion": (shot.camera_direction if shot else "") or "", "portrait": portrait.id if portrait else 0,
+            "model": reg.active_model("lipsync") or "", "aspect": project.aspect_ratio or ""}
+
+
+def _key(purpose: str, request: dict) -> str:
+    return _digest({"purpose": purpose, **request})
+
+
+def shot_key(db: Session, project: models.VideoProject, variant: models.HookVariant, clip: "ComposeClip") -> str:
+    return _key(PURPOSE_SHOT, _shot_request(db, project, variant, clip))
+
+
+def avatar_key(db: Session, project: models.VideoProject, variant: models.HookVariant, index: int,
+               clip: "ComposeClip", start: float, seconds: float, voice_fp: str, *, single: bool = False) -> str:
+    return _key(PURPOSE_AVATAR, _avatar_request(db, project, variant, index, clip, start, seconds, voice_fp,
+                                                single=single))
+
+
+def reusable_clip(db: Session, variant: models.HookVariant, purpose: str, key: str) -> Optional[models.VideoJob]:
+    """A finished clip of this opening (any earlier make round) made from
+    exactly these inputs, whose file is still there; else None."""
+    if not variant.id:
+        return None
+    for job in (db.query(models.VideoJob)
+                .filter(models.VideoJob.ref_id == variant.id, models.VideoJob.project_id == variant.project_id,
+                        models.VideoJob.purpose == purpose, models.VideoJob.status == "completed")
+                .order_by(models.VideoJob.id.desc())):
+        if (job.context_json or {}).get("inputs") == key and job.result_path and Path(job.result_path).is_file():
+            return job
+    return None
 
 
 def _job_variant(db: Session, job: models.VideoJob) -> Optional[models.HookVariant]:
@@ -1108,9 +1325,10 @@ def _job_variant(db: Session, job: models.VideoJob) -> Optional[models.HookVaria
 
 def variant_clips(db: Session, variant: models.HookVariant) -> dict[str, str]:
     """{clip index: file} of the clips made for the variant's current make
-    round (its render): worked out from the finished VideoJobs, never from a
-    read-modify-write of clips_json, so two clips landing at once (a webhook
-    and the poller) can't lose one."""
+    round (its render), and those it reuses from an earlier round
+    (clips_json "reused", set once by Make): worked out from the finished
+    VideoJobs, never from a read-modify-write of clips_json, so two clips
+    landing at once (a webhook and the poller) can't lose one."""
     from . import video_jobs
 
     if not variant.render_id:
@@ -1123,6 +1341,12 @@ def variant_clips(db: Session, variant: models.HookVariant) -> dict[str, str]:
                 .order_by(models.VideoJob.id)):
         if job.result_path and Path(job.result_path).is_file():
             out[str(int((job.context_json or {}).get("index") or 0))] = job.result_path
+    # Clips an earlier round of this opening made, taken by Make (_make_one).
+    for key, job_id in ((variant.clips_json or {}).get("reused") or {}).items():
+        job = db.get(models.VideoJob, int(job_id))
+        if job is not None and job.ref_id == variant.id and job.purpose in video_jobs.HOOK_PURPOSES \
+                and job.status == "completed" and job.result_path and Path(job.result_path).is_file():
+            out.setdefault(str(key), job.result_path)
     return out
 
 
@@ -1207,6 +1431,8 @@ def sweep(db: Session, *, grace_seconds: float = 120.0, now: Optional[datetime] 
         if render is None or render.status != "generating_shots" or (
                 render.updated_at is not None and render.updated_at > cutoff):
             continue
+        if _make_running(db, variant.project_id, now):
+            continue  # Make may still be submitting its clips (a slow upload or provider)
         busy = (db.query(models.VideoJob.id)
                 .filter(models.VideoJob.ref_id == variant.id, models.VideoJob.render_id == render.id,
                         models.VideoJob.purpose.in_(video_jobs.HOOK_PURPOSES),
@@ -1262,6 +1488,32 @@ def sweep(db: Session, *, grace_seconds: float = 120.0, now: Optional[datetime] 
 
 
 ORPHANED = "Stopped before it was made (its job was lost); make it again"
+
+
+def _make_running(db: Session, project_id: int, now: datetime) -> bool:
+    """A Make job may still hold the project ("generating" under a hook-lab
+    claim) and not have finished submitting its openings' clips. It counts
+    as running only while its queue entry can still run it, or while the
+    claim is younger than the time the render sweeper waits before taking
+    it back. After that the opening is failed as usual, which ends its
+    render, so the render sweeper (sweepers.sweep_renders) can then give
+    the project back. Without this limit the two sweepers would each wait
+    for the other forever."""
+    from datetime import timedelta
+
+    from ..workers.queue import queue_entry_state
+    from .pipeline import HOOK_CLAIM
+    from .sweepers import RENDER_GRACE
+
+    P = models.VideoProject
+    project = (db.query(P).filter(P.id == project_id, P.status == "generating",
+                                  P.claim_token.startswith(HOOK_CLAIM)).first())
+    if project is None:
+        return False
+    limit = timedelta(seconds=get_settings().queue_job_timeout_seconds) + RENDER_GRACE
+    if project.updated_at is not None and project.updated_at > now - limit:
+        return True
+    return queue_entry_state(project.queue_job_id or "") != "gone"
 
 
 def _sweep_orphan_claims(db: Session, cutoff: datetime, now: datetime) -> int:
@@ -1366,6 +1618,10 @@ def compose_variant(db: Session, variant_id: int) -> Optional[models.Render]:
         events.hook_variant_event(db, variant, project, "progress", detail="Putting the video together")
         db.commit()
         script = base_script(db, base)
+        # The captions and the stored script (what publishing drafts from)
+        # are the opening inside this script: checked as that, again here,
+        # since the project's script can change after Make.
+        check_opening(db, base, variant.hook_text or "")
         body = sum(clip_seconds(c) for c in clips)
         window = float(variant.window_seconds)
         speech = window
@@ -1377,7 +1633,9 @@ def compose_variant(db: Session, variant_id: int) -> Optional[models.Render]:
                  voice_fingerprint=variant.audio_fingerprint, hook_window=window, hook_variant_id=variant.id,
                  hook_text=variant.hook_text, script=replace_first_sentence(script, variant.hook_text),
                  extra={"base_render_id": base.id, "hook_label": variant.label, "hook_style": variant.style,
-                        "shot1_source": variant.shot1_source})
+                        "shot1_source": variant.shot1_source,
+                        # The base's voice: check_base made sure the opening was spoken in it.
+                        "voice": dict((base.composition_json or {}).get("voice") or {})})
         render.status = "completed"
         variant.status = "completed"
         variant.error = ""

@@ -38,19 +38,25 @@ _IDLE = ("draft", "planned", "completed", "failed", "cancelled")
 _DONE_RENDER = ("completed", "failed", "cancelled", "expired")
 
 
-def claim_project(db: Session, project: models.VideoProject, to: str, busy: str) -> tuple[str, str]:
+def claim_project(db: Session, project: models.VideoProject, to: str, busy: str,
+                  *, hook_lab: bool = False) -> tuple[str, str]:
     """Move the project to `to` ("generating" / "planning") before its job is
     queued, atomically and only from an idle state with no render running,
     so a double-click or a second tab can't queue a second paid run (409
     `busy`), and the editor keeps polling while the job waits for a worker.
     Returns the previous status (for release_project) and the claim's
-    unique token, which the queued job must consume before it does anything."""
+    unique token, which the queued job must consume before it does anything.
+    `hook_lab`: a hook-lab "Make videos" claim; its token says so and holds
+    the previous status (pipeline.hook_claim_token)."""
+    from ..services.pipeline import hook_claim_token
+
     latest = (db.query(models.Render.status).filter(models.Render.project_id == project.id)
               .order_by(models.Render.id.desc()).first())
     if latest is not None and latest[0] not in _DONE_RENDER:
         raise HTTPException(409, busy)
     previous = project.status or "draft"
-    token = uuid.uuid4().hex
+    previous = previous if previous in _IDLE else "draft"
+    token = hook_claim_token(previous) if hook_lab else uuid.uuid4().hex
     claimed = (db.query(models.VideoProject)
                .filter(models.VideoProject.id == project.id, models.VideoProject.status.in_(_IDLE))
                .update({"status": to, "claim_token": token, "updated_at": datetime.utcnow()},
@@ -59,7 +65,7 @@ def claim_project(db: Session, project: models.VideoProject, to: str, busy: str)
     if not claimed:
         raise HTTPException(409, busy)
     db.refresh(project)
-    return (previous if previous in _IDLE else "draft"), token
+    return previous, token
 
 
 def release_project(db: Session, project_id: int, claimed: str, previous: str, token: str) -> None:
@@ -271,7 +277,12 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
         .first()
     )
     from ..services import video_jobs
+    from ..services.pipeline import hook_claim_previous
 
+    if project.status == "generating" and hook_claim_previous(project.claim_token):
+        # Held by the hook lab's "Make videos": its openings are stopped
+        # there, one by one; this never cancels the finished video.
+        raise HTTPException(409, "Other openings are being made for this video. Stop them in the hook lab.")
     if latest is None or latest.status in _DONE_RENDER:
         # Claimed (Generate / Retry / plan) but its job hasn't made a render
         # yet: still queued, or it stopped before it could. Give the claim
@@ -306,12 +317,15 @@ def _release_waiting_claim(db: Session, project: models.VideoProject) -> bool:
     if was not in ("generating", "planning"):
         return False
     from ..services import events
+    from ..services.pipeline import HOOK_CLAIM
 
     # Only while no worker has taken the claim over (its token is still
     # set): after that the job owns it and cancel goes through its render.
+    # Never a hook-lab claim (the project's finished video stays as it is).
     done = (db.query(models.VideoProject)
             .filter(models.VideoProject.id == project.id, models.VideoProject.status == was,
-                    models.VideoProject.claim_token != "")
+                    models.VideoProject.claim_token != "",
+                    ~models.VideoProject.claim_token.startswith(HOOK_CLAIM))
             .update({"status": "cancelled", "claim_token": "", "updated_at": datetime.utcnow()},
                     synchronize_session=False))
     if done != 1:
@@ -487,9 +501,13 @@ def project_status(project_id: int, db: Session = Depends(get_db)) -> ProjectSta
         .order_by(models.Render.created_at.desc())
         .first()
     )
+    from ..services.pipeline import hook_claim_previous
+
     return ProjectStatusOut(
         project_id=project.id,
         project_status=project.status,
+        # Held by the hook lab's "Make videos", not by a render of its own.
+        hook_lab_making=project.status == "generating" and hook_claim_previous(project.claim_token) is not None,
         latest_render=render_out(db, latest) if latest else None,
         shots=[ShotOut.model_validate(s) for s in project.shots],
     )

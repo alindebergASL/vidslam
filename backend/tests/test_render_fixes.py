@@ -91,14 +91,42 @@ def test_long_clips_are_cut_to_their_shot_and_short_ones_kept(auth_client, tmp_p
         assert comp["body_seconds"] == pytest.approx(6.0)
         assert comp["captions"][-1]["end"] == pytest.approx(6.0, abs=0.01)
 
-        # A clip shorter than its shot plays as it is.
+        # A clip shorter than its shot plays as it is (still long enough
+        # for the mock voiceover, which a shorter video would play on for).
         p = db.get(models.VideoProject, pid)
         body = pipeline._body_shots(p)
-        body[1].clip_path = str(_clip(tmp_path / "short.mp4", 2.0))
+        body[1].clip_path = str(_clip(tmp_path / "short.mp4", 2.5))
         db.commit()
         r2 = pipeline.recompose_project(db, pid)
-        assert _duration(r2.final_video_path) == pytest.approx(5.0, abs=0.15)
-        assert [sh["seconds"] for sh in r2.composition_json["shots"]] == [3.0, pytest.approx(2.0, abs=0.05)]
+        assert _duration(r2.final_video_path) == pytest.approx(5.5, abs=0.15)
+        assert [sh["seconds"] for sh in r2.composition_json["shots"]] == [3.0, pytest.approx(2.5, abs=0.05)]
+    finally:
+        db.close()
+
+
+def test_a_voiceover_longer_than_the_clips_is_never_cut_off(auth_client, tmp_path, monkeypatch):
+    """Two 5 s shots and a 9.5 s voiceover: the last clip plays on (held on
+    its last frame) until the voice has finished, instead of the video
+    ending at 10 s - 2 s of trimming and losing the last words."""
+    from app import models
+    from app.services import pipeline
+
+    pid = _rendered(auth_client)
+    voice = tmp_path / "long_voice.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=9.5",
+                    "-c:a", "aac", str(voice)], check=True)
+    monkeypatch.setattr(pipeline, "_recompose_voiceover", lambda db, p: (voice, ""))
+    db = _db()
+    try:
+        p = db.get(models.VideoProject, pid)
+        for s in pipeline._body_shots(p):  # 4 s shots, 5 s clips: 8 s of picture
+            s.duration_seconds = 4.0
+            s.clip_path = str(_clip(tmp_path / f"c_{s.id}.mp4", 5.0))
+        db.commit()
+        r = pipeline.recompose_project(db, pid)
+        assert r.status == "completed"
+        assert _duration(r.final_video_path) >= 9.45
+        assert r.composition_json["body_seconds"] >= 9.45
     finally:
         db.close()
 
@@ -457,6 +485,29 @@ def test_publish_meta_per_render_uses_its_hook_and_never_repeats_it(auth_client)
     assert bdesc == desc
     assert auth_client.get(f"/api/projects/{pid}/publish-meta",
                            params={"render_id": stray_id}).status_code == 404
+
+
+def test_publish_meta_of_an_opening_typed_without_end_punctuation(auth_client):
+    """An opening typed as "What if you never scrolled again" is voiced
+    with a period; the description's body must not start with "."."""
+    from app import models
+
+    pid = _rendered(auth_client)
+    db = _db()
+    try:
+        vr = models.Render(project_id=pid, status="completed", composition_json={
+            "script": "What if you never scrolled again. Here is the rest of it.",
+            "hook": "What if you never scrolled again"})
+        db.add(vr)
+        db.commit()
+        vr_id = vr.id
+    finally:
+        db.close()
+    desc = auth_client.get(f"/api/projects/{pid}/publish-meta", params={"render_id": vr_id}).json()["description"]
+    lines = desc.split("\n")
+    assert lines[0] == "What if you never scrolled again."
+    assert not any(ln.startswith(".") for ln in lines)
+    assert "Here is the rest of it." in desc and desc.count("never scrolled") == 1
 
 
 def test_publish_meta_with_a_hook_that_is_not_the_first_sentence():

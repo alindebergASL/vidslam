@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -168,7 +169,15 @@ def _resolve_references_for_shot(
     db: Session, project: models.VideoProject, shot: models.VideoShot
 ) -> list[ImageRef]:
     """Convert per-shot reference_asset_ids (or fall back to all project cast assets) → ImageRefs."""
-    asset_ids: list[int] = list(shot.reference_asset_ids_json or [])
+    # Shots keep asset-id order (what IN() gave before): a frame_images shot
+    # pins refs[0] as its first frame, and the shot picker shows no order.
+    return _asset_refs(db, reference_asset_ids(project, shot))
+
+
+def reference_asset_ids(project: models.VideoProject, shot: models.VideoShot) -> list[int]:
+    """The asset ids a shot's clip is made with: its own picks, else the
+    first two pictures of each Cast member; sorted."""
+    asset_ids: list = list(shot.reference_asset_ids_json or [])
     if not asset_ids:
         for cm in project.cast_members:
             owner = cm.avatar if cm.member_kind == "avatar" else cm.ingredient
@@ -176,9 +185,7 @@ def _resolve_references_for_shot(
                 continue
             for a in owner.assets[:2]:
                 asset_ids.append(a.id)
-    # Shots keep asset-id order (what IN() gave before): a frame_images shot
-    # pins refs[0] as its first frame, and the shot picker shows no order.
-    return _asset_refs(db, sorted(_asset_ids(asset_ids)))
+    return sorted(_asset_ids(asset_ids))
 
 
 def _asset_ids(raw) -> list[int]:
@@ -289,6 +296,7 @@ def _check_plan(plan: StoryboardPlan) -> None:
     from .safety import UnsafePromptError, check_prompt, check_script, steers_young
 
     check_script(plan.cleaned_voice_script or "")
+    check_script(plan.hook or "")  # normally the script's first sentence (the schema sees to it)
     for shot in plan.shots:
         check_prompt(shot.visual_prompt or "")
         if steers_young(shot.visual_prompt or "", shot.negative_prompt or ""):
@@ -322,18 +330,48 @@ def claim_held(db: Session, project_id: int, claim: str, token: Optional[str] = 
     return True
 
 
+# A hook-lab "Make videos" claim: its token starts with this, then the
+# status the project goes back to, then the random part (dropped once the
+# job takes the claim over). The project page and the sweeper read it, so
+# the claim never ends as "cancelled" or "failed" on a finished video.
+HOOK_CLAIM = "hl:"
+_HOOK_PREVIOUS = ("draft", "planned", "completed", "failed", "cancelled")
+
+
+def hook_claim_token(previous: str) -> str:
+    import secrets
+
+    return f"{HOOK_CLAIM}{previous}:{secrets.token_hex(12)}"
+
+
+def hook_claim_previous(token: Optional[str]) -> Optional[str]:
+    """The status a hook-lab claim goes back to; None when `token` is not
+    a hook-lab claim's."""
+    if not token or not token.startswith(HOOK_CLAIM):
+        return None
+    previous = token[len(HOOK_CLAIM):].split(":", 1)[0]
+    return previous if previous in _HOOK_PREVIOUS else "completed"
+
+
+def claim_marker(token: Optional[str]) -> str:
+    """What claim_token holds once a job took the claim with `token` over."""
+    previous = hook_claim_previous(token)
+    return f"{HOOK_CLAIM}{previous}:" if previous else ""
+
+
 def consume_claim(db: Session, project_id: int, claim: str, token: Optional[str]) -> bool:
     """Take over the claim atomically (conditional UPDATE, not committed:
     the caller commits it together with its first write). After this a
     cancel can no longer release the claim, and a second entry with the
     same token can't start. Without a token (older queue entries) it only
-    checks the status."""
+    checks the status. A hook-lab claim keeps its marker (without the
+    random part), so it is still known as one while its job runs."""
     if not token:
         return claim_held(db, project_id, claim)
     done = (db.query(models.VideoProject)
             .filter(models.VideoProject.id == project_id, models.VideoProject.status == claim,
                     models.VideoProject.claim_token == token)
-            .update({"claim_token": ""}, synchronize_session=False))
+            .update({"claim_token": claim_marker(token)}, synchronize_session=False))
     if done != 1:
         log.info("project %s claim %s was cancelled or replaced; skipping its job", project_id, claim)
         return False
@@ -1219,7 +1257,8 @@ def adopt_unfingerprinted_voiceover(db: Session, project: models.VideoProject) -
     latest = _latest_audio_render(db, project.id)
     if latest is None or latest.voice_fingerprint:
         return False
-    if project.voiceover_upload_path and Path(latest.audio_path) == Path(project.voiceover_upload_path):
+    if (project.voiceover_upload_path and Path(latest.audio_path) == Path(project.voiceover_upload_path)) \
+            or is_voice_copy(Path(latest.audio_path)):
         return False  # that render used the uploaded file, not a synthesized voice
     latest.voice_fingerprint = fingerprints.voice_fingerprint(db, project)
     db.commit()
@@ -1756,6 +1795,40 @@ class ComposeClip:
     provider_model: str = ""
     # Plays for exactly `seconds`: held on its last frame when shorter.
     exact: bool = False
+    # What the shot was made with, as the render recorded it (None: read
+    # the shot row). The hook lab reads these, since a re-plan or a shot
+    # delete can change or remove the row after the render.
+    lipsynced: Optional[bool] = None
+    reference_asset_ids: Optional[list[int]] = None
+    reference_strategy: Optional[str] = None
+    negative_prompt: Optional[str] = None
+
+
+def clip_record(db: Session, project: models.VideoProject, clip: ComposeClip) -> dict:
+    """What `clip`'s shot was made with, for the render's composition_json:
+    whether it is lip-synced, its reference pictures, reference strategy
+    and avoid list. The clip's own record when it has one (a hook-lab
+    opening of a recorded base), else the shot row and take as they are."""
+    shot = db.get(models.VideoShot, clip.shot_id) if clip.shot_id else None
+    if shot is not None and shot.project_id != project.id:
+        shot = None
+    lipsynced = clip.lipsynced
+    if lipsynced is None:
+        lipsynced = False
+        if clip.shot_type == "talking_head":
+            take = db.get(models.ShotTake, clip.take_id) if clip.take_id else None
+            lipsynced = (take.provider if take is not None else (shot.provider if shot else "")) == "lipsync"
+    refs = clip.reference_asset_ids
+    if refs is None:
+        refs = reference_asset_ids(project, shot) if shot is not None else []
+    strategy = clip.reference_strategy
+    if strategy is None:
+        strategy = (shot.reference_strategy if shot else "") or ""
+    negative = clip.negative_prompt
+    if negative is None:
+        negative = (shot.negative_prompt if shot else "") or ""
+    return {"lipsynced": bool(lipsynced), "reference_asset_ids": list(refs),
+            "reference_strategy": strategy, "negative_prompt": negative}
 
 
 def shot_clips(project: models.VideoProject) -> list[ComposeClip]:
@@ -1793,6 +1866,30 @@ def clip_seconds(clip: ComposeClip) -> float:
     return float(real or clip.seconds or 0.0)
 
 
+def cover_voice(clips: list[ComposeClip], audio: Optional[Path], end_card: float, *,
+                render_id: Optional[int] = None) -> list[ComposeClip]:
+    """`clips` with the last one played longer when the voiceover runs past
+    the body plus the end card: clips are cut to their shots' lengths and
+    the video ends with the picture, so a long voiceover lost its last words
+    (often the call to action). The last clip plays on (its own footage
+    first, then held on its last frame) until the voice has finished."""
+    from dataclasses import replace
+
+    from .renderer import _probe_duration
+
+    if not clips or audio is None or not audio.exists():
+        return clips
+    voice = _probe_duration(audio)
+    short = voice - (sum(clip_seconds(c) for c in clips) + end_card)
+    if short <= 0.05:
+        return clips
+    last = clips[-1]
+    longer = round(clip_seconds(last) + short + 0.05, 3)
+    log.warning("render %s: voiceover runs %.2f s past the clips; the last clip plays on to %.2f s",
+                render_id, short, longer)
+    return [*clips[:-1], replace(last, seconds=longer, exact=True)]
+
+
 def base_captions(plan: StoryboardPlan, body_seconds: float) -> list[CaptionTiming]:
     """The plan's captions over the video's body (its clips, not the end card)."""
     return chunks_to_timed(plan.caption_chunks, max(body_seconds, 1.0))
@@ -1819,7 +1916,12 @@ def _compose(
     look = settings if settings is not None else compose_settings(db, project, plan)
     project_dir = storage.render_subdir(project.id)
     look = keep_music(look, project_dir, render.id)
+    voice = voice_identity(db, project, audio, voice_fingerprint)
+    audio = keep_voice(project, audio, project_dir, render.id)
+    if audio is not None:
+        render.audio_path = str(audio)
     work = render_files.scratch_dir(project_dir, render.id)
+    clips = cover_voice(clips, audio, END_CARD_SECONDS if look["cta_text"] else 0.0, render_id=render.id)
     used = [clip_seconds(c) for c in clips]
     try:
         outputs = compose(
@@ -1847,7 +1949,7 @@ def _compose(
         render_files.finalize(db, render, outputs.final_video_path, outputs.thumbnail_path)
     except BaseException:
         render_files.drop_scratch(project_dir, render.id)
-        for own in project_dir.glob(f"render_{render.id}_music.*"):  # its copy (keep_music)
+        for own in own_copies(project_dir, render.id):  # its copies (keep_music, keep_voice)
             own.unlink(missing_ok=True)
         raise
     if script is None and plan is None:
@@ -1860,10 +1962,11 @@ def _compose(
             "shot_id": c.shot_id, "shot_order": c.shot_order, "shot_type": c.shot_type,
             "take_id": c.take_id, "clip_path": str(c.path), "fingerprint": c.fingerprint,
             "provider_model": c.provider_model, "planned_seconds": c.seconds,
-            "seconds": round(u, 3),
+            "seconds": round(u, 3), **clip_record(db, project, c),
         } for c, u in zip(clips, used, strict=True)],
         "audio_path": str(audio) if audio else "",
         "voice_fingerprint": voice_fingerprint,
+        "voice": voice,
         "captions": [{"start": round(t.start, 3), "end": round(t.end, 3), "text": t.text} for t in timed],
         "body_seconds": round(sum(used), 3),
         "end_card_seconds": END_CARD_SECONDS if look["cta_text"] else 0.0,
@@ -1916,6 +2019,73 @@ def keep_music(look: dict, project_dir: Path, render_id: int) -> dict:
         except OSError:
             shutil.copy2(src, dst)
     return {**look, "music_path": str(dst), "music_sha256": file_sha256(dst)}
+
+
+_VOICE_COPY = re.compile(r"render_\d+_voice\.\w+")
+
+
+def own_copies(project_dir: Path, render_id: int) -> list[Path]:
+    """The render's own copies of its music bed and uploaded voiceover
+    (keep_music, keep_voice): removed with the render's files."""
+    return [*project_dir.glob(f"render_{render_id}_music.*"), *project_dir.glob(f"render_{render_id}_voice.*")]
+
+
+def is_voice_copy(path: Path) -> bool:
+    """A render's own copy of an uploaded voiceover (keep_voice)."""
+    return bool(_VOICE_COPY.fullmatch(path.name))
+
+
+def keep_voice(project: models.VideoProject, audio: Optional[Path], project_dir: Path,
+               render_id: int) -> Optional[Path]:
+    """`audio`, pinned to this render when it is an uploaded voiceover: the
+    upload keeps its name (voiceover.<ext>) when a new one is uploaded, so
+    the render keeps its own copy (`render_<id>_voice.<ext>`, a hard link
+    when the disk allows it), like keep_music does for the music. A
+    synthesized voiceover needs nothing: each synthesis is a new file."""
+    import os
+    import shutil
+
+    if audio is None or not audio.is_file():
+        return audio
+    upload = Path(project.voiceover_upload_path) if project.voiceover_upload_path else None
+    if audio != upload and not is_voice_copy(audio):
+        return audio
+    dst = project_dir / f"render_{render_id}_voice{audio.suffix}"
+    if audio != dst:
+        dst.unlink(missing_ok=True)
+        try:
+            os.link(audio, dst)
+        except OSError:
+            shutil.copy2(audio, dst)
+    return dst
+
+
+def voice_identity(db: Session, project: models.VideoProject, audio: Optional[Path], voice_fp: str) -> dict:
+    """What a render's voiceover was spoken with, recorded in its
+    composition_json["voice"]: {"source": "upload"} for an uploaded
+    recording, {"source": "tts", voice_id, default_voice, model, options}
+    for a synthesized one, {"source": "silent"} without one. {} when it
+    isn't known (an older voiceover from a render that didn't record it)."""
+    if audio is None:
+        return {"source": "silent"}
+    upload = Path(project.voiceover_upload_path) if project.voiceover_upload_path else None
+    if audio == upload or is_voice_copy(audio):
+        return {"source": "upload"}
+    if voice_fp and fingerprints.voice_source(project) == "tts" \
+            and voice_fp == fingerprints.voice_fingerprint(db, project):
+        return {"source": "tts", **fingerprints.tts_identity(db, project)}
+    # An older voiceover kept under the clips: what the render that made it recorded.
+    R = models.Render
+    q = (db.query(R).filter(R.project_id == project.id, R.audio_path == str(audio),
+                            R.hook_variant_id.is_(None), R.composition_json.isnot(None))
+         .order_by(R.id.desc()))
+    if voice_fp:
+        q = q.filter(R.voice_fingerprint == voice_fp)
+    for r in q.limit(20):
+        voice = (r.composition_json or {}).get("voice")
+        if voice:
+            return dict(voice)
+    return {}
 
 
 def compose_settings(db: Session, project: models.VideoProject, plan: Optional[StoryboardPlan]) -> dict:
@@ -2078,7 +2248,9 @@ def _recompose_voiceover(db: Session, project: models.VideoProject) -> tuple[Opt
     captions match what is said. The last render's voiceover instead when the
     lip-synced clips were all cut from that one (nothing was re-rolled
     against the new voiceover yet): swapping it would put every one of them
-    out of step."""
+    out of step. An uploaded voiceover is the upload file itself: each
+    render plays its own copy of it (keep_voice), so a newly uploaded
+    recording is found there, never under an older render."""
     old_audio = _latest_completed_audio(db, project.id)
     source_render = _latest_audio_render(db, project.id)
     # Same voiceover file as before: keep knowing what it was made from.
@@ -2086,7 +2258,13 @@ def _recompose_voiceover(db: Session, project: models.VideoProject) -> tuple[Opt
               if source_render is not None and old_audio and source_render.audio_path == str(old_audio)
               else "")
     voice_fp = fingerprints.voice_fingerprint(db, project)
-    current = _reusable_voiceover(db, project, voice_fp) if voice_fp else None
+    if fingerprints.voice_source(project) == "upload":
+        current = project.voiceover_upload_path if voice_fp != old_fp else None
+        if current is not None and old_audio is not None and Path(current) == old_audio:
+            # An older render played the upload file itself: it holds the new recording now.
+            return old_audio, voice_fp
+    else:
+        current = _reusable_voiceover(db, project, voice_fp) if voice_fp else None
     if current is None or (old_audio is not None and Path(current) == old_audio):
         return old_audio, old_fp
     clips = _lipsynced_clips(project)

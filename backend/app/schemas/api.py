@@ -417,6 +417,9 @@ class RenderOut(BaseModel):
 class ProjectStatusOut(BaseModel):
     project_id: int
     project_status: str
+    # The project is held by the hook lab making other openings (no render
+    # of its own is waiting or running).
+    hook_lab_making: bool = False
     latest_render: Optional[RenderOut] = None
     shots: list[ShotOut] = Field(default_factory=list)
 

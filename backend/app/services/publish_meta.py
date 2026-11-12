@@ -138,10 +138,13 @@ def _storyboard(project: models.VideoProject, render: Optional[models.Render] = 
     # The hook opens the description once: the script follows without its
     # first sentence when that sentence is the hook (it usually is).
     body = script
-    if hook and first_sentence(script).strip() == hook.strip():
-        body = rest_of_script(script)
+    opening = first_sentence(script).strip()
+    if hook and opening in (hook.strip(), hook.strip() + "."):
+        # An opening typed without end punctuation is voiced with a period:
+        # the description shows that sentence, and the body starts after it.
+        hook, body = opening, rest_of_script(script)
     elif hook and script.strip().startswith(hook.strip()):
-        body = script.strip()[len(hook.strip()):].strip()
+        body = script.strip()[len(hook.strip()):].lstrip(" .!?…").strip()
     lines = [hook, "", body] if hook else [script]
     if project.cta_text:
         lines += ["", project.cta_text]

@@ -2067,6 +2067,8 @@ export const api = {
     req<{
       project_id: number;
       project_status: string;
+      // Held by the hook lab making other openings (no render of its own).
+      hook_lab_making: boolean;
       latest_render: Render | null;
       shots: Shot[];
     }>(`/api/projects/${id}/status`),

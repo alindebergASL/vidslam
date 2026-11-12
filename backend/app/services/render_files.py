@@ -128,8 +128,11 @@ def prune(db: Session, project_id: int) -> int:
             except OSError:
                 pass
         if r.final_video_path:
-            # Its own copy of the music bed (pipeline.keep_music).
-            for p in Path(r.final_video_path).parent.glob(f"render_{r.id}_music.*"):
+            # Its own copies of the music bed and an uploaded voiceover
+            # (pipeline.keep_music, keep_voice).
+            from .pipeline import own_copies
+
+            for p in own_copies(Path(r.final_video_path).parent, r.id):
                 p.unlink(missing_ok=True)
         r.status = "expired"
         r.render_log = ("expired by retention policy (RENDER_RETENTION_KEEP=%d)\n" % keep) + (r.render_log or "")

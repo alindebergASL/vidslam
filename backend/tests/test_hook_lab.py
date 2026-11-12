@@ -152,6 +152,9 @@ def test_suggestions_from_the_mock_planner(auth_client, monkeypatch):
 
     monkeypatch.setattr(mock_chat.MockChatProvider, "hook_ideas", lambda self, **kw: "Sorry, I can't help.")
     r = auth_client.post(f"/api/projects/{pid}/hook-lab/suggest", json={"base_render_id": base_id})
+    assert r.status_code == 422 and "declined" in r.json()["detail"] and "Write your own" in r.json()["detail"]
+    monkeypatch.setattr(mock_chat.MockChatProvider, "hook_ideas", lambda self, **kw: "not json at all")
+    r = auth_client.post(f"/api/projects/{pid}/hook-lab/suggest", json={"base_render_id": base_id})
     assert r.status_code == 502 and "write your own" in r.json()["detail"]
     too_long = '{"hooks": [{"style": "question", "text": "' + "word " * 30 + '"}]}'
     monkeypatch.setattr(mock_chat.MockChatProvider, "hook_ideas", lambda self, **kw: too_long)
@@ -407,6 +410,87 @@ def test_redo_talking_head_and_the_lip_synced_shots_the_opening_overlaps(auth_cl
     assert [s["clip_path"] for s in comp["shots"]] == [v.clips_json["clips"]["0"], v.clips_json["clips"]["1"]]
 
 
+def test_a_refused_lip_sync_is_caught_before_any_clip_is_paid(auth_client, monkeypatch):
+    """Make's up-front check covers the words of every shot lip-synced
+    again: a refusal there comes before the new shot 1 is bought."""
+    from app import models
+    from app.services import minor_check
+    from app.services.safety import UnsafePromptError
+
+    pid, base_id = _talking_base(auth_client, extra_shot=True)  # shot 2 starts inside a 3.5 s opening
+    made = _create(auth_client, pid, base_id, [
+        {"hook_text": "Hi, quick test here.", "style": "custom", "shot1_source": "new",
+         "shot1_prompt": "a green kite"}], window=3.5)
+    (vid,) = (v["id"] for v in made["variants"])
+    assert [e["shot_order"] for e in made["plan"]["variants"][0]["extra_lipsync"]] == [2]
+    real = minor_check.check_generation
+
+    def spy(prompt, negative="", *, kind):
+        if kind == "lipsync":
+            raise UnsafePromptError("lip-sync refused")
+        return real(prompt, negative, kind=kind)
+
+    monkeypatch.setattr(minor_check, "check_generation", spy)
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    v = _get(models.HookVariant, vid)
+    assert v.status == "failed" and "lip-sync refused" in v.error
+    assert _jobs(pid, "hook_shot") == [] and _jobs(pid, "hook_avatar") == []
+
+
+def test_a_bases_lip_synced_shots_are_known_after_their_shot_is_deleted(auth_client):
+    """The base's own record says which shots were lip-synced: a re-plan or
+    a shot delete that removes the row doesn't hide them."""
+    from app import models
+
+    pid, base_id = _talking_base(auth_client, extra_shot=True)
+    comp = _get(models.Render, base_id).composition_json
+    assert [s["lipsynced"] for s in comp["shots"]] == [True, True]
+    db = _db()
+    try:
+        db.delete(db.get(models.VideoShot, comp["shots"][1]["shot_id"]))
+        db.commit()
+    finally:
+        db.close()
+    made = _create(auth_client, pid, base_id, [
+        {"hook_text": "Hi, quick test here.", "style": "custom", "shot1_source": "lipsync"}], window=3.5)
+    assert [e["shot_order"] for e in made["plan"]["variants"][0]["extra_lipsync"]] == [2]
+
+
+def test_a_new_shot_1_uses_the_pictures_the_base_was_made_with(auth_client, monkeypatch, tmp_path):
+    """A new shot 1 is made with the references the base's shot 1 had,
+    even when its shot row is gone since."""
+    from app import models
+    from app.services import pipeline
+
+    pid, _ = _base(auth_client)
+    db = _db()
+    try:
+        pic = tmp_path / "ref.png"
+        pic.write_bytes(b"png")
+        asset = models.Asset(owner_kind="ingredient", file_path=str(pic), asset_type="hero")
+        db.add(asset)
+        db.flush()
+        first = pipeline._body_shots(db.get(models.VideoProject, pid))[0]
+        first.reference_asset_ids_json = [asset.id]
+        db.commit()
+        asset_id = asset.id
+        base = pipeline.recompose_project(db, pid)
+        base_id = base.id
+        assert base.composition_json["shots"][0]["reference_asset_ids"] == [asset_id]
+        db.delete(db.get(models.VideoShot, base.composition_json["shots"][0]["shot_id"]))
+        db.commit()
+    finally:
+        db.close()
+    asked: list[list[int]] = []
+    real = pipeline._asset_refs
+    monkeypatch.setattr(pipeline, "_asset_refs", lambda db, ids: asked.append(list(ids)) or real(db, ids))
+    made = _create(auth_client, pid, base_id, [
+        {"hook_text": "Fact: stop the scroll.", "style": "stat", "shot1_source": "new", "shot1_prompt": "a blue kite"}])
+    assert _make(auth_client, pid, [made["variants"][0]["id"]]).status_code == 202
+    assert [asset_id] in asked
+    assert len(_jobs(pid, "hook_shot")) == 1
+
+
 def test_a_single_talking_head_video_is_lip_synced_again_whole(auth_client):
     pid, base_id = _talking_base(auth_client, extra_shot=False)
     made = _create(auth_client, pid, base_id, [
@@ -580,6 +664,35 @@ def test_events_per_variant(auth_client):
 
 
 # ---------- edit and delete ----------
+
+
+def test_deleting_an_opening_takes_its_earlier_failed_renders_with_it(auth_client):
+    """An opening's renders from earlier failed or cancelled tries must not
+    be left behind as ordinary storyboard renders."""
+    from app import models
+
+    pid, base_id = _base(auth_client)
+    made = _create(auth_client, pid, base_id, [{"hook_text": "Why stop now?", "style": "question"}])
+    vid = made["variants"][0]["id"]
+    db = _db()
+    try:
+        old = [models.Render(project_id=pid, status=st, hook_variant_id=vid) for st in ("failed", "cancelled")]
+        db.add_all(old)
+        db.flush()
+        last = models.Render(project_id=pid, status="failed", hook_variant_id=vid)
+        db.add(last)
+        db.flush()
+        v = db.get(models.HookVariant, vid)
+        v.status, v.render_id = "failed", last.id
+        db.commit()
+        ids = [r.id for r in old] + [last.id]
+    finally:
+        db.close()
+    r = auth_client.delete(f"/api/hook-variants/{vid}")
+    assert r.status_code == 200 and not r.json()["render_kept"]
+    assert all(_get(models.Render, i) is None for i in ids)
+    assert _get(models.HookVariant, vid) is None
+    assert [x.id for x in _renders(pid)] == [base_id]
 
 
 def test_patch_and_delete(auth_client):
@@ -845,6 +958,54 @@ def test_two_clips_landing_at_once_are_both_counted(auth_client, monkeypatch, tm
         db.refresh(v)
         assert v.status == "ready" and set(v.clips_json["clips"]) == {"0", "1"}
         assert queued == [(vid,)]
+    finally:
+        db.close()
+
+
+def test_the_sweeper_leaves_an_opening_alone_while_make_still_submits_its_clips(auth_client, monkeypatch,
+                                                                               tmp_path):
+    """Make holds the project while it submits the clips: an opening whose
+    first clip is not submitted yet (a slow upload) is not failed then. If
+    the Make job died, the opening is failed once the claim is old and its
+    queue entry gone, and the render sweeper then gives the project back
+    (neither sweeper waits on the other forever)."""
+    from app import models
+    from app.config import get_settings
+    from app.services import hook_lab, sweepers
+    from app.services.pipeline import claim_marker, hook_claim_token
+    from app.workers import queue
+
+    state = {"q": "alive"}
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: state["q"])
+    pid, base_id = _base(auth_client)
+    vid, rid = _waiting_variant(pid, base_id, [0], tmp_path)
+    soon = datetime.utcnow() + timedelta(minutes=10)
+    old = (datetime.utcnow() + timedelta(seconds=get_settings().queue_job_timeout_seconds)
+           + sweepers.RENDER_GRACE + timedelta(minutes=5))
+    db = _db()
+    try:
+        p = db.get(models.VideoProject, pid)
+        p.status, p.claim_token, p.queue_job_id = "generating", claim_marker(hook_claim_token("completed")), "q1"
+        db.commit()
+        # A young claim: Make may still be submitting, whatever the queue says.
+        state["q"] = "gone"
+        hook_lab.sweep(db, now=soon)
+        sweepers.sweep_renders(db, now=soon)
+        assert db.get(models.HookVariant, vid).status == "making"
+        assert db.get(models.Render, rid).status == "generating_shots"
+        # An old claim whose queue entry still runs: still left alone.
+        state["q"] = "alive"
+        hook_lab.sweep(db, now=old)
+        assert db.get(models.HookVariant, vid).status == "making"
+        # The Make job is gone: the opening fails, then the project is given back.
+        state["q"] = "gone"
+        hook_lab.sweep(db, now=old)
+        sweepers.sweep_renders(db, now=old)
+        db.expire_all()
+        assert db.get(models.HookVariant, vid).status == "failed"
+        assert db.get(models.Render, rid).status == "failed"
+        p = db.get(models.VideoProject, pid)
+        assert (p.status, p.claim_token) == ("completed", "")
     finally:
         db.close()
 
@@ -1328,3 +1489,571 @@ def test_the_voice_listen_paid_for_is_charged_to_the_opening(auth_client, monkey
         assert round(total - others, 4) == 0.0
     finally:
         db.close()
+
+
+# ---------- an opening inside the script it joins ----------
+
+_ADULT_SCRIPT = "Stop scrolling now! Watch her strip naked and have sex on camera. And one more line."
+_MINOR_HOOK = "She just turned 15."
+
+
+def _adult_base(auth_client) -> tuple[int, int]:
+    """A base whose script is explicit (adults only): fine on its own, and
+    an opening that only states an age passes alone too."""
+    from app import models
+    from app.services import safety
+
+    pid, base_id = _base(auth_client)
+    db = _db()
+    try:
+        r = db.get(models.Render, base_id)
+        r.composition_json = {**(r.composition_json or {}), "script": _ADULT_SCRIPT}
+        db.commit()
+    finally:
+        db.close()
+    safety.check_script(_MINOR_HOOK)  # passes alone: the gap these tests close
+    with pytest.raises(safety.UnsafeScriptError):
+        safety.check_script(f"{_MINOR_HOOK} Watch her strip naked and have sex on camera. And one more line.")
+    return pid, base_id
+
+
+def _set_hook(vid: int, text: str) -> None:
+    from app import models
+
+    db = _db()
+    try:
+        db.get(models.HookVariant, vid).hook_text = text
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_an_opening_is_checked_inside_the_script_it_joins(auth_client):
+    from app import models
+
+    pid, base_id = _adult_base(auth_client)
+    url = f"/api/projects/{pid}/hook-lab/variants"
+    r = auth_client.post(url, json={"base_render_id": base_id, "window_seconds": 2.5,
+                                    "variants": [{"hook_text": _MINOR_HOOK, "style": "custom"}]})
+    assert r.status_code == 422 and "minor" in r.json()["detail"]
+    assert not auth_client.get(f"/api/projects/{pid}/hook-lab").json()["bases"][0]["variants"]
+
+    made = _create(auth_client, pid, base_id, [{"hook_text": "Why stop now?", "style": "question"}])
+    vid = made["variants"][0]["id"]
+    # Changing it to that opening is refused as soon as it is written.
+    r = auth_client.patch(f"/api/hook-variants/{vid}", json={"hook_text": _MINOR_HOOK})
+    assert r.status_code == 422 and "minor" in r.json()["detail"]
+    assert _get(models.HookVariant, vid).hook_text == "Why stop now?"
+
+    # Got in anyway (written before this check): Listen makes no voice ...
+    _set_hook(vid, _MINOR_HOOK)
+    r = auth_client.post(f"/api/hook-variants/{vid}/preview-audio")
+    assert r.status_code == 422 and "minor" in r.json()["detail"]
+    v = _get(models.HookVariant, vid)
+    assert not v.audio_path and v.voicing_until is None
+    db = _db()
+    try:
+        from app.services import hook_lab
+
+        assert not hook_lab.raw_hook_path(db, db.get(models.VideoProject, pid), v).is_file()
+    finally:
+        db.close()
+    # ... and Make fails it before anything is paid.
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    v = _get(models.HookVariant, vid)
+    assert v.status == "failed" and "minor" in v.error and not v.audio_path
+    assert not _jobs(pid, "hook_shot") and not _jobs(pid, "hook_avatar")
+
+
+def test_compose_checks_the_opening_inside_the_script_again(auth_client, tmp_path):
+    """The script can change after Make (an older base takes the project's
+    current one): the captions and the stored script are checked as composed."""
+    from app import models
+    from app.services import hook_lab
+
+    pid, base_id = _adult_base(auth_client)
+    vid, rid = _waiting_variant(pid, base_id, [], tmp_path)
+    _set_hook(vid, _MINOR_HOOK)
+    db = _db()
+    try:
+        db.get(models.HookVariant, vid).status = "ready"
+        db.commit()
+        assert hook_lab.compose_variant(db, vid) is None
+    finally:
+        db.close()
+    v = _get(models.HookVariant, vid)
+    assert v.status == "failed" and "minor" in v.error
+    assert _get(models.Render, rid).status == "failed"
+
+
+def test_suggested_openings_meet_the_minors_check(auth_client, monkeypatch):
+    import json
+
+    from app.providers import mock_chat
+
+    pid, base_id = _adult_base(auth_client)
+    url = f"/api/projects/{pid}/hook-lab/suggest"
+
+    def ideas(*texts):
+        reply = json.dumps({"hooks": [{"style": s, "text": t}
+                                      for s, t in zip(("question", "bold_claim", "stat"), texts, strict=False)]})
+        monkeypatch.setattr(mock_chat.MockChatProvider, "hook_ideas", lambda self, **kw: reply)
+
+    # Refused alone, and refused only inside the script: both dropped.
+    ideas("Sexy 14-year-old here?", _MINOR_HOOK, "Honestly, stop scrolling.")
+    r = auth_client.post(url, json={"base_render_id": base_id, "n": 3})
+    assert r.status_code == 200, r.text
+    assert [i["text"] for i in r.json()["suggestions"]] == ["Honestly, stop scrolling."]
+    # None left: a 422 that says why, not "try again".
+    ideas("Sexy 14-year-old here?", _MINOR_HOOK)
+    r = auth_client.post(url, json={"base_render_id": base_id, "n": 3})
+    assert r.status_code == 422 and "safety check" in r.json()["detail"] and "Sexy" not in r.text
+
+    # The planner's sentinels are refusals, not unusable answers.
+    monkeypatch.setattr(mock_chat.MockChatProvider, "hook_ideas", lambda self, **kw: "REFUSED_MINOR")
+    r = auth_client.post(url, json={"base_render_id": base_id})
+    assert r.status_code == 422 and "minor" in r.json()["detail"]
+    monkeypatch.setattr(mock_chat.MockChatProvider, "hook_ideas", lambda self, **kw: "DECLINED")
+    r = auth_client.post(url, json={"base_render_id": base_id})
+    assert r.status_code == 422 and "declined" in r.json()["detail"]
+
+
+def test_the_hook_ideas_instructions_keep_minors_out():
+    from app.providers.openrouter_chat import HOOK_IDEAS_SYSTEM
+
+    assert "REFUSED_MINOR" in HOOK_IDEAS_SYSTEM and "DECLINED" in HOOK_IDEAS_SYSTEM
+    assert "under 18" in HOOK_IDEAS_SYSTEM
+
+
+# ---------- the base's script and voice ----------
+
+
+def _edit(pid: int, **fields) -> None:
+    """Change the project's script or voice directly (as the editor would)."""
+    from app import models
+
+    db = _db()
+    try:
+        p = db.get(models.VideoProject, pid)
+        if "script" in fields:
+            p.generated_plan_json = {**p.generated_plan_json, "cleaned_voice_script": fields.pop("script")}
+        for k, v in fields.items():
+            setattr(p, k, v)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_an_unrecorded_base_needs_the_script_and_voice_it_was_made_with(auth_client):
+    """A render from before its script was recorded takes its script and
+    opening from the project's plan: refused once that script or the voice
+    changed, as the captions and the cut would no longer match its audio."""
+    from app import models
+    from app.services import hook_lab
+
+    pid, base_id = _base(auth_client)
+    db = _db()
+    try:
+        db.get(models.Render, base_id).composition_json = None
+        db.commit()
+        hook_lab.check_base(db, db.get(models.Render, base_id), pid)  # unchanged: fine
+    finally:
+        db.close()
+    script = _get(models.VideoProject, pid).generated_plan_json["cleaned_voice_script"]
+    _edit(pid, script="A whole new opening line. Here is the rest of it. And one more line.")
+    db = _db()
+    try:
+        with pytest.raises(hook_lab.HookLabError, match="Re-compose this version first"):
+            hook_lab.check_base(db, db.get(models.Render, base_id), pid)
+    finally:
+        db.close()
+    r = auth_client.post(f"/api/projects/{pid}/hook-lab/variants",
+                         json={"base_render_id": base_id, "window_seconds": 2.5,
+                               "variants": [{"hook_text": "Why stop now?", "style": "question"}]})
+    assert r.status_code == 409 and "Re-compose" in r.text, r.text
+    _edit(pid, script=script)  # back to what it said
+    _edit(pid, voice_id="another-voice")
+    db = _db()
+    try:
+        with pytest.raises(hook_lab.HookLabError, match="Re-compose this version first"):
+            hook_lab.check_base(db, db.get(models.Render, base_id), pid)
+    finally:
+        db.close()
+
+
+def test_the_opening_is_refused_when_the_voice_changed(auth_client):
+    """The opening is spoken with the project's current voice and joined onto
+    the base voiceover: the base records its voice, and a change refuses it
+    (a script edit doesn't: the base records its script too)."""
+    from app import models
+    from app.services import hook_lab
+
+    pid, base_id = _base(auth_client)
+    voice = _get(models.Render, base_id).composition_json["voice"]
+    assert voice["source"] == "tts" and "voice_id" in voice and "model" in voice
+    _edit(pid, script="A whole new opening line. Here is the rest of it. And one more line.")
+    db = _db()
+    try:
+        assert hook_lab.check_base(db, db.get(models.Render, base_id), pid)
+    finally:
+        db.close()
+    _edit(pid, voice_id="another-voice")
+    db = _db()
+    try:
+        with pytest.raises(hook_lab.HookLabError, match="voice changed since this version was made"):
+            hook_lab.check_base(db, db.get(models.Render, base_id), pid)
+    finally:
+        db.close()
+    r = auth_client.post(f"/api/projects/{pid}/hook-lab/variants",
+                         json={"base_render_id": base_id, "window_seconds": 2.5,
+                               "variants": [{"hook_text": "Why stop now?", "style": "question"}]})
+    assert r.status_code == 409 and "voice changed" in r.text, r.text
+    _edit(pid, voice_id="")  # switched back
+    made = _create(auth_client, pid, base_id, [{"hook_text": "Why stop now?", "style": "question"}])
+    assert _make(auth_client, pid, [made["variants"][0]["id"]]).status_code == 202
+    vr = _renders(pid)[-1]
+    assert vr.hook_variant_id and vr.status == "completed", vr.error
+    assert vr.composition_json["voice"] == voice
+
+
+def test_an_uploaded_voiceover_is_kept_per_version_and_gets_no_new_opening(auth_client, tmp_path, monkeypatch):
+    """An uploaded voiceover keeps its file name when uploaded again: each
+    version keeps its own copy (removed with its files), and a new opening
+    can't be spoken in an uploaded recording."""
+    from app import models
+    from app.services import hook_lab, render_files
+
+    pid = _rendered(auth_client)
+    first = _voice(tmp_path / "first.m4a", [("tone", 2.0), ("gap", 0.5), ("tone", 3.0)])
+    with first.open("rb") as f:
+        r = auth_client.post(f"/api/projects/{pid}/voiceover", files={"file": ("v.m4a", f, "audio/mp4")})
+    assert r.status_code == 200, r.text
+    assert auth_client.post(f"/api/projects/{pid}/generate-video", params={"force": "true"}).status_code == 202
+    base = _renders(pid)[-1]
+    assert base.status == "completed", base.error
+    upload = _get(models.VideoProject, pid).voiceover_upload_path
+    assert base.audio_path != upload and Path(base.audio_path).name.startswith(f"render_{base.id}_voice")
+    assert base.composition_json["voice"] == {"source": "upload"}
+    original = _sha(first)
+    assert _sha(base.audio_path) == original
+    # Uploaded again: same file name, other sound. The version keeps its own.
+    second = _tone(tmp_path / "second.m4a", 4.0)
+    with second.open("rb") as f:
+        r = auth_client.post(f"/api/projects/{pid}/voiceover", files={"file": ("v.m4a", f, "audio/mp4")})
+    assert r.status_code == 200, r.text
+    assert _sha(upload) != original and _sha(base.audio_path) == original
+    db = _db()
+    try:
+        with pytest.raises(hook_lab.HookLabError, match="uploaded recording"):
+            hook_lab.check_base(db, db.get(models.Render, base.id), pid)
+        # A version from before its voice was recorded, made with the upload.
+        r0 = db.get(models.Render, base.id)
+        r0.composition_json, r0.audio_path = None, upload
+        db.commit()
+        with pytest.raises(hook_lab.HookLabError, match="uploaded recording"):
+            hook_lab.check_base(db, db.get(models.Render, base.id), pid)
+    finally:
+        db.close()
+    # A later version expires the earlier ones: their copies go with them.
+    assert auth_client.post(f"/api/projects/{pid}/generate-video", params={"force": "true"}).status_code == 202
+    latest = _renders(pid)[-1]
+    copy = Path(latest.audio_path)
+    assert copy.is_file() and copy.name.startswith(f"render_{latest.id}_voice")
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "render_retention_keep", 1)
+    assert auth_client.post(f"/api/projects/{pid}/generate-video", params={"force": "true"}).status_code == 202
+    db = _db()
+    try:
+        render_files.prune(db, pid)
+    finally:
+        db.close()
+    assert _get(models.Render, latest.id).status == "expired"
+    assert not copy.exists()
+    assert Path(_renders(pid)[-1].audio_path).is_file()
+
+
+def test_a_recompose_after_a_new_upload_plays_the_new_recording(auth_client, tmp_path):
+    """Each version keeps its own copy of an uploaded voiceover, so a
+    recompose must look at the upload itself: after a new recording is
+    uploaded, the next recompose plays it, not the last version's copy."""
+    from app import models
+    from app.services import fingerprints, pipeline
+
+    pid = _rendered(auth_client)
+    first = _voice(tmp_path / "first.m4a", [("tone", 2.0), ("gap", 0.5), ("tone", 3.0)])
+    with first.open("rb") as f:
+        r = auth_client.post(f"/api/projects/{pid}/voiceover", files={"file": ("v.m4a", f, "audio/mp4")})
+    assert r.status_code == 200, r.text
+    assert auth_client.post(f"/api/projects/{pid}/generate-video", params={"force": "true"}).status_code == 202
+    base = _renders(pid)[-1]
+    assert base.status == "completed", base.error
+    db = _db()
+    try:
+        # Nothing new uploaded: the recompose keeps the same recording.
+        same = pipeline.recompose_project(db, pid)
+        assert same.status == "completed", same.error
+        assert _sha(same.audio_path) == _sha(first)
+        assert same.voice_fingerprint == base.voice_fingerprint
+    finally:
+        db.close()
+    second = _tone(tmp_path / "second.m4a", 4.0)
+    with second.open("rb") as f:
+        r = auth_client.post(f"/api/projects/{pid}/voiceover", files={"file": ("v.m4a", f, "audio/mp4")})
+    assert r.status_code == 200, r.text
+    db = _db()
+    try:
+        again = pipeline.recompose_project(db, pid)
+        assert again.status == "completed", again.error
+        assert Path(again.audio_path).name.startswith(f"render_{again.id}_voice")
+        assert _sha(again.audio_path) == _sha(second)
+        project = db.get(models.VideoProject, pid)
+        assert again.voice_fingerprint == fingerprints.voice_fingerprint(db, project)
+        # The older versions still play what they were made with.
+        assert _sha(base.audio_path) == _sha(first)
+    finally:
+        db.close()
+
+
+def test_make_again_reuses_the_clips_a_failed_try_finished(auth_client, monkeypatch):
+    """A new shot 1 finished, then the lip-sync of shot 2 failed: Make again
+    takes the finished shot 1 (same opening, same inputs, file still there)
+    instead of buying it again, and leaves it out of the price."""
+    from app import models
+    from app.providers.mock_avatar import MockAvatarProvider
+
+    pid, base_id = _talking_base(auth_client, extra_shot=True)  # shot 1: 3 s, shot 2: 4 s, both lip-synced
+    made = _create(auth_client, pid, base_id, [
+        {"hook_text": "Hi, quick test here.", "style": "custom", "shot1_source": "new",
+         "shot1_prompt": "a red car"},
+        {"hook_text": "Hello, short test here.", "style": "custom", "shot1_source": "new",
+         "shot1_prompt": "a red car"},
+    ], window=3.5)
+    first = made["plan"]["variants"][0]
+    assert first["shot1"]["cost"] > 0 and not first["shot1"]["reused"] and first["reused"] == {}
+    vid, other = (v["id"] for v in made["variants"])
+
+    real = MockAvatarProvider.submit_avatar
+
+    def refuse(self, **kw):
+        raise RuntimeError("lip-sync provider is down")
+
+    monkeypatch.setattr(MockAvatarProvider, "submit_avatar", refuse)
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    v = _get(models.HookVariant, vid)
+    assert v.status == "failed" and "down" in v.error, (v.status, v.error)
+    (shot_job,) = _jobs(pid, "hook_shot")
+    assert shot_job.status == "completed" and shot_job.ref_id == vid and shot_job.context_json["inputs"]
+
+    # Make again: shot 1 is reused (not priced, not submitted), shot 2 is made.
+    monkeypatch.setattr(MockAvatarProvider, "submit_avatar", real)
+    priced = auth_client.post(f"/api/projects/{pid}/hook-lab/plan", json={"variant_ids": [vid]}).json()
+    row = priced["variants"][0]
+    assert row["shot1"]["reused"] and row["shot1"]["cost"] == 0
+    assert row["reused"] == {"0": shot_job.id} and row["extra_lipsync"][0]["cost"] > 0
+    assert row["total"] == pytest.approx(row["extra_lipsync"][0]["cost"] + row["tts_cost"], abs=1e-4)
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    v = _get(models.HookVariant, vid)
+    assert v.status == "completed", v.error
+    assert [j.id for j in _jobs(pid, "hook_shot")] == [shot_job.id]  # not bought again
+    assert v.shot1_clip_path == shot_job.result_path and v.clips_json["clips"]["0"] == shot_job.result_path
+    render = _get(models.Render, v.render_id)
+    assert render.composition_json["shots"][0]["clip_path"] == shot_job.result_path
+    assert render.estimated_cost == pytest.approx(row["total"], abs=1e-4)
+
+    # Never another opening's clip, even with the same prompt.
+    priced = auth_client.post(f"/api/projects/{pid}/hook-lab/plan", json={"variant_ids": [other]}).json()
+    assert not priced["variants"][0]["shot1"]["reused"] and priced["variants"][0]["shot1"]["cost"] > 0
+
+    # A changed prompt, or a clip whose file is gone, is made again.
+    db = _db()
+    try:
+        from app.services import hook_lab
+
+        variant = db.get(models.HookVariant, vid)
+        variant.status = "failed"
+        db.commit()
+        assert hook_lab.parts(db, variant)["shot1"]["reused"]
+        variant.shot1_prompt = "a blue car"
+        db.commit()
+        assert not hook_lab.parts(db, variant)["shot1"]["reused"]
+        variant.shot1_prompt = "a red car"
+        db.commit()
+        Path(shot_job.result_path).unlink()
+        assert not hook_lab.parts(db, variant)["shot1"]["reused"]
+    finally:
+        db.close()
+
+
+def test_make_again_reuses_a_finished_lip_sync_with_the_same_voice(auth_client, monkeypatch):
+    from app import models
+    from app.providers.mock_avatar import MockAvatarProvider
+
+    pid, base_id = _talking_base(auth_client, extra_shot=True)
+    made = _create(auth_client, pid, base_id, [
+        {"hook_text": "Hi, quick test here.", "style": "custom", "shot1_source": "lipsync"}], window=3.5)
+    vid = made["variants"][0]["id"]
+    real = MockAvatarProvider.submit_avatar
+    calls = []
+
+    def second_fails(self, **kw):
+        calls.append(kw)
+        if len(calls) == 2:
+            raise RuntimeError("lip-sync provider is down")
+        return real(self, **kw)
+
+    monkeypatch.setattr(MockAvatarProvider, "submit_avatar", second_fails)
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    assert _get(models.HookVariant, vid).status == "failed"
+    done = [j for j in _jobs(pid, "hook_avatar") if j.status == "completed"]
+    assert [j.context_json["index"] for j in done] == [0]
+    monkeypatch.setattr(MockAvatarProvider, "submit_avatar", real)
+    row = auth_client.post(f"/api/projects/{pid}/hook-lab/plan", json={"variant_ids": [vid]}).json()["variants"][0]
+    assert row["shot1"]["reused"] and row["shot1"]["cost"] == 0 and row["extra_lipsync"][0]["cost"] > 0
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    v = _get(models.HookVariant, vid)
+    assert v.status == "completed", v.error
+    jobs = _jobs(pid, "hook_avatar")
+    assert sorted(j.context_json["index"] for j in jobs if j.status == "completed") == [0, 1]
+    assert v.clips_json["clips"]["0"] == done[0].result_path
+    # Another opening text means another voice: shot 1's lip-sync is made again.
+    db = _db()
+    try:
+        from app.services import hook_lab
+
+        variant = db.get(models.HookVariant, vid)
+        variant.status = "failed"
+        db.commit()
+        assert hook_lab.parts(db, variant)["shot1"]["reused"]
+        variant.hook_text = "Hey, a quick test now."
+        db.commit()
+        p = hook_lab.parts(db, variant)
+        assert not p["shot1"]["reused"] and p["shot1"]["cost"] > 0 and p["reused"] == {}
+    finally:
+        db.close()
+
+
+# ---------- the project page while other openings are being made ----------
+
+
+def _queued_make(auth_client, monkeypatch, text="Why stop now?"):
+    from app.api import hook_lab as api
+
+    pid, base_id = _base(auth_client)
+    vid = _create(auth_client, pid, base_id, [{"hook_text": text, "style": "question"}])["variants"][0]["id"]
+    queued: list = []
+    monkeypatch.setattr(api, "enqueue", lambda fn, *args, **kw: queued.append((args, kw)) or "rq-hl")
+    assert _make(auth_client, pid, [vid]).status_code == 202
+    return pid, vid, queued
+
+
+def test_the_project_page_says_other_openings_are_being_made_and_cancel_leaves_it(auth_client, monkeypatch):
+    """A queued Make holds the project as "generating": the status says the
+    hook lab holds it, and the editor's Cancel neither cancels the finished
+    video nor gives the openings back."""
+    from app import models
+
+    pid, vid, queued = _queued_make(auth_client, monkeypatch)
+    st = auth_client.get(f"/api/projects/{pid}/status").json()
+    assert st["project_status"] == "generating" and st["hook_lab_making"] is True
+    r = auth_client.post(f"/api/projects/{pid}/cancel")
+    assert r.status_code == 409 and "hook lab" in r.json()["detail"]
+    assert auth_client.get(f"/api/projects/{pid}").json()["status"] == "generating"
+
+    # The job runs, holds the claim (still known as the hook lab's), and
+    # gives the project back as it was.
+    from app.services import hook_lab as svc
+
+    seen: list = []
+    real = svc._make_one
+
+    def spy(db, variant):
+        seen.append(auth_client.get(f"/api/projects/{pid}/status").json()["hook_lab_making"])
+        assert auth_client.post(f"/api/projects/{pid}/cancel").status_code == 409
+        return real(db, variant)
+
+    monkeypatch.setattr(svc, "_make_one", spy)
+    from app.workers.jobs import make_hook_variants_job
+
+    make_hook_variants_job(*queued[0][0], **queued[0][1])
+    assert seen == [True]
+    st = auth_client.get(f"/api/projects/{pid}/status").json()
+    assert st["project_status"] == "completed" and st["hook_lab_making"] is False
+    assert _get(models.VideoProject, pid).claim_token == ""
+    assert _get(models.HookVariant, vid).status == "completed"
+
+
+def test_a_render_claim_still_says_waiting_and_can_be_cancelled(auth_client, monkeypatch):
+    """Only the hook lab's claim is flagged; Generate's waiting claim is not."""
+    from app.api import generation
+
+    pid, _ = _base(auth_client)
+    monkeypatch.setattr(generation, "enqueue", lambda fn, *a, **k: "rq-gen")
+    assert auth_client.post(f"/api/projects/{pid}/recompose").status_code in (200, 202)
+    st = auth_client.get(f"/api/projects/{pid}/status").json()
+    assert st["project_status"] == "generating" and st["hook_lab_making"] is False
+    assert auth_client.post(f"/api/projects/{pid}/cancel").json()["action"] == "released"
+
+
+@pytest.mark.parametrize("taken_over", [False, True])
+def test_the_sweeper_gives_a_lost_make_back_to_the_finished_video(auth_client, monkeypatch, taken_over):
+    """The Make job's queue entry is gone (never ran, or died before its
+    first opening): the project goes back to "completed", not "failed",
+    and the openings it never reached go back to drafts."""
+    from sqlalchemy import update
+
+    from app import models
+    from app.config import get_settings
+    from app.services import pipeline, sweepers
+    from app.workers import queue
+
+    pid, vid, queued = _queued_make(auth_client, monkeypatch)
+    db = _db()
+    try:
+        if taken_over:
+            assert pipeline.consume_claim(db, pid, "generating", queued[0][1]["claim_token"])
+            db.commit()
+        monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "gone")
+        db.execute(update(models.VideoProject).where(models.VideoProject.id == pid).values(
+            updated_at=datetime.utcnow() - timedelta(seconds=get_settings().queue_job_timeout_seconds + 11 * 60)))
+        db.commit()
+        assert sweepers.sweep_renders(db)["projects"] == 1
+    finally:
+        db.close()
+    p = _get(models.VideoProject, pid)
+    assert p.status == "completed" and p.claim_token == ""
+    assert _get(models.HookVariant, vid).status == "draft"
+
+
+def test_a_stuck_opening_render_leaves_the_project_to_the_hook_lab(auth_client, monkeypatch):
+    """The job died while an opening's render was stuck: that render fails,
+    but the project is not set to "failed"; once the job is gone it goes
+    back to "completed"."""
+    from sqlalchemy import update
+
+    from app import models
+    from app.config import get_settings
+    from app.services import pipeline, sweepers
+    from app.workers import queue
+
+    pid, vid, queued = _queued_make(auth_client, monkeypatch)
+    old = datetime.utcnow() - timedelta(seconds=get_settings().queue_job_timeout_seconds + 11 * 60)
+    db = _db()
+    try:
+        assert pipeline.consume_claim(db, pid, "generating", queued[0][1]["claim_token"])
+        render = models.Render(project_id=pid, status="generating_audio", hook_variant_id=vid)
+        db.add(render)
+        db.flush()
+        db.query(models.HookVariant).filter_by(id=vid).update({"render_id": render.id}, synchronize_session=False)
+        db.commit()
+        db.execute(update(models.Render).where(models.Render.id == render.id).values(updated_at=old))
+        db.execute(update(models.VideoProject).where(models.VideoProject.id == pid).values(updated_at=old))
+        db.commit()
+        monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "gone")
+        out = sweepers.sweep_renders(db)
+        assert out["failed"] == 1 and out["projects"] == 1
+        db.expire_all()
+        assert db.get(models.Render, render.id).status == "failed"
+    finally:
+        db.close()
+    assert _get(models.VideoProject, pid).status == "completed"

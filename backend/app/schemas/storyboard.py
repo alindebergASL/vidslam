@@ -43,10 +43,11 @@ class StoryboardPlan(BaseModel):
 
     @model_validator(mode="after")
     def _derive_hook(self) -> "StoryboardPlan":
-        if not (self.hook or "").strip():
-            from ..services.hook_lab import first_sentence
+        # Always the script's own first sentence: a planner's hook that
+        # says something else is never voiced, so it is not kept (and it
+        # would skip the script's safety checks).
+        from ..services.hook_lab import first_sentence
 
-            self.hook = first_sentence(self.cleaned_voice_script or "")
-        else:
-            self.hook = self.hook.strip()
+        script = (self.cleaned_voice_script or "").strip()
+        self.hook = first_sentence(script) if script else ""
         return self

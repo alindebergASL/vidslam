@@ -68,6 +68,8 @@ function Inner() {
   const [lab, setLab] = useState<HookLab | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [plan, setPlan] = useState<HookPlan | null>(null);
+  // The price is being worked out again: the shown one may be out of date.
+  const [planLoading, setPlanLoading] = useState(false);
   // Variants left out of "Make videos" (all drafts are in by default).
   const [excluded, setExcluded] = useState<Set<number>>(new Set());
   // Latest progress line per variant, from the live events (only a
@@ -125,14 +127,17 @@ function Inner() {
   useEffect(() => {
     if (!selectedKey) {
       setPlan(null);
+      setPlanLoading(false);
       return;
     }
     let live = true;
+    setPlanLoading(true);
     const ids = selectedKey.split(",").map(Number);
     api
       .hookPlan(projectId, ids)
       .then((p) => live && setPlan(p))
-      .catch(() => live && setPlan(null));
+      .catch(() => live && setPlan(null))
+      .finally(() => live && setPlanLoading(false));
     return () => {
       live = false;
     };
@@ -172,7 +177,7 @@ function Inner() {
       : "";
 
   const make = async () => {
-    if (!plan || selected.length === 0 || blockReason) return;
+    if (!plan || planLoading || selected.length === 0 || blockReason) return;
     const guessedLong = drafts.filter((v) => selected.includes(v.id) && v.fits === false && !v.audio_url);
     if (
       guessedLong.length > 0 &&
@@ -264,9 +269,14 @@ function Inner() {
           <Original base={base} drafts={drafts} current={currentWin} win={win} setWin={setWin} onChanged={load} />
 
           {!base.reusable ? (
-            <div className="card p-4 mb-6 text-sm text-amber-200" role="status">
-              {base.reuse_error || "This version can't be reused right now."}
-            </div>
+            <>
+              <div className="card p-4 mb-6 text-sm text-amber-200" role="status">
+                {base.reuse_error || "This version can't be reused right now."}
+              </div>
+              {drafts.length > 0 && (
+                <StrandedDrafts drafts={drafts} reason={base.reuse_error} onChanged={load} />
+              )}
+            </>
           ) : (
             <Drafts
               win={win}
@@ -296,7 +306,9 @@ function Inner() {
                 <div className="text-sm font-medium">
                   {selected.length === 0
                     ? "Tick at least one opening to make it."
-                    : plan?.summary ?? "Working out the price…"}
+                    : planLoading || !plan
+                    ? "Working out the price…"
+                    : plan.summary}
                 </div>
                 <p className="text-[11px] text-ink-400 mt-0.5">
                   An estimate. Each opening becomes its own video next to the original.
@@ -310,14 +322,14 @@ function Inner() {
               <button
                 type="button"
                 className="btn-primary disabled:opacity-50 shrink-0"
-                disabled={making || selected.length === 0 || !plan || !!blockReason}
+                disabled={making || selected.length === 0 || !plan || planLoading || !!blockReason}
                 onClick={make}
                 title={blockReason || undefined}
               >
                 {making
                   ? "Starting…"
                   : `Make ${selected.length || ""} video${selected.length === 1 ? "" : "s"}${
-                      plan ? ` · about ${fmtPrice(plan.total, "$0.00")}` : ""
+                      plan && !planLoading ? ` · about ${fmtPrice(plan.total, "$0.00")}` : ""
                     }`}
               </button>
             </section>
@@ -361,6 +373,64 @@ function Inner() {
 }
 
 // ---------- the original opening + its window ----------
+
+// Openings not made yet (or failed) of a version that can't be reused right
+// now: they can't be edited or made, but they can still be removed.
+function StrandedDrafts({
+  drafts,
+  reason,
+  onChanged,
+}: {
+  drafts: HookVariant[];
+  reason?: string | null;
+  onChanged: () => void;
+}) {
+  const toast = useToast();
+  const [busy, setBusy] = useState<number | null>(null);
+  const remove = async (v: HookVariant) => {
+    setBusy(v.id);
+    try {
+      await api.hookDeleteVariant(v.id);
+      onChanged();
+    } catch (e) {
+      toast.error(errorText(e, "Couldn't remove it"));
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <section aria-labelledby="hl-stranded" className="mb-6">
+      <h2 id="hl-stranded" className="text-base font-medium mb-1">Openings not made</h2>
+      <p className="text-[11px] text-ink-400 mb-2">
+        These can&apos;t be made from this version right now
+        {reason ? ` (${reason.replace(/\.$/, "")})` : ""}. You can remove them.
+      </p>
+      <ul className="space-y-2">
+        {drafts.map((v) => (
+          <li key={v.id} className="card p-3 flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="text-sm truncate">
+                <span className="text-ink-300 mr-1">{v.label}</span>
+                {v.hook_text}
+              </div>
+              {v.status === "failed" && v.error && (
+                <p className="text-[11px] text-red-300 mt-0.5">{v.error}</p>
+              )}
+            </div>
+            <button
+              type="button"
+              className="btn-ghost text-xs shrink-0 disabled:opacity-50"
+              disabled={busy === v.id}
+              onClick={() => remove(v)}
+            >
+              {busy === v.id ? "Removing…" : "Remove"}
+            </button>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
 
 function Original({
   base,
@@ -746,6 +816,9 @@ function LocalCard({
   );
 }
 
+// A line as the server saves it: trimmed, runs of spaces made single.
+const squash = (t: string) => (t || "").split(/\s+/).filter(Boolean).join(" ");
+
 function DraftCard({
   lab,
   base,
@@ -800,12 +873,13 @@ function DraftCard({
   };
 
   const saveText = () => {
-    const t = text.trim();
-    if (!t) {
+    const t = squash(text);
+    if (!t || t === v.hook_text) {
+      // Nothing to save (only spaces changed): show the saved line again.
       setText(v.hook_text);
       return;
     }
-    if (t !== v.hook_text) patch({ hook_text: t });
+    patch({ hook_text: t });
   };
 
   // Free only for the original line itself (the server's is_original rule).
@@ -837,7 +911,9 @@ function DraftCard({
   };
 
   const audioUrl = preview ? preview.url : v.audio_url;
-  const textDirty = text.trim() !== v.hook_text;
+  // The server saves the line with runs of spaces made single, so only a
+  // change in the words themselves is unsaved.
+  const textDirty = squash(text) !== v.hook_text;
   const dirtyWhy = busy
     ? `Saving opening ${v.label}…`
     : textDirty

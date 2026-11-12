@@ -42,7 +42,28 @@ def test_old_plans_get_the_first_sentence_as_hook():
     old = {"title": "t", "cleaned_voice_script": "Did you know? Cats sleep a lot.", "estimated_duration_seconds": 10}
     assert StoryboardPlan.model_validate(old).hook == "Did you know?"
     assert plan_hook(old) == "Did you know?"
-    assert StoryboardPlan.model_validate({**old, "hook": " Mine. "}).hook == "Mine."
+    # A hook that isn't the script's first sentence is never voiced: the
+    # plan keeps the first sentence instead.
+    assert StoryboardPlan.model_validate({**old, "hook": " Mine. "}).hook == "Did you know?"
+    assert plan_hook({**old, "hook": "Mine."}) == "Did you know?"
+
+
+def test_a_planners_hook_is_matched_to_the_script_and_safety_checked(monkeypatch):
+    """The planner's hook field is replaced by the script's first sentence,
+    and the plan's safety checks look at the hook too."""
+    from app.schemas.storyboard import StoryboardPlan
+    from app.services import pipeline, safety
+
+    plan = StoryboardPlan.model_validate({
+        "title": "t", "cleaned_voice_script": "Cats nap. All day long.", "estimated_duration_seconds": 5,
+        "hook": "Something the voice never says."})
+    assert plan.hook == "Cats nap."
+    seen: list[str] = []
+    monkeypatch.setattr(safety, "check_script", lambda text: seen.append(text))
+    monkeypatch.setattr("app.services.minor_check.check_generation", lambda *a, **k: None)
+    built = StoryboardPlan.model_construct(**{**plan.model_dump(), "hook": "An unvalidated hook."})
+    pipeline._check_plan(built)
+    assert "An unvalidated hook." in seen
 
 
 def test_planner_prompt_asks_for_the_hook():

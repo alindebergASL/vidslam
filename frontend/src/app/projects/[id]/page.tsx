@@ -45,6 +45,8 @@ function Inner() {
   const projectId = Number(params?.id);
   const [project, setProject] = useState<Project | null>(null);
   const [render, setRender] = useState<Render | null>(null);
+  // The project is held by the hook lab making other openings.
+  const [hookLabMaking, setHookLabMaking] = useState(false);
   const [castAssets, setCastAssets] = useState<Asset[]>([]);
   const toast = useToast();
   const [preflight, setPreflight] = useState<{
@@ -113,6 +115,7 @@ function Inner() {
       setProject(p);
       const st = await api.projectStatus(projectId);
       setRender(st.latest_render);
+      setHookLabMaking(st.hook_lab_making);
       const ca = await api.castAssets(projectId);
       setCastAssets(ca);
       // Fetch a lightweight preflight summary so the editor can surface blockers
@@ -503,7 +506,17 @@ function Inner() {
           />
         )}
 
+      {project.status === "generating" && hookLabMaking && (
+        <div className="card p-3 mb-6 flex items-center gap-3 text-sm" role="status">
+          <span className="flex-1 text-ink-300">Other openings are being made for this video…</span>
+          <Link href={`/projects/${projectId}/hooks`} className="btn-ghost text-xs">
+            See them
+          </Link>
+        </div>
+      )}
+
       {project.status === "generating" &&
+        !hookLabMaking &&
         (!render || ["completed", "failed", "cancelled", "expired"].includes(render.status)) && (
           <div className="card p-3 mb-6 flex items-center gap-3 text-sm" role="status">
             <span className="flex-1 text-ink-300">Waiting to start this video…</span>

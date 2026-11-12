@@ -123,6 +123,14 @@ def _check_spec(spec: VariantSpec | VariantPatch) -> None:
         raise HTTPException(422, f"shot1_source must be one of {', '.join(hook_lab.SOURCES)}")
 
 
+def _check_opening(db: Session, base: models.Render, hook: str) -> None:
+    """The minors check, on the opening alone and inside the script it joins."""
+    try:
+        hook_lab.check_opening(db, base, hook)
+    except hook_lab.HookLabError as e:
+        raise _err(e) from e
+
+
 def _publish_state(db: Session, render_ids: set[int]) -> dict[int, dict]:
     if not render_ids:
         return {}
@@ -322,6 +330,7 @@ def create_variants(project_id: int, body: VariantsIn, db: Session = Depends(get
     base = _base(db, project_id, body.base_render_id)
     for spec in body.variants:
         _check_spec(spec)
+        _check_opening(db, base, " ".join(spec.hook_text.split()))
     try:
         hook_lab.base_clips(db, base)  # its clips are still there to reuse
     except hook_lab.HookLabError as e:
@@ -418,7 +427,7 @@ def make(project_id: int, body: VariantIdsIn, db: Session = Depends(get_db)) -> 
             provider_gate.require_model("lipsync")
     require_budget_for(db, priced["total"])
     busy = "This video is busy right now (a render or other openings are being made). Try again when it is done."
-    previous, token = claim_project(db, project, "generating", busy)
+    previous, token = claim_project(db, project, "generating", busy, hook_lab=True)
     ids = [v.id for v in variants]
     claimed = (db.query(models.HookVariant)
                .filter(models.HookVariant.id.in_(ids), models.HookVariant.status.in_(hook_lab.EDITABLE),
@@ -470,6 +479,7 @@ def patch_variant(variant_id: int, body: VariantPatch, db: Session = Depends(get
     audio_changed = False
     if "hook_text" in fields and body.hook_text is not None:
         text = " ".join(body.hook_text.split())
+        _check_opening(db, base, text)
         audio_changed |= text != v.hook_text
         v.hook_text = text
     if "style" in fields and body.style is not None:
@@ -541,26 +551,42 @@ def delete_variant(variant_id: int, delete_render: bool = False, db: Session = D
         raise HTTPException(409, "This opening's video is on YouTube, so it is kept.")
     files = [v.audio_path] if v.audio_path and v.audio_path != (
         db.get(models.Render, v.base_render_id).audio_path if v.base_render_id else "") else []
-    if render is not None:
-        files += [render.final_video_path, render.thumbnail_path]
-        if render.final_video_path:  # its own copy of the music bed (pipeline.keep_music)
-            files += [str(p) for p in Path(render.final_video_path).parent.glob(f"render_{render.id}_music.*")]
-        (db.query(models.HookVariant).filter(models.HookVariant.render_id == render.id)
+    # Its renders from earlier tries (failed or cancelled) go too: once the
+    # opening is gone they would read as ordinary storyboard renders. One
+    # that finished or is on YouTube stays, and so does the opening
+    # (archived), so that render keeps saying it is an opening.
+    earlier = (db.query(models.Render)
+               .filter(models.Render.hook_variant_id == v.id,
+                       models.Render.id != (render.id if render is not None else -1))
+               .order_by(models.Render.id).all())
+    kept = [r for r in earlier if r.status == "completed" or _published(db, r.id)]
+    for r in [r for r in earlier if r not in kept] + ([render] if render is not None else []):
+        files += [r.final_video_path, r.thumbnail_path]
+        if r.final_video_path:  # its own copies (pipeline.keep_music, keep_voice)
+            from ..services.pipeline import own_copies
+
+            files += [str(p) for p in own_copies(Path(r.final_video_path).parent, r.id)]
+        (db.query(models.HookVariant).filter(models.HookVariant.render_id == r.id)
          .update({"render_id": None}, synchronize_session=False))
         # Only failed uploads are left (a published one refused above).
-        db.query(models.PublishJob).filter(models.PublishJob.render_id == render.id).delete(
+        db.query(models.PublishJob).filter(models.PublishJob.render_id == r.id).delete(
             synchronize_session=False)
-        db.delete(render)
-    db.delete(v)
+        db.delete(r)
+    if kept:
+        v.status = hook_lab.ARCHIVED
+        v.render_id = kept[-1].id
+        files = [f for f in files if f != v.audio_path]  # a kept render may play it
+    else:
+        db.delete(v)
     events.emit(db, "hook_lab", "hook_variant", variant_id, "cancelled",
                 f"Opening {v.label} removed: {events._name(project)}", url=events.hook_lab_url(project),
-                project_id=v.project_id)
+                project_id=project.id)
     db.commit()
     for f in files:
         if f:
             Path(f).unlink(missing_ok=True)
-    render_files.prune(db, v.project_id)
-    return {"id": variant_id, "deleted": True, "render_kept": False, "render_id": None}
+    render_files.prune(db, project.id)
+    return {"id": variant_id, "deleted": True, "render_kept": bool(kept), "render_id": kept[-1].id if kept else None}
 
 
 VOICING_FOR = timedelta(minutes=3)  # longer than any TTS call; a crashed Listen frees it then
@@ -578,6 +604,7 @@ def preview_audio(variant_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(409, "This opening is being made or is already made.")
     base = _base(db, v.project_id, v.base_render_id)
     project = db.get(models.VideoProject, v.project_id)
+    _check_opening(db, base, v.hook_text)  # before any voice is made
     cost = 0.0
     if not hook_lab.is_original(db, v, base) and not hook_lab.raw_hook_path(db, project, v).is_file():
         cost = round(hook_lab.tts_cost(v.hook_text), 4)

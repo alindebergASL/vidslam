@@ -150,7 +150,8 @@ def record_video_job(db: Session, job: models.VideoJob) -> None:
     """Called once when a video job completes (webhook or poll)."""
     if job.provider == "mock":
         return
-    kind = "avatar" if job.purpose == "avatar" else "video"
+    # A hook-lab opening's lip-sync is a lip-sync too: its kind and rate.
+    kind = "avatar" if job.purpose in ("avatar", "hook_avatar") else "video"
     ref = f"video_job:{job.id}"
     if db.query(models.SpendEntry.id).filter_by(ref=ref).first():
         return  # already recorded (a retried completion)
