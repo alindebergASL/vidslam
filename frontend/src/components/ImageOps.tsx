@@ -24,6 +24,16 @@ export function priceFromText(text?: string | null): number | null {
   return m ? Number(m[1]) : null;
 }
 
+/** A model's price for one picture or 5 s of clip from its price text:
+ *  "free (Free Spark)" is 0, and with reference pictures picked, a part
+ *  "…; about $0.15 with reference pictures" (or "; free with …") is used
+ *  instead. null = unknown. */
+export function modelPrice(text: string | null | undefined, withRefs = false): number | null {
+  const [plain, refs] = (text || "").split(/;\s*/);
+  const part = withRefs && refs && /with reference pictures/.test(refs) ? refs : plain;
+  return /^free\b/i.test(part) ? 0 : priceFromText(part);
+}
+
 /** The price for upscaling ×`factor` from an upscaler's price text ("about
  *  $0.0006 for ×2, $0.0013 for ×4" → the ×4 one); a text without per-factor
  *  prices gives its only price; null when that factor isn't listed. */

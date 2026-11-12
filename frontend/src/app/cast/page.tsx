@@ -829,7 +829,7 @@ function DetailDrawer({
               {runs.map(({ job: j, assetType, saved }) => {
                 const done = j.status === "completed" || j.status === "saved";
                 return (
-                  <li key={j.id} className="card p-2 flex items-center gap-3">
+                  <li key={j.id} className="card p-2 flex flex-wrap items-center gap-3">
                     <div
                       className={clsx(
                         "w-14 h-14 shrink-0 rounded-sm overflow-hidden bg-ink-800 flex items-center justify-center",
@@ -854,7 +854,9 @@ function DetailDrawer({
                           : "Working on it…"}
                       </div>
                     </div>
-                    <div className="flex flex-wrap justify-end gap-1 shrink-0">
+                    {/* On phones the buttons drop to their own row under the text, so they
+                        don't squeeze the name and size away or push the drawer sideways. */}
+                    <div className="flex flex-wrap justify-end gap-1 w-full sm:w-auto sm:shrink-0">
                       {done && (
                         <button
                           type="button"

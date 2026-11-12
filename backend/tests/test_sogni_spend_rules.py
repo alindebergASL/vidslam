@@ -47,6 +47,42 @@ def test_free_spark_models_count_nothing_vendor_models_do(monkeypatch):
     assert sogni.video_spend_rate_usd("sogni/ltx25") == sogni.video_rate_usd("sogni/ltx25")
 
 
+def _sogni_entry(model_id):
+    from app.services import model_catalog
+
+    return next(e for e in model_catalog._sogni_entries() if e["id"] == model_id)
+
+
+def test_picker_prices_free_spark_models_as_free(monkeypatch):
+    """The price shown before running is what Spend will record: a Free
+    Spark model isn't "about $0.0125 per image" when it's counted as $0."""
+    from app.providers import sogni
+    from app.services.prices import price_text
+
+    _settings(monkeypatch)
+    assert price_text(_sogni_entry("sogni/krea-2-turbo"), "image") == "free (Free Spark)"
+    assert price_text(_sogni_entry("sogni/ltx25"), "video") == "free (Free Spark)"
+    vendor_video = next(m.selector for m in sogni.video_models() if m.premium)
+    assert price_text(_sogni_entry(f"sogni/{vendor_video}"), "video").startswith("about $")
+    assert price_text(_sogni_entry("sogni/gpt-image-2"), "image").startswith("about $")
+    # A Free Spark model whose reference pictures go to a Premium Spark editor
+    # says what a picture with references costs.
+    _settings(monkeypatch, SOGNI_SCENE_EDIT_MODEL="gpt-image-2")
+    text = price_text(_sogni_entry("sogni/z-turbo"), "image")
+    assert text.startswith("free (Free Spark); about $") and text.endswith("with reference pictures")
+
+
+def test_picker_keeps_list_prices_when_free_spark_is_counted(monkeypatch):
+    from app.providers import sogni
+    from app.services.prices import money, price_text
+
+    _settings(monkeypatch, SOGNI_COUNT_FREE_SPARK="true")
+    assert price_text(_sogni_entry("sogni/krea-2-turbo"), "image") == \
+        f"about {money(sogni.image_cost_usd('sogni/krea-2-turbo'))} per image"
+    assert price_text(_sogni_entry("sogni/ltx25"), "video") == \
+        f"about {money(sogni.video_rate_usd('sogni/ltx25') * 5)} per 5 s"
+
+
 def test_free_spark_video_job_is_recorded_at_zero_with_a_note(client, monkeypatch):
     from app import models
     from app.db import SessionLocal

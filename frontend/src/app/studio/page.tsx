@@ -12,6 +12,7 @@ import { StudioViewer, ViewerItem, downloadName, mayBeTransparent } from "@/comp
 import {
   OpModels,
   UpscaleDialog,
+  modelPrice,
   priceFromText,
   removeBgLabel,
   sourceChipText,
@@ -216,6 +217,32 @@ function Studio() {
         .catch(() => setUpscaleEstimates((cur) => ({ ...cur, [j.id]: null })));
     }
   }, [jobs]);
+  // "Try another model" on an upscale: each offered model's price for this
+  // job's source and factor (model id → USD, null when it couldn't be
+  // priced). The catalog price is for a 1 MP source, so a model shows no
+  // price until its estimate has arrived.
+  const [pickerEstimates, setPickerEstimates] = useState<Record<string, number | null>>({});
+  useEffect(() => {
+    setPickerEstimates({});
+    const j = retrying;
+    if (!j || j.operation !== "upscale") return;
+    const source: ImageOpSource | null = j.source_job_id
+      ? { jobId: j.source_job_id }
+      : j.source_asset_id
+      ? { assetId: j.source_asset_id }
+      : null;
+    if (!source) return;
+    let alive = true;
+    for (const m of opModels.upscale) {
+      api
+        .imageOpEstimate("upscale", { model: m.id, factor: j.options?.factor || 2, source })
+        .then((e) => alive && setPickerEstimates((cur) => ({ ...cur, [m.id]: e.too_large ? null : e.free ? 0 : e.cost_usd })))
+        .catch(() => alive && setPickerEstimates((cur) => ({ ...cur, [m.id]: null })));
+    }
+    return () => {
+      alive = false;
+    };
+  }, [retrying, opModels.upscale]);
   const [upscaling, setUpscaling] = useState<{ source: ImageOpSource; label: string } | null>(null);
   // The last character sheet made here, for "Select this sheet".
   const [lastSheet, setLastSheet] = useState<{ avatarId: number; ids: number[] } | null>(null);
@@ -267,25 +294,31 @@ function Studio() {
   // fresh: the first page (new filters). Otherwise (a reload after an
   // action) as many as are loaded, so "Load more" pages don't disappear
   // under the viewer or the user's scroll position.
+  // "Load more" pages on from the oldest result the list itself loaded. A
+  // job fetched on its own (an original opened from "from #12", or a
+  // ?job= link) is older than the loaded pages and would skip the rest.
+  const oldestListed = useRef<number | null>(null);
   const loadJobs = async (fresh = false) => {
     const seq = ++listSeq.current;
     const limit = fresh ? PAGE_SIZE : Math.min(200, Math.max(PAGE_SIZE, jobsRef.current.length + 10));
     const jb = await api.listStudioJobs({ ...queryRef.current, limit });
     if (seq !== listSeq.current) return;
     const rows = jb.map(newest);
+    oldestListed.current = rows.length > 0 ? Math.min(...rows.map((j) => j.id)) : null;
     setJobs(rows);
     setHasMore(jb.length === limit);
     trackRunning(rows);
   };
 
   const loadMore = async () => {
-    if (jobs.length === 0) return;
+    const before_id = oldestListed.current;
+    if (before_id === null) return;
     setLoadingMore(true);
     const seq = listSeq.current;
     try {
-      const before_id = Math.min(...jobs.map((j) => j.id));
       const page = (await api.listStudioJobs({ ...queryRef.current, limit: PAGE_SIZE, before_id })).map(newest);
       if (seq !== listSeq.current) return;
+      if (page.length > 0) oldestListed.current = Math.min(before_id, ...page.map((j) => j.id));
       setJobs((cur) => [...cur, ...page.filter((p) => !cur.some((c) => c.id === p.id))]);
       setHasMore(page.length === PAGE_SIZE);
       trackRunning(page);
@@ -490,7 +523,8 @@ function Studio() {
   const retryPrice = (job: StudioJob): string => {
     const m = modelOptionsFor(job).find((x) => x.id === job.provider_model);
     if (!m?.price_text) return "";
-    if (m.price_text === "free") return "free";
+    const withRefs = job.output_kind === "image" && (job.reference_asset_ids || []).length > 0;
+    if (m.price_text === "free" || (!job.operation && modelPrice(m.price_text, withRefs) === 0)) return "free";
     // An upscale is priced by its source's size (the catalog price is for
     // 1 MP), so it shows the server's estimate for this picture, and no
     // price until that has arrived.
@@ -498,7 +532,7 @@ function Studio() {
       const est = upscaleEstimates[job.id];
       return est === undefined || est === null ? "" : est === 0 ? "free" : `about ${usd(est)}`;
     }
-    const p = priceFromText(m.price_text);
+    const p = job.operation ? priceFromText(m.price_text) : modelPrice(m.price_text, withRefs);
     if (p === null) return "";
     // Clips are priced per 5 s in the picker.
     const n = job.output_kind === "video_clip" && !job.operation ? p * ((job.duration_seconds || 5) / 5) : p;
@@ -1096,7 +1130,16 @@ function Studio() {
       {retrying && (
         <ModelPickerDialog
           job={retrying}
-          models={modelOptionsFor(retrying)}
+          models={
+            retrying.operation === "upscale"
+              ? modelOptionsFor(retrying).map((m) => {
+                  const est = pickerEstimates[m.id];
+                  const price_text =
+                    est === undefined || est === null ? undefined : est === 0 ? "free" : `about ${usd(est)}`;
+                  return { ...m, price_text };
+                })
+              : modelOptionsFor(retrying)
+          }
           onClose={() => setRetrying(null)}
           onPick={async (model) => {
             if (await retry(retrying, model)) setRetrying(null);
@@ -1588,7 +1631,7 @@ function PromptBar({
   // "About $0.08" next to Generate: the picked model's rough price, times
   // the variations (images) or scaled to the clip length (priced per 5 s).
   const pickedModel = currentModels.find((m) => m.id === model);
-  const unitPrice = priceFromText(pickedModel?.price_text);
+  const unitPrice = modelPrice(pickedModel?.price_text, outputKind === "image" && selectedRefs.length > 0);
   const total =
     unitPrice === null ? null : outputKind === "image" ? unitPrice * variations : unitPrice * (clipSeconds / 5);
   const aboutText = total === null ? "" : total === 0 ? "Free" : `About ${usd(total)}`;

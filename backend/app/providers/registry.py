@@ -428,6 +428,13 @@ def provider_status() -> dict:
 
     training_lora = _train("replicate", not s.mock_providers and provider_keys.has("replicate"))
     training_voice = _train("elevenlabs", not s.tts_is_mocked())
+    # Kinds that can't run only because their provider has no key yet (not
+    # switched off), so the home page can say "needs a key" instead.
+    needs_key = []
+    for k in reg.KINDS:
+        provider, blocked = reg.route_info(k, snap[k]["model"])
+        if provider == "unavailable" and blocked in provider_keys.KEYS and not provider_keys.has(blocked):
+            needs_key.append(k)
     return {
         "mock_providers_env": s.mock_providers,
         "chat": snap["chat"]["provider"],
@@ -440,5 +447,6 @@ def provider_status() -> dict:
         "upscale": snap["upscale"]["provider"],
         "training_lora": training_lora,
         "training_voice": training_voice,
+        "needs_key": needs_key,
         "models": {k: v["model"] for k, v in snap.items()},
     }

@@ -53,6 +53,14 @@ CURATED = [
     "luma:ray@3.2",
     "klingai:6@1",              # Kling 2.5 Turbo Pro
     "bytedance:2@1",            # Seedance 1.0 Pro
+    # picture operations: remove background
+    "runware:112@5",            # BiRefNet General (the default)
+    "runware:109@1",            # RemBG v1.4
+    "bria:2@1",                 # Bria RMBG v2.0
+    # picture operations: upscale
+    "runware:504@1",            # Real-ESRGAN (the default)
+    "runware:500@1",            # Clarity
+    "topazlabs:wonder@4",       # Topaz Labs Wonder 4
 ]
 
 IMAGE_CAPS = {"text-to-image", "image-to-image", "edit"}

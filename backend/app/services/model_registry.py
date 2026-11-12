@@ -128,11 +128,24 @@ def selected(kind: str) -> Optional[str]:
     return (v or {}).get("model") if v else None
 
 
+def default_model(kind: str) -> str:
+    """The model `kind` uses when nothing is picked in Settings → Models."""
+    m = env_default(kind) or ("" if kind == "lipsync" else MOCK_DEFAULTS[kind])
+    if kind == "upscale" and m.startswith("runware/") and not get_settings().mock_providers:
+        from .provider_keys import has
+
+        # No Runware key: the free basic upscale instead of a model that
+        # can't run. Adding the key brings the Runware default back.
+        if not has("runware"):
+            return LOCAL_MODELS["upscale"][0]
+    return m
+
+
 def active_model(kind: str) -> str:
     sel = selected(kind)
     if sel is not None:
         return sel
-    return env_default(kind) or ("" if kind == "lipsync" else MOCK_DEFAULTS[kind])
+    return default_model(kind)
 
 
 def active_options(kind: str) -> dict:
@@ -273,7 +286,7 @@ def snapshot() -> dict:
         out[k] = {
             "model": m,
             "provider": provider_for(k, m),
-            "default": env_default(k) or ("" if k == "lipsync" else MOCK_DEFAULTS[k]),
+            "default": default_model(k),
             "is_default": selected(k) is None,
             "options": active_options(k),
         }
