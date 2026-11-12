@@ -302,7 +302,7 @@ class OpenRouterChatProvider(ChatProvider):
             "reasoning": {"effort": "low", "exclude": True},
             "messages": [
                 {"role": "system", "content": MINOR_CHECK_SYSTEM},
-                {"role": "user", "content": text[:6000]},
+                {"role": "user", "content": text[:6000]},  # minor_check.JUDGE_WINDOW
             ],
         }
         # No response_format: not every model takes it, and a 400 here would
@@ -337,14 +337,20 @@ Not a problem: children in ordinary non-sexual scenes (family, school, sport, sw
 Reply with JSON only, no prose: {"minor_sexual": true|false, "reason": "<one short sentence>"}."""
 
 
+class ModelDeclined(ValueError):
+    """The safety check model answered with a refusal instead of a verdict."""
+
+
 def parse_minor_verdict(reply: str) -> dict:
     """{"minor_sexual": bool, "reason": str} from a classifier reply; raises
-    ValueError on a refusal or anything else."""
+    ModelDeclined on a refusal, ValueError on anything else."""
     from ..services.prompting import refusal
 
     reply = (reply or "").strip()
-    if not reply or refusal(reply):
-        raise ValueError("the safety check model declined to answer")
+    if not reply:
+        raise ValueError("empty safety check reply")
+    if refusal(reply):
+        raise ModelDeclined("the safety check model declined to answer")
     data = extract_json(reply)
     verdict = data.get("minor_sexual") if isinstance(data, dict) else None
     if not isinstance(verdict, bool):
@@ -364,7 +370,7 @@ Rules:
 - Styles: question = asks the viewer something; bold_claim = a confident statement; stat = leads with a number or fact from the script; story = starts a tiny personal moment; contrarian = pushes against a common belief.
 - Plain words, no hashtags, no emojis, no quotes around the text.
 - Everyone in anything sexual or suggestive is an adult: never mention or hint at an age under 18, childlike traits or school settings in an opening.
-- If the script sexualises a minor or childlike traits, reply with exactly REFUSED_MINOR. If you won't write openings for any other reason, reply with exactly DECLINED: never a partial, safer or different version."""
+- If the script sexualises a minor or childlike traits, reply with exactly REFUSED_MINOR. If you won't write openings for any other reason, reply with exactly DECLINED: never a partial, safer or different version. If you must reply in JSON, put that word in {"hooks": [], "refusal": "..."}."""
 
 
 SCENE_REWRITE_SYSTEM = """You turn a short description of a calm place into a description for a realistic photograph, for an image model. Reply with JSON only: {"scene": "...", "light": "...", "camera": "..."}.

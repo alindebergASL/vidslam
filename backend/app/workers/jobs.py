@@ -315,3 +315,14 @@ def inspect_take_job(take_id: int) -> None:
         log.exception("clip check of take %s failed", take_id)
     finally:
         db.close()
+
+
+def check_cast_pictures_job(avatar_id: int) -> None:
+    """The safety check of pictures added to the card of a Cast character
+    ticked "Adult content allowed" (services/cast_pictures.py)."""
+    from ..services import cast_pictures
+
+    try:
+        cast_pictures.run(avatar_id)
+    except Exception:  # noqa: BLE001 — the pictures keep the filter; "Check new pictures" retries
+        log.exception("picture check of cast character %s failed", avatar_id)

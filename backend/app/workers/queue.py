@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import queue as queue_mod
+import re
 import threading
 import time
 from typing import Callable
@@ -177,3 +178,115 @@ def enqueue_low(func: Callable, *args, queue_name: str = LOW_QUEUE, **kwargs) ->
     job = q.enqueue(func, *args, **kwargs, job_timeout=s.queue_job_timeout_seconds,
                     result_ttl=24 * 3600, failure_ttl=7 * 24 * 3600)
     return job.id
+
+
+# ---------- one waiting job per key (checks that mustn't pile up) ----------
+
+_bg_waiting: set[str] = set()
+_bg_running: dict[str, int] = {}
+_bg_waiting_lock = threading.Lock()
+# What RQ (3.x) takes as a custom job id; Job.fetch and enqueue raise
+# ValueError for anything else.
+_JOB_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def keyed_job_ids(key: str) -> tuple[str, str]:
+    """The RQ job ids enqueue_once uses for `key`: the one that waits, and
+    the one that can wait behind it while it runs. Raises ValueError for a
+    key RQ wouldn't take."""
+    ids = (key, f"{key}-next")
+    for job_id in ids:
+        if not _JOB_ID.fullmatch(job_id):
+            raise ValueError(f"not a job id RQ takes: {job_id!r}")
+    return ids
+
+
+def _run_keyed(key: str, func: Callable, args: tuple, kwargs: dict) -> None:
+    with _bg_waiting_lock:
+        _bg_waiting.discard(key)  # started: a change from now on needs a run of its own
+        _bg_running[key] = _bg_running.get(key, 0) + 1
+    try:
+        func(*args, **kwargs)
+    finally:
+        with _bg_waiting_lock:
+            left = _bg_running.get(key, 1) - 1
+            if left > 0:
+                _bg_running[key] = left
+            else:
+                _bg_running.pop(key, None)
+
+
+def _keyed_status(job_id: str) -> "str | None":
+    """The RQ status of a job id ("queued", "started", "finished", …), None
+    when there's no such job."""
+    from rq.exceptions import NoSuchJobError
+    from rq.job import Job
+
+    try:
+        job = Job.fetch(job_id, connection=_redis_singleton)
+    except NoSuchJobError:
+        return None
+    status = job.get_status(refresh=False)
+    return str(getattr(status, "value", status) or "")
+
+
+def _drop_keyed(job_id: str) -> None:
+    """Forget a finished (or failed, stopped, cancelled) job so its id can be used again."""
+    from rq.exceptions import NoSuchJobError
+    from rq.job import Job
+
+    try:
+        Job.fetch(job_id, connection=_redis_singleton).delete()
+    except NoSuchJobError:
+        pass
+
+
+def enqueue_once(func: Callable, *args, key: str, at_front: bool = False, **kwargs) -> str:
+    """Queue `func` on the default queue unless a job for `key` is already
+    waiting there: that one runs later and sees whatever the caller just
+    committed. A job for `key` that has started may have missed it, so one
+    more can wait behind it (ids keyed_job_ids(key): `key` and `key-next`).
+    `at_front`: ahead of the jobs already waiting (a short check that
+    shouldn't wait behind renders). Never runs in the caller: without Redis
+    (QUEUE_MODE=auto, or inline) it runs on the side-job thread, with the
+    same rule. QUEUE_MODE=required with Redis down: not queued, ""
+    returned (logged). Returns the job id."""
+    ids = keyed_job_ids(key)
+    s = get_settings()
+    mode = (s.queue_mode or "auto").lower()
+    q = None if mode == "inline" else _try_redis_queue()
+    if q is None:
+        if mode == "required":
+            log.warning("job queue (Redis) unavailable: %s not queued", key)
+            return ""
+        with _bg_waiting_lock:
+            if key in _bg_waiting:
+                return f"background:{key}"
+            _bg_waiting.add(key)
+        _run_in_background(_run_keyed, key, func, args, kwargs)
+        return f"background:{key}"
+    for job_id in ids:
+        status = _keyed_status(job_id)
+        if status in ("queued", "deferred", "scheduled"):
+            return job_id  # waiting: it will see this change
+        if status == "started":
+            continue  # running: it may have read what it checks before this change
+        if status is not None:
+            _drop_keyed(job_id)
+        job = q.enqueue(func, *args, **kwargs, job_id=job_id, job_timeout=s.queue_job_timeout_seconds,
+                        result_ttl=3600, failure_ttl=7 * 24 * 3600, at_front=at_front)
+        return job.id
+    log.info("%s: two runs already under way; not queued again", key)
+    return key
+
+
+def keyed_state(key: str) -> str:
+    """Whether a run for `key` (enqueue_once) is waiting or under way:
+    "alive", "gone", or "unknown" (Redis didn't answer). Without Redis, the
+    side-job thread of this process is asked."""
+    mode = (get_settings().queue_mode or "auto").lower()
+    if mode == "inline" or _try_redis_queue() is None:
+        with _bg_waiting_lock:
+            return "alive" if key in _bg_waiting or key in _bg_running else "gone"
+    states = [queue_entry_state(job_id) for job_id in keyed_job_ids(key)]
+    return "alive" if "alive" in states else ("unknown" if "unknown" in states else "gone")

@@ -84,8 +84,9 @@ async def put_enabled(name: str, request: Request) -> dict:
 
 @router.put("/{name}/options")
 async def put_options(name: str, request: Request) -> dict:
-    """Set a provider's options, e.g. Runware {"check_content": true | false
-    | null} (null = back to its default)."""
+    """Set a provider's options: Runware {"check_content": …} or Sogni
+    {"safe_filter": …}, each true | false | null (null = back to its
+    default). They apply while adult mode is on; off, both are always on."""
     _known(name)
     allowed = dict(provider_keys.KEYS[name].options)
     try:

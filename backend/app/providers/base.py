@@ -15,8 +15,9 @@ class ImageRef:
     # first or last frame (image-to-video / keyframe interpolation).
     frame_type: Optional[Literal["first_frame", "last_frame"]] = None
     # A picture on the card of a Cast character marked "adult content
-    # allowed" (fictional, or the person consented), however it was made:
-    # in adult mode it skips the forced content filter
+    # allowed" (fictional, or the person consented) that the safety check
+    # looked at, however it was made: in adult mode it skips the forced
+    # content filter
     # (services/content_mode.exempt). Minors are refused regardless.
     adult_ok: bool = False
     # A Cast character's picture sent in another role (an ambient scene's

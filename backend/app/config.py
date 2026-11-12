@@ -71,13 +71,20 @@ class Settings(BaseSettings):
     openrouter_chat_model: str = "anthropic/claude-haiku-5.5"
     # Adult mode (Settings → Adult content overrides this default): text work
     # (planning, ✨ Enhance, scene rewrites) moves to ADULT_TEXT_MODEL and the
-    # picture/video filters follow their own settings; off, the planner above
-    # and the filters on. See services/content_mode.py. DeepSeek V4 Flash
+    # picture/video filters follow their switches in Settings → API keys;
+    # off, the planner above and the filters on. See services/content_mode.py. DeepSeek V4 Flash
     # rewrote and planned the owner's adult prompts where the planner refused
     # or toned them down; V4 Pro is Enhance's fallback when Flash declines.
     adult_mode: bool = False
     adult_text_model: str = "deepseek/deepseek-v4-flash"
     adult_text_fallback_model: str = "deepseek/deepseek-v4-pro"
+    # The Cast picture check (services/minor_check.py, check_pictures): before
+    # a character is ticked "Adult content allowed", and when a picture is
+    # added to a ticked card, a small copy of each picture goes to this model
+    # through OpenRouter, which says whether anyone in it looks under 18. It
+    # must take images (DeepSeek V4.1 Flash does; ADULT_TEXT_MODEL is
+    # text-only). The card's text is still judged by the planner.
+    character_picture_check_model: str = "deepseek/deepseek-v4.1-flash"
     openrouter_image_model: str = ""
     openrouter_video_model: str = ""
     # Studio picture operations (Settings → Models: "Remove background",
@@ -178,9 +185,14 @@ class Settings(BaseSettings):
     # catalog; empty = use the copy bundled with the app.
     sogni_tools_manifest_url: str = (
         "https://cdn.jsdelivr.net/npm/@sogni-ai/sogni-protocol@alpha/manifests/generation-tools.json")
-    # Sogni's own content filter (safe_content_filter on every workflow).
-    # Off: the app has no NSFW gate. Vendor models (GPT Image, standard
-    # Seedance, HappyHorse, standard Wan 3) refuse mature prompts anyway.
+    # Sogni's own content filter (safe_content_filter on every workflow):
+    # the default for the switch on Sogni's row in Settings → API keys,
+    # which wins once set. It only applies in adult mode: outside it the
+    # filter is always on. Even in adult mode it is forced on for a picture
+    # of a Cast character not ticked "Adult content allowed", a prompt that
+    # mentions a child, and a sexual prompt whose avoid list steers young.
+    # Vendor models (GPT Image, standard Seedance, HappyHorse, standard
+    # Wan 3) keep their vendor's moderation either way.
     sogni_safe_content_filter: bool = False
     # Native Sogni models run on Free Spark: by default only vendor (Premium
     # Spark) models count toward Spend and the monthly cap. True counts the
@@ -225,10 +237,15 @@ class Settings(BaseSettings):
     # Public model docs (no key): the index of models and each one's schema.
     runware_models_index_url: str = "https://runware.ai/docs/models/index.json"
     runware_docs_models_base: str = "https://runware.ai/docs/models"
-    # Runware's own content check. Off = uncensored output on the open
-    # models Runware hosts (vendor models stay moderated by their vendor).
-    # Always on for requests carrying a Cast member's picture; a request
-    # whose prompt involves minors is refused before it's sent (safety.py).
+    # Runware's own content check (safety.checkContent): the default for
+    # the box on Runware's row in Settings → API keys, which wins once set.
+    # It only applies in adult mode: outside it the check is always on.
+    # Off = uncensored output on the open models Runware hosts (vendor
+    # models stay moderated by their vendor). Even in adult mode it is
+    # forced on for a picture of a Cast character not ticked "Adult content
+    # allowed", a prompt that mentions a child, and a sexual prompt whose
+    # avoid list steers young. A prompt involving minors is refused before
+    # it's sent (safety.py).
     runware_check_content: bool = False
     runware_image_timeout_seconds: float = 300.0
     # Long side of a generated still (16:9 → 1920×1080, or 1920×1088 on

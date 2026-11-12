@@ -93,8 +93,9 @@ def _repair_image_types() -> None:
     from .services import storage
 
     db = SessionLocal()
+    pictures: set[int] = set()
     try:
-        types_fixed, sizes_filled = storage.repair_image_types(db)
+        types_fixed, sizes_filled = storage.repair_image_types(db, pictures)
         if types_fixed:
             log.warning("corrected the image type of %d asset(s) to match their files", types_fixed)
         if sizes_filled:
@@ -103,6 +104,11 @@ def _repair_image_types() -> None:
         log.warning("image type check skipped: %s", e)
     finally:
         db.close()
+    if pictures:
+        from .services import cast_pictures
+
+        for avatar_id in sorted(pictures):  # now pictures on a card: a ticked character's are checked
+            cast_pictures.picture_added(avatar_id)
 
 
 def create_app() -> FastAPI:

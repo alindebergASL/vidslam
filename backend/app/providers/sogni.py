@@ -74,6 +74,19 @@ def _forces_filter(ref: ImageRef) -> bool:
     return forces_filter(ref)
 
 
+def safe_filter_default() -> bool:
+    """Sogni's safe filter: always on unless adult mode is; then as set in
+    Settings → API keys (else SOGNI_SAFE_CONTENT_FILTER). SogniClient.start
+    still forces it on for an unticked Cast picture, a prompt that mentions
+    a child and an avoid list that steers young."""
+    if not _adult_mode():
+        return True
+    try:
+        return provider_keys.option("sogni", "safe_filter")
+    except Exception:  # noqa: BLE001 — no database (scripts): the config value
+        return bool(get_settings().sogni_safe_content_filter)
+
+
 def is_sogni(model: Optional[str]) -> bool:
     return bool(model) and str(model).startswith(PREFIX)
 
@@ -913,11 +926,14 @@ def model_capabilities(m: VideoModel) -> VideoCapabilities:
 
 class SogniError(RuntimeError):
     def __init__(self, message: str, *, status: int = 0, code: Any = None,
-                 retry_after: Optional[float] = None) -> None:
+                 retry_after: Optional[float] = None, refused: bool = False) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.retry_after = retry_after
+        # Held for review (a safety pause): refused, so no other model is
+        # tried in its place (providers/refusals.py).
+        self.refused = refused
 
 
 def _retry_after(r: httpx.Response, body: dict) -> Optional[float]:
@@ -1002,14 +1018,14 @@ class SogniClient:
         (network errors, 429 within the wait cap, 5xx).
 
         A prompt sexualising minors is refused before it's sent. Sogni's safe
-        filter is on outside adult mode. In adult mode it is on only for a
+        filter is on outside adult mode. In adult mode it is always on for a
         picture of a Cast character not marked "adult content allowed"
         (`cast`; content_mode.forces_filter, which also counts a Cast
         picture used as an ambient scene's picture or as a first frame), a
         prompt mentioning a child or a minor's age, or a sexual prompt whose
-        avoid list (`negative`) removes signs of adulthood. Any other
-        picture (a marked character, a scene, a Studio result) follows
-        SOGNI_SAFE_CONTENT_FILTER."""
+        avoid list (`negative`) removes signs of adulthood. Otherwise it
+        follows the switch on Sogni's row in Settings → API keys
+        (safe_filter_default)."""
         from ..services.safety import check_prompt, mentions_minor, steers_young
 
         prompt = str(arguments.get("prompt") or "")
@@ -1022,9 +1038,9 @@ class SogniClient:
             ]},
             "token_type": "auto",
             "app_source": APP_SOURCE,
-            # On unless adult mode is (then SOGNI_SAFE_CONTENT_FILTER decides),
-            # and always when guarded (above).
-            "safe_content_filter": bool(get_settings().sogni_safe_content_filter) or guarded or not _adult_mode(),
+            # On unless adult mode is (then the Settings switch decides), and
+            # always when guarded (above).
+            "safe_content_filter": guarded or safe_filter_default(),
         }
         if media_references:
             body["media_references"] = media_references
@@ -1151,6 +1167,20 @@ def workflow_state(wf: dict) -> tuple[str, Optional[str]]:
     if status == "running":
         return "running", None
     return "queued", None
+
+
+# Pauses about money, not content: another model may take these.
+_BILLING_PAUSE = re.compile(r"credit|balance|cost|payment|spark|quota|fund", re.IGNORECASE)
+
+
+def held_for_review(wf: dict) -> bool:
+    """A workflow paused for a person to look at it: a safety review
+    ("safety_review_required"), or a reason we don't know. Not a cost
+    approval or a lack of credit. It counts as a refusal: no other model
+    is tried in its place."""
+    if str(wf.get("status") or "").lower() != "waiting_for_user" or wf.get("awaitingCostApproval"):
+        return False
+    return not _BILLING_PAUSE.search(str(wf.get("waitingReason") or ""))
 
 
 def _failure_message(wf: dict, status: str) -> str:
@@ -1292,7 +1322,7 @@ class SogniImageProvider(ImageProvider):
             if state == "done":
                 return wf
             if state == "failed":
-                raise SogniError(err or "Sogni workflow failed")
+                raise SogniError(err or "Sogni workflow failed", refused=held_for_review(wf))
             if time.monotonic() > deadline:
                 raise SogniError(f"Sogni image timed out after {int(get_settings().sogni_image_timeout_seconds)} s "
                                  f"(workflow {wid} still {wf.get('status')})")

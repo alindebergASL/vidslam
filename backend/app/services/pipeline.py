@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +23,7 @@ from ..providers import (
     uses_webhooks,
 )
 from ..providers.base import CastContext, ImageRef
+from ..providers.refusals import ContentRefused, is_content_refusal, is_refusal_text
 from ..schemas.storyboard import StoryboardPlan
 from . import alerts, events, fingerprints, render_files, storage, takes
 from .captions import CaptionTiming, chunks_to_timed
@@ -229,18 +232,16 @@ def _asset_refs(db: Session, asset_ids: list) -> list[ImageRef]:
     return refs
 
 
-def _exempt_asset(asset: Optional[models.Asset], marked: set[int]) -> bool:
+def _exempt_asset(asset: Optional[models.Asset], marked: Mapping[int, AbstractSet[int]]) -> bool:
     """Whether a Cast picture counts as its marked character ("adult content
-    allowed"): any non-logo picture on a marked character's card, as long
-    as the character's own text names no minor. How the picture was made
-    doesn't matter (uploaded, generated, a cutout or upscale, from any
-    picture, even one deleted since): the tick covers every picture the
-    owner keeps on that card."""
-    if asset is None or asset.owner_kind != "avatar" or asset.asset_type == "logo" or asset.avatar_id not in marked:
+    allowed"): a non-logo picture on a marked character's card that the
+    safety check looked at when the character was ticked (`marked` is
+    content_mode.adult_ok_avatars(): only ticks that still hold, each with
+    the pictures checked). How the picture was made doesn't matter. One
+    added to the card since keeps the filter until it is checked."""
+    if asset is None or asset.owner_kind != "avatar" or asset.asset_type == "logo" or asset.avatar_id is None:
         return False
-    from .content_mode import describes_minor
-
-    return asset.avatar is not None and not describes_minor(asset.avatar)
+    return asset.id in marked.get(asset.avatar_id, ())
 
 
 def cast_avatar_of(asset: Optional[models.Asset]) -> Optional[int]:
@@ -251,39 +252,38 @@ def cast_avatar_of(asset: Optional[models.Asset]) -> Optional[int]:
     return int(asset.avatar_id)
 
 
-def avatar_adult_ok(db: Session, avatar_id: int, marked: set[int]) -> bool:
-    """Whether a Cast character's pictures skip the forced content filter:
-    marked "adult content allowed" and its own text names no minor (as
-    _exempt_asset, for a picture that is no longer on the card)."""
-    if avatar_id not in marked:
-        return False
-    from .content_mode import describes_minor
-
-    avatar = db.get(models.Avatar, avatar_id)
-    return avatar is not None and not describes_minor(avatar)
+def avatar_adult_ok(avatar_id: Optional[int], asset_id: Optional[int],
+                    marked: Mapping[int, AbstractSet[int]]) -> bool:
+    """Whether a copy of a Cast picture (a cutout, an upscale, an ambient
+    scene's picture) skips the forced content filter: the picture it was
+    made from is one the tick covers (as _exempt_asset). Not when that
+    picture isn't known or was deleted since."""
+    return avatar_id is not None and asset_id is not None and asset_id in marked.get(avatar_id, ())
 
 
-def studio_cast_avatar(db: Session, job: Optional[models.AssetGenerationJob]) -> Optional[int]:
-    """The Cast character a Studio picture shows when it is only a cutout
-    or upscale of one of their pictures (followed back through each
-    operation to the picture it started from), else None: a picture made
-    in Studio is a new picture, not the character's. When the starting
-    picture was deleted since, the operation's owner (copied from its
-    source when it was made) says whose it was."""
+def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob]) -> tuple[Optional[int], Optional[int]]:
+    """(the Cast character a Studio picture shows, the card picture it was
+    made from) when it is only a cutout or upscale of one of their pictures
+    (followed back through each operation to the picture it started from),
+    else (None, None): a picture made in Studio is a new picture, not the
+    character's. When the starting picture was deleted since, the
+    operation's owner (copied from its source when it was made) says whose
+    it was, and the picture is None."""
     seen: set[int] = set()
     while job is not None and job.operation and job.id not in seen:
         seen.add(job.id)
         if job.source_asset_id:
             asset = db.get(models.Asset, job.source_asset_id)
             if asset is not None:
-                return cast_avatar_of(asset)
+                avatar_id = cast_avatar_of(asset)
+                return avatar_id, (int(asset.id) if avatar_id is not None else None)
         elif job.source_job_id:
             src = db.get(models.AssetGenerationJob, job.source_job_id)
             if src is not None:
                 job = src
                 continue
-        return int(job.owner_id) if job.owner_kind == "avatar" and job.owner_id is not None else None
-    return None
+        return (int(job.owner_id) if job.owner_kind == "avatar" and job.owner_id is not None else None), None
+    return None, None
 
 
 # ---------- public entry points ----------
@@ -293,17 +293,18 @@ def _check_plan(plan: StoryboardPlan) -> None:
     """The planner's own output gets the minors checks too (in adult mode a
     permissive model plans): every shot prompt, with its avoid list, and
     the spoken script."""
-    from .safety import UnsafePromptError, check_prompt, check_script, steers_young
+    from .safety import check_prompt, check_script
 
     check_script(plan.cleaned_voice_script or "")
     check_script(plan.hook or "")  # normally the script's first sentence (the schema sees to it)
     for shot in plan.shots:
         check_prompt(shot.visual_prompt or "")
-        if steers_young(shot.visual_prompt or "", shot.negative_prompt or ""):
-            raise UnsafePromptError(
-                "This plan was refused: a shot's avoid list removes signs of adulthood from a sexual prompt.")
     # The AI safety check, once per distinct shot prompt (fills its cache,
     # so the clip calls later are hits), and on the script when it's sexual.
+    # An avoid list that removes signs of adulthood (steers_young) always
+    # gets the AI check, which sees the avoid list, and is refused when the
+    # check can't run: no refusal on the words alone ("wrinkled sheets",
+    # "men in background").
     from .minor_check import check_generation
 
     seen: set[tuple[str, str]] = set()
@@ -713,8 +714,14 @@ def on_shot_clip_failed(db: Session, job: models.VideoJob) -> None:
         # failed late by the sweeper): its newer clip stands.
         return
     project = db.get(models.VideoProject, job.project_id)
-    if job.purpose == "avatar" and project is not None:
-        # Lip-sync failed → fall back to the regular video model for this shot.
+    error = job.error or ""
+    if job.purpose == "avatar" and project is not None and is_refusal_text(error):
+        # Refused for its content: the video model doesn't get it instead
+        # (it may have no filter). The shot fails, like any other refusal.
+        error = lipsync_refused_message(error)
+    elif job.purpose == "avatar" and project is not None:
+        # Lip-sync failed (an outage, a timeout…) → fall back to the
+        # regular video model for this shot.
         shot.error = f"lip-sync failed, used video model instead: {job.error[:300]}"
         db.commit()
         _log_provider_call(db, project_id=project.id, provider="avatar", endpoint="avatar.submit",
@@ -728,11 +735,11 @@ def on_shot_clip_failed(db: Session, job: models.VideoJob) -> None:
             _after_shot(db, job)
         return
     shot.status = "failed"
-    shot.error = job.error[:500]
+    shot.error = error[:500]
     db.commit()
     _log_provider_call(db, project_id=job.project_id, provider=job.provider or "video",
                        endpoint="video.job", request_summary={"shot": shot.id, "job": job.id},
-                       response_summary={"error": job.error[:500]}, status="error")
+                       response_summary={"error": (job.error or "")[:500]}, status="error")
     _after_shot(db, job)
 
 
@@ -875,7 +882,13 @@ def submit_talking_head(
     the submit itself fails, a note to keep on the shot. Anything but True
     means the caller uses the regular video model.
     If the avatar job later fails, on_shot_clip_failed falls back to the
-    regular video model for this shot."""
+    regular video model for this shot.
+
+    A refusal is never worked around with the video model: the app's
+    minors refusal raises UnsafeScriptError, and a lip-sync provider
+    refusing the shot for its content marks the shot failed and raises
+    ContentRefused (on_shot_clip_failed does the same for a job refused
+    later)."""
     from ..providers import get_avatar
     from . import public_media, video_jobs
     from .renderer import slice_audio
@@ -935,10 +948,31 @@ def submit_talking_head(
         db.rollback()
         raise
     except Exception as e:  # noqa: BLE001 — submit failed: use the video model
-        log.warning("talking-head submit failed for shot %s, falling back: %s", shot.id, e)
         db.rollback()
+        if is_content_refusal(e):
+            # Refused for its content by the lip-sync provider: never redone
+            # on the video model (it may have no filter). The shot fails.
+            msg = lipsync_refused_message(str(e))
+            log.warning("talking-head shot %s refused for its content: %s", shot.id, e)
+            shot = db.get(models.VideoShot, shot.id)
+            shot.status = "failed"
+            shot.error = msg
+            db.commit()
+            _log_provider_call(db, project_id=project.id, provider="avatar", endpoint="avatar.submit",
+                               request_summary={"shot": shot.id}, response_summary={"error": str(e)[:500],
+                                                                                    "refused": True},
+                               status="error")
+            raise ContentRefused(msg) from e
+        log.warning("talking-head submit failed for shot %s, falling back: %s", shot.id, e)
         return f"lip-sync failed, used video model instead: {str(e)[:300]}"
     return True
+
+
+def lipsync_refused_message(error: str) -> str:
+    """The shot's error when the lip-sync provider refused it for its content."""
+    why = str(error or "").removeprefix("submit failed: ").strip()
+    return ("The lip-sync provider refused this shot for its content, so it wasn't made "
+            f"(and wasn't redone on the video model): {why[:300]}")
 
 
 def _talking_head_script(project: models.VideoProject, shot: models.VideoShot, plan: StoryboardPlan) -> str:
@@ -2389,11 +2423,11 @@ def studio_first_frame(db: Session, job: models.AssetGenerationJob) -> Optional[
 
         # A cutout or upscale of a Cast picture is still that character's
         # picture (a newly made Studio picture isn't).
-        avatar_id = studio_cast_avatar(db, src)
+        avatar_id, source_id = studio_cast_source(db, src)
         return ImageRef(url=public_media.publish(storage.reference_copy(Path(src.result_path))),
                         role="scene" if avatar_id is None else "character",
                         name="first frame", frame_type="first_frame",
-                        adult_ok=avatar_id is not None and avatar_adult_ok(db, avatar_id, adult_ok_avatars()))
+                        adult_ok=avatar_adult_ok(avatar_id, source_id, adult_ok_avatars()))
     if job.first_frame_asset_id:
         asset = db.get(models.Asset, job.first_frame_asset_id)
         if asset is None or not (asset.mime_type or "").startswith("image/"):
@@ -2664,6 +2698,11 @@ def save_studio_result_as_asset(
     job.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(asset)
+    if kind == "avatar":
+        from . import cast_pictures
+
+        # A ticked character's new picture is checked off this request.
+        cast_pictures.picture_added(oid, asset)
     return asset
 
 

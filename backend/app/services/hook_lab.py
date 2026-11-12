@@ -184,11 +184,19 @@ def opening_script(db: Session, base: models.Render, hook: str) -> str:
     return replace_first_sentence(base_script(db, base), hook)
 
 
-def check_opening(db: Session, base: models.Render, hook: str) -> None:
+HEARD_NOTE = "It was checked together with the original voiceover heard after it."
+
+
+def check_opening(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> None:
     """The minors check an opening meets: on its own, and inside the script
     it joins. The script check only refuses a minor and a sexual word in
     the same text, so "She just turned 15." passes alone but not in front
-    of an adult script. Raises HookLabError (422) when refused."""
+    of an adult script.
+
+    What is heard is the new opening, then the base voiceover from `window`
+    on, and the window can be moved anywhere, even inside the original first
+    sentence. So the opening is also checked with what of the original may
+    be heard after it (heard_checks). Raises HookLabError (422) when refused."""
     from . import minor_check
     from .safety import UnsafeScriptError
 
@@ -197,6 +205,137 @@ def check_opening(db: Session, base: models.Render, hook: str) -> None:
         minor_check.check_generation(opening_script(db, base, hook), kind="script")
     except UnsafeScriptError as e:
         raise HookLabError(f"This opening can't be used: {e}", 422) from None
+    try:
+        heard_checks(db, base, hook, window)
+    except UnsafeScriptError as e:
+        raise HookLabError(f"This opening can't be used: {e} {HEARD_NOTE}", 422) from None
+
+
+def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> None:
+    """The opening with the original words that may be heard after it.
+
+    1. The opening, then the whole original script (the safety check, with
+       the AI check): every word of the original that can be heard after
+       the opening is in it, wherever the window is.
+    2. With the window known: the opening joined to the original where the
+       voiceover picks up (heard_cuts). The safety check sees that best
+       guess as it is heard, without the replaced words around it (they
+       could make it read as being about someone else). The word filter
+       also sees the joins near the guess, since the words aren't timed: a
+       phrase can form only across the join ("she is" + "sixteen tips").
+       Each join is also read without the punctuation at the end of the
+       opening, which a listener doesn't hear ("Her age?" + "fifteen, and").
+    3. When the voiceover may pick up inside the original first sentence,
+       speech is too uneven to trust the guess: the safety check sees the
+       opening joined at every word of that sentence (heard_joins), a few
+       at a time.
+    Raises UnsafeScriptError."""
+    from . import minor_check
+    from .renderer import _probe_duration
+    from .safety import check_script
+
+    hook = " ".join((hook or "").split())
+    script = base_script(db, base).strip()
+    if not hook or not script:
+        return
+    minor_check.check_generation(f"{hook} {script}", kind="script")
+    path = Path(base.audio_path or "")
+    if not window or window <= 0 or not path.is_file():
+        return
+    total = _probe_duration(path)
+    if window >= total - 0.05:
+        return  # nothing of the original is heard after the opening
+    try:
+        end_of_first: Optional[float] = find_hook_window(base, script)
+    except HookLabError:
+        end_of_first = None
+    best, near = heard_cuts(script, float(window), total, end_of_first)
+    rest = rest_of_script(script)
+    rest_at = len(script) - len(rest) if rest else len(script)
+    inside = (window < end_of_first - 0.05) if end_of_first else best < rest_at
+    cuts = sorted(set(near) | (set(word_starts(script, rest_at)) if inside else set()))
+    bare = _HOOK_END.sub("", hook) or hook
+    for cut in cuts:
+        check_script(f"{hook} {script[cut:]}")
+        check_script(f"{bare} {script[cut:].lstrip(_PUNCT)}")
+    if rest and best == rest_at:
+        heard = replace_first_sentence(script, hook)  # the usual join: checked already
+    else:
+        heard = f"{hook} {script[best:]}"
+    minor_check.check_generation(heard, kind="script")
+    if inside:
+        for text in heard_joins(hook, script, [c for c in cuts if c < rest_at], rest_at):
+            minor_check.check_generation(text, kind="script")
+
+
+_PUNCT = " \t.,;:!?…-–—\"'“”‘’()"
+_HOOK_END = re.compile(r"[\s.,;:!?…\-–—\"'“”‘’()]+$")
+# How much of the script after the first sentence each join shows.
+_JOIN_TAIL = 160
+
+
+def word_starts(script: str, upto: int) -> list[int]:
+    """The offsets of the words that start before `upto`."""
+    return [m.start() for m in re.finditer(r"\S+", script) if m.start() < upto]
+
+
+def heard_joins(hook: str, script: str, cuts: list[int], rest_at: int) -> list[str]:
+    """The opening joined to the original at each cut inside the first
+    sentence, as numbered lines, packed into texts the safety check reads
+    whole (minor_check.JUDGE_WINDOW). Each line runs to a little past the
+    first sentence; the rest of the script was checked with the opening
+    already (heard_checks, step 1)."""
+    from .minor_check import JUDGE_WINDOW
+
+    head = "The opening may be heard joined to the original voiceover at any of these points:"
+    tail = script[rest_at:rest_at + _JOIN_TAIL]
+    lines = [f"{i}. {hook} {script[c:rest_at]}{tail}".strip() for i, c in enumerate(cuts, 1)]
+    texts: list[str] = []
+    room = JUDGE_WINDOW - 200
+    cur = head
+    for line in lines:
+        line = line[:room - len(head) - 1]
+        if len(cur) + 1 + len(line) > room and cur != head:
+            texts.append(cur)
+            cur = head
+        cur += "\n" + line
+    if cur != head:
+        texts.append(cur)
+    return texts
+
+
+def heard_cuts(script: str, window: float, total: float,
+               end_of_first: Optional[float] = None) -> tuple[int, list[int]]:
+    """Where the base voiceover picks up in its script when the opening ends
+    at `window` seconds of `total`: (the best guess, every place near it),
+    as character offsets of word starts in the stripped script.
+
+    The guess spreads the characters evenly over the voiceover, as
+    estimate_window does. When `end_of_first` (where the first sentence
+    ends, find_hook_window) is known, it is spread over the first sentence
+    and the rest separately, so a window inside the first sentence lands
+    inside it. The places near it allow for an uneven pace: about a quarter
+    of the way more or less, and about 0.75 s of speech either side."""
+    script = (script or "").strip()
+    starts = [m.start() for m in re.finditer(r"\S+", script)]
+    if not starts or total <= 0 or window <= 0 or window >= total:
+        return 0, []
+    n = len(script)
+    guesses = [n * window / total]
+    rest = rest_of_script(script)
+    rest_at = n - len(rest) if rest else n
+    if end_of_first and 0 < end_of_first < total:
+        if window <= end_of_first:
+            guesses.append(rest_at * window / end_of_first)
+        else:
+            guesses.append(rest_at + (n - rest_at) * (window - end_of_first) / (total - end_of_first))
+    best = min(starts, key=lambda s: abs(s - guesses[-1]))
+    margin = max(0.25 * max(guesses) + 0.75 * n / total, 12.0)
+    lo, hi = min(guesses) - margin, max(guesses) + margin
+    near = sorted(s for s in starts if lo <= s <= hi)
+    if len(near) > 40:  # a very late window: the 40 nearest
+        near = sorted(sorted(near, key=lambda s: abs(s - best))[:40])
+    return best, near
 
 
 def check_base(db: Session, render: Optional[models.Render], project_id: Optional[int] = None) -> models.Render:
@@ -523,21 +662,18 @@ def suggest_hooks(db: Session, project: models.VideoProject, base_render: models
         raise HookLabError("The planner couldn't suggest openings right now. Try again, or write your own.",
                            502) from e
     if isinstance(reply, str):
-        from . import content_mode
         from .prompting import refusal
 
         why = refusal(reply, script)
-        if why == "minor":
-            raise HookLabError("No openings were suggested: the planner refused this script, as it appears "
-                               "to involve a minor in a sexual context.", 422)
         if why:
-            hint = "" if content_mode.adult_mode() else " For adult scripts, turn on Adult mode in Settings."
-            raise HookLabError("The planner declined to suggest openings for this script. Write your own "
-                               f"opening.{hint}", 422)
+            raise _planner_refused(why)
     try:
         data = extract_json(reply) if isinstance(reply, str) else reply
     except Exception:  # noqa: BLE001
         data = None
+    why = wrapped_refusal(data, script)
+    if why:
+        raise _planner_refused(why)
     items = data.get("hooks") if isinstance(data, dict) else data
     if not isinstance(items, list):
         raise HookLabError("The planner's answer couldn't be used. Try again, or write your own opening.", 502)
@@ -565,8 +701,9 @@ def suggest_hooks(db: Session, project: models.VideoProject, base_render: models
         if style in used_styles and style != "custom":
             continue
         try:
-            # Alone and inside the script, like an opening the user writes.
-            check_opening(db, base_render, text)
+            # Alone, inside the script and with what is heard after it at
+            # the found window, like an opening the user writes.
+            check_opening(db, base_render, text, window or None)
         except HookLabError as e:
             refused = str(e).removeprefix("This opening can't be used: ")
             log.warning("hook idea for project %s refused by the minors check", project.id)
@@ -584,6 +721,79 @@ def suggest_hooks(db: Session, project: models.VideoProject, base_render: models
     if not out:
         raise HookLabError("The planner's answer couldn't be used. Try again, or write your own opening.", 502)
     return out
+
+
+def _planner_refused(why: str) -> HookLabError:
+    """The 422 for a planner that refused ("minor") or declined: asking
+    again would get the same answer, so it never says "try again"."""
+    from . import content_mode
+
+    if why == "minor":
+        return HookLabError("No openings were suggested: the planner refused this script, as it appears "
+                            "to involve a minor in a sexual context.", 422)
+    hint = "" if content_mode.adult_mode() else " For adult scripts, turn on Adult mode in Settings."
+    return HookLabError("The planner declined to suggest openings for this script. Write your own "
+                        f"opening.{hint}", 422)
+
+
+_SENTINEL_IN = re.compile(r"\b(REFUSED_MINOR|DECLINED)\b")
+_ONLY_DECLINED = re.compile(r"\W*DECLINED\W*")
+_REFUSAL_KEYS = ("refusal", "refused", "declined", "decline", "error")
+
+
+def _strings(node: object, is_text: bool = False):
+    """(text, is an opening's "text") for every key and string value in a
+    parsed answer, however deep."""
+    if isinstance(node, str):
+        yield node, is_text
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            yield str(k), False
+            yield from _strings(v, str(k) == "text")
+    elif isinstance(node, list):
+        for x in node:
+            yield from _strings(x, is_text)
+
+
+def wrapped_refusal(data: object, script: str) -> Optional[str]:
+    """Whether the parsed answer is a refusal: "minor", "declined" or None.
+
+    The instructions ask for a bare REFUSED_MINOR or DECLINED, but a model
+    held to JSON wraps it: {"hooks": "REFUSED_MINOR"}, {"error": "DECLINED"},
+    {"hooks": [], "refusal": "REFUSED_MINOR"}, {"hooks": [{"text":
+    "REFUSED_MINOR"}]}. So REFUSED_MINOR anywhere is a minors refusal, and
+    DECLINED anywhere is a refusal too (a minors one when it names a minor or
+    the script mentions one), except inside an opening's text unless it is
+    all of it ("Loan DECLINED, then approved?" is an opening). With no usable
+    opening in it, a refusal in words in any field counts too ({"hooks": [],
+    "reason": "I can't help with that."}), and so does a refusal or error field."""
+    from .prompting import refusal
+
+    found: Optional[str] = None
+    for text, is_text in _strings(data):
+        flat = " ".join(text.split())
+        m = _SENTINEL_IN.search(flat)
+        if m is None:
+            continue
+        if m.group(1) == "REFUSED_MINOR":
+            return "minor"
+        if is_text and not _ONLY_DECLINED.fullmatch(flat):
+            continue
+        found = refusal(f"DECLINED: {flat[:200]}", script) or "declined"
+        if found == "minor":
+            return found
+    if found:
+        return found
+    items = data.get("hooks") if isinstance(data, dict) else data
+    if isinstance(items, list) and any(isinstance(i, dict) and str(i.get("text") or "").strip() for i in items):
+        return None
+    for text, _ in _strings(data):
+        why = refusal(text, script)
+        if why:
+            return why
+    if isinstance(data, dict) and any(data.get(k) for k in _REFUSAL_KEYS):
+        return refusal("DECLINED", script)
+    return None
 
 
 # ---------- variant audio ----------
@@ -769,8 +979,9 @@ def make_variant_audio(db: Session, variant: models.HookVariant) -> dict:
         db.commit()
         return {"path": base.audio_path, "fits": True, "overflow_seconds": 0.0, "hook_seconds": window,
                 "tempo": 1.0, "cost": 0.0, "reused": True}
-    # Before any voice is made or reused: the opening inside its script.
-    check_opening(db, base, variant.hook_text or "")
+    # Before any voice is made or reused: the opening inside its script,
+    # and with the original heard after it from this window on.
+    check_opening(db, base, variant.hook_text or "", window)
     if variant.audio_fingerprint == fp and variant.audio_path and Path(variant.audio_path).is_file():
         return {"path": variant.audio_path, "fits": True, "overflow_seconds": 0.0, "hook_seconds": None,
                 "tempo": None, "cost": 0.0, "reused": True}
@@ -1023,7 +1234,8 @@ def precheck(db: Session, project: models.VideoProject, variant: models.HookVari
     from .prompting import effective_negative
     from .safety import check_prompt
 
-    check_opening(db, db.get(models.Render, variant.base_render_id), variant.hook_text or "")
+    check_opening(db, db.get(models.Render, variant.base_render_id), variant.hook_text or "",
+                  variant.window_seconds)
     if variant.shot1_source == "new":
         check_generation(variant.shot1_prompt or "", effective_negative("video", _negative(db, clips[0])),
                          kind="video")
@@ -1620,8 +1832,9 @@ def compose_variant(db: Session, variant_id: int) -> Optional[models.Render]:
         script = base_script(db, base)
         # The captions and the stored script (what publishing drafts from)
         # are the opening inside this script: checked as that, again here,
-        # since the project's script can change after Make.
-        check_opening(db, base, variant.hook_text or "")
+        # since the project's script can change after Make (and with the
+        # original heard after it from the window on).
+        check_opening(db, base, variant.hook_text or "", variant.window_seconds)
         body = sum(clip_seconds(c) for c in clips)
         window = float(variant.window_seconds)
         speech = window

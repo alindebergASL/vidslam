@@ -29,7 +29,11 @@ SCHEMA_URL = "https://runware.ai/docs/models/{id}/schema.json"
 OUT = Path(__file__).resolve().parents[1] / "app" / "providers" / "runware_models.json"
 
 # Suggested first, in picker order. Open = Runware-hosted open weights
-# (no vendor moderation; Runware's own content check is off by default).
+# (no vendor moderation; Runware's own content check follows Settings in
+# adult mode and is always on outside it). None of the generation models
+# here documents a vendor safety setting (providers/runware._PERMISSIVE;
+# checked 2026-11-12), so adult mode loosens nothing on them. If a new
+# snapshot adds one, tests/test_runware_vendor_knobs.py says so.
 CURATED = [
     # photoreal stills
     "runware:107@1",          # FLUX.1 Krea [dev] (open)

@@ -211,19 +211,80 @@ def test_adult_mode_asks_the_planner_not_the_adult_text_model(client, monkeypatc
     bodies = [json.loads(c.request.content) for c in route.calls]
     assert [b["model"] for b in bodies] == ["acme/planner-1", "acme/planner-1"]
     assert bodies[0]["temperature"] == 0 and bodies[0]["max_tokens"] <= 300
-    assert minor_check.availability() == {"model": "acme/planner-1", "available": True}
+    status = minor_check.availability()
+    assert (status["model"], status["available"]) == ("acme/planner-1", True) and status["note"]
 
 
 @respx.mock
 def test_planner_refusal_or_error_fails_closed(client, monkeypatch):
+    """A planner that declines to judge refuses the prompt (asking again
+    gets the same answer); an error is "couldn't run"."""
     _real_planner(monkeypatch)
-    respx.post(f"{OR}/chat/completions").mock(side_effect=[
+    route = respx.post(f"{OR}/chat/completions").mock(side_effect=[
         _reply("DECLINED"), _reply("I can't help with that."), httpx.Response(500, json={}),
     ])
-    for _ in range(3):
+    for want in (minor_check.DECLINED, minor_check.DECLINED, minor_check.UNAVAILABLE):
         with pytest.raises(safety.UnsafePromptError) as e:
             minor_check.check_generation(ADULT_SEXUAL, kind="image")
+        assert str(e.value) == want
+    assert len(route.calls) == 3  # a decline isn't remembered: another planner may answer
+
+
+def test_a_decline_refuses_even_a_prompt_that_would_go_ahead_unchecked(client):
+    """Outside adult mode, a prompt that only mentions a child goes ahead when
+    the check can't run (the provider filters are on), but not when the
+    model declines to judge it."""
+    from app.providers.openrouter_chat import ModelDeclined
+
+    mock_chat.MINOR_REPLY = RuntimeError("HTTP 500")
+    minor_check.check_generation("kids playing football in a park", kind="image")
+    mock_chat.MINOR_REPLY = ModelDeclined("declined")
+    with pytest.raises(safety.UnsafePromptError) as e:
+        minor_check.check_generation("kids playing football in a park", kind="image")
+    assert str(e.value) == minor_check.DECLINED
+
+
+# ---------- adult mode with the check down (review) ----------
+
+
+@pytest.mark.parametrize("prompt", [
+    "upskirt shot of a petite girl with pigtails",
+    "petite flat-chested girl with pigtails and braces, wearing nothing, legs apart, on a bed",
+    "girl with pigtails giving a lap dance", "birthday suit", "skinny dipping", "in the buff", "no clothes",
+    "on all fours", "a mountain lake at dawn",
+])
+def test_adult_mode_refuses_every_picture_when_the_check_cant_run(client, prompt):
+    """Words outside the lists still reach a provider with its filters off in
+    adult mode, so nothing goes out unchecked there."""
+    mock_chat.MINOR_REPLY = RuntimeError("HTTP 500")
+    _adult(True)
+    for kind in ("image", "video", "lipsync"):
+        with pytest.raises(safety.UnsafePromptError) as e:
+            minor_check.check_generation(prompt, kind=kind)
         assert str(e.value) == minor_check.UNAVAILABLE
+    _adult(False)
+    minor_check.check_generation(prompt, kind="image")  # provider filters on: goes ahead, as before
+
+
+# ---------- what the model reads (review) ----------
+
+
+def test_the_avoid_list_comes_first_and_a_long_prompt_is_never_cut(client):
+    long = "nude woman, petite, flat chest, " + "a sunlit meadow with wildflowers, " * 200
+    assert len(long) > minor_check.JUDGE_WINDOW
+    text = minor_check.classifier_text("nude woman", "older looking skin, 21 year old")
+    assert text.startswith("Avoid list (negative prompt): older looking skin") and text.endswith("Prompt: nude woman")
+    # An "ok" given when the model was shown only a part of it doesn't count.
+    minor_check._store(minor_check.text_hash(long, "curvy, voluptuous"), "ok", minor_check._identity(), "part")
+    with pytest.raises(safety.UnsafePromptError) as e:
+        minor_check.check_generation(long, "curvy, voluptuous", kind="image")
+    assert "longer than the safety check can read" in str(e.value)
+    assert _calls() == 0  # not judged on a part of it
+    calm = "a sunlit meadow with wildflowers, " * 200
+    minor_check.check_generation(calm, kind="image")  # not sexual, filters on: goes ahead
+    _adult(True)
+    with pytest.raises(safety.UnsafePromptError):
+        minor_check.check_generation(calm, kind="image")  # adult mode: refused, it can't be judged
 
 
 @respx.mock
@@ -493,7 +554,8 @@ def test_plan_check_asks_once_per_unique_shot_prompt(client, monkeypatch):
 
 def test_adult_mode_status_names_the_safety_check(auth_client):
     body = auth_client.get("/api/settings/content").json()
-    assert body["safety_check"] == {"model": body["planner"], "available": True}
+    check = body["safety_check"]
+    assert (check["model"], check["available"]) == (body["planner"], True) and "minors" in check["note"]
 
 
 # ---------- everyday words, cache identity, races ----------

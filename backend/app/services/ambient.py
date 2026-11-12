@@ -732,8 +732,14 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
                    endpoint: str = "image.generate(still)",
                    summary: Optional[dict] = None) -> tuple[bytes, str]:
     """One still for this scene, at the model's best settings. If the
-    primary model fails (an error, a timeout, a refused prompt), retry once
+    primary model fails (an outage, a timeout, another error), retry once
     with the fallback model. Returns (image bytes, model used).
+
+    A refusal for content is final for this still, never retried on
+    another model: the app's minors refusal, a Sogni safety pause, a
+    Runware content refusal, or a vendor's moderation saying no
+    (providers/refusals.is_content_refusal). The next model may have no
+    filter at all (the default fallback is an OpenRouter model).
 
     With `references` (Day to night's "same place"), `prompt` is the full
     still prompt and `edit_prompt` an instruction to change only the light
@@ -762,14 +768,20 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
             png = image.generate(model=model, prompt=call_prompt, references=(references or []) if with_refs else [],
                                  negative_prompt=negative_prompt, settings=settings)
         except Exception as e:  # noqa: BLE001 — try the fallback model
+            from ..providers.refusals import is_content_refusal
             from .safety import UnsafeScriptError
 
             if isinstance(e, UnsafeScriptError):
                 raise  # refused for minors: no other model gets it either
-            last = e
-            log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
-            if isinstance(e, _ProviderUnavailable):
-                continue  # switched off in Settings: a refusal, not a provider error
+            refused = is_content_refusal(e)
+            if not refused:
+                last = e
+                log.warning("still with %s failed (%s); trying the next model", model, str(e)[:300])
+                if isinstance(e, _ProviderUnavailable):
+                    continue  # switched off in Settings: a refusal, not a provider error
+            else:
+                log.warning("still with %s refused for its content (%s); not trying another model",
+                            model, str(e)[:300])
             # Recorded (status=error) so the provider-error alerts see it.
             route = getattr(image, "last_route", None)
             _log_provider_call(db, project_id=project_id,
@@ -777,7 +789,12 @@ def generate_still(db: Session, cfg: AmbientConfig, *, prompt: str, aspect_ratio
                                endpoint=endpoint,
                                request_summary={"model": model, "reference": with_refs, **(summary or {}),
                                                 **({"edit_model": route.model.selector} if route else {})},
-                               response_summary={"error": str(e)[:500]}, status="error")
+                               response_summary={"error": str(e)[:500], **({"refused": True} if refused else {})},
+                               status="error")
+            if refused:
+                # Refused for its content (a safety pause, a vendor's
+                # moderation): no other model gets it either.
+                raise
             continue
         route = getattr(image, "last_route", None)
         _log_provider_call(db, project_id=project_id, provider=_pname(image), endpoint=endpoint,
@@ -990,19 +1007,22 @@ def _invalidate_loop(project: models.VideoProject) -> None:
 
 
 # Whose Cast picture the scene's own picture is, recorded when it is set:
-# {"avatar_id": id}, or {"avatar_id": None} for any other picture.
+# {"avatar_id": id, "asset_id": the card picture it is a copy of}, or
+# {"avatar_id": None} for any other picture.
 _PICTURE_CAST_KEY = "_picture_cast"
 
 
 def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: str, *,
-                discard_loop: bool = False, cast_avatar: Optional[int] = None) -> models.VideoProject:
-    """`cast_avatar`: the picture is this Cast character's (picture_from)."""
+                discard_loop: bool = False, cast_avatar: Optional[int] = None,
+                cast_asset: Optional[int] = None) -> models.VideoProject:
+    """`cast_avatar`: the picture is this Cast character's (picture_from),
+    a copy of their card picture `cast_asset` (None when that isn't known)."""
     png = _crop_to_aspect(raw, project.aspect_ratio)
     _check_discard(db, project, discard_loop)
     picture_path(project).write_bytes(png)
     _invalidate_loop(project)
     _set_state(project, "picture_origin", origin)
-    _set_state(project, _PICTURE_CAST_KEY, {"avatar_id": cast_avatar})
+    _set_state(project, _PICTURE_CAST_KEY, {"avatar_id": cast_avatar, "asset_id": cast_asset})
     db.commit()
     db.refresh(project)
     return project
@@ -1039,7 +1059,12 @@ def _picture_mark(db: Session, project: models.VideoProject) -> dict:
     from .content_mode import adult_ok_avatars
     from .pipeline import avatar_adult_ok
 
-    return {"cast_picture": True, "adult_ok": avatar_adult_ok(db, int(rec["avatar_id"]), adult_ok_avatars())}
+    # Only a copy of a card picture the tick covers (recorded since the
+    # tick began to cover pictures one by one; an older record keeps the
+    # filter: choose the picture again).
+    asset_id = rec.get("asset_id")
+    return {"cast_picture": True, "adult_ok": avatar_adult_ok(
+        int(rec["avatar_id"]), int(asset_id) if isinstance(asset_id, int) else None, adult_ok_avatars())}
 
 
 def still_prompt(cfg: AmbientConfig) -> str:
@@ -1086,21 +1111,23 @@ def picture_from(db: Session, project: models.VideoProject, *, asset_id: Optiona
     """A Cast character's picture (or a cutout or upscale of one) is
     recorded as theirs, so the loop made from it keeps their content
     filter unless they're ticked "adult content allowed"."""
-    from .pipeline import cast_avatar_of, studio_cast_avatar
+    from .pipeline import cast_avatar_of, studio_cast_source
 
     if asset_id is not None:
         asset = db.get(models.Asset, asset_id)
         if asset is None or not asset.file_path or not Path(asset.file_path).exists():
             raise LookupError("asset not found")
+        cast = cast_avatar_of(asset)
         return set_picture(db, project, Path(asset.file_path).read_bytes(), "asset", discard_loop=discard_loop,
-                           cast_avatar=cast_avatar_of(asset))
+                           cast_avatar=cast, cast_asset=asset.id if cast is not None else None)
     if studio_job_id is not None:
         job = db.get(models.AssetGenerationJob, studio_job_id)
         if (job is None or job.output_kind != "image" or job.status not in ("completed", "saved")
                 or not job.result_path or not Path(job.result_path).exists()):
             raise LookupError("studio image not found")
+        cast, source = studio_cast_source(db, job)
         return set_picture(db, project, Path(job.result_path).read_bytes(), "studio",
-                           discard_loop=discard_loop, cast_avatar=studio_cast_avatar(db, job))
+                           discard_loop=discard_loop, cast_avatar=cast, cast_asset=source)
     raise PictureError("give asset_id or studio_job_id")
 
 
