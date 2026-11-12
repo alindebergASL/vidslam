@@ -126,6 +126,14 @@ def exempt(ref) -> bool:  # noqa: ANN001 — ImageRef
     return bool(getattr(ref, "adult_ok", False)) and adult_mode()
 
 
+def forces_filter(ref) -> bool:  # noqa: ANN001 — ImageRef
+    """A picture that turns the content filter on: a Cast character's
+    picture (role "character", or `cast_picture` for one sent as a scene or
+    a frame) that isn't exempt."""
+    cast = getattr(ref, "role", "") == "character" or bool(getattr(ref, "cast_picture", False))
+    return cast and not exempt(ref)
+
+
 def set_adult_mode(value: Optional[bool]) -> dict:
     """Switch adult mode on/off; None goes back to ADULT_MODE."""
     from .model_registry import put_setting

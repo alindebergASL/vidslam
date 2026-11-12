@@ -18,6 +18,7 @@ from .conftest import make_png_bytes
 MINOR_SEXUAL = "a teenage girl in a bikini, provocative pose"
 IMPLIED = "she takes off her school uniform in the locker room"  # no minor or sexual word
 ADULT_SEXUAL = "a sexy woman on a beach at sunset"
+KIDS_SWIM = "two kids in swimsuits on the beach"  # not refused (soft word), but names children
 PLAIN = "a mountain lake at dawn"
 OR = "https://openrouter.ai/api/v1"
 
@@ -300,8 +301,12 @@ def test_runware_forces_content_check_for_sexual_prompt_with_any_picture_outside
     assert runware._pictures_need_check([ref], ADULT_SEXUAL)
     assert not runware._pictures_need_check([], ADULT_SEXUAL)
     assert not runware._pictures_need_check([ref], PLAIN)
-    _adult(True)  # adult mode: only an unmarked Cast picture forces it (`cast`)
+    _adult(True)  # adult mode: only an unmarked Cast picture forces it (`cast`)...
     assert not runware._pictures_need_check([ref], ADULT_SEXUAL)
+    # ...and the minors rules: a child named, or an avoid list that removes signs of adulthood.
+    assert runware._pictures_need_check([ref], KIDS_SWIM)
+    assert runware._pictures_need_check([ref], ADULT_SEXUAL, "adult, mature, woman")
+    assert not runware._pictures_need_check([], KIDS_SWIM)
     _adult(False)
     sch = {"request": {"properties": {"positivePrompt": {"type": "string"}, "safety": {
         "type": "object", "properties": {"checkContent": {"type": "boolean"}}}}}}
@@ -312,6 +317,30 @@ def test_runware_forces_content_check_for_sexual_prompt_with_any_picture_outside
         runware._bases(no_switch, "imageInference", "m:1@1", ADULT_SEXUAL, "", True, False, pictures=True)
     assert "sexual prompt" in str(e.value)
     runware._bases(no_switch, "imageInference", "m:1@1", PLAIN, "", False, False)  # no picture rule: fine
+
+
+def test_runware_without_a_content_check_refuses_a_picture_when_the_minors_rules_want_it(client, monkeypatch):
+    """Adult mode: a sexual prompt naming a child, sent with any picture,
+    needs Runware's content check. A model without one is refused, as
+    outside adult mode, never sent unchecked. An adult prompt is sent."""
+    from app.providers import runware
+
+    from .test_runware import _CORE, _IMG, _fake_model, _ref
+
+    model = _fake_model(monkeypatch, "test:nocheck@1", {
+        "type": "object", "additionalProperties": False, "required": ["taskType", "taskUUID", "model"],
+        "properties": {**_CORE,
+                       "inputs": {"type": "object", "properties": {"referenceImages": {"type": "array", "items": _IMG}}}}},
+        modes=[{"id": "text"}, {"id": "reference-images", "inputs": ["referenceImages"]}], caps=["text-to-image", "edit"])
+    _adult(True)
+    for prompt, negative in ((KIDS_SWIM, ""), (ADULT_SEXUAL, "adult, mature, woman")):
+        with pytest.raises(runware.RunwareError) as e:
+            runware.build_image_task(model, prompt, [_ref()], negative_prompt=negative)
+        assert "sexual prompt" in str(e.value)
+    task = runware.build_image_task(model, ADULT_SEXUAL, [_ref()])
+    assert "safety" not in task and task["inputs"]["referenceImages"]
+    runware.build_image_task(model, KIDS_SWIM, [])  # no picture: no picture rule
+    _adult(False)
 
 
 def test_sogni_safe_filter_off_for_sexual_prompt_with_a_non_cast_picture_in_adult_mode(client, monkeypatch):

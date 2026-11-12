@@ -769,8 +769,9 @@ def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str
         task["negativePrompt"] = neg
     if not _put(task, props, ("safety", "checkContent"), bool(check_content)) and (cast or pictures):
         # Rule: a Cast member's picture (unless marked "adult content
-        # allowed", in adult mode), or outside adult mode any picture with
-        # a sexual prompt, never goes out without the check.
+        # allowed", in adult mode), or any picture with a sexual prompt
+        # (in adult mode only when the minors rules want the check), never
+        # goes out without the check.
         if cast:
             raise RunwareError(f"{model_air} has no content check, so it can't be sent pictures of your Cast")
         raise RunwareError(f"{model_air} has no content check, so it can't be sent a picture with a "
@@ -819,9 +820,9 @@ def build_image_task(model: str, prompt: str, references: list[ImageRef], *, neg
                     len(refs) - len(used), "fewer" if used else "none of this kind")
     # A Cast member's likeness (unless marked "adult content allowed", in
     # adult mode), or a prompt about children, goes through Runware's check.
-    cast = any(r.role == "character" and not _exempt(r) for r in used)
+    cast = any(_forces_filter(r) for r in used)
     sent = _name_refs(prompt, used)
-    pictures = _pictures_need_check(used, sent)
+    pictures = _pictures_need_check(used, sent, negative_prompt)
     checked = _content_check(check_content, cast, sent, negative_prompt) or pictures
     bases = _bases(sch, "imageInference", a, sent, negative_prompt, checked, cast, pictures=pictures)
     for base in bases:
@@ -922,9 +923,9 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
         # the prompt (storyboard shots attach the Cast to every shot).
         log.warning("runware %s: %d reference picture(s) not used (the model takes %s)", a,
                     len(refs) - len(used), "fewer" if used else "only pinned frames")
-    cast = any(r.role == "character" and not _exempt(r) for r in used)
+    cast = any(_forces_filter(r) for r in used)
     sent = _name_refs(prompt, used if not first else [])
-    pictures = _pictures_need_check(used, sent)
+    pictures = _pictures_need_check(used, sent, negative_prompt)
     checked = _content_check(check_content, cast, sent, negative_prompt) or pictures
     bases = _bases(sch, "videoInference", a, sent, negative_prompt, checked, cast, pictures=pictures)
     loop = first is not None and last is not None and first.url == last.url
@@ -1194,21 +1195,24 @@ def _content_check(explicit: Optional[bool], cast: bool, sent: str, negative: st
     return bool(default or cast or mentions_minor(sent) or steers_young(sent, negative))
 
 
-def _pictures_need_check(used: list[ImageRef], sent: str) -> bool:
-    """Outside adult mode, a sexual prompt sent with any reference picture
-    (not only a Cast member's) always goes through Runware's content
-    check, and a model without one is refused. In adult mode this rule
-    is off: only a picture of a Cast character not marked "adult content
-    allowed" forces the check (`cast`), with the minors rules."""
-    from ..services.safety import is_sexual
+def _pictures_need_check(used: list[ImageRef], sent: str, negative: str = "") -> bool:
+    """A sexual prompt sent with any reference picture (not only a Cast
+    member's) goes through Runware's content check, and a model without
+    one is refused. In adult mode only when the minors rules want the
+    check too (the prompt mentions a child or a minor's age, or its avoid
+    list removes signs of adulthood); otherwise only a picture of a Cast
+    character not marked "adult content allowed" forces it (`cast`)."""
+    from ..services.safety import is_sexual, steers_young
 
-    return bool(used) and not _adult_mode() and is_sexual(sent)
+    if not used or not is_sexual(sent):
+        return False
+    return not _adult_mode() or mentions_minor(sent) or steers_young(sent, negative)
 
 
-def _exempt(ref: ImageRef) -> bool:
-    from ..services.content_mode import exempt
+def _forces_filter(ref: ImageRef) -> bool:
+    from ..services.content_mode import forces_filter
 
-    return exempt(ref)
+    return forces_filter(ref)
 
 
 def _guard(prompt: str) -> None:

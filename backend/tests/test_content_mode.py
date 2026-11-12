@@ -607,3 +607,160 @@ def test_a_cutout_or_upscale_on_a_marked_card_counts_whatever_its_source(auth_cl
     on_sams_card = _asset(sam, source="generated", job=op_job(sam, source_asset_id=own))
     assert _exempt_ids([from_own, from_sam, from_studio, no_source]) == [True] * 4
     assert _exempt_ids([on_sams_card]) == [False]  # Sam isn't marked
+
+
+# ---------- second review ----------
+
+
+def _op_job(owner, tmp_path, *, operation="upscale", **source):
+    """A finished cutout or upscale (or, with operation="", a picture made
+    in Studio) with a real result file."""
+    from app import models
+    from app.db import SessionLocal
+
+    from .conftest import make_png_bytes
+
+    path = tmp_path / f"op-{owner}-{len(list(tmp_path.iterdir()))}.png"
+    path.write_bytes(make_png_bytes((1024, 1024)))
+    db = SessionLocal()
+    try:
+        j = models.AssetGenerationJob(owner_kind="avatar", owner_id=owner, output_kind="image", prompt="p",
+                                      status="completed", operation=operation, result_path=str(path),
+                                      reference_asset_ids_json=[], **source)
+        db.add(j)
+        db.commit()
+        return j.id
+    finally:
+        db.close()
+
+
+def _sogni_video_filters(monkeypatch, frames, prompt="a nude portrait by the window"):
+    """safe_content_filter of a Sogni clip started from each set of frames."""
+    from app.providers.sogni import SogniVideoProvider
+
+    monkeypatch.setenv("SOGNI_API_KEY", "sk-test-123456789")
+    monkeypatch.setenv("MOCK_PROVIDERS", "false")
+    _reset()
+    bodies = []
+
+    def started(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(201, json={"status": "success", "data": {"workflow": {"workflowId": "wf", "status": "queued"}}})
+
+    with respx.mock() as router:
+        router.post(SOGNI_WF).mock(side_effect=started)
+        for refs in frames:
+            SogniVideoProvider().submit(model="sogni/wan3.0-video", prompt=prompt, references=refs,
+                                        duration_seconds=10, reference_strategy="frame_images")
+    assert all(b.get("media_references") for b in bodies)
+    _reset()
+    return [b["safe_content_filter"] for b in bodies]
+
+
+def test_animating_a_cutout_or_upscale_of_a_cast_picture_keeps_it_theirs(auth_client, monkeypatch, tmp_path):
+    """"Animate this" on an upscale or cutout of a Cast picture (even of
+    another cutout, or of a picture deleted since) is still that
+    character's picture: an unticked character keeps the filter. A picture
+    newly made in Studio is not a Cast picture."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import content_mode
+    from app.services.pipeline import studio_first_frame
+
+    maya, sam = _avatar("Maya"), _avatar("Sam")
+    content_mode.set_avatar_adult_ok(maya, True)
+    up_sam = _op_job(sam, tmp_path, source_asset_id=_asset(sam))
+    cut_of_up = _op_job(sam, tmp_path, operation="remove_background", source_job_id=up_sam)
+    up_maya = _op_job(maya, tmp_path, source_asset_id=_asset(maya))
+    source_gone = _op_job(sam, tmp_path)  # its Cast picture was deleted since
+    logo = _op_job(sam, tmp_path, source_asset_id=_asset(sam, asset_type="logo"))
+    made = _op_job(sam, tmp_path, operation="")  # a new Studio picture
+    cases = ((up_sam, "character", False), (cut_of_up, "character", False), (up_maya, "character", True),
+             (source_gone, "character", False), (logo, "scene", False), (made, "scene", False))
+    db = SessionLocal()
+    try:
+        frames = []
+        for src, role, ok in cases:
+            job = models.AssetGenerationJob(owner_kind="avatar", owner_id=sam, output_kind="video_clip",
+                                            prompt="p", status="pending", first_frame_job_id=src)
+            ref = studio_first_frame(db, job)
+            assert (ref.frame_type, ref.role, ref.adult_ok) == ("first_frame", role, ok), src
+            frames.append([ref])
+    finally:
+        db.close()
+    content_mode.set_adult_mode(True)
+    assert _sogni_video_filters(monkeypatch, frames) == [True, True, False, True, False, False]
+
+
+def test_an_ambient_loop_made_from_a_cast_picture_keeps_that_characters_filter(auth_client, monkeypatch, tmp_path):
+    """Ambient: a Cast character's picture chosen as the scene's picture
+    (or an upscale of one) counts as that character's picture on every
+    frame and still made from it, so an unticked character keeps the
+    filter. The tick is read when each clip is sent."""
+    from app import models
+    from app.db import SessionLocal
+    from app.providers import mock_image, mock_video
+    from app.services import ambient, content_mode
+
+    from .conftest import make_png_bytes
+    from .test_ambient import SHORT
+
+    maya, sam = _avatar("Maya"), _avatar("Sam")
+    content_mode.set_avatar_adult_ok(maya, True)
+
+    def cast_picture(avatar_id):
+        up = auth_client.post(f"/api/avatars/{avatar_id}/assets",
+                              files={"file": ("h.png", make_png_bytes((1024, 1024)), "image/png")},
+                              data={"asset_type": "hero", "rights_confirmed": "true"}).json()
+        return up["id"] if "id" in up else up["assets"][0]["id"]
+
+    sam_pic, maya_pic = cast_picture(sam), cast_picture(maya)
+    sent: list = []  # the reference pictures of every clip and still
+    for cls, name in ((mock_video.MockVideoProvider, "submit"), (mock_image.MockImageProvider, "generate")):
+        def spy(self, real=getattr(cls, name), **kw):
+            sent.append(list(kw["references"]))
+            return real(self, **kw)
+
+        monkeypatch.setattr(cls, name, spy)
+
+    def loop(picture: dict, **cfg) -> tuple[int, list]:
+        sid = auth_client.post("/api/ambient", json={
+            "config": {**SHORT, "music_mood": "none", "variety": "day_night", "variations": 2, **cfg},
+            "generate": False}).json()["id"]
+        if picture:
+            assert auth_client.post(f"/api/ambient/{sid}/picture/from", json=picture).status_code == 200
+        else:
+            auth_client.post(f"/api/ambient/{sid}/picture",
+                             files={"file": ("p.png", make_png_bytes((1920, 1080)), "image/png")})
+        sent.clear()
+        auth_client.post(f"/api/ambient/{sid}/generate-loop")
+        assert auth_client.get(f"/api/ambient/{sid}").json()["loop_status"] == "completed"
+        refs = [r for refs in sent for r in refs]
+        assert refs and all(r.role == "scene" for r in refs)  # still sent as the scene and its frames
+        return sid, refs
+
+    sid, sam_refs = loop({"asset_id": sam_pic})
+    assert any(r.frame_type == "first_frame" for r in sam_refs) and any(r.frame_type is None for r in sam_refs)
+    assert all(r.cast_picture and not r.adult_ok for r in sam_refs)
+    _, maya_refs = loop({"asset_id": maya_pic})
+    assert all(r.cast_picture and r.adult_ok for r in maya_refs)
+    _, drift_refs = loop({"asset_id": sam_pic}, source="image_drift")  # the night still, from the picture
+    assert len(drift_refs) == 1 and drift_refs[0].cast_picture and not drift_refs[0].adult_ok
+    _, up_refs = loop({"studio_job_id": _op_job(sam, tmp_path, source_asset_id=sam_pic)})
+    assert all(r.cast_picture and not r.adult_ok for r in up_refs)
+    for picture in ({}, {"studio_job_id": _op_job(sam, tmp_path, operation="")}):  # upload, a new Studio picture
+        _, refs = loop(picture)
+        assert not any(r.cast_picture or r.adult_ok for r in refs)
+
+    # Ticking Sam afterwards applies to the next clip sent.
+    content_mode.set_avatar_adult_ok(sam, True)
+    db = SessionLocal()
+    try:
+        assert ambient._picture_mark(db, db.get(models.VideoProject, sid)) == {"cast_picture": True, "adult_ok": True}
+    finally:
+        db.close()
+    content_mode.set_avatar_adult_ok(sam, False)
+
+    content_mode.set_adult_mode(True)
+    loops = [[r for r in refs if r.frame_type] for refs in (sam_refs, maya_refs)]
+    assert _sogni_video_filters(monkeypatch, loops) == [True, False]

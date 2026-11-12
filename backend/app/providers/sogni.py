@@ -68,10 +68,10 @@ def _adult_mode() -> bool:
     return adult_mode()
 
 
-def _exempt(ref: ImageRef) -> bool:
-    from ..services.content_mode import exempt
+def _forces_filter(ref: ImageRef) -> bool:
+    from ..services.content_mode import forces_filter
 
-    return exempt(ref)
+    return forces_filter(ref)
 
 
 def is_sogni(model: Optional[str]) -> bool:
@@ -936,10 +936,12 @@ class SogniClient:
         A prompt sexualising minors is refused before it's sent. Sogni's safe
         filter is on outside adult mode. In adult mode it is on only for a
         picture of a Cast character not marked "adult content allowed"
-        (`cast`; content_mode.exempt), a prompt mentioning a child or a
-        minor's age, or a sexual prompt whose avoid list (`negative`)
-        removes signs of adulthood. Any other picture (a marked character, a
-        scene, a Studio result) follows SOGNI_SAFE_CONTENT_FILTER."""
+        (`cast`; content_mode.forces_filter, which also counts a Cast
+        picture used as an ambient scene's picture or as a first frame), a
+        prompt mentioning a child or a minor's age, or a sexual prompt whose
+        avoid list (`negative`) removes signs of adulthood. Any other
+        picture (a marked character, a scene, a Studio result) follows
+        SOGNI_SAFE_CONTENT_FILTER."""
         from ..services.safety import check_prompt, mentions_minor, steers_young
 
         prompt = str(arguments.get("prompt") or "")
@@ -1169,7 +1171,8 @@ class SogniImageProvider(ImageProvider):
             # generate_image has no identity-reference input.
             log.info("sogni %s: ignoring %d reference image(s) (no reference input)", model, len(references))
         wf = self.client.start(title=prompt[:80], tool="generate_image", arguments=args, negative=negative_prompt,
-                               media_references=media or None)
+                               media_references=media or None,
+                               cast=source is not None and _forces_filter(source))
         wf = self._wait(wf)
         url = self.client.artifact_url(wf, "image")
         if not url:
@@ -1192,7 +1195,7 @@ class SogniImageProvider(ImageProvider):
         media = [{"kind": "image", "url": r.url} for r in route.refs]
         self.last_route = route
         wf = self.client.start(title=prompt[:80], tool=EDIT_TOOL, arguments=args, media_references=media,
-                               cast=any(r.role == "character" and not _exempt(r) for r in route.refs),
+                               cast=any(_forces_filter(r) for r in route.refs),
                                negative=negative_prompt)
         wf = self._wait(wf)
         url = self.client.artifact_url(wf, "image")
@@ -1329,7 +1332,7 @@ class SogniVideoProvider(VideoProvider):
                 log.info("sogni %s: ignoring %d reference image(s) (model takes none)", model, len(loose))
         sent = {m["url"] for m in media}
         wf = self.client.start(title=prompt[:80], tool=tool, arguments=args, media_references=media or None,
-                               cast=any(r.role == "character" and r.url in sent and not _exempt(r) for r in refs),
+                               cast=any(r.url in sent and _forces_filter(r) for r in refs),
                                negative=negative_prompt)
         wid = str(wf["workflowId"])
         return SubmittedJob(provider="sogni", model=model, job_id=wid,

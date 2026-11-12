@@ -19,6 +19,11 @@ class ImageRef:
     # in adult mode it skips the forced content filter
     # (services/content_mode.exempt). Minors are refused regardless.
     adult_ok: bool = False
+    # A Cast character's picture sent in another role (an ambient scene's
+    # own picture, or a frame or still made from it): the forced content
+    # filter treats it as that character's picture (content_mode.forces_filter)
+    # while the providers still use it as a scene or a frame.
+    cast_picture: bool = False
 
 
 @dataclass
