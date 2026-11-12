@@ -406,6 +406,20 @@ def test_each_picture_model_says_which_editor_it_runs_as(edit_env):
     assert sogni.with_pictures("sogni/krea-2-turbo") is None
 
 
+def test_a_missing_default_editor_is_logged_for_pictures_not_for_the_pickers(edit_env, caplog):
+    from app.providers import sogni
+
+    edit_env(SOGNI_IDENTITY_EDIT_MODEL="no-such-editor")
+    with caplog.at_level("WARNING", logger=sogni.log.name):
+        assert sogni.with_pictures("sogni/seedream-5-0-pro-uncensored")["identity"] is not None
+        assert sogni.editor_for("sogni/moss-image", "identity") is not None
+    assert "isn't in Sogni's edit list" not in caplog.text
+    # A real picture still says so.
+    with caplog.at_level("WARNING", logger=sogni.log.name):
+        sogni.edit_route("sogni/moss-image", [_ref("character")])
+    assert "'no-such-editor' isn't in Sogni's edit list" in caplog.text
+
+
 def test_the_studio_image_model_list_says_which_editor_runs(auth_client, monkeypatch):
     from app import config
     from app.services import model_catalog, provider_keys
@@ -485,6 +499,28 @@ def test_a_studio_picture_records_the_editor_that_really_ran(auth_client, live_s
     job = auth_client.get(f"/api/studio/jobs/{jid}").json()
     assert job["status"] == "failed" and job["ref_intent"] == "guide"
     assert (job["ran_on_name"], job["ran_on_editor"]) == ("FLUX.3 Klein edit", "flux-3-klein")
+
+    # A start Sogni refused (or never reached) ran no editor: the failed
+    # tile names none, and the provider says no edit was used.
+    from app.providers.sogni import SogniImageProvider
+
+    refused = httpx.Response(400, json={"status": "error", "errorCode": 4103, "message": "not allowed"})
+    for answer in (refused, httpx.ConnectError("down")):
+        with SessionLocal() as db:
+            jid = _studio_job(db, "sogni/seedream-5-0-pro-uncensored", options={"note": "kept"})
+            with respx.mock() as router:
+                router.post(WF).mock(side_effect=[answer] * 3)
+                with pytest.raises(SogniError):
+                    pipeline.run_studio_job(db, jid)
+        job = auth_client.get(f"/api/studio/jobs/{jid}").json()
+        assert job["status"] == "failed" and job["ref_intent"] == "identity"
+        assert (job["ran_on_name"], job["ran_on_editor"], job["options"]) == (None, None, {"note": "kept"})
+    provider = SogniImageProvider()
+    with respx.mock() as router:
+        router.post(WF).mock(return_value=refused)
+        with pytest.raises(SogniError):
+            provider.generate(model="sogni/krea-2-turbo", prompt="Mia by the lamp.", references=[_ref("character")])
+    assert provider.last_route is None
 
 
 def test_a_picture_without_an_edit_records_nothing(auth_client):

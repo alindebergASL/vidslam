@@ -2149,7 +2149,8 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
     except Exception as e:  # noqa: BLE001
         db.rollback()
         values: dict = {"status": "failed", "error": str(e)[:500]}
-        # A failed Sogni edit says which editor it was tried on.
+        # A Sogni edit that started and then failed says which editor it
+        # was tried on; a start Sogni refused ran nothing, so says nothing.
         ran_on = _ran_on(image)
         if ran_on:
             values["options_json"] = _options_with_ran_on(job.options_json, ran_on)

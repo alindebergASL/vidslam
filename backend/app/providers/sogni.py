@@ -716,9 +716,11 @@ def reference_intent(refs: list[ImageRef], intent: str = "") -> str:
     return "guide"
 
 
-def edit_route(model: str, refs: list[ImageRef], intent: str = "") -> Optional[EditRoute]:
+def edit_route(model: str, refs: list[ImageRef], intent: str = "", *, warn: bool = True) -> Optional[EditRoute]:
     """Which edit model makes a picture with these references for `model`
-    (a sogni/ image model), or None when references aren't routed to edits."""
+    (a sogni/ image model), or None when references aren't routed to edits.
+    `warn=False` for a look-up that makes no picture (the pickers): only a
+    real picture logs that a default editor is missing."""
     s = get_settings()
     if not refs or not s.sogni_edit_references:
         return None
@@ -730,7 +732,7 @@ def edit_route(model: str, refs: list[ImageRef], intent: str = "") -> Optional[E
     if twin is not None and twin.identity and intent != "identity":
         twin = None  # an identity editor is for likeness; a place gets the scene editor
     default = selector(s.sogni_identity_edit_model if intent == "identity" else s.sogni_scene_edit_model)
-    if twin is None and default and default not in offered:
+    if warn and twin is None and default and default not in offered:
         log.warning("sogni: edit model %r isn't in Sogni's edit list; using the next default", default)
     choice = twin or offered.get(default)
     if choice is not None and len(refs) > choice.max_refs and not choice.premium:
@@ -779,7 +781,7 @@ def editor_for(model: str, intent: str, n_refs: int = 1) -> Optional[EditModel]:
     if not is_sogni(model) or n_refs < 1 or takes_source_image(model):
         return None
     probe = [ImageRef(url="https://example.invalid/x.png", role="character" if intent == "identity" else "scene")]
-    route = edit_route(model, probe * n_refs, intent)
+    route = edit_route(model, probe * n_refs, intent, warn=False)
     return route.model if route is not None else None
 
 
@@ -1170,7 +1172,7 @@ class SogniImageProvider(ImageProvider):
     def __init__(self, *, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         self.client = SogniClient(api_key)
         self.model = model or f"{PREFIX}krea-2-turbo"
-        self.last_route: Optional[EditRoute] = None  # the edit used by the last generate(), if any
+        self.last_route: Optional[EditRoute] = None  # the edit Sogni took for the last generate(), if any
 
     def list_models(self) -> list[ModelInfo]:
         return [ModelInfo(id=f"{PREFIX}{m.selector}", name=display_name(m), modality="image",
@@ -1242,11 +1244,13 @@ class SogniImageProvider(ImageProvider):
         if negative_prompt:  # edit_image has no negative prompt
             log.info("sogni %s: edit_image takes no negative prompt; dropped", model)
         media = [{"kind": "image", "url": r.url} for r in route.refs]
-        self.last_route = route
         wf = self.client.start(title=prompt[:80], tool=EDIT_TOOL, arguments=args, media_references=media,
                                cast=any(r.role == "character" and not _exempt(r) for r in route.refs),
                                exempt=bool(route.refs) and all(_exempt(r) for r in route.refs),
                                negative=negative_prompt)
+        # Only once Sogni took the workflow: a start that was refused (or
+        # never got there) ran no editor, so nothing says it did.
+        self.last_route = route
         wf = self._wait(wf)
         url = self.client.artifact_url(wf, "image")
         if not url:

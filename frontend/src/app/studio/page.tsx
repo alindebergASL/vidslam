@@ -30,6 +30,7 @@ import {
   costText,
   editorFor,
   editorPriceText,
+  jobPictures,
   pictureIntent,
   ranOnText,
   sheetSlot,
@@ -494,8 +495,13 @@ function Studio() {
       : videoModels;
   const retryPrice = (job: StudioJob): string => {
     const m = modelOptionsFor(job).find((x) => x.id === job.provider_model);
-    if (!m?.price_text) return "";
-    if (m.price_text === "free") return "free";
+    // With reference pictures a Sogni model runs again on its Sogni editor,
+    // at that editor's price (as in Try another model).
+    const { intent, count } = jobPictures(job);
+    const editor = editorFor(m, intent, count);
+    const priceText = editor ? editorPriceText(editor, count) : m?.price_text;
+    if (!priceText) return "";
+    if (priceText === "free") return "free";
     // An upscale is priced by its source's size (the catalog price is for
     // 1 MP), so it shows the server's estimate for this picture, and no
     // price until that has arrived.
@@ -503,7 +509,7 @@ function Studio() {
       const est = upscaleEstimates[job.id];
       return est === undefined || est === null ? "" : est === 0 ? "free" : `about ${usd(est)}`;
     }
-    const p = priceFromText(m.price_text);
+    const p = priceFromText(priceText);
     if (p === null) return "";
     // Clips are priced per 5 s in the picker.
     const n = job.output_kind === "video_clip" && !job.operation ? p * ((job.duration_seconds || 5) / 5) : p;
@@ -1489,7 +1495,9 @@ function TileCard({
           {ranOn && !selectMode && (
             <div
               className="chip text-[10px] py-0.5 bg-ink-900/85 truncate max-w-full"
-              title={`Picked ${job?.provider_model}. With the reference pictures, Sogni made it with ${job?.ran_on_name}.`}
+              title={`Picked ${job?.provider_model}. With the reference pictures, Sogni ${
+                job?.status === "failed" ? "tried it" : "made it"
+              } with ${job?.ran_on_name}.`}
             >
               {ranOn}
             </div>

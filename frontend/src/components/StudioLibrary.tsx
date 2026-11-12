@@ -57,11 +57,25 @@ export function editorChoices(
   return Array.from(out.values());
 }
 
-/** "Ran on Krea 2 Identity Edit (Sogni)" when a Sogni editor made it, not the picked model. */
-export function ranOnText(job: Pick<StudioJob, "ran_on_name" | "ran_on_editor" | "provider_model">): string | null {
+/** What a Studio picture job's reference pictures are for, and how many are
+ *  still there (deleted ones aren't sent); no intent for clips and operations. */
+export function jobPictures(
+  job: Pick<StudioJob, "output_kind" | "operation" | "ref_intent" | "reference_asset_ids" | "missing_reference_ids">
+): { intent: PictureIntent | null; count: number } {
+  const intent = job.output_kind === "image" && !job.operation ? job.ref_intent ?? null : null;
+  const missing = new Set(job.missing_reference_ids || []);
+  const count = intent ? (job.reference_asset_ids || []).filter((id) => !missing.has(id)).length : 0;
+  return { intent, count };
+}
+
+/** "Ran on Krea 2 Identity Edit (Sogni)" when a Sogni editor made it, not the
+ *  picked model; "Tried on …" when it started there and then failed. */
+export function ranOnText(
+  job: Pick<StudioJob, "ran_on_name" | "ran_on_editor" | "provider_model" | "status">
+): string | null {
   if (!job.ran_on_name) return null;
   if (job.ran_on_editor && `sogni/${job.ran_on_editor}` === job.provider_model) return null;
-  return `Ran on ${job.ran_on_name} (Sogni)`;
+  return `${job.status === "failed" ? "Tried on" : "Ran on"} ${job.ran_on_name} (Sogni)`;
 }
 
 /** The options of a Studio model picker. With reference pictures, each Sogni
@@ -154,9 +168,7 @@ export function ModelPickerDialog({
   // With reference pictures a Sogni model runs on one of Sogni's editors:
   // the one this job ran on, else the one its model runs as now.
   const isOp = Boolean(job.operation);
-  const intent = job.output_kind === "image" && !isOp ? job.ref_intent ?? null : null;
-  const missing = new Set(job.missing_reference_ids || []);
-  const count = intent ? (job.reference_asset_ids || []).filter((id) => !missing.has(id)).length : 0;
+  const { intent, count } = jobPictures(job);
   const jobEditor =
     (intent && job.ran_on_editor) || editorFor(models.find((m) => m.id === job.provider_model), intent, count)?.id || null;
   const sameEditor = (e: SogniEditor | null) => Boolean(jobEditor) && e?.id === jobEditor;
