@@ -323,6 +323,13 @@ def _mux_audio_captions_overlays(
         ]
     else:
         cmd += ["-an"]
+    # The padded voice (apad) never ends, so -shortest alone decides where
+    # the file stops, and newer FFmpeg releases overshoot it by up to a
+    # second or two of audio buffered past the last frame. Cap the output at
+    # the picture's own length so every version ends with the video.
+    video_seconds = _probe_duration(silent_in)
+    if video_seconds > 0:
+        cmd += ["-t", f"{video_seconds:.3f}"]
     cmd += [str(out)]
 
     rc, log = _run(cmd)
