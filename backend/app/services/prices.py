@@ -57,12 +57,38 @@ def image_price(entry: dict) -> Optional[float]:
     return None
 
 
+FREE_SPARK = "free (Free Spark)"
+
+
+def _sogni_price_text(model: str, kind: str) -> str:
+    """A Sogni model's price as Spend will count it: Free Spark models are
+    free unless SOGNI_COUNT_FREE_SPARK is on. A picture made with reference
+    pictures runs on an edit model, so the text also says when that one is
+    free and the plain picture isn't, or the other way round."""
+    from ..providers import sogni
+
+    if kind == "video":
+        rate = sogni.video_spend_rate_usd(model)
+        return f"about {money(rate * 5)} per 5 s" if rate > 0 else FREE_SPARK
+    usd = sogni.image_spend_usd(model)
+    text = f"about {money(usd)} per image" if usd > 0 else FREE_SPARK
+    probe = [sogni.ImageRef(url="https://example.invalid/x.png", role="scene")]
+    route = None if sogni.takes_source_image(model) else sogni.edit_route(model, probe)
+    if route is not None:
+        ref_usd = sogni.edit_spend_usd(route.model.selector, 1)
+        if (ref_usd > 0) != (usd > 0):
+            text += f"; {f'about {money(ref_usd)}' if ref_usd > 0 else 'free'} with reference pictures"
+    return text
+
+
 def price_text(entry: Optional[dict], kind: str) -> str:
     """"about $0.04 per image" / "about $0.30 per 5 s" for a catalog entry."""
     if not entry:
         return ""
     if entry.get("price_text"):
         return str(entry["price_text"])
+    if (entry.get("provider") or "") == "sogni" and entry.get("id") and kind in ("image", "video"):
+        return _sogni_price_text(str(entry.get("id") or ""), kind)
     if kind == "image":
         usd = image_price(entry)
         shown = money(usd) if usd else ""

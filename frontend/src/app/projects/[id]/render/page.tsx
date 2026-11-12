@@ -169,6 +169,10 @@ function Inner() {
 
       {!render ? (
         <div className="card p-6 text-ink-300">No render yet.</div>
+      ) : render.status === "expired" ? (
+        <div className="card p-6 text-ink-300">
+          This render expired (its files were removed by the retention policy).
+        </div>
       ) : render.status !== "completed" ? (
         <GenerationProgress
           render={render}
