@@ -211,7 +211,8 @@ def test_adult_mode_asks_the_planner_not_the_adult_text_model(client, monkeypatc
     bodies = [json.loads(c.request.content) for c in route.calls]
     assert [b["model"] for b in bodies] == ["acme/planner-1", "acme/planner-1"]
     assert bodies[0]["temperature"] == 0 and bodies[0]["max_tokens"] <= 300
-    assert minor_check.availability() == {"model": "acme/planner-1", "available": True}
+    status = minor_check.availability()
+    assert (status["model"], status["available"]) == ("acme/planner-1", True) and status["note"]
 
 
 @respx.mock
@@ -493,7 +494,8 @@ def test_plan_check_asks_once_per_unique_shot_prompt(client, monkeypatch):
 
 def test_adult_mode_status_names_the_safety_check(auth_client):
     body = auth_client.get("/api/settings/content").json()
-    assert body["safety_check"] == {"model": body["planner"], "available": True}
+    check = body["safety_check"]
+    assert (check["model"], check["available"]) == (body["planner"], True) and "minors" in check["note"]
 
 
 # ---------- everyday words, cache identity, races ----------

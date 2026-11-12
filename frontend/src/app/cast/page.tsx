@@ -706,6 +706,11 @@ function DetailDrawer({
                     });
                     setEntity(updated);
                     onChange();
+                    if (updated.adult_ok_notice) {
+                      // The edit took "Adult content allowed" off: say why.
+                      toast.error(updated.adult_ok_notice);
+                      window.dispatchEvent(new Event("content-mode-changed"));
+                    }
                   } catch (err) {
                     toast.error(errorText(err, "Couldn't change the voice"));
                   }
@@ -924,6 +929,10 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   const toast = useToast();
   const { mode, failed, reload } = useContentModeState();
   const [busy, setBusy] = useState(false);
+  // Why the last tick was refused (the safety check's own words), kept on
+  // the card until the next try.
+  const [refusal, setRefusal] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
   if (!mode) {
     return failed ? (
       <div className="card p-4 mb-4 text-xs text-ink-400">
@@ -940,19 +949,24 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
     if (
       next &&
       !window.confirm(
-        `Allow adult content with ${name}'s pictures?\n\nConfirm that ${name} is an adult (18 or older), either fictional or a real adult who has consented, and that the pictures you put on ${name}'s card show ${name}.\n\nWhile Adult mode is on, every picture on ${name}'s card then skips the filter that's forced on for Cast pictures (Sogni's safe filter, Runware's content check), however it was made (uploaded, made in Studio, upscaled or cut out). It follows your Sogni and Runware filter settings, like any other picture. Pictures of characters that aren't ticked always get the filter, and so does a prompt that mentions a child. Prompts involving minors are always refused.`
+        `Allow adult content with ${name}'s pictures?\n\nConfirm that ${name} is an adult (18 or older), either fictional or a real adult who has consented, and that the pictures you put on ${name}'s card show ${name}. The safety check reads ${name}'s card first and refuses if it describes someone under 18.\n\nWhile Adult mode is on, every picture on ${name}'s card then skips the filter that's forced on for Cast pictures (Sogni's safe filter, Runware's content check), however it was made (uploaded, made in Studio, upscaled or cut out). It follows your Sogni and Runware filter settings, like any other picture. Pictures of characters that aren't ticked always get the filter, and so does a prompt that mentions a child. Prompts involving minors are always refused.`
       )
     )
       return;
     setBusy(true);
+    setChecking(next);
+    setRefusal(null);
     try {
       await api.setAvatarAdultOk(avatarId, next);
       window.dispatchEvent(new Event("content-mode-changed"));
       toast.success(next ? `${name}: adult content allowed` : `${name}: pictures are always checked`);
     } catch (err) {
-      toast.error(errorText(err, "Couldn't change the setting"));
+      const why = errorText(err, "Couldn't change the setting");
+      if (next) setRefusal(why);
+      toast.error(why);
     } finally {
       setBusy(false);
+      setChecking(false);
     }
   };
 
@@ -968,6 +982,7 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
         />
         <span>
           <span className="font-medium">Adult content allowed</span>
+          {checking && <span className="ml-2 text-xs text-ink-400">Checking…</span>}
           <span className="block text-xs text-ink-400">
             {name} is an adult (18+), fictional or a real adult who consented. While Adult mode is on, every picture
             on {name}&rsquo;s card skips the filter that&rsquo;s forced on for Cast pictures (Sogni&rsquo;s safe
@@ -979,6 +994,11 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
           </span>
         </span>
       </label>
+      {refusal && !allowed && (
+        <p className="text-xs text-amber-200" role="status">
+          {refusal}
+        </p>
+      )}
     </div>
   );
 }

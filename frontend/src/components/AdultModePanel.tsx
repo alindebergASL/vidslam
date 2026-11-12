@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import clsx from "clsx";
 import { api, ContentMode } from "@/lib/api";
 import { useToast } from "@/components/Toaster";
+import { SafetyMemory } from "@/components/SafetyMemory";
 
 /** "deepseek/deepseek-v4-flash" → "deepseek-v4-flash". */
 function shortModel(id: string): string {
@@ -163,6 +164,7 @@ export function AdultModePanel() {
           )}
         </p>
       )}
+      <SafetyMemory />
     </section>
   );
 }

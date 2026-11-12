@@ -106,6 +106,8 @@ export type Avatar = {
   created_at: string;
   updated_at: string;
   assets: Asset[];
+  /** After an edit: why "Adult content allowed" was taken off (the new text failed the minors checks). */
+  adult_ok_notice?: string | null;
 };
 
 export type Ingredient = {
@@ -686,10 +688,13 @@ export type ContentMode = {
   /** The planner chosen in Settings → Models (used while adult mode is off). */
   planner: string;
   /** The model that checks prompts for minors before they're sent. */
-  safety_check?: { model: string; available: boolean };
+  safety_check?: { model: string; available: boolean; note?: string };
   /** Cast characters marked "adult content allowed" (fictional, or the person consented). */
   adult_ok_avatars?: number[];
 };
+
+/** What the AI safety check remembers (Settings → Adult content). */
+export type SafetyMemory = { refusals: number; oks: number };
 
 export type PromptPreset = {
   id: string;
@@ -2154,6 +2159,12 @@ export const api = {
     req<ContentMode>(`/api/settings/content/avatars/${avatarId}`, {
       method: "PUT",
       body: JSON.stringify({ adult_ok: adultOk }),
+    }),
+  getSafetyMemory: () => req<SafetyMemory>("/api/settings/content/safety-memory"),
+  /** Forget the AI safety check's refusals (word-filter refusals aren't remembered). */
+  clearSafetyRefusals: () =>
+    req<SafetyMemory & { cleared: number }>("/api/settings/content/safety-memory/clear-refusals", {
+      method: "POST",
     }),
   enhancePrompt: (body: { text: string; kind: EnhanceKind; model?: string | null }) =>
     req<{ text: string; model: string }>("/api/prompts/enhance", {
