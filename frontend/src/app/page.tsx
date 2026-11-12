@@ -22,9 +22,17 @@ const KIND_NAMES: Record<string, string> = {
 /** One sentence for the provider status instead of raw flags. */
 function providerSummary(st: Record<string, any>): { live: boolean; text: string } {
   const kinds = Object.keys(KIND_NAMES).filter((k) => typeof st[k] === "string");
-  const real = kinds.filter((k) => st[k] !== "mock" && st[k] !== "off" && st[k] !== "unavailable");
+  // "local" runs in this app (the free basic upscale): not a paid provider.
+  const real = kinds.filter((k) => !["mock", "off", "unavailable", "local"].includes(st[k]));
+  // Kinds that only lack their provider's API key (e.g. no Runware key yet):
+  // not switched off, so say they need a key instead.
+  const needsKeyKinds: string[] = Array.isArray(st.needs_key) ? st.needs_key : [];
+  const needsKey = kinds.filter((k) => st[k] === "unavailable" && needsKeyKinds.includes(k)).map((k) => KIND_NAMES[k]);
+  const needsKeyText = needsKey.length ? ` Needs an API key: ${needsKey.join(", ")}.` : "";
   // Kinds whose provider is switched off in Settings → API keys.
-  const switchedOff = kinds.filter((k) => st[k] === "unavailable").map((k) => KIND_NAMES[k]);
+  const switchedOff = kinds
+    .filter((k) => st[k] === "unavailable" && !needsKeyKinds.includes(k))
+    .map((k) => KIND_NAMES[k]);
   if (st.mock_providers_env === true || real.length === 0) {
     if (switchedOff.length && st.mock_providers_env !== true) {
       const placeholder = ["chat", "image", "video", "tts", "music"].filter((k) => st[k] === "mock").map((k) => KIND_NAMES[k]);
@@ -32,7 +40,8 @@ function providerSummary(st: Record<string, any>): { live: boolean; text: string
         live: false,
         text:
           `Switched off: ${switchedOff.join(", ")}.` +
-          (placeholder.length ? ` Placeholder (no API key): ${placeholder.join(", ")}.` : ""),
+          (placeholder.length ? ` Placeholder (no API key): ${placeholder.join(", ")}.` : "") +
+          needsKeyText,
       };
     }
     return { live: false, text: "Demo mode: videos use placeholder clips and nothing is billed." };
@@ -48,7 +57,8 @@ function providerSummary(st: Record<string, any>): { live: boolean; text: string
     text:
       `Live with ${names}.` +
       (mocked.length ? ` Still placeholder: ${mocked.join(", ")}.` : "") +
-      (switchedOff.length ? ` Switched off: ${switchedOff.join(", ")}.` : ""),
+      (switchedOff.length ? ` Switched off: ${switchedOff.join(", ")}.` : "") +
+      needsKeyText,
   };
 }
 

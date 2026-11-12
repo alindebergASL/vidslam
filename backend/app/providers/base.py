@@ -14,10 +14,16 @@ class ImageRef:
     # For reference_strategy="frame_images": pin this image as the clip's
     # first or last frame (image-to-video / keyframe interpolation).
     frame_type: Optional[Literal["first_frame", "last_frame"]] = None
-    # A picture of a Cast character marked "adult content allowed" (fictional,
-    # or the person consented): in adult mode it skips the forced content
-    # filter (services/content_mode.exempt). Minors are refused regardless.
+    # A picture on the card of a Cast character marked "adult content
+    # allowed" (fictional, or the person consented), however it was made:
+    # in adult mode it skips the forced content filter
+    # (services/content_mode.exempt). Minors are refused regardless.
     adult_ok: bool = False
+    # A Cast character's picture sent in another role (an ambient scene's
+    # own picture, or a frame or still made from it): the forced content
+    # filter treats it as that character's picture (content_mode.forces_filter)
+    # while the providers still use it as a scene or a frame.
+    cast_picture: bool = False
 
 
 @dataclass

@@ -165,6 +165,40 @@ def test_kinds_defaults_and_routing_never_openrouter(client, monkeypatch):
     assert reg.route_info("bg_removal")[0] == "unavailable"
 
 
+def test_no_runware_key_upscale_defaults_to_free_local(auth_client, monkeypatch):
+    """Live without a Runware key: upscaling falls back to the free basic
+    upscale (an explicit Settings choice still wins), and the status says
+    background removal needs a key rather than that it's switched off."""
+    from app.providers import get_image_op, provider_status
+    from app.providers.local_upscale import LocalUpscaleProvider
+    from app.services import model_registry as reg
+
+    _go_live(monkeypatch, runware_key=False)
+    assert reg.active_model("upscale") == "local/lanczos"
+    assert reg.snapshot()["upscale"]["default"] == "local/lanczos"
+    assert isinstance(get_image_op("upscale"), LocalUpscaleProvider)
+    st = provider_status()
+    assert st["upscale"] == "local" and st["bg_removal"] == "unavailable"
+    assert st["needs_key"] == ["bg_removal"]
+
+    aid = _avatar(auth_client)
+    up = auth_client.post(f"/api/studio/assets/{_upload(auth_client, aid, (300, 200))}/upscale",
+                          json={"factor": 2})
+    assert up.status_code in (200, 201, 202), up.text
+    assert up.json()["provider_model"] == "local/lanczos"
+
+    # A model picked in Settings wins over the fallback.
+    reg.set_active("upscale", "runware/runware:500@1")
+    assert reg.active_model("upscale") == "runware/runware:500@1"
+    assert provider_status()["needs_key"] == ["bg_removal", "upscale"]
+    reg.set_active("upscale", None)
+
+    # With the key back, the Runware default returns.
+    _go_live(monkeypatch)
+    assert reg.active_model("upscale") == "runware/runware:504@1"
+    assert provider_status()["needs_key"] == []
+
+
 # ---------- catalog and prices ----------
 
 
@@ -692,6 +726,7 @@ def test_free_upscale_ignores_the_budget_cap(auth_client, tmp_path, monkeypatch)
 
 def test_operation_models_say_whether_they_run_and_keep_the_active_price(auth_client, monkeypatch):
     from app.services import image_ops, provider_keys
+    from app.services import model_registry as reg
 
     # Mock mode: Runware's models run through the placeholder, so they're
     # listed, usable and priced even with Runware off.
@@ -699,8 +734,10 @@ def test_operation_models_say_whether_they_run_and_keep_the_active_price(auth_cl
     by_id = {m["id"]: m for m in image_ops.models_for("upscale")}
     assert by_id["runware/runware:504@1"]["usable"] and by_id["runware/runware:504@1"]["price_text"]
     provider_keys.set_enabled("runware", True)
-    # Live without a Runware key: the active one is still priced but can't run.
+    # Live without a Runware key: a Runware model picked in Settings is still
+    # priced but can't run (the default falls back to the free upscale).
     _go_live(monkeypatch, runware_key=False)
+    reg.set_active("upscale", "runware/runware:504@1")
     models_ = image_ops.models_for("upscale")
     active = next(m for m in models_ if m["active"])
     assert active["id"] == "runware/runware:504@1"
