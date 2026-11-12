@@ -145,6 +145,8 @@ def test_fit_verdicts():
     assert cut["fit"] == "too_long" and "cut" in cut["fit_text"]
     assert cut["fit_text"] == ("about 20 s longer than the video: the last shot is held for 4 s more at most, "
                                "then the last 13.5 s of the voice are cut")
+    assert cut["cut_seconds"] == 13.5
+    assert held["cut_seconds"] == 0.0 and over["cut_seconds"] == 0.0
     short = voiceover_fit(p, 7)
     assert short["fit"] == "too_short" and short["fit_text"].startswith("about 3 s shorter")
 
