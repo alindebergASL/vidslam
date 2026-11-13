@@ -274,8 +274,9 @@ def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob]) ->
     owner, with no picture, so it never skips the filter either."""
     seen: set[int] = set()
     while job is not None and job.operation and job.id not in seen:
-        if job.operation == "join_clips":
-            return None, None  # joined clips: a new clip, never a Cast picture
+        if job.operation in ("join_clips", "upload_video"):
+            # Joined clips, or a video uploaded as a clip: never a Cast picture.
+            return None, None
         seen.add(job.id)
         if job.source_asset_id:
             asset = db.get(models.Asset, job.source_asset_id)
@@ -2732,6 +2733,9 @@ def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models
     if job.operation == video_ops.JOIN_OP:
         # Finished Studio clips played back to back, joined here: free.
         return video_ops.run_join(db, job)
+    if job.operation == video_ops.UPLOAD_OP:
+        # Finished when it was uploaded; there is nothing to run again.
+        raise ValueError("An uploaded video can't be made again; upload it again")
     kind = image_ops.kind_for(job.operation)
     model = job.provider_model or reg.active_model(kind)
     provider = get_image_op(kind, model)
@@ -3092,6 +3096,10 @@ def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
             Path(path).unlink(missing_ok=True)
             return
         db.refresh(job)
+        # "Continue this clip" with "Join with the original": the join is
+        # added in this same transaction, so only the completion that won
+        # the claim above makes it, exactly once (video_ops.plan_auto_join).
+        join = _plan_auto_join(db, job)
         events.studio_event(db, job, "completed")
         db.commit()
     except Exception:
@@ -3101,6 +3109,23 @@ def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
         Path(path).unlink(missing_ok=True)
         raise
     Path(vjob.result_path).unlink(missing_ok=True)  # only once the clip is saved
+    if join is not None:
+        from . import video_ops
+
+        video_ops.queue_join(db, join)
+
+
+def _plan_auto_join(db: Session, job: models.AssetGenerationJob) -> Optional[models.AssetGenerationJob]:
+    """video_ops.plan_auto_join, but a fault in it never costs the paid clip:
+    it is noted on the clip instead (the clip still completes)."""
+    from . import video_ops
+
+    try:
+        return video_ops.plan_auto_join(db, job)
+    except Exception:  # noqa: BLE001
+        log.exception("studio job %s: couldn't plan the join with the original", job.id)
+        job.options_json = {**(job.options_json or {}), video_ops.JOIN_NOTE: "Not joined: something went wrong"}
+        return None
 
 
 def on_studio_clip_failed(db: Session, vjob: models.VideoJob) -> None:

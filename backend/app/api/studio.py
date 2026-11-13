@@ -25,6 +25,8 @@ from ..schemas.api import (
     StudioBulkIds,
     StudioBulkSave,
     StudioBulkSaveOut,
+    StudioContinueInfo,
+    StudioContinueRequest,
     StudioFrameRequest,
     StudioJobUpdate,
     StudioJoinRequest,
@@ -130,10 +132,12 @@ def _check_safety(prompt: str, negative: str, output_kind: str) -> None:
     check_or_422(prompt or "", effective_negative(kind, negative or ""), kind=kind)
 
 
-def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int) -> StudioJobOut:
+def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int, *,
+                 options: Optional[dict] = None) -> StudioJobOut:
     """`count` separate jobs for one request (same prompt, refs, model and
     aspect), each enqueued on its own. Answers with the first job plus the
-    ids of all of them."""
+    ids of all of them. `options`: each job's options_json (a continuation's
+    intent)."""
     if not _owner_exists(db, body.owner_kind, body.owner_id):
         raise HTTPException(404, "owner not found")
     # The model's provider switched off in Settings: 409 before anything is queued.
@@ -153,6 +157,7 @@ def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int)
             provider_model=body.model or "",
             first_frame_job_id=body.first_frame_job_id,
             first_frame_asset_id=body.first_frame_asset_id,
+            options_json=dict(options) if options else None,
             status="pending",
         )
         for _ in range(count)
@@ -555,6 +560,8 @@ def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest
         from ..services import video_ops
 
         return _frame_from_clip(db, src.source_job_id, video_ops.at_of(src), response)
+    if src.operation == "upload_video":
+        raise HTTPException(409, "An uploaded video can't be made again; upload it again")
     if src.operation == "join_clips":
         # Joins the same clips again, the same way (free, no model).
         from ..services import video_ops
@@ -577,6 +584,8 @@ def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest
         return _queue_operation(db, src.operation, body.model or src.provider_model or None,
                                 image_ops.factor_of(src), source_job_id=src.source_job_id,
                                 source_asset_id=src.source_asset_id, label=src.label or None)
+    from ..services import video_ops
+
     budget_guard()
     model = body.model or src.provider_model or ""
     provider_gate.require_model("image" if src.output_kind == "image" else "video", model or None, db)
@@ -594,6 +603,9 @@ def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest
         provider_model=model,
         first_frame_job_id=src.first_frame_job_id,
         first_frame_asset_id=src.first_frame_asset_id,
+        # A continuation run again stays one (and joins with its original
+        # once finished, when it was asked to).
+        options_json=video_ops.continuation_of(src),
         status="pending",
     )
     _check_safety(job.prompt, job.negative_prompt, job.output_kind)
@@ -817,20 +829,28 @@ def _frame_from_clip(db: Session, job_id: int, at, response: Response) -> Studio
         _enqueue_jobs(db, [job])
         response.status_code = 202
     else:
-        try:
-            data, seconds = video_ops.grab(Path(src.result_path), at)
-        except RuntimeError as e:
-            raise HTTPException(422, "Couldn't read a frame from that clip") from e
-        job = video_ops.new_clip_job(db, src, at, seconds=seconds)
-        job.status = "submitted"
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        job = video_ops.finish(db, job, data, seconds)
+        job = _grab_now(db, src, at)
         response.status_code = 201
     out = _with_costs(db, [job])[0]
     out.batch_ids = [job.id]
     return out
+
+
+def _grab_now(db: Session, src: models.AssetGenerationJob, at) -> models.AssetGenerationJob:
+    """The frame of `src` at `at`, grabbed here and stored as a finished
+    Studio picture (ffmpeg must be here)."""
+    from ..services import video_ops
+
+    try:
+        data, seconds = video_ops.grab(Path(src.result_path), at)
+    except RuntimeError as e:
+        raise HTTPException(422, "Couldn't read a frame from that clip") from e
+    job = video_ops.new_clip_job(db, src, at, seconds=seconds)
+    job.status = "submitted"
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    return video_ops.finish(db, job, data, seconds)
 
 
 @router.post("/jobs/{job_id}/frame-to-picture", response_model=StudioJobOut, status_code=201,
@@ -936,3 +956,123 @@ def join_clips(body: StudioJoinRequest, response: Response, db: Session = Depend
     except video_ops.OpError as e:
         raise HTTPException(e.status, e.message) from e
     return _join(db, list(body.job_ids), body.transition, crossfade, response)
+
+
+# ---------- continue a clip ----------
+
+
+def _continue_model(db: Session, src: models.AssetGenerationJob) -> str:
+    """The model a continuation of `src` uses when none is picked: the model
+    of the clip it follows on from when that one can start from a picture,
+    else the default video model when it can; "" when neither can."""
+    from ..providers import video_capabilities
+    from ..services import video_ops
+
+    origin = video_ops.continue_origin(db, src)
+    own = (origin.provider_model if origin is not None else "") or ""
+    if own and not own.startswith(LOCAL_PREFIX):
+        try:
+            if video_capabilities(_video_model(db, own)).first_frame:
+                return own
+        except Exception:  # noqa: BLE001 — an old or unknown model: the default instead
+            pass
+    default = _video_model(db, None)
+    return default if video_capabilities(default).first_frame else ""
+
+
+def _continue_source(db: Session, job_id: int) -> models.AssetGenerationJob:
+    from ..services import video_ops
+
+    try:
+        src = video_ops.source_clip(db, job_id)
+    except video_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+    if not _owner_exists(db, src.owner_kind, src.owner_id):
+        raise HTTPException(404, "owner not found")
+    return src
+
+
+@router.get("/jobs/{job_id}/continue", response_model=StudioContinueInfo)
+def continue_info(job_id: int, db: Session = Depends(get_db)) -> StudioContinueInfo:
+    """What "Continue this clip" starts from (nothing is made)."""
+    from ..services import video_ops
+
+    src = _continue_source(db, job_id)
+    origin = video_ops.continue_origin(db, src)
+    return StudioContinueInfo(
+        prompt=video_ops.continue_prompt(db, src),
+        negative_prompt=(origin.negative_prompt or "") if origin is not None else "",
+        aspect_ratio=video_ops.continue_aspect(src),
+        model=_continue_model(db, src),
+        duration_seconds=float(origin.duration_seconds or 5.0) if origin is not None else 5.0,
+    )
+
+
+@router.post("/jobs/{job_id}/continue", response_model=StudioJobOut, status_code=202,
+             dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
+def continue_clip(job_id: int, body: StudioContinueRequest, db: Session = Depends(get_db)) -> StudioJobOut:
+    """A new clip that carries on from this finished Studio clip (generated,
+    joined, continued or uploaded): its last frame is saved as a Studio
+    picture and the new clip starts from it, from `prompt` (paid like any
+    clip). With `auto_join`, once the new clip is finished it is joined
+    after this one as one more clip (see services/video_ops.py). Every
+    check a clip's prompt gets applies; nothing gets a Cast exemption."""
+    from ..providers import video_capabilities
+    from ..services import video_ops
+
+    src = _continue_source(db, job_id)
+    model = body.model or _continue_model(db, src)
+    if not model:
+        raise HTTPException(422, "The default video model can't start from a picture; pick a model that can")
+    # Every check before anything is made (the frame included).
+    provider_gate.require_model("video", model, db)
+    resolved = _video_model(db, model)
+    if not video_capabilities(resolved).first_frame:
+        raise HTTPException(422, f"{resolved or 'This model'} can't start from a picture; pick another model")
+    _check_safety(body.prompt, body.negative_prompt, "video_clip")
+    if not video_ops.ffmpeg_here():
+        raise HTTPException(503, video_ops.NO_FFMPEG)
+    frame = _grab_now(db, src, "last")
+    if frame.status not in ("completed", "saved"):
+        raise HTTPException(409, "Couldn't save the clip's last frame; try again")
+    request = StudioRequest(
+        owner_kind=src.owner_kind, owner_id=src.owner_id, output_kind="video_clip", prompt=body.prompt,
+        negative_prompt=body.negative_prompt, model=model, duration_seconds=body.duration_seconds,
+        aspect_ratio=video_ops.continue_aspect(src) or None, first_frame_job_id=frame.id,
+    )
+    return _create_jobs(db, request, "video_clip", 1,
+                        options=video_ops.continue_options(src.id, body.auto_join))
+
+
+# ---------- a video uploaded as a clip ----------
+
+
+@router.post("/upload-video", response_model=StudioJobOut, status_code=201,
+             dependencies=[Depends(rate_limit("generation"))])
+def upload_video(
+    file: UploadFile = File(...),
+    owner_kind: Literal["avatar", "ingredient"] = Form(...),
+    owner_id: int = Form(...),
+    db: Session = Depends(get_db),
+) -> StudioJobOut:
+    """Keep a video from this device as a finished Studio clip owned by
+    `owner` (free), so it can be continued, joined or have its frames
+    saved. Frames across it go through the picture safety checks before
+    anything is stored, and it is refused when they can't run (see
+    services/video_ops.py)."""
+    from ..config import get_settings
+    from ..services import video_ops
+
+    if not _owner_exists(db, owner_kind, owner_id):
+        raise HTTPException(404, "owner not found")
+    if not video_ops.looks_like_video(file.content_type or "", file.filename or ""):
+        raise HTTPException(422, video_ops.NOT_A_VIDEO)
+    try:
+        job = video_ops.video_from_upload(
+            db, owner_kind=owner_kind, owner_id=owner_id, file=file.file, filename=file.filename or "",
+            limit=get_settings().max_upload_bytes)
+    except video_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+    out = _with_costs(db, [job])[0]
+    out.batch_ids = [job.id]
+    return out

@@ -23,7 +23,8 @@ import {
 } from "@/components/ImageOps";
 import { TileMenu, TileMenuItem } from "@/components/TileMenu";
 import { UseInProjectDialog } from "@/components/UseInProjectDialog";
-import { FrameFromVideoDialog } from "@/components/FrameFromVideo";
+import { FrameFromVideoDialog, UploadVideoDialog } from "@/components/FrameFromVideo";
+import { ContinueClipDialog, clipPriceText } from "@/components/ContinueClipDialog";
 import { JoinClipsDialog } from "@/components/JoinClipsDialog";
 import {
   BulkSaveDialog,
@@ -539,11 +540,44 @@ function Studio() {
   };
   // A frame of a video from this device.
   const [framing, setFraming] = useState(false);
+  // A video from this device kept as a clip.
+  const [uploadingVideo, setUploadingVideo] = useState(false);
+  // "Continue this clip": the finished clip the dialog continues.
+  const [continuing, setContinuing] = useState<StudioJob | null>(null);
+  // Rough price of continuing a clip with its own model, for its menu ("" = unknown).
+  const continuePrice = (job: StudioJob): string => {
+    const own = job.operation ? undefined : videoModels.find((m) => m.first_frame && m.id === job.provider_model);
+    return clipPriceText(own, snapClipSeconds(job.duration_seconds || 5)).replace(/^About /, "about ");
+  };
+  const continueStarted = (j: StudioJob) => {
+    setContinuing(null);
+    addCreated(batchPlaceholders(j));
+    toast.success(
+      j.options?.auto_join ? "Making the next clip; it's joined with the original when done" : "Making the next clip…"
+    );
+  };
+  // A finished continuation's join with its original: shown as soon as it
+  // exists (it is made on the server when the continuation finishes).
+  const askedJoins = useRef(new Set<number>());
+  useEffect(() => {
+    for (const j of jobs) {
+      const joinId = j.options?.join_job_id;
+      if (!joinId || askedJoins.current.has(joinId) || jobs.some((x) => x.id === joinId)) continue;
+      askedJoins.current.add(joinId);
+      api
+        .getStudioJob(joinId)
+        .then((join) => {
+          setJobs((cur) => (cur.some((x) => x.id === join.id) ? cur : [join, ...cur]));
+          if (!TERMINAL.includes(join.status)) setPendingJobIds((cur) => Array.from(new Set([...cur, join.id])));
+        })
+        .catch(() => undefined); // deleted since
+    }
+  }, [jobs]);
 
   // Rough price of running a job again with this model ("" = unknown).
   const modelOptionsFor = (job: StudioJob): ModelOption[] =>
-    job.operation === "extract_frame" || job.operation === "join_clips"
-      ? [] // a saved frame or joined clips have no model to pick
+    job.operation === "extract_frame" || job.operation === "join_clips" || job.operation === "upload_video"
+      ? [] // a saved frame, joined clips or an uploaded video have no model to pick
       : job.operation
       ? opModels[job.operation].map((m) => withKnownPrice({ id: m.id, name: m.name, price_text: m.free ? "free" : m.price_text }))
       : job.output_kind === "image"
@@ -552,7 +586,8 @@ function Studio() {
       ? videoModels.filter((m) => m.first_frame)
       : videoModels;
   const retryPrice = (job: StudioJob): string => {
-    if (job.operation === "extract_frame" || job.operation === "join_clips") return "free";
+    if (job.operation === "extract_frame" || job.operation === "join_clips" || job.operation === "upload_video")
+      return "free";
     const m = modelOptionsFor(job).find((x) => x.id === job.provider_model);
     // With reference pictures a Sogni model runs again on its Sogni editor,
     // at that editor's price (as in Try another model); any other model's
@@ -621,7 +656,9 @@ function Studio() {
         kind: "job",
         imageUrl: ready && isImage ? api.studioPreview(j.id) : undefined,
         videoUrl: ready && !isImage ? api.studioPreview(j.id) : undefined,
-        label: j.prompt.slice(0, 60) || `${j.output_kind} job`,
+        label:
+          j.prompt.slice(0, 60) ||
+          (j.operation === "upload_video" ? j.options?.upload || "Uploaded video" : `${j.output_kind} job`),
         sub: `${j.output_kind} · ${j.owner_kind} #${j.owner_id}`,
         status: j.status,
         jobId: j.id,
@@ -878,7 +915,8 @@ function Studio() {
       else toast.info(assetById.has(job.source_asset_id) ? "Pick All Media to see the Cast picture" : "That Cast picture was deleted");
       return;
     }
-    const id = job.source_job_id;
+    // A saved frame's clip, an operation's picture, or the clip a continuation carries on from.
+    const id = job.source_job_id || job.options?.continues_job_id;
     if (!id) return;
     const key = `job-${id}`;
     if (tiles.some((t) => t.key === key)) {
@@ -890,7 +928,7 @@ function Studio() {
       setJobs((cur) => (cur.some((j) => j.id === src.id) ? cur : [...cur, src]));
       setViewKey(key);
     } catch (e) {
-      toast.error(errorText(e, "That picture was deleted"));
+      toast.error(errorText(e, job.source_job_id ? "That picture was deleted" : "That clip was deleted"));
     }
   };
   const selectedAssets: Asset[] = useMemo(
@@ -965,6 +1003,8 @@ function Studio() {
       onOpenSource={() => t.job && openSource(t.job)}
       onSaveFrame={(at) => t.job && saveFrame(t.job, at)}
       onJoinWith={() => t.job && joinWith(t.job)}
+      onContinue={() => t.job && setContinuing(t.job)}
+      continuePrice={t.job ? continuePrice(t.job) : ""}
       retryPrice={t.job ? retryPrice(t.job) : ""}
     />
   );
@@ -987,14 +1027,24 @@ function Studio() {
         <span className="text-xs text-ink-400 min-w-0 order-last basis-full sm:order-none sm:basis-auto sm:flex-1 sm:ml-2">
           Browse your cast, generate new images and clips, save them back.
         </span>
-        <button
-          type="button"
-          className="btn-ghost text-xs ml-auto shrink-0"
-          onClick={() => setFraming(true)}
-          title="Save a frame of a video from this device as a picture (free)"
-        >
-          Frame from a video…
-        </button>
+        <div className="ml-auto flex shrink-0 flex-wrap gap-1">
+          <button
+            type="button"
+            className="btn-ghost text-xs"
+            onClick={() => setUploadingVideo(true)}
+            title="Add a video from this device as a clip you can continue or join (free)"
+          >
+            Upload a video…
+          </button>
+          <button
+            type="button"
+            className="btn-ghost text-xs"
+            onClick={() => setFraming(true)}
+            title="Save a frame of a video from this device as a picture (free)"
+          >
+            Frame from a video…
+          </button>
+        </div>
       </header>
 
       <div className="px-6 pt-4 flex flex-wrap gap-2">
@@ -1218,6 +1268,8 @@ function Studio() {
             sourceUrl,
             onOpenSource: openSource,
             onSaveFrame: saveFrame,
+            onContinue: setContinuing,
+            continuePrice,
           }}
         />
       )}
@@ -1246,6 +1298,30 @@ function Studio() {
             addCreated(batchPlaceholders(j));
             toast.success("Saved the frame as a picture");
           }}
+        />
+      )}
+
+      {uploadingVideo && (
+        <UploadVideoDialog
+          avatars={avatars}
+          ingredients={ingredients}
+          defaultOwner={ownerFilter || undefined}
+          onClose={() => setUploadingVideo(false)}
+          onSaved={(j) => {
+            setUploadingVideo(false);
+            addCreated(batchPlaceholders(j));
+            toast.success("Added the video as a clip");
+          }}
+        />
+      )}
+
+      {continuing && (
+        <ContinueClipDialog
+          job={continuing}
+          videoModels={videoModels}
+          durations={CLIP_SECONDS}
+          onClose={() => setContinuing(null)}
+          onStarted={continueStarted}
         />
       )}
 
@@ -1358,6 +1434,8 @@ function TileCard({
   onOpenSource,
   onSaveFrame,
   onJoinWith,
+  onContinue,
+  continuePrice,
   retryPrice,
 }: {
   tile: Tile;
@@ -1387,6 +1465,10 @@ function TileCard({
   onSaveFrame: (at: FrameAt) => void;
   /** Finished clips: start select mode with this clip picked, to join others after it. */
   onJoinWith: () => void;
+  /** Finished clips: open "Continue this clip". */
+  onContinue: () => void;
+  /** "about $0.30" for continuing with the clip's own model; "" = unknown. */
+  continuePrice: string;
   /** "about $0.04" for running it again with the same model; "" = unknown. */
   retryPrice: string;
 }) {
@@ -1423,7 +1505,7 @@ function TileCard({
       menu.push({ label: "Cancel…", onSelect: onCancel, title: "Stop waiting for this result" });
     }
     // A frame of an uploaded video can't be grabbed again: the video wasn't kept.
-    if (failed && !(job.operation === "extract_frame" && !job.source_job_id)) {
+    if (failed && !(job.operation === "extract_frame" && !job.source_job_id) && job.operation !== "upload_video") {
       menu.push({
         label: retryPrice ? `Retry · ${retryPrice}` : "Retry",
         onSelect: onRetry,
@@ -1442,6 +1524,11 @@ function TileCard({
       menu.push({ label: "Animate this", onSelect: onAnimate, title: "Make a clip that starts from this picture" });
     }
     if (finished && tile.videoUrl) {
+      menu.push({
+        label: `Continue this clip… · ${continuePrice || "paid"}`,
+        onSelect: onContinue,
+        title: "Make a new clip that starts from this clip's last frame; the price shows before it runs",
+      });
       menu.push({
         label: "Use in project…",
         onSelect: onUseInProject,
@@ -1486,7 +1573,12 @@ function TileCard({
         title: "Load this result's prompt, avoid list, references, model and aspect into the prompt bar",
       });
     }
-    if ((finished || failed) && job.operation !== "extract_frame" && job.operation !== "join_clips") {
+    if (
+      (finished || failed) &&
+      job.operation !== "extract_frame" &&
+      job.operation !== "join_clips" &&
+      job.operation !== "upload_video"
+    ) {
       menu.push({
         label: "Try another model…",
         onSelect: onTryModel,
@@ -1682,6 +1774,14 @@ function TileCard({
           {job?.label && (
             <div className="chip text-[10px] py-0.5 bg-ink-900/85 truncate max-w-full" title={job.label}>
               {job.label}
+            </div>
+          )}
+          {job?.options?.join_note && !selectMode && (
+            <div
+              className="chip text-[10px] py-0.5 bg-ink-900/85 text-amber-200 truncate max-w-full"
+              title={job.options.join_note}
+            >
+              {job.options.join_note}
             </div>
           )}
           {ranOn && !selectMode && (

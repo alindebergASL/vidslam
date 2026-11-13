@@ -1,7 +1,8 @@
 """Studio's free video operations, made here by ffmpeg: save a frame of
 a video as a Studio picture ("Save last frame as picture", "Save first
-frame", "Save this frame"), and join finished clips into one ("Join
-clips", at the end of this module).
+frame", "Save this frame"), join finished clips into one ("Join clips"),
+keep an uploaded video as a Studio clip ("Upload a video"), and the
+frame and join steps of "Continue this clip" (the last sections).
 
 The source is either a finished Studio clip (source_job_id) or a video the
 owner uploads for this (not kept: only the frame is stored). Each grab is a
@@ -65,6 +66,12 @@ MINOR_REFUSED = ("This frame was refused: the safety check thinks it shows someo
 CHECK_UNAVAILABLE = ("The safety check couldn't look at this frame, so it wasn't saved. Try again later "
                      "(OpenRouter must be on and have a key in Settings → API keys).")
 CHECK_DECLINED = ("This frame was refused: the safety check model declined to judge it, which counts as a no.")
+VIDEO_MINOR_REFUSED = ("This video was refused: the safety check thinks it shows someone under 18. Uploaded "
+                       "videos can't show anyone under 18.")
+VIDEO_CHECK_UNAVAILABLE = ("The safety check couldn't look at this video, so it wasn't saved. Try again later "
+                           "(OpenRouter must be on and have a key in Settings → API keys).")
+VIDEO_CHECK_DECLINED = ("This video was refused: the safety check model declined to judge it, which counts as "
+                        "a no.")
 NOT_A_VIDEO = "That file isn't a video this app can read (MP4, MOV or WebM)."
 NO_FFMPEG = "This server can't read videos right now (ffmpeg is missing)."
 
@@ -240,25 +247,42 @@ def check_uploaded_frame(path: Path, data: bytes, label: str) -> None:
     """The checks a frame from an uploaded video must pass before it is
     stored (see the module notes). OpError (422 refused, 503 the check
     couldn't run) otherwise."""
+    check_uploaded_frames([(path, data)], label)
+
+
+def check_uploaded_frames(frames: list[tuple[Path, bytes]], label: str, *, video: bool = False) -> None:
+    """The checks every one of `frames` (a frame's file and its bytes) of an
+    uploaded video must pass before anything of it is stored: the picture
+    minors check on all of them, then, on a clean deployment, the explicit
+    picture check on each. Any frame failing refuses the lot; no answer is
+    a no. `video`: the messages speak of the video (a whole uploaded clip),
+    not of one frame. OpError (422 refused, 503 the check couldn't run)."""
     from . import explicit_check, minor_check
 
-    digest = hashlib.sha256(data).hexdigest()
-    picture = SimpleNamespace(id=0, checksum=digest, file_path=str(path), original_filename=label)
-    seen = minor_check.check_pictures("an uploaded video", [picture])
+    refused, unavailable, declined = ((VIDEO_MINOR_REFUSED, VIDEO_CHECK_UNAVAILABLE, VIDEO_CHECK_DECLINED)
+                                      if video else (MINOR_REFUSED, CHECK_UNAVAILABLE, CHECK_DECLINED))
+    if not frames:
+        raise OpError(503, unavailable)
+    digests = [hashlib.sha256(data).hexdigest() for _path, data in frames]
+    pictures = [SimpleNamespace(id=i, checksum=digests[i], file_path=str(path),
+                                original_filename=label if len(frames) == 1 else f"{label} (frame {i + 1})")
+                for i, (path, _data) in enumerate(frames)]
+    seen = minor_check.check_pictures("an uploaded video", pictures)
     if seen["verdict"] == "minor":
-        raise OpError(422, MINOR_REFUSED)
+        raise OpError(422, refused)
     if seen["verdict"] != "ok":
-        raise OpError(503, CHECK_UNAVAILABLE)
+        raise OpError(503, unavailable)
     if seen["declined"]:
-        raise OpError(422, CHECK_DECLINED)
-    if 0 not in seen["checked"]:
-        # Not judged (e.g. the frame couldn't be read): never a yes.
-        raise OpError(503, CHECK_UNAVAILABLE)
-    try:
-        explicit_check.check_picture(str(path), digest)
-    except explicit_check.ExplicitContentError as e:
-        status = 503 if str(e) == explicit_check.PICTURE_UNAVAILABLE else 422
-        raise OpError(status, str(e)) from None
+        raise OpError(422, declined)
+    if any(i not in seen["checked"] for i in range(len(frames))):
+        # Not judged (e.g. a frame couldn't be read): never a yes.
+        raise OpError(503, unavailable)
+    for (path, _data), digest in zip(frames, digests, strict=True):
+        try:
+            explicit_check.check_picture(str(path), digest)
+        except explicit_check.ExplicitContentError as e:
+            status = 503 if str(e) == explicit_check.PICTURE_UNAVAILABLE else 422
+            raise OpError(status, str(e)) from None
 
 
 def frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
@@ -502,3 +526,307 @@ def run_join(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerat
     events.studio_event(db, job, "completed")
     db.commit()
     return job
+
+
+# ---------- an uploaded video kept as a Studio clip ("Upload a video") ----------
+#
+# A video from the owner's device, kept as a finished Studio clip (operation
+# "upload_video", provider "local", free) so it can be continued, joined or
+# have its frames saved like any clip. It is stored as an ordinary
+# H.264/AAC MP4 (re-encoded when it isn't one already) with its real size
+# and length.
+#
+# Checks: it comes from outside the app, so before anything of it is stored
+# several frames across it (the first, the last and about one every 10 s
+# between, at most UPLOAD_MAX_FRAMES) go through the picture minors check
+# (minor_check.check_pictures) and, on a clean deployment, the explicit
+# picture check (explicit_check.check_picture), as a frame of an uploaded
+# video does. Any frame failing, or a check that can't answer, refuses the
+# upload. It belongs to no Cast card: pipeline.studio_cast_source gives
+# (None, None) for it, so it, its frames and anything made from them keep
+# the content filter. The temporary files are removed on every path.
+
+UPLOAD_OP = "upload_video"
+UPLOAD_MODEL = "local/upload"
+UPLOAD_LABEL = "Uploaded video"
+UPLOAD_MIN_FRAMES, UPLOAD_MAX_FRAMES = 3, 8
+UPLOAD_FRAME_EVERY = 10.0  # seconds
+UPLOAD_MAX_SECONDS = JOIN_MAX_SECONDS
+
+
+def upload_frame_times(seconds: float) -> list[float]:
+    """The times of the frames checked in an uploaded video of `seconds`:
+    the first, the last (math.inf: ffmpeg keeps it to the last frame) and
+    about one every UPLOAD_FRAME_EVERY seconds between, 3 to 8 in all."""
+    n = min(UPLOAD_MAX_FRAMES, max(UPLOAD_MIN_FRAMES, math.ceil(max(seconds, 0.0) / UPLOAD_FRAME_EVERY) + 1))
+    return [0.0] + [round(seconds * i / (n - 1), 3) for i in range(1, n - 1)] + [math.inf]
+
+
+def _streams(path: Path) -> dict:
+    """{"video": codec, "pix_fmt": ..., "audio": codec or ""} of a file's
+    first video and audio streams ({} when unreadable)."""
+    import json
+
+    from .renderer import _run
+
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries",
+                    "stream=codec_type,codec_name,pix_fmt", str(path)])
+    if rc != 0:
+        return {}
+    try:
+        streams = json.loads(log).get("streams") or []
+    except ValueError:
+        return {}
+    out: dict = {"audio": ""}
+    for s in streams:
+        if s.get("codec_type") == "video" and "video" not in out:
+            out["video"], out["pix_fmt"] = s.get("codec_name") or "", s.get("pix_fmt") or ""
+        elif s.get("codec_type") == "audio" and not out["audio"]:
+            out["audio"] = s.get("codec_name") or ""
+    return out if "video" in out else {}
+
+
+def plays_everywhere(path: Path, streams: dict) -> bool:
+    """Whether an upload already is an ordinary MP4 every later step (the
+    browser, joins, frame grabs, providers) reads: H.264 in 4:2:0, AAC
+    sound or none, in an MP4 file."""
+    return (sniffed_extension(path) == ".mp4" and streams.get("video") == "h264"
+            and streams.get("pix_fmt") in ("yuv420p", "yuvj420p") and streams.get("audio") in ("", "aac"))
+
+
+def normalize_upload(src: Path, dst: Path, seconds: float) -> bool:
+    """Write `src` to `dst` as an ordinary H.264/AAC MP4 (only its first
+    picture and sound streams, fast start). Copied when it already is one,
+    else re-encoded (at most 1080p, even sides). Returns whether it was
+    re-encoded. RuntimeError when ffmpeg can't."""
+    from .renderer import _probe_size, _run, join_size, join_timeout
+
+    streams = _streams(src)
+    if not streams:
+        raise RuntimeError("no picture")
+    maps = ["-map", "0:v:0"] + (["-map", "0:a:0"] if streams.get("audio") else [])
+    if plays_everywhere(src, streams):
+        rc, _ = _run(["ffmpeg", "-y", "-v", "error", "-i", str(src), *maps, "-c", "copy",
+                      "-movflags", "+faststart", str(dst)], timeout=join_timeout(seconds))
+        if rc == 0 and dst.exists() and dst.stat().st_size > 0:
+            return False
+    size = _probe_size(src)
+    w, h = join_size(size) if size else (0, 0)
+    vf = ["-vf", f"scale={w}:{h}"] if w and h else ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+    audio = ["-c:a", "aac", "-b:a", "160k"] if streams.get("audio") else []
+    rc, log = _run(["ffmpeg", "-y", "-v", "error", "-i", str(src), *maps, *vf, "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", *audio,
+                    "-movflags", "+faststart", str(dst)], timeout=join_timeout(seconds))
+    if rc != 0 or not dst.exists() or dst.stat().st_size == 0:
+        raise RuntimeError(f"couldn't re-encode the video: {log[-500:]}")
+    return True
+
+
+def aspect_for(size: Optional[tuple[int, int]]) -> str:
+    """The Studio aspect ("9:16", "16:9" or "1:1") nearest a picture size;
+    "" when it isn't known."""
+    if not size or not size[0] or not size[1]:
+        return ""
+    ratio = size[0] / size[1]
+    return min((("9:16", 9 / 16), ("1:1", 1.0), ("16:9", 16 / 9)), key=lambda a: abs(math.log(ratio / a[1])))[0]
+
+
+def video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
+                      limit: int) -> models.AssetGenerationJob:
+    """Keep an uploaded video as a finished Studio clip owned by `owner`,
+    once frames across it passed the picture checks (see above). OpError
+    for a file that isn't a readable video, too long, or refused."""
+    from . import events, storage
+    from .renderer import _probe_clip, _probe_size
+
+    if not ffmpeg_here():
+        raise OpError(503, NO_FFMPEG)
+    name = Path(filename or "video").name[:60] or "video"
+    with tempfile.TemporaryDirectory(prefix="upload-video-") as tmp:
+        raw = Path(tmp) / "upload"
+        save_upload(file, raw, limit)
+        # The client's own suffix is never used for the file on disk.
+        video = raw.rename(raw.with_name("upload" + sniffed_extension(raw)))
+        seconds, _, _ = _probe_clip(video)
+        if seconds <= 0:
+            raise OpError(422, NOT_A_VIDEO)
+        if seconds > UPLOAD_MAX_SECONDS:
+            raise OpError(422, f"That video is {clock(seconds)} long; the most is "
+                               f"{int(UPLOAD_MAX_SECONDS // 60)} minutes")
+        out = Path(tmp) / "clip.mp4"
+        try:
+            reencoded = normalize_upload(video, out, seconds)
+        except RuntimeError:
+            raise OpError(422, NOT_A_VIDEO) from None
+        video.unlink(missing_ok=True)
+        length, has_audio, _ = _probe_clip(out)
+        size = _probe_size(out)
+        if length <= 0 or not size:
+            raise OpError(422, NOT_A_VIDEO)
+        frames: list[tuple[Path, bytes]] = []
+        for i, t in enumerate(upload_frame_times(length)):
+            try:
+                data, _used = grab(out, "last" if math.isinf(t) else t)
+            except RuntimeError:
+                raise OpError(422, NOT_A_VIDEO) from None
+            frame = Path(tmp) / f"frame{i}.png"
+            frame.write_bytes(data)
+            frames.append((frame, data))
+        check_uploaded_frames(frames, name, video=True)
+        path = storage.save_generated_file(out, extension="mp4", subdir_name="clips")
+    job = models.AssetGenerationJob(
+        owner_kind=owner_kind, owner_id=owner_id, output_kind="video_clip", duration_seconds=round(length, 3),
+        aspect_ratio=aspect_for(size), prompt="", negative_prompt="", reference_asset_ids_json=[],
+        provider=PROVIDER, provider_model=UPLOAD_MODEL, label=UPLOAD_LABEL, operation=UPLOAD_OP,
+        options_json={"upload": name, "has_audio": has_audio, "reencoded": reencoded},
+        result_path=str(path), result_width=size[0], result_height=size[1],
+        result_duration_seconds=round(length, 3), status="completed",
+    )
+    try:
+        db.add(job)
+        db.commit()
+    except Exception:
+        db.rollback()
+        Path(path).unlink(missing_ok=True)
+        raise
+    db.refresh(job)
+    events.studio_event(db, job, "completed")
+    db.commit()
+    return job
+
+
+# ---------- continue a clip ("Continue this clip") ----------
+#
+# A finished Studio clip's last frame is saved as a Studio picture (an
+# "extract_frame" job, source_job_id the clip) and a new image-to-video
+# clip starts from it (first_frame_job_id), from the prompt the owner
+# writes: a paid generation like any clip, through every check a clip's
+# prompt goes through (api/studio.py). The intent is kept on the new clip:
+# options_json {"continues_job_id": the clip, "auto_join": bool}. With
+# auto_join, when that clip finishes (pipeline.on_studio_clip_ready, the
+# one place a Studio clip completes, from a webhook or a poll alike) one
+# join [original, continuation] with a cut is made, once: in the same
+# transaction as the conditional "polling → completed" write only one
+# completion wins, and the join's id ("join_job_id") or why there is none
+# ("join_note", shown in Studio) is stored with it. Auto-joins count
+# toward JOIN_MAX_RUNNING like any join, but are queued even when the cap
+# is full (one join per paid, rate-limited clip): a manual join waits.
+#
+# Checks: the frame is a frame of a Studio clip (no new check, as above);
+# the continuation and the join carry no Cast exemption
+# (pipeline.studio_cast_source gives (None, None) for each).
+
+CONTINUES = "continues_job_id"
+AUTO_JOIN = "auto_join"
+JOIN_JOB = "join_job_id"
+JOIN_NOTE = "join_note"
+AUTO_JOIN_FOR = "auto_join_for"
+
+
+def continue_options(continues_job_id: int, auto_join: bool) -> dict:
+    return {CONTINUES: int(continues_job_id), AUTO_JOIN: bool(auto_join)}
+
+
+def continuation_of(job: models.AssetGenerationJob) -> Optional[dict]:
+    """The continuation intent a clip carries (for Retry), or None."""
+    opts = job.options_json or {}
+    if not opts.get(CONTINUES):
+        return None
+    try:
+        return continue_options(int(opts[CONTINUES]), bool(opts.get(AUTO_JOIN)))
+    except (TypeError, ValueError):
+        return None
+
+
+def continue_origin(db: Session, job: Optional[models.AssetGenerationJob], *,
+                    depth: int = 0) -> Optional[models.AssetGenerationJob]:
+    """The generated clip a continuation of `job` follows on from: `job`
+    itself when it was generated from a prompt; for joined clips, the last
+    clip's (followed back); None for an uploaded video or anything else."""
+    if job is None or depth > 8 or job.output_kind != "video_clip":
+        return None
+    if job.operation == JOIN_OP:
+        ids, _, _ = join_options(job)
+        return continue_origin(db, db.get(models.AssetGenerationJob, ids[-1]) if ids else None, depth=depth + 1)
+    return None if job.operation else job
+
+
+def continue_prompt(db: Session, job: Optional[models.AssetGenerationJob]) -> str:
+    """What a continuation of `job` prefills its prompt with: the prompt of
+    the clip it follows on from ("" for an uploaded video)."""
+    origin = continue_origin(db, job)
+    return (origin.prompt or "") if origin is not None else ""
+
+
+def continue_aspect(job: models.AssetGenerationJob) -> str:
+    """The aspect a continuation of `job` is made in: the clip's own, else
+    the nearest to its real size, else the owner's default ("")."""
+    if job.aspect_ratio in ("9:16", "16:9", "1:1"):
+        return job.aspect_ratio
+    if job.result_width and job.result_height:
+        return aspect_for((job.result_width, job.result_height))
+    return ""
+
+
+def _owner_exists(db: Session, kind: str, owner_id: int) -> bool:
+    model = {"avatar": models.Avatar, "ingredient": models.Ingredient}.get(kind)
+    return model is not None and db.get(model, owner_id) is not None
+
+
+def not_joined_note(error: OpError) -> str:
+    if error.status == 404:
+        return "Not joined: the original was deleted"
+    text = error.message.rstrip(".")
+    return f"Not joined: {text[:1].lower() + text[1:]}"
+
+
+def plan_auto_join(db: Session, job: models.AssetGenerationJob) -> Optional[models.AssetGenerationJob]:
+    """In the caller's transaction, right after `job` (a clip) was claimed
+    completed: when it continues a clip with auto_join on and nothing was
+    joined or noted for it yet, add the pending join [original, `job`]
+    (a cut) and record its id on `job`, or record why it can't be made
+    ("join_note"). Returns the join to queue once committed, else None.
+    Never raises for a join that can't be made."""
+    opts = dict(job.options_json or {})
+    original = opts.get(CONTINUES)
+    if not original or not opts.get(AUTO_JOIN) or opts.get(JOIN_JOB) or opts.get(JOIN_NOTE):
+        return None
+    join = None
+    try:
+        sources = join_sources(db, [int(original), job.id])
+        if not _owner_exists(db, sources[0].owner_kind, sources[0].owner_id):
+            opts[JOIN_NOTE] = "Not joined: the original's character or scene was deleted"
+        else:
+            join = new_join_job(sources, "cut", 0.0)
+            join.options_json = {**(join.options_json or {}), AUTO_JOIN_FOR: job.id}
+            db.add(join)
+            db.flush()
+            opts[JOIN_JOB] = join.id
+    except OpError as e:
+        opts[JOIN_NOTE] = not_joined_note(e)
+    except (TypeError, ValueError):
+        opts[JOIN_NOTE] = "Not joined: the original clip isn't known"
+    job.options_json = opts
+    return join
+
+
+def queue_join(db: Session, join: models.AssetGenerationJob) -> None:
+    """Queue a committed auto-join for the worker; when the queue refuses
+    it, it is marked failed (Retry joins again). Never raises."""
+    import logging
+
+    from ..workers.jobs import generate_asset_job
+    from ..workers.queue import enqueue
+
+    Job = models.AssetGenerationJob
+    try:
+        qid = enqueue(generate_asset_job, join.id)
+        db.query(Job).filter(Job.id == join.id, Job.status == "pending").update(
+            {"queue_job_id": str(qid)[:80]}, synchronize_session=False)
+        db.commit()
+    except Exception:  # noqa: BLE001 — the clip itself is finished; only the join waits
+        db.rollback()
+        logging.getLogger(__name__).exception("couldn't queue the auto-join %s", join.id)
+        db.query(Job).filter(Job.id == join.id, Job.status == "pending").update(
+            {"status": "failed", "error": "Couldn't queue this join; retry it"}, synchronize_session=False)
+        db.commit()
