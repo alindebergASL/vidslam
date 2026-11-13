@@ -673,3 +673,48 @@ def test_sweeper_fails_an_orphaned_join_well_before_the_general_limit(auth_clien
     with SessionLocal() as db:
         assert joins_running(db) == 2  # the queued one and the one running
     assert status[other_id][0] == "submitted"  # not a join: the general limit
+
+
+def test_a_running_command_is_killed_soon_after_should_stop_says_yes():
+    """FFmpeg of a cancelled join is stopped within about a second, so the
+    join doesn't keep re-encoding after giving up its place."""
+    import time
+
+    from app.services.renderer import _run
+
+    asked = []
+    t0 = time.monotonic()
+    rc, log = _run(["sleep", "30"], should_stop=lambda: asked.append(1) or len(asked) >= 2)
+    assert (rc, log) == (-2, "stopped") and time.monotonic() - t0 < 5
+    rc, _ = _run(["sleep", "30"], timeout=1.5, should_stop=lambda: False)
+    assert rc == -1
+    # A check that fails never stops the work.
+    rc, _ = _run(["true"], should_stop=lambda: 1 / 0)
+    assert rc == 0
+
+
+def test_cancelling_a_running_join_stops_its_ffmpeg_and_keeps_it_cancelled(auth_client, tmp_path, monkeypatch):
+    from app import models
+    from app.db import SessionLocal
+    from app.services import renderer, video_ops
+
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4", seconds=1.5), aid)
+    b = _clip_job(_video(tmp_path / "b.mp4", seconds=1.5), aid)
+    seen = {}
+
+    def fake_join(clips, dst, *, transition="cut", crossfade=0.5, should_stop=None):
+        with SessionLocal() as db:  # the user cancels while FFmpeg runs
+            db.query(models.AssetGenerationJob).filter(
+                models.AssetGenerationJob.operation == video_ops.JOIN_OP).update(
+                {"status": "failed", "error": "Cancelled"}, synchronize_session=False)
+            db.commit()
+        seen["stop"] = should_stop()
+        raise renderer.JoinStopped("stopped")
+
+    monkeypatch.setattr(renderer, "join_clips_with_audio", fake_join)
+    r = auth_client.post("/api/studio/join-clips", json={"job_ids": [a, b]})
+    assert r.status_code == 202, r.text
+    assert seen["stop"] is True
+    job = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+    assert job["status"] == "failed" and job["error"] == "Cancelled"

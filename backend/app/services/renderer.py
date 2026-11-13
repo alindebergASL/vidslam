@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .captions import CaptionTiming, write_ass
 
@@ -57,14 +57,37 @@ def textfile_arg(path: Path) -> str:
     return f"textfile='{p}':expansion=none"
 
 
-def _run(cmd: list[str], timeout: Optional[float] = None) -> tuple[int, str]:
+def _run(cmd: list[str], timeout: Optional[float] = None,
+         should_stop: Optional[Callable[[], bool]] = None) -> tuple[int, str]:
     """(exit code, output). With `timeout` (seconds) a run that takes longer
-    is killed and answers (-1, "timed out ...")."""
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return -1, f"timed out after {timeout:.0f}s"
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    is killed and answers (-1, "timed out ..."). With `should_stop`, it is
+    asked about once a second while the command runs; when it says yes the
+    command is killed and the answer is (-2, "stopped")."""
+    if should_stop is None:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return -1, f"timed out after {timeout:.0f}s"
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    import time
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+        while True:
+            try:
+                out, err = proc.communicate(timeout=1.0)
+                return proc.returncode, (out or "") + (err or "")
+            except subprocess.TimeoutExpired:
+                pass
+            stop = False
+            try:
+                stop = bool(should_stop())
+            except Exception:  # a failed check never stops the work
+                stop = False
+            if stop or (deadline is not None and time.monotonic() > deadline):
+                proc.kill()
+                proc.communicate()
+                return (-2, "stopped") if stop else (-1, f"timed out after {timeout:.0f}s")
 
 
 def _dims_for_aspect(aspect: str, resolution: str = "1080p") -> tuple[int, int]:
@@ -1411,14 +1434,21 @@ def join_audio_graph(lengths: list[float], has_audio: list[bool], *, crossfade: 
     return ";".join(parts)
 
 
+class JoinStopped(RuntimeError):
+    """The join's FFmpeg was killed because the job was cancelled or deleted."""
+
+
 def join_clips_with_audio(
     clips: list[Path],
     dst: Path,
     *,
     transition: str = "cut",
     crossfade: float = 0.5,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> tuple[Path, float, bool]:
     """Play `clips` back to back as one clip (Studio's "Join clips").
+    `should_stop`: asked about once a second while FFmpeg runs; yes kills it
+    (JoinStopped).
 
     The picture is the first clip's size; the others are fitted into it
     (scaled and padded, or cropped when their shape is nearly the same:

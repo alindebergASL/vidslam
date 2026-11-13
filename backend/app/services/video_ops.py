@@ -457,17 +457,32 @@ def run_join(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerat
 
     from . import events, storage
     from .pipeline import STUDIO_RUNNING
-    from .renderer import _probe_size, join_clips_with_audio
+    from .renderer import JoinStopped, _probe_size, join_clips_with_audio
 
     ids, transition, crossfade = join_options(job)
     try:
         sources = join_sources(db, ids)
     except OpError as e:
         raise ValueError(e.message) from None
+    def stopped() -> bool:
+        # Cancelled or deleted while FFmpeg runs: stop it, so a cancelled
+        # join doesn't go on re-encoding after giving up its place.
+        from ..db import SessionLocal
+
+        with SessionLocal() as check:
+            status = check.query(models.AssetGenerationJob.status).filter(
+                models.AssetGenerationJob.id == job.id).scalar()
+        return status not in STUDIO_RUNNING
+
     with tempfile.TemporaryDirectory(prefix="join-") as tmp:
         out = Path(tmp) / "joined.mp4"
-        _, seconds, has_audio = join_clips_with_audio(
-            [Path(s.result_path) for s in sources], out, transition=transition, crossfade=crossfade)
+        try:
+            _, seconds, has_audio = join_clips_with_audio(
+                [Path(s.result_path) for s in sources], out, transition=transition, crossfade=crossfade,
+                should_stop=stopped)
+        except JoinStopped:
+            db.refresh(job)
+            return job
         size = _probe_size(out)
         path = storage.save_generated_file(out, extension="mp4", subdir_name="clips")
     opts = dict(job.options_json or {})
