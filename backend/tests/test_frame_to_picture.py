@@ -82,6 +82,28 @@ def test_renderer_extract_frame_at_keeps_the_time_inside_the_video(tmp_path):
         extract_frame_at(bad, out, 0)
 
 
+def test_last_frame_is_found_when_the_sound_outlasts_the_picture(tmp_path):
+    """2 s of picture (red, then blue) with 4 s of sound: the last frame is
+    the blue one near 2 s, not the first frame."""
+    import subprocess
+
+    from app.services.renderer import extract_frame_at
+
+    video = tmp_path / "long_sound.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error",
+                    "-f", "lavfi", "-i", "color=red:s=96x64:r=24:d=1",
+                    "-f", "lavfi", "-i", "color=blue:s=96x64:r=24:d=1",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+                    "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+                    "-map", "[v]", "-map", "2:a", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(video)], check=True)
+    out = tmp_path / "last.png"
+    used = extract_frame_at(video, out, 99)
+    assert 1.5 < used <= 2.0
+    r, g, b = Image.open(out).convert("RGB").getpixel((48, 32))
+    assert b > 150 and r < 100
+
+
 def test_first_last_and_a_time_are_free_pictures_of_the_clips_size(auth_client):
     from app import models
     from app.db import SessionLocal
