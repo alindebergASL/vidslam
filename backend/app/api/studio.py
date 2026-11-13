@@ -27,6 +27,7 @@ from ..schemas.api import (
     StudioBulkSaveOut,
     StudioFrameRequest,
     StudioJobUpdate,
+    StudioJoinRequest,
     StudioRemoveBackgroundRequest,
     StudioRetryRequest,
     StudioSaveRequest,
@@ -554,6 +555,18 @@ def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest
         from ..services import video_ops
 
         return _frame_from_clip(db, src.source_job_id, video_ops.at_of(src), response)
+    if src.operation == "join_clips":
+        # Joins the same clips again, the same way (free, no model).
+        from ..services import video_ops
+
+        ids, transition, crossfade = video_ops.join_options(src)
+        try:
+            return _join(db, ids, transition, crossfade, response)
+        except HTTPException as e:
+            if e.status_code == 404:
+                # A clip it joined was deleted since: it can't be made again.
+                raise HTTPException(409, f"{e.detail}, so these clips can't be joined again") from e
+            raise
     if src.operation:
         # Runs the same operation again on the same picture (the prompt,
         # avoid text and aspect don't apply); a model given replaces it.
@@ -866,3 +879,47 @@ def frame_from_video(
     out = _with_costs(db, [job])[0]
     out.batch_ids = [job.id]
     return out
+
+
+# ---------- join clips ----------
+
+
+def _join(db: Session, job_ids: list[int], transition: str, crossfade: float, response: Response) -> StudioJobOut:
+    """Check the clips and queue one job that joins them (202): a new
+    Studio clip owned by the first clip's owner. Free: no model, no spend,
+    no budget cap, but at most JOIN_MAX_RUNNING at once (429). No new
+    safety check: see services/video_ops.py."""
+    from ..services import video_ops
+
+    try:
+        sources = video_ops.join_sources(db, job_ids)
+    except video_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+    first = sources[0]
+    if not _owner_exists(db, first.owner_kind, first.owner_id):
+        raise HTTPException(404, "owner not found")
+    if video_ops.join_busy(db):
+        raise HTTPException(429, f"{video_ops.JOIN_MAX_RUNNING} joins are already running; "
+                                 "try again when one has finished")
+    job = video_ops.new_join_job(sources, transition, crossfade)
+    _enqueue_jobs(db, [job])
+    db.refresh(job)
+    response.status_code = 202
+    out = _with_costs(db, [job])[0]
+    out.batch_ids = [job.id]
+    return out
+
+
+@router.post("/join-clips", response_model=StudioJobOut, status_code=202,
+             dependencies=[Depends(rate_limit("generation"))])
+def join_clips(body: StudioJoinRequest, response: Response, db: Session = Depends(get_db)) -> StudioJobOut:
+    """One new Studio clip that plays 2 to 12 finished Studio clips back to
+    back, in the order given (a clip may repeat), with a cut or a short
+    dissolve between them. Free (made here by ffmpeg)."""
+    from ..services import video_ops
+
+    try:
+        crossfade = video_ops.parse_crossfade(body.transition, body.crossfade)
+    except video_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+    return _join(db, list(body.job_ids), body.transition, crossfade, response)

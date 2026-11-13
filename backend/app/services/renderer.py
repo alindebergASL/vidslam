@@ -57,8 +57,13 @@ def textfile_arg(path: Path) -> str:
     return f"textfile='{p}':expansion=none"
 
 
-def _run(cmd: list[str]) -> tuple[int, str]:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+def _run(cmd: list[str], timeout: Optional[float] = None) -> tuple[int, str]:
+    """(exit code, output). With `timeout` (seconds) a run that takes longer
+    is killed and answers (-1, "timed out ...")."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return -1, f"timed out after {timeout:.0f}s"
     return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
@@ -1229,6 +1234,148 @@ def join_segments(
     if rc != 0:
         raise RuntimeError(f"ffmpeg segment join failed: {log[-2000:]}")
     return dst, _probe_duration(dst)
+
+
+def _probe_clip(path: Path) -> tuple[float, bool]:
+    """(video length in seconds, whether the file has an audio stream).
+    The length is the video stream's own when ffprobe knows it (a sound
+    track a little longer than the picture would otherwise stretch it),
+    else the container's; 0.0 when the file can't be read."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json",
+                    "-show_entries", "stream=codec_type,duration:format=duration", str(path)])
+    if rc != 0:
+        return 0.0, False
+    try:
+        info = json.loads(log)
+    except ValueError:
+        return 0.0, False
+    streams = info.get("streams") or []
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    length = 0.0
+    for s in streams:
+        if s.get("codec_type") == "video":
+            try:
+                length = float(s.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                length = 0.0
+            break
+    else:
+        return 0.0, has_audio  # no picture: not a clip
+    if length <= 0:
+        try:
+            length = float((info.get("format") or {}).get("duration") or 0.0)
+        except (TypeError, ValueError):
+            length = 0.0
+    return max(length, 0.0), has_audio
+
+
+# Below this a dissolve is too short to see (and leaves no whole frame to
+# blend): it is a cut.
+MIN_DISSOLVE = 0.1
+JOIN_AUDIO_RATE = 48000
+
+
+# The joined clip is at most 1080p (long side 1920, short side 1080): a 4K
+# first clip is scaled down so one join can't write a 10-minute 4K file.
+JOIN_MAX_LONG, JOIN_MAX_SHORT = 1920, 1080
+
+
+def join_size(size: tuple[int, int]) -> tuple[int, int]:
+    """The joined clip's size: the first clip's, scaled down (keeping its
+    shape) to fit 1080p, with even sides (x264 with 4:2:0 needs them)."""
+    w, h = size
+    long_max, short_max = (JOIN_MAX_LONG, JOIN_MAX_SHORT) if w >= h else (JOIN_MAX_SHORT, JOIN_MAX_LONG)
+    scale = min(1.0, long_max / max(w, 1), short_max / max(h, 1))
+    w, h = int(w * scale), int(h * scale)
+    return max(2, w - w % 2), max(2, h - h % 2)
+
+
+def join_timeout(total_seconds: float) -> float:
+    """How long the join's ffmpeg may run before it is killed: a few times
+    the clips' total length, and at least two minutes."""
+    return max(120.0, 6.0 * total_seconds)
+
+
+def join_crossfade(lengths: list[float], transition: str, crossfade: float) -> float:
+    """The dissolve actually used: 0 for a cut; else `crossfade` kept to a
+    third of the shortest clip, and 0 when that is too short to see."""
+    if transition != "dissolve" or len(lengths) < 2:
+        return 0.0
+    cf = max(0.0, min(float(crossfade), min(lengths) / 3.0))
+    return round(cf, 3) if cf >= MIN_DISSOLVE else 0.0
+
+
+def join_audio_graph(lengths: list[float], has_audio: list[bool], *, crossfade: float) -> str:
+    """filter_complex text for the joined sound (output label [aout]): each
+    clip's own, or silence for a clip without any, fitted to exactly that
+    clip's picture length, then joined back to back (`crossfade` > 0: each
+    join crossfades over the same span as the picture's dissolve)."""
+    fmt = "aformat=sample_fmts=fltp:channel_layouts=stereo"
+    parts: list[str] = []
+    for i, (L, audio) in enumerate(zip(lengths, has_audio, strict=True)):
+        # A clip's sound can start after its picture (its first pts > 0):
+        # async/first_pts=0 fills that gap with silence so the sound stays
+        # on the clip's own timeline before it is padded and trimmed to L.
+        src = (f"[{i}:a]aresample={JOIN_AUDIO_RATE}:async=1:first_pts=0," if audio
+               else f"anullsrc=r={JOIN_AUDIO_RATE}:cl=stereo,")
+        parts.append(f"{src}{fmt},apad,atrim=start=0:end={L:.4f},asetpts=PTS-STARTPTS[a{i}]")
+    n = len(lengths)
+    if crossfade > 0 and n > 1:
+        prev = "a0"
+        for i in range(1, n):
+            out = "aout" if i == n - 1 else f"ax{i}"
+            parts.append(f"[{prev}][a{i}]acrossfade=d={crossfade:.4f}:{AUDIO_XFADE_CURVES}[{out}]")
+            prev = out
+    else:
+        parts.append(f"{''.join(f'[a{i}]' for i in range(n))}concat=n={n}:v=0:a=1[aout]")
+    return ";".join(parts)
+
+
+def join_clips_with_audio(
+    clips: list[Path],
+    dst: Path,
+    *,
+    transition: str = "cut",
+    crossfade: float = 0.5,
+) -> tuple[Path, float, bool]:
+    """Play `clips` back to back as one clip (Studio's "Join clips").
+
+    The picture is the first clip's size; the others are fitted into it
+    (scaled and padded, or cropped when their shape is nearly the same:
+    fit_vf), at FPS with square pixels, as join_segments does. Sound: each
+    clip's own, silence for a clip without any so the track stays
+    continuous, and no sound track at all when no clip has sound.
+    `transition` "dissolve" crossfades picture and sound over `crossfade`
+    seconds (see join_crossfade); "cut" plays them straight on. Returns
+    (path, length, has sound). RuntimeError when a clip can't be read or
+    ffmpeg fails."""
+    if len(clips) < 2:
+        raise ValueError("join needs at least two clips")
+    probed = [_probe_clip(p) for p in clips]
+    lengths = [length for length, _ in probed]
+    has_audio = [audio for _, audio in probed]
+    if any(length <= 0 for length in lengths):
+        raise RuntimeError("a clip to join can't be read")
+    size = _probe_size(clips[0])
+    if size is None:
+        raise RuntimeError("the first clip's size can't be read")
+    width, height = join_size(size)
+    cf = join_crossfade(lengths, transition, crossfade)
+    graph = join_graph(lengths, crossfade=cf, width=width, height=height,
+                       sizes=[_probe_size(p) for p in clips])
+    audio = any(has_audio)
+    if audio:
+        graph += ";" + join_audio_graph(lengths, has_audio, crossfade=cf)
+    cmd = ["ffmpeg", "-y"]
+    for p in clips:
+        cmd += ["-i", str(p)]
+    cmd += ["-filter_complex", graph, "-map", "[out]"]
+    cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"] if audio else ["-an"]
+    cmd += [*_X264, "-r", str(FPS), "-movflags", "+faststart", str(dst)]
+    rc, log = _run(cmd, timeout=join_timeout(sum(lengths)))
+    if rc != 0 or not dst.exists():
+        raise RuntimeError(f"ffmpeg clip join failed: {log[-2000:]}")
+    return dst, _probe_duration(dst), audio
 
 
 def slice_audio(src: Path, dst: Path, *, start: float, duration: float) -> Path:

@@ -10,6 +10,10 @@ import { sourceChipText } from "@/components/ImageOps";
 import { clockText } from "@/components/FrameFromVideo";
 
 /** One thing the viewer can show: a Studio result or a cast picture. */
+/** Operations made here without a model and without one original picture
+ *  (a saved frame, joined clips): no Compare, no "Try another model". */
+const NO_ORIGINAL: string[] = ["extract_frame", "join_clips"];
+
 export type ViewerItem = {
   key: string;
   kind: "asset" | "job";
@@ -243,10 +247,12 @@ export function StudioViewer({
   const act = "chip text-xs py-1.5";
   const checker = mayBeTransparent(item);
   const fromText = job ? sourceChipText(job) : null;
-  // A saved frame's source is a clip (or a video that wasn't kept): there is
-  // no picture to compare it with.
+  // A saved frame's source is a clip (or a video that wasn't kept), and
+  // joined clips have several: there is no one picture to compare with.
   const sourceOf =
-    job?.operation && job.operation !== "extract_frame" && finished && actions.sourceUrl ? actions.sourceUrl(job) : null;
+    job?.operation && !NO_ORIGINAL.includes(job.operation) && finished && actions.sourceUrl
+      ? actions.sourceUrl(job)
+      : null;
   const originalUrl = sourceOf && sourceOf !== brokenOriginal ? sourceOf : null;
   const showCompare = compare && Boolean(originalUrl) && Boolean(item.imageUrl);
   const isPicture = !isVideo && Boolean(item.imageUrl) && (item.kind === "asset" || finished);
@@ -270,7 +276,13 @@ export function StudioViewer({
     } else {
       details.push("Image");
     }
-    if (job.provider_model) details.push(job.provider_model);
+    if (job.operation === "join_clips") {
+      const n = job.options?.job_ids?.length ?? 0;
+      details.push(
+        `Joined ${n ? `${n} clips` : "clips"} (${job.options?.transition === "dissolve" ? "dissolve" : "cut"}` +
+          `${job.options?.has_audio === false ? ", no sound" : ""}) · free`
+      );
+    } else if (job.provider_model) details.push(job.provider_model);
     // Reference pictures sent a Sogni model to one of Sogni's editors.
     const ranOn = ranOnText(job);
     if (ranOn) details.push(ranOn);
@@ -561,7 +573,7 @@ export function StudioViewer({
               </button>
             </>
           )}
-          {job && finished && job.operation !== "extract_frame" && (
+          {job && finished && !NO_ORIGINAL.includes(job.operation || "") && (
             <button onClick={closeThen(() => actions.onTryModel(job))} className={act}>
               Try another model…
             </button>

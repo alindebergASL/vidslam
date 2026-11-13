@@ -1,0 +1,361 @@
+"""Join clips: finished Studio clips played back to back as one new Studio
+clip (free, made here by ffmpeg), with a cut or a short dissolve, each
+clip's own sound and silence for a clip without any."""
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from .test_image_ops import _avatar, _picture
+
+
+def _video(path: Path, *, size=(96, 64), seconds: float = 1.5, audio: bool = False, rate: int = 10,
+           pix_fmt: str = "yuv420p") -> Path:
+    """A small real clip: a test pattern, with a tone when `audio`."""
+    cmd = ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+           f"testsrc=size={size[0]}x{size[1]}:rate={rate}:duration={seconds}"]
+    if audio:
+        cmd += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}", "-c:a", "aac", "-shortest"]
+    cmd += ["-pix_fmt", pix_fmt, str(path)]
+    subprocess.run(cmd, check=True)
+    return path
+
+
+def _streams(path: Path) -> dict[str, float]:
+    out = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries",
+                          "stream=codec_type,duration", str(path)], capture_output=True, text=True, check=True)
+    return {s["codec_type"]: float(s.get("duration") or 0) for s in json.loads(out.stdout)["streams"]}
+
+
+def _mean_volume(path: Path, start: float, seconds: float) -> float:
+    out = subprocess.run(["ffmpeg", "-v", "info", "-ss", f"{start}", "-t", f"{seconds}", "-i", str(path),
+                          "-vn", "-af", "volumedetect", "-f", "null", "-"], capture_output=True, text=True)
+    for line in out.stderr.splitlines():
+        if "mean_volume:" in line:
+            return float(line.split("mean_volume:")[1].split("dB")[0])
+    raise AssertionError(out.stderr[-500:])
+
+
+# ---------- the renderer ----------
+
+
+def test_cut_plays_the_clips_back_to_back_with_sound_and_silence(tmp_path):
+    from app.services.renderer import _probe_size, join_clips_with_audio
+
+    a = _video(tmp_path / "a.mp4", seconds=2.0, audio=True)
+    b = _video(tmp_path / "b.mp4", seconds=1.5, audio=False, size=(64, 96), rate=24)
+    out, seconds, has_audio = join_clips_with_audio([a, b, a], tmp_path / "out.mp4")
+    assert has_audio is True
+    assert seconds == pytest.approx(5.5, abs=0.1)
+    assert _probe_size(out) == (96, 64)  # the first clip's size
+    streams = _streams(out)
+    assert streams["video"] == pytest.approx(5.5, abs=0.1)
+    assert streams["audio"] == pytest.approx(5.5, abs=0.1)
+    # The tone, then silence where the clip without sound plays, then the tone.
+    assert _mean_volume(out, 0.3, 1.2) > -40
+    assert _mean_volume(out, 2.3, 0.9) < -80
+    assert _mean_volume(out, 3.8, 1.2) > -40
+
+
+def test_dissolve_overlaps_each_join_and_is_kept_to_a_third_of_the_shortest_clip(tmp_path):
+    from app.services.renderer import join_clips_with_audio, join_crossfade
+
+    a = _video(tmp_path / "a.mp4", seconds=2.0, audio=True)
+    b = _video(tmp_path / "b.mp4", seconds=2.0, audio=True)
+    _, seconds, _ = join_clips_with_audio([a, b, a], tmp_path / "d.mp4", transition="dissolve", crossfade=0.5)
+    assert seconds == pytest.approx(6.0 - 2 * 0.5, abs=0.1)
+    streams = _streams(tmp_path / "d.mp4")
+    assert streams["audio"] == pytest.approx(streams["video"], abs=0.1)
+
+    short = _video(tmp_path / "s.mp4", seconds=0.9)
+    assert join_crossfade([2.0, 0.9], "dissolve", 1.5) == pytest.approx(0.3)
+    _, seconds, _ = join_clips_with_audio([a, short], tmp_path / "e.mp4", transition="dissolve", crossfade=1.5)
+    assert seconds == pytest.approx(2.0 + 0.9 - 0.3, abs=0.1)
+    # A dissolve too short to see is a cut; "cut" ignores the crossfade.
+    assert join_crossfade([2.0, 0.2], "dissolve", 1.0) == 0.0
+    assert join_crossfade([2.0, 2.0], "cut", 1.0) == 0.0
+
+
+def test_sound_starting_after_the_picture_stays_in_sync(tmp_path):
+    """A clip whose sound starts late (audio start_time > 0) keeps that
+    lead-in as silence, so its sound neither runs short nor drifts early."""
+    from app.services.renderer import join_clips_with_audio
+
+    late = tmp_path / "late.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=96x64:rate=10:duration=2",
+                    "-itsoffset", "0.6", "-f", "lavfi", "-i", "sine=frequency=440:duration=1.4",
+                    "-map", "0", "-map", "1", "-pix_fmt", "yuv420p", "-c:a", "aac", str(late)], check=True)
+    for transition, expected in (("cut", 8.0), ("dissolve", 8.0 - 3 * 0.5)):
+        out, seconds, _ = join_clips_with_audio([late] * 4, tmp_path / f"{transition}.mp4", transition=transition)
+        streams = _streams(out)
+        assert streams["video"] == pytest.approx(expected, abs=0.1)
+        assert streams["audio"] == pytest.approx(streams["video"], abs=0.1)
+    # Cut: the 4th clip's lead-in (6.0-6.5 s) is silent, its tone after it.
+    out = tmp_path / "cut.mp4"
+    assert _mean_volume(out, 6.05, 0.4) < -60
+    assert _mean_volume(out, 6.8, 1.0) > -40
+
+
+def test_no_sound_anywhere_means_no_sound_track(tmp_path):
+    from app.services.renderer import _probe_size, join_clips_with_audio
+
+    # Odd sides (kept to even ones) and another pixel format; the second
+    # clip, another shape, is fitted into the first's frame.
+    a = _video(tmp_path / "a.mp4", size=(65, 97), pix_fmt="yuv444p")
+    b = _video(tmp_path / "b.mp4", size=(96, 64))
+    out, seconds, has_audio = join_clips_with_audio([a, b], tmp_path / "n.mp4", transition="dissolve")
+    assert has_audio is False
+    assert set(_streams(out)) == {"video"}
+    assert _probe_size(out) == (64, 96)
+    assert seconds == pytest.approx(3.0 - 0.5, abs=0.1)
+
+
+def test_unreadable_clip_is_an_error(tmp_path):
+    from app.services.renderer import join_clips_with_audio
+
+    a = _video(tmp_path / "a.mp4")
+    bad = tmp_path / "bad.mp4"
+    bad.write_bytes(b"not a video")
+    with pytest.raises(RuntimeError):
+        join_clips_with_audio([a, bad], tmp_path / "x.mp4")
+    with pytest.raises(ValueError):
+        join_clips_with_audio([a], tmp_path / "x.mp4")
+
+
+# ---------- the API ----------
+
+
+def _clip_job(path: Path, owner_id: int, *, owner_kind: str = "avatar", status: str = "completed",
+              seconds: float = 1.5, output_kind: str = "video_clip", aspect: str = "") -> int:
+    """A Studio clip job pointing at a real file."""
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        job = models.AssetGenerationJob(
+            owner_kind=owner_kind, owner_id=owner_id, output_kind=output_kind, prompt="a clip",
+            negative_prompt="", reference_asset_ids_json=[], provider="mock", provider_model="mock/video",
+            status=status, result_path=str(path), result_duration_seconds=seconds, duration_seconds=seconds,
+            aspect_ratio=aspect)
+        db.add(job)
+        db.commit()
+        return job.id
+
+
+def _ingredient(client) -> int:
+    r = client.post("/api/ingredients", json={"name": "Cafe", "kind": "scene"})
+    assert r.status_code in (200, 201), r.text
+    return r.json()["id"]
+
+
+def _spend_rows() -> int:
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        return db.query(models.SpendEntry).count()
+
+
+def test_join_makes_one_new_clip_owned_by_the_first_clips_owner(auth_client, tmp_path, monkeypatch):
+    from app.api import studio
+
+    aid = _avatar(auth_client)
+    iid = _ingredient(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4", seconds=2.0, audio=True), aid, seconds=2.0, aspect="16:9")
+    b = _clip_job(_video(tmp_path / "b.mp4", seconds=1.5, size=(64, 96)), iid, owner_kind="ingredient")
+    spent = _spend_rows()
+
+    def guard():
+        raise AssertionError("budget_guard called")
+
+    monkeypatch.setattr(studio, "budget_guard", guard)  # free: the monthly cap doesn't apply
+    r = auth_client.post("/api/studio/join-clips", json={"job_ids": [a, b, a], "transition": "dissolve"})
+    assert r.status_code == 202, r.text
+    assert r.json()["batch_ids"] == [r.json()["id"]]
+    # Tests run the queue inline: the worker joined them.
+    job = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+    assert job["status"] == "completed", job
+    assert (job["owner_kind"], job["owner_id"]) == ("avatar", aid)
+    assert (job["output_kind"], job["operation"], job["provider_model"]) == ("video_clip", "join_clips", "local/join")
+    assert job["source_job_id"] is None and job["aspect_ratio"] == "16:9"
+    assert job["label"] == "Joined 3 clips"
+    assert job["options"] == {"job_ids": [a, b, a], "transition": "dissolve", "crossfade": 0.5, "has_audio": True}
+    assert (job["result_width"], job["result_height"]) == (96, 64)
+    assert job["result_duration_seconds"] == pytest.approx(5.5 - 1.0, abs=0.1)
+    assert Path(job["result_path"]).is_file()
+    assert _spend_rows() == spent
+    # Its file is served like any other clip's.
+    assert auth_client.get(f"/api/studio/jobs/{job['id']}/preview").headers["content-type"] == "video/mp4"
+
+
+def test_join_errors(auth_client, tmp_path):
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4"), aid)
+    url = "/api/studio/join-clips"
+    assert auth_client.post(url, json={"job_ids": [a]}).status_code == 422
+    assert auth_client.post(url, json={"job_ids": [a] * 13}).status_code == 422
+    assert auth_client.post(url, json={"job_ids": [a, a], "transition": "wipe"}).status_code == 422
+    assert auth_client.post(url, json={"job_ids": [a, a], "transition": "dissolve",
+                                       "crossfade": 2}).status_code == 422
+    assert auth_client.post(url, json={"job_ids": [a, 999999]}).status_code == 404
+    running = _clip_job(tmp_path / "a.mp4", aid, status="polling")
+    assert auth_client.post(url, json={"job_ids": [a, running]}).status_code == 409
+    gone = _clip_job(tmp_path / "missing.mp4", aid)
+    assert auth_client.post(url, json={"job_ids": [a, gone]}).status_code == 409
+    pic = _picture(auth_client, aid)
+    r = auth_client.post(url, json={"job_ids": [a, pic["id"]]})
+    assert r.status_code == 409 and "picture" in r.json()["detail"]
+    long = _clip_job(tmp_path / "a.mp4", aid, seconds=400)
+    assert auth_client.post(url, json={"job_ids": [long, long]}).status_code == 422
+    # A repeated clip is fine (2 to 12 counts each time it plays).
+    assert auth_client.post(url, json={"job_ids": [a, a]}).status_code == 202
+    deleted = _clip_job(_video(tmp_path / "d.mp4"), aid)
+    auth_client.delete(f"/api/studio/jobs/{deleted}")
+    assert auth_client.post(url, json={"job_ids": [a, deleted]}).status_code == 404
+
+
+def test_cut_without_sound_and_saved_clips_count_as_finished(auth_client, tmp_path):
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4"), aid, status="saved")
+    b = _clip_job(_video(tmp_path / "b.mp4"), aid)
+    r = auth_client.post("/api/studio/join-clips", json={"job_ids": [b, a]})
+    assert r.status_code == 202, r.text
+    job = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+    assert job["status"] == "completed"
+    assert job["options"] == {"job_ids": [b, a], "transition": "cut", "crossfade": 0.0, "has_audio": False}
+    assert job["result_duration_seconds"] == pytest.approx(3.0, abs=0.1)
+    assert set(_streams(Path(job["result_path"]))) == {"video"}
+
+
+def test_retry_joins_the_same_clips_again_and_409_once_one_is_gone(auth_client, tmp_path):
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4", audio=True), aid)
+    b = _clip_job(_video(tmp_path / "b.mp4"), aid)
+    first = auth_client.post("/api/studio/join-clips",
+                             json={"job_ids": [a, b], "transition": "dissolve", "crossfade": 0.3}).json()
+    r = auth_client.post(f"/api/studio/jobs/{first['id']}/retry", json={"model": "mock/anything", "prompt": "x"})
+    assert r.status_code == 202, r.text
+    again = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+    assert again["id"] != first["id"] and again["status"] == "completed"
+    assert again["operation"] == "join_clips" and again["provider_model"] == "local/join"
+    assert again["options"]["job_ids"] == [a, b] and again["options"]["crossfade"] == 0.3
+    assert again["prompt"] == first["prompt"] == "Joined 2 clips"
+    auth_client.delete(f"/api/studio/jobs/{b}")
+    r = auth_client.post(f"/api/studio/jobs/{first['id']}/retry")
+    assert r.status_code == 409 and "deleted" in r.json()["detail"]
+
+
+def test_worker_fails_plainly_when_a_clip_went_missing_before_it_ran(auth_client, tmp_path, monkeypatch):
+    from app.api import studio
+
+    aid = _avatar(auth_client)
+    pa = _video(tmp_path / "a.mp4")
+    a = _clip_job(pa, aid)
+    b = _clip_job(_video(tmp_path / "b.mp4"), aid)
+    queued: list = []
+    monkeypatch.setattr(studio, "enqueue", lambda fn, *args: queued.append((fn, args)) or "q1")
+    job = auth_client.post("/api/studio/join-clips", json={"job_ids": [a, b]}).json()
+    assert job["status"] == "pending"
+    pa.unlink()
+    fn, args = queued[0]
+    with pytest.raises(ValueError):
+        fn(*args)  # the worker records the failure, then raises (RQ logs it)
+    job = auth_client.get(f"/api/studio/jobs/{job['id']}").json()
+    assert job["status"] == "failed" and "missing" in job["error"]
+
+
+def test_a_joined_clip_is_never_cast_exempt(auth_client, tmp_path):
+    """Even when the clips belong to a Cast character marked "adult content
+    allowed": the joined clip, and a frame of it, are new Studio results."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import pipeline
+
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4"), aid)
+    joined = auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]}).json()
+    frame = auth_client.post(f"/api/studio/jobs/{joined['id']}/frame-to-picture", json={"at": "first"})
+    assert frame.status_code == 201, frame.text
+    with SessionLocal() as db:
+        for jid in (joined["id"], frame.json()["id"]):
+            job = db.get(models.AssetGenerationJob, jid)
+            assert pipeline.studio_cast_source(db, job) == (None, None)
+            avatar_id, source = pipeline.studio_cast_source(db, job)
+            assert pipeline.avatar_adult_ok(avatar_id, source, {aid: frozenset({1, 2, 3})}) is False
+
+
+def test_a_generated_clip_can_be_joined(auth_client):
+    aid = _avatar(auth_client)
+    r = auth_client.post("/api/studio/generate-clip", json={"owner_kind": "avatar", "owner_id": aid,
+                                                            "prompt": "slow push-in"})
+    clip = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+    assert clip["status"] == "completed", clip
+    r = auth_client.post("/api/studio/join-clips", json={"job_ids": [clip["id"], clip["id"]]})
+    assert r.status_code == 202, r.text
+    job = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+    assert job["status"] == "completed", job
+    assert (job["result_width"], job["result_height"]) == (clip["result_width"], clip["result_height"])
+
+
+def test_at_most_two_joins_run_at_once(auth_client, tmp_path):
+    """Joins are free but heavy: a third while two are queued or running is
+    refused (429), on retry too; once one finishes another may start."""
+    from app import models
+    from app.db import SessionLocal
+
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4"), aid)
+    url = "/api/studio/join-clips"
+    done = auth_client.post(url, json={"job_ids": [a, a]})
+    assert done.status_code == 202
+    with SessionLocal() as db:
+        db.query(models.AssetGenerationJob).filter(models.AssetGenerationJob.id == done.json()["id"]).update(
+            {"status": "pending"})
+        busy = models.AssetGenerationJob(
+            owner_kind="avatar", owner_id=aid, output_kind="video_clip", prompt="Joined 2 clips",
+            negative_prompt="", reference_asset_ids_json=[], provider="local", provider_model="local/join",
+            operation="join_clips", options_json={"job_ids": [a, a]}, status="polling")
+        db.add(busy)
+        db.commit()
+        busy_id = busy.id
+    r = auth_client.post(url, json={"job_ids": [a, a]})
+    assert r.status_code == 429, r.text
+    assert "already running" in r.json()["detail"]
+    assert auth_client.post(f"/api/studio/jobs/{done.json()['id']}/retry").status_code == 429
+    with SessionLocal() as db:
+        db.query(models.AssetGenerationJob).filter(models.AssetGenerationJob.id == busy_id).update(
+            {"status": "failed"})
+        db.commit()
+    assert auth_client.post(url, json={"job_ids": [a, a]}).status_code == 202
+
+
+def test_joined_clip_is_at_most_1080p_and_ffmpeg_is_time_limited(tmp_path, monkeypatch):
+    from app.services import renderer
+
+    assert renderer.join_size((3840, 2160)) == (1920, 1080)
+    assert renderer.join_size((2160, 3840)) == (1080, 1920)
+    assert renderer.join_size((4096, 4096)) == (1080, 1080)
+    assert renderer.join_size((65, 97)) == (64, 96)
+    assert renderer.join_timeout(600) == 3600
+    assert renderer.join_timeout(3) == 120
+
+    big = _video(tmp_path / "big.mp4", size=(2560, 1440), seconds=0.5)
+    out, _, _ = renderer.join_clips_with_audio([big, big], tmp_path / "o.mp4")
+    assert renderer._probe_size(out) == (1920, 1080)
+
+    seen = {}
+    real = renderer._run
+
+    def run(cmd, timeout=None):
+        if cmd[0] == "ffmpeg":
+            seen["timeout"] = timeout
+            return -1, "timed out after 120s"
+        return real(cmd, timeout)
+
+    monkeypatch.setattr(renderer, "_run", run)
+    with pytest.raises(RuntimeError, match="timed out"):
+        renderer.join_clips_with_audio([big, big], tmp_path / "t.mp4")
+    assert seen["timeout"] == 120

@@ -24,6 +24,7 @@ import {
 import { TileMenu, TileMenuItem } from "@/components/TileMenu";
 import { UseInProjectDialog } from "@/components/UseInProjectDialog";
 import { FrameFromVideoDialog } from "@/components/FrameFromVideo";
+import { JoinClipsDialog } from "@/components/JoinClipsDialog";
 import {
   BulkSaveDialog,
   CharacterSheetDialog,
@@ -49,6 +50,7 @@ import {
   FrameAt,
   ImageOp,
   ImageOpSource,
+  JOIN_MAX_CLIPS,
   Ingredient,
   PromptPreset,
   StudioAspect,
@@ -205,6 +207,10 @@ function Studio() {
   const [bulkSave, setBulkSave] = useState<{ owner?: string; slot?: string } | null>(null);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [retrying, setRetrying] = useState<StudioJob | null>(null);
+  // Join clips: the dialog's clips (in the order picked), and the new clip to
+  // open in the viewer once it's ready.
+  const [joining, setJoining] = useState<{ clips: StudioJob[]; skipped: number } | null>(null);
+  const [openWhenReady, setOpenWhenReady] = useState<number | null>(null);
   // Picture operations: the models offered (with prices) and the Upscale dialog.
   const opModels = useOpModels();
   // Server estimates for running an upscale again on its own source
@@ -536,8 +542,8 @@ function Studio() {
 
   // Rough price of running a job again with this model ("" = unknown).
   const modelOptionsFor = (job: StudioJob): ModelOption[] =>
-    job.operation === "extract_frame"
-      ? [] // a saved frame has no model to pick
+    job.operation === "extract_frame" || job.operation === "join_clips"
+      ? [] // a saved frame or joined clips have no model to pick
       : job.operation
       ? opModels[job.operation].map((m) => withKnownPrice({ id: m.id, name: m.name, price_text: m.free ? "free" : m.price_text }))
       : job.output_kind === "image"
@@ -546,7 +552,7 @@ function Studio() {
       ? videoModels.filter((m) => m.first_frame)
       : videoModels;
   const retryPrice = (job: StudioJob): string => {
-    if (job.operation === "extract_frame") return "free";
+    if (job.operation === "extract_frame" || job.operation === "join_clips") return "free";
     const m = modelOptionsFor(job).find((x) => x.id === job.provider_model);
     // With reference pictures a Sogni model runs again on its Sogni editor,
     // at that editor's price (as in Try another model); any other model's
@@ -716,6 +722,44 @@ function Studio() {
   }, [selectMode]);
 
   const checkedJobs = useMemo(() => jobs.filter((j) => checked.includes(j.id)), [jobs, checked]);
+  // Join clips: the finished clips among the selected, in the order picked.
+  const joinable = useMemo(() => {
+    const byId = new Map(jobs.map((j) => [j.id, j]));
+    return checked
+      .map((id) => byId.get(id))
+      .filter((j): j is StudioJob => Boolean(j && j.output_kind === "video_clip" && FINISHED.includes(j.status) && j.result_path));
+  }, [jobs, checked]);
+  // The dialog uses at most JOIN_MAX_CLIPS of them (the first picked).
+  const joinUsed = Math.min(joinable.length, JOIN_MAX_CLIPS);
+  const startJoin = () => {
+    if (joinable.length >= 2) setJoining({ clips: joinable, skipped: checked.length - joinable.length });
+  };
+  const joinStarted = (j: StudioJob) => {
+    setJoining(null);
+    leaveSelect();
+    addCreated(batchPlaceholders(j));
+    if (FINISHED.includes(j.status)) {
+      setViewKey(`job-${j.id}`);
+      toast.success("Joined the clips");
+    } else {
+      setOpenWhenReady(j.id);
+      toast.success("Joining the clips…");
+    }
+  };
+  // "Join with…": select mode with this clip picked first.
+  const joinWith = (job: StudioJob) => {
+    setSelectMode(true);
+    setChecked([job.id]);
+    toast.info("Pick the clips to play after it, then choose Join clips");
+  };
+  // The joined clip opens in the viewer once it's made.
+  useEffect(() => {
+    if (openWhenReady === null) return;
+    const j = jobs.find((x) => x.id === openWhenReady);
+    if (!j || !TERMINAL.includes(j.status)) return;
+    setOpenWhenReady(null);
+    if (FINISHED.includes(j.status)) setViewKey(`job-${j.id}`);
+  }, [jobs, openWhenReady]);
 
   // The last character sheet, once all its views are done.
   const sheetJobs = useMemo(
@@ -920,6 +964,7 @@ function Studio() {
       onUpscale={() => startUpscale(t)}
       onOpenSource={() => t.job && openSource(t.job)}
       onSaveFrame={(at) => t.job && saveFrame(t.job, at)}
+      onJoinWith={() => t.job && joinWith(t.job)}
       retryPrice={t.job ? retryPrice(t.job) : ""}
     />
   );
@@ -1077,6 +1122,24 @@ function Studio() {
               Save to Cast…
             </button>
             <button
+              className="chip text-xs disabled:opacity-50"
+              disabled={bulkBusy || joinable.length < 2}
+              title={
+                joinable.length < 2
+                  ? "Select at least 2 finished clips to play them one after another"
+                  : `Play the ${joinUsed} selected clips one after another as a new clip (free)` +
+                    (joinable.length > JOIN_MAX_CLIPS ? `; only the first ${JOIN_MAX_CLIPS} of ${joinable.length} are used` : "") +
+                    (joinable.length < checked.length ? "; pictures and unfinished clips are left out" : "")
+              }
+              onClick={startJoin}
+            >
+              {joinable.length < 2
+                ? "Join clips…"
+                : joinable.length > JOIN_MAX_CLIPS
+                  ? `Join ${joinUsed} clips… (first ${JOIN_MAX_CLIPS} of ${joinable.length})`
+                  : `Join ${joinUsed} clips…`}
+            </button>
+            <button
               className="chip text-xs hover:text-accent disabled:opacity-50"
               disabled={bulkBusy || checked.length === 0}
               onClick={bulkDelete}
@@ -1186,6 +1249,15 @@ function Studio() {
         />
       )}
 
+      {joining && (
+        <JoinClipsDialog
+          clips={joining.clips}
+          skipped={joining.skipped}
+          onClose={() => setJoining(null)}
+          onJoined={joinStarted}
+        />
+      )}
+
       {retrying && (
         <ModelPickerDialog
           job={retrying}
@@ -1285,6 +1357,7 @@ function TileCard({
   onUpscale,
   onOpenSource,
   onSaveFrame,
+  onJoinWith,
   retryPrice,
 }: {
   tile: Tile;
@@ -1312,6 +1385,8 @@ function TileCard({
   onOpenSource: () => void;
   /** Finished clips: save a frame as a new picture. */
   onSaveFrame: (at: FrameAt) => void;
+  /** Finished clips: start select mode with this clip picked, to join others after it. */
+  onJoinWith: () => void;
   /** "about $0.04" for running it again with the same model; "" = unknown. */
   retryPrice: string;
 }) {
@@ -1355,6 +1430,8 @@ function TileCard({
         title:
           job.operation === "extract_frame"
             ? "Save the same frame of the clip again"
+            : job.operation === "join_clips"
+            ? "Join the same clips again (free)"
             : job.operation
             ? "Run this step again on the same picture"
             : "Run this generation again with the same settings",
@@ -1380,6 +1457,11 @@ function TileCard({
         onSelect: () => onSaveFrame("first"),
         title: "Make a new picture from the clip's first frame",
       });
+      menu.push({
+        label: "Join with… · free",
+        onSelect: onJoinWith,
+        title: "Pick other clips to play after this one, as one new clip",
+      });
     }
     if (tile.status === "completed" && tile.imageUrl) {
       menu.push({
@@ -1404,7 +1486,7 @@ function TileCard({
         title: "Load this result's prompt, avoid list, references, model and aspect into the prompt bar",
       });
     }
-    if ((finished || failed) && job.operation !== "extract_frame") {
+    if ((finished || failed) && job.operation !== "extract_frame" && job.operation !== "join_clips") {
       menu.push({
         label: "Try another model…",
         onSelect: onTryModel,
