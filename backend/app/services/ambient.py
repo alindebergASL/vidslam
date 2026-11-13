@@ -1108,7 +1108,8 @@ def generate_picture(db: Session, project: models.VideoProject, *,
 
 def picture_from(db: Session, project: models.VideoProject, *, asset_id: Optional[int] = None,
                  studio_job_id: Optional[int] = None, discard_loop: bool = False) -> models.VideoProject:
-    """A Cast character's picture (or a cutout or upscale of one) is
+    """A Cast character's picture (or a cutout or upscale of one, or a
+    saved frame of a clip made from one: pipeline.studio_cast_source) is
     recorded as theirs, so the loop made from it keeps their content
     filter unless they're ticked "adult content allowed"."""
     from .pipeline import cast_avatar_of, studio_cast_source

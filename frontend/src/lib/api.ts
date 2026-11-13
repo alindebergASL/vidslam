@@ -2371,7 +2371,8 @@ export const api = {
     fd.append("file", file);
     fd.append("owner_kind", owner.kind);
     fd.append("owner_id", String(owner.id));
-    fd.append("at", typeof at === "number" ? at.toFixed(2) : at);
+    // To the microsecond (rounded down by the caller): never into the next frame.
+    fd.append("at", typeof at === "number" ? at.toFixed(6) : at);
     const r = await fetch(`${API_BASE}/api/studio/frame-from-video`, { method: "POST", credentials: "include", body: fd });
     if (!r.ok) {
       const text = await r.text();

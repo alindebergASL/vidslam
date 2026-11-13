@@ -7,7 +7,7 @@ import { costText, ranOnText, studioStatusLabel } from "@/components/StudioLibra
 import { downloadFile, extFromMime, extFromPath } from "@/lib/download";
 import { useToast } from "@/components/Toaster";
 import { sourceChipText } from "@/components/ImageOps";
-import { clockText } from "@/components/FrameFromVideo";
+import { clockText, frameSeconds } from "@/components/FrameFromVideo";
 
 /** One thing the viewer can show: a Studio result or a cast picture. */
 export type ViewerItem = {
@@ -529,7 +529,7 @@ export function StudioViewer({
                 onClick={() => {
                   const v = videoRef.current;
                   v?.pause();
-                  actions.onSaveFrame!(job, v ? Math.round(v.currentTime * 100) / 100 : "first");
+                  actions.onSaveFrame!(job, v ? frameSeconds(v.currentTime) : "first");
                 }}
                 className={act}
                 title="Make a new picture from the frame showing now (free); pause where you want first"

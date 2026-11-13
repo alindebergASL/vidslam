@@ -4,31 +4,51 @@ picture", "Save first frame", "Save this frame").
 The source is either a finished Studio clip (source_job_id) or a video the
 owner uploads for this (not kept: only the frame is stored). Each grab is a
 new Studio image job with operation "extract_frame", the time asked for in
-options_json ({"at": "first" | "last" | seconds, "seconds": the time used})
-and a local model id: no provider is called, nothing is billed, and the
-monthly budget cap doesn't apply (the rate limit does: it uses this
-machine's CPU). ffmpeg is in the API image, so the API grabs the frame
-itself and the job is finished before it answers; without ffmpeg there, a
-clip's frame is queued for the worker instead (as the free upscale is).
+options_json ({"at": "first" | "last" | seconds, "seconds": the time of the
+frame saved}) and a local model id: no provider is called and nothing is
+billed. A frame of a Studio clip makes no paid call at all, so the monthly
+budget cap doesn't apply to it (the rate limit does: it uses this
+machine's CPU); a frame of an uploaded video does pay for its safety check
+(below), so it is refused once the budget's hard stop is reached. ffmpeg
+is in the API image, so the API grabs the frame itself and the job is
+finished before it answers; without ffmpeg there, a clip's frame is queued
+for the worker instead (as the free upscale is). The frame is the one a
+paused player shows at that time (renderer.extract_frame_at), as an
+8-bit PNG (HDR tone-mapped), and every ffprobe/ffmpeg run for it shares
+one time limit (renderer.FRAME_TIMEOUT): past it the tool is stopped,
+nothing is stored and the API answers 504.
 
 Which checks apply:
 
 - A frame of a Studio clip: no new check. The clip was made from a prompt
   that already passed the minors checks (and, on a clean deployment, with
-  the providers' content filters on). The frame is a new Studio picture,
-  never a Cast character's own picture: it never skips the content filter
-  ("adult content allowed" covers only pictures on the card;
-  pipeline.studio_cast_source follows it back to the clip, which isn't one).
+  the providers' content filters on); an animated clip's picture comes
+  mostly from the picture it started from, which had that picture's own
+  checks. So the frame counts as the picture the clip was made from
+  (pipeline.studio_cast_source): a clip animated from a Cast character's
+  picture (or from a cutout, upscale or saved frame of one), or made with
+  their pictures as references, gives frames that are that character's
+  picture, so wherever the frame is used next (Animate, an ambient scene's
+  picture, a cutout or upscale of it) an unticked character's provider
+  content filter is forced on, exactly as for the Cast picture itself; a
+  ticked character's filter is skipped only when every card picture the
+  frame comes from is one the tick's picture check covers. A frame of a
+  clip made from a prompt alone (or from a new Studio picture) is a new
+  Studio picture, like any other.
 - A frame of an uploaded video comes from outside the app, so before it is
   stored the picture model is asked whether anyone in it is, or looks,
-  under 18 (minor_check.check_pictures, the same check as Cast pictures).
+  under 18 (minor_check.check_pictures, the same check as Cast pictures;
+  a vision call costing a fraction of a cent, remembered per picture).
   A yes is refused; so is no answer (the check can't run, the model won't
   judge it, the frame can't be read): it fails closed. On a clean
   deployment (ADULT_FEATURES=false) the picture model is also asked
   whether the frame shows nudity or sexual content
   (explicit_check.check_picture), failing closed the same way. The stored
-  frame belongs to no Cast card, so it never skips the content filter
-  either.
+  frame counts as a picture of its owner when that is a Cast character,
+  with no card picture behind it, so no tick covers it: the owner's filter
+  is forced on wherever it is used next (saved onto a ticked card, the new
+  card picture is covered once the tick's picture check has looked at it,
+  like any picture added to the card).
 """
 from __future__ import annotations
 
@@ -44,6 +64,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from .image_ops import STUDIO_DELETED, OpError
+from .renderer import FFmpegTimeout, extract_frame_at
 
 OP = "extract_frame"
 # The model id a frame job records: made here, by ffmpeg.
@@ -64,6 +85,9 @@ CHECK_UNAVAILABLE = ("The safety check couldn't look at this frame, so it wasn't
 CHECK_DECLINED = ("This frame was refused: the safety check model declined to judge it, which counts as a no.")
 NOT_A_VIDEO = "That file isn't a video this app can read (MP4, MOV or WebM)."
 NO_FFMPEG = "This server can't read videos right now (ffmpeg is missing)."
+TOO_SLOW = ("Reading that video took too long, so no frame was saved. Try a shorter or smaller video "
+            "(an MP4 reads fastest).")
+CLIP_TOO_SLOW = "Reading that clip took too long, so no frame was saved. Try again."
 
 
 # ---------- the time asked for ----------
@@ -85,12 +109,13 @@ def parse_at(value: object) -> At:
     t = float(value)
     if not math.isfinite(t) or t < 0:
         raise OpError(422, "The time must be 0 seconds or more")
-    return round(t, 3)
+    # Kept to the microsecond, rounded down: a paused player shows the frame
+    # at or before its time, and rounding up could cross into the next one.
+    return math.floor(t * 1_000_000 + 1e-6) / 1_000_000
 
 
 def seconds_for(at: At) -> float:
-    """The time to ask ffmpeg for ("last" is past the end: it is kept to
-    the last frame)."""
+    """The time to ask ffmpeg for ("last": math.inf, the last frame)."""
     if at == "first":
         return 0.0
     if at == "last":
@@ -117,14 +142,12 @@ def ffmpeg_here() -> bool:
 
 
 def grab(video: Path, at: At) -> tuple[bytes, float]:
-    """(PNG bytes, the time used) of the frame of `video` at `at`. Raises
-    RuntimeError when it can't be read."""
-    from .renderer import extract_frame_at
-
-    t = seconds_for(at)
+    """(PNG bytes, the frame's time) of the frame of `video` shown at `at`.
+    Raises RuntimeError when it can't be read (renderer.FFmpegTimeout, a
+    RuntimeError, when that takes too long)."""
     with tempfile.TemporaryDirectory(prefix="frame-") as tmp:
         out = Path(tmp) / "frame.png"
-        used = extract_frame_at(video, out, 1e9 if math.isinf(t) else t)
+        used = extract_frame_at(video, out, seconds_for(at))
         return out.read_bytes(), used
 
 
@@ -272,6 +295,8 @@ def frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
         video = raw.rename(raw.with_name("upload" + sniffed_extension(raw)))
         try:
             data, used = grab(video, at)
+        except FFmpegTimeout:
+            raise OpError(504, TOO_SLOW) from None
         except RuntimeError:
             raise OpError(422, NOT_A_VIDEO) from None
         label = label_for(name, used)

@@ -261,32 +261,89 @@ def avatar_adult_ok(avatar_id: Optional[int], asset_id: Optional[int],
     return avatar_id is not None and asset_id is not None and asset_id in marked.get(avatar_id, ())
 
 
-def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob]) -> tuple[Optional[int], Optional[int]]:
+def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob],
+                       marked: Optional[Mapping[int, AbstractSet[int]]] = None) -> tuple[Optional[int], Optional[int]]:
     """(the Cast character a Studio picture shows, the card picture it was
-    made from) when it is only a cutout or upscale of one of their pictures
-    (followed back through each operation to the picture it started from),
-    else (None, None): a picture made in Studio is a new picture, not the
-    character's. When the starting picture was deleted since, the
-    operation's owner (copied from its source when it was made) says whose
-    it was, and the picture is None. A saved frame of a clip
-    ("extract_frame") leads back to the clip, a new picture like any
-    other: (None, None). One from an uploaded video has no source: its
-    owner, with no picture, so it never skips the filter either."""
-    seen: set[int] = set()
-    while job is not None and job.operation and job.id not in seen:
+    made from) when it is a copy of one of their pictures, else (None,
+    None): a picture made in Studio is a new picture, not the
+    character's. A copy is a cutout or upscale of the picture, or a saved
+    frame ("extract_frame") of a clip animated from it or made with it as a
+    reference, followed back through each step (a cutout of a frame of a
+    clip animated from an upscale of the picture still counts). When the
+    starting picture was deleted since, the step's owner (a cutout's is
+    copied from its source; a clip's is its Studio owner) says whose it
+    was, and the picture is None: never covered by a tick. A frame of a
+    clip made from more than one Cast picture: with `marked` (the ticks
+    now, content_mode.adult_ok_avatars()), the first of them a tick doesn't
+    cover (so the filter stays on), else the first; without, the first
+    one's character with no picture, which keeps the filter whatever the
+    ticks say later. A frame of an uploaded video has no source: its
+    owner, with no picture. A frame of a clip made from a prompt alone is
+    a new picture."""
+    found = list(dict.fromkeys(_cast_sources(db, job, set())))
+    if not found:
+        return None, None
+    if len(found) == 1:
+        return found[0]
+    if marked is None:
+        return found[0][0], None
+    return next((x for x in found if not avatar_adult_ok(*x, marked)), found[0])
+
+
+def _owner_avatar(job: models.AssetGenerationJob) -> list[tuple[int, Optional[int]]]:
+    return [(int(job.owner_id), None)] if job.owner_kind == "avatar" and job.owner_id is not None else []
+
+
+def _cast_sources(db: Session, job: Optional[models.AssetGenerationJob],
+                  seen: set[int]) -> list[tuple[int, Optional[int]]]:
+    """Every (character, card picture or None) a Studio result is a copy
+    of (studio_cast_source), in order."""
+    while job is not None and job.id not in seen:
         seen.add(job.id)
+        if job.output_kind == "video_clip":
+            return _clip_cast_sources(db, job, seen)
+        if not job.operation:
+            return []  # made in Studio: a new picture
         if job.source_asset_id:
             asset = db.get(models.Asset, job.source_asset_id)
             if asset is not None:
                 avatar_id = cast_avatar_of(asset)
-                return avatar_id, (int(asset.id) if avatar_id is not None else None)
+                return [(avatar_id, int(asset.id))] if avatar_id is not None else []
         elif job.source_job_id:
             src = db.get(models.AssetGenerationJob, job.source_job_id)
             if src is not None:
                 job = src
                 continue
-        return (int(job.owner_id) if job.owner_kind == "avatar" and job.owner_id is not None else None), None
-    return None, None
+        return _owner_avatar(job)
+    return []
+
+
+def _clip_cast_sources(db: Session, clip: models.AssetGenerationJob,
+                       seen: set[int]) -> list[tuple[int, Optional[int]]]:
+    """The Cast pictures a clip was made from (its frames are copies of
+    them): the picture it was animated from (followed back as
+    _cast_sources) and its character reference pictures. A picture deleted
+    since counts as its owner's (when that is a character)."""
+    found: list[tuple[int, Optional[int]]] = []
+    if clip.first_frame_job_id:
+        src = db.get(models.AssetGenerationJob, clip.first_frame_job_id)  # tombstones keep their sources
+        found += _cast_sources(db, src, seen) if src is not None else _owner_avatar(clip)
+    elif clip.first_frame_asset_id:
+        asset = db.get(models.Asset, clip.first_frame_asset_id)
+        if asset is None:
+            found += _owner_avatar(clip)
+        elif (avatar_id := cast_avatar_of(asset)) is not None:
+            found.append((avatar_id, int(asset.id)))
+    ids = _asset_ids(clip.reference_asset_ids_json)
+    if ids:
+        rows = {r.id: r for r in db.query(models.Asset).filter(models.Asset.id.in_(ids)).all()}
+        for aid in dict.fromkeys(ids):
+            row = rows.get(aid)
+            if row is None:
+                found += _owner_avatar(clip)
+            elif (avatar_id := cast_avatar_of(row)) is not None:
+                found.append((avatar_id, int(row.id)))
+    return found
 
 
 # ---------- public entry points ----------
@@ -2631,13 +2688,15 @@ def studio_first_frame(db: Session, job: models.AssetGenerationJob) -> Optional[
         from . import public_media
         from .content_mode import adult_ok_avatars
 
-        # A cutout or upscale of a Cast picture is still that character's
-        # picture (a newly made Studio picture isn't).
-        avatar_id, source_id = studio_cast_source(db, src)
+        # A cutout or upscale of a Cast picture, or a saved frame of a clip
+        # made from one, is still that character's picture (a newly made
+        # Studio picture isn't).
+        marked = adult_ok_avatars()
+        avatar_id, source_id = studio_cast_source(db, src, marked)
         return ImageRef(url=public_media.publish(storage.reference_copy(Path(src.result_path))),
                         role="scene" if avatar_id is None else "character",
                         name="first frame", frame_type="first_frame",
-                        adult_ok=avatar_adult_ok(avatar_id, source_id, adult_ok_avatars()))
+                        adult_ok=avatar_adult_ok(avatar_id, source_id, marked))
     if job.first_frame_asset_id:
         asset = db.get(models.Asset, job.first_frame_asset_id)
         if asset is None or not (asset.mime_type or "").startswith("image/"):
@@ -2716,8 +2775,9 @@ def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models
     Studio result or a Cast picture), or save a frame of a Studio clip. No
     prompt, so no safety check: the operation makes nothing new, it only
     cuts out, enlarges or copies a frame of a clip made from a checked
-    prompt (a frame of an uploaded video is checked before it is stored,
-    in the API: services/video_ops.py)."""
+    prompt; the result stays the picture it was made from wherever it is
+    used next (studio_cast_source). A frame of an uploaded video is
+    checked before it is stored, in the API: services/video_ops.py."""
     from ..providers import get_image_op
     from . import image_ops, video_ops
     from . import model_registry as reg

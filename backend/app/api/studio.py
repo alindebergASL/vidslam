@@ -806,6 +806,8 @@ def _frame_from_clip(db: Session, job_id: int, at, response: Response) -> Studio
     else:
         try:
             data, seconds = video_ops.grab(Path(src.result_path), at)
+        except video_ops.FFmpegTimeout as e:
+            raise HTTPException(504, video_ops.CLIP_TOO_SLOW) from e
         except RuntimeError as e:
             raise HTTPException(422, "Couldn't read a frame from that clip") from e
         job = video_ops.new_clip_job(db, src, at, seconds=seconds)
@@ -846,13 +848,16 @@ def frame_from_video(
     db: Session = Depends(get_db),
 ) -> StudioJobOut:
     """Save a frame of a video uploaded from this device ("first", "last" or
-    a time in seconds) as a new Studio picture owned by `owner` (free).
-    The video isn't kept. The frame comes from outside the app, so the
-    picture safety check runs on it before it is stored, and refuses it
-    when it can't run (see services/video_ops.py)."""
+    a time in seconds) as a new Studio picture owned by `owner`. The video
+    isn't kept. The frame comes from outside the app, so the picture
+    safety check runs on it before it is stored (a vision call that costs
+    a fraction of a cent: refused past the budget's hard stop, before
+    anything is read), and refuses it when it can't run (see
+    services/video_ops.py)."""
     from ..config import get_settings
     from ..services import video_ops
 
+    budget_guard()
     if not _owner_exists(db, owner_kind, owner_id):
         raise HTTPException(404, "owner not found")
     if not video_ops.looks_like_video(file.content_type or "", file.filename or ""):

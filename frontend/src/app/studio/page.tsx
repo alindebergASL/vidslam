@@ -946,7 +946,7 @@ function Studio() {
           type="button"
           className="btn-ghost text-xs ml-auto shrink-0"
           onClick={() => setFraming(true)}
-          title="Save a frame of a video from this device as a picture (free)"
+          title="Save a frame of a video from this device as a picture (its safety check costs a fraction of a cent)"
         >
           Frame from a video…
         </button>
