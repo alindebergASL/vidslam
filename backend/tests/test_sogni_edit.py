@@ -622,3 +622,29 @@ def test_seedream_edits_with_the_pictures_itself(client, live_sogni, monkeypatch
     assert "Image 3 shows Ana" in args["prompt"]
     assert provider.last_route.model.name == "Seedream 5.0 Pro (uncensored) edit"
     assert sogni.edit_cost_usd("seedream-5-0-pro-uncensored", 3) == pytest.approx((13.5 + 2 * 0.9) * 0.005)
+
+
+def test_seedream_5_5_is_offered_and_edits_with_the_pictures_itself(client, live_sogni):  # noqa: F811
+    """Seedream 5.5 (uncensored): not in Sogni's published schema, named in
+    its client library (5.81.0). Live 2026-11-13: edit_image with one
+    reference kept the place, 8.4 Spark quoted, 7.98 billed."""
+    from app.providers import sogni
+
+    assert "seedream-5-5-uncensored" not in sogni.listed()["tools"]["edit_image"]
+    m = next(m for m in sogni.image_models() if m.selector == "seedream-5-5-uncensored")
+    assert (m.premium, m.uncensored, m.keep) == (True, True, True)
+    assert "seedream-5-5-uncensored" in [e.selector for e in sogni.edit_models()]
+    for intent in ("identity", "guide"):
+        e = sogni.editor_for("sogni/seedream-5-5-uncensored", intent)
+        assert e is not None and e.selector == "seedream-5-5-uncensored"
+    wp = sogni.with_pictures("sogni/seedream-5-5-uncensored")["identity"]
+    assert (wp["name"], wp["own"], wp["max_refs"]) == ("Seedream 5.5 (uncensored) edit", True, 10)
+
+    refs = [_ref("scene", "Lake"), _ref("character", "Maya")]
+    body, provider = _generate("sogni/seedream-5-5-uncensored", refs, prompt="At sunset",
+                               settings={"aspect_ratio": "9:16"})
+    step = body["input"]["steps"][0]
+    assert step["toolName"] == "edit_image" and step["arguments"]["model"] == "seedream-5-5-uncensored"
+    assert step["arguments"]["prompt"].startswith("Image 1 is the place (Lake). Image 2 shows Maya")
+    assert provider.last_route.model.name == "Seedream 5.5 (uncensored) edit"
+    assert sogni.edit_cost_usd("seedream-5-5-uncensored", 2) == pytest.approx((8.4 + 0.9) * sogni.SPARK_USD)
