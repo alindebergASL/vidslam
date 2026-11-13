@@ -267,6 +267,95 @@ def test_the_fit_counts_a_stale_clip_at_its_planned_length(auth_client):
         db.close()
 
 
+def test_the_fit_says_what_a_recompose_with_a_stale_clip_does(auth_client, tmp_path):
+    """Generate video makes an out-of-date clip again at its shot's length,
+    but the free Re-compose reuses the old clip: when the two differ, the
+    fit says what each does, and the Re-compose numbers match its render."""
+    from app import models
+    from app.services import fingerprints, pipeline
+
+    pid = _rendered(auth_client)
+    db = _db()
+    try:
+        project = db.get(models.VideoProject, pid)
+        body = pipeline._body_shots(project)
+        last = body[-1]
+        old = _duration(last.clip_path)
+        last.duration_seconds = float(last.duration_seconds) + 6.0
+        db.commit()
+        assert fingerprints.shot_is_stale(last)
+        others = sum(min(_duration(s.clip_path), float(s.duration_seconds)) for s in body[:-1])
+        planned = others + float(last.duration_seconds)
+        voice = tmp_path / "voice.m4a"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=f=440:d={planned}",
+                        "-c:a", "aac", str(voice)], check=True)
+        r = auth_client.post(f"/api/projects/{pid}/voiceover",
+                             files={"file": ("v.m4a", voice.read_bytes(), "audio/mp4")})
+        assert r.status_code == 200, r.text
+        fit = auth_client.get(f"/api/projects/{pid}/voiceover/fit").json()
+        assert fit["fit"] == "fits" and fit["cut_seconds"] == 0.0
+        cap = pipeline.VOICE_HOLD_MAX_SECONDS
+        again = others + min(old, planned)
+        assert fit["recompose_fit"] == "too_long"
+        assert fit["recompose_video_seconds"] == pytest.approx(again, abs=0.1)
+        expected_cut = planned - (again + cap)
+        assert expected_cut > 1.0
+        assert fit["recompose_cut_seconds"] == pytest.approx(expected_cut, abs=0.15)
+        assert fit["recompose_note"].startswith("Fits after Generate video; a Re-compose with the current clips cuts")
+        # When a Re-compose would play a different recording (an older
+        # voiceover the lip-synced clips still follow), nothing is predicted.
+        real = pipeline._recompose_voiceover
+        pipeline._recompose_voiceover = lambda _db, _p: (voice, "an-older-voiceover")
+        try:
+            other = auth_client.get(f"/api/projects/{pid}/voiceover/fit").json()
+        finally:
+            pipeline._recompose_voiceover = real
+        assert other["fit"] == "fits" and other["recompose_fit"] is None and other["recompose_note"] == ""
+        # The Re-compose itself cuts what the fit said it would.
+        db.expire_all()
+        render = pipeline.recompose_project(db, pid)
+        assert render.status == "completed"
+        assert render.composition_json["voice_cut_seconds"] == pytest.approx(
+            fit["recompose_cut_seconds"], abs=0.2)
+        # Once the clip is up to date again, the two agree and nothing extra is said.
+        last = db.get(models.VideoShot, last.id)
+        last.duration_seconds = float(last.duration_seconds) - 6.0
+        db.commit()
+        assert not fingerprints.shot_is_stale(last)
+        fresh = pipeline.voiceover_fit(db.get(models.VideoProject, pid), again)
+        assert fresh["recompose_fit"] is None and fresh["recompose_note"] == ""
+    finally:
+        db.close()
+
+
+def test_no_storyboard_gives_no_fit(auth_client, tmp_path):
+    """An uploaded voiceover on a project with no storyboard yet: there are
+    no shots to fit, so the fit says so instead of warning that the whole
+    voice is cut."""
+    from types import SimpleNamespace
+
+    from app.services import pipeline
+
+    pid = auth_client.post("/api/projects", json={
+        "title": "No plan", "original_script": "Hello there. One more line.", "target_duration_seconds": 6,
+    }).json()["id"]
+    voice = tmp_path / "upload.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=f=440:d=26",
+                    "-c:a", "aac", str(voice)], check=True)
+    r = auth_client.post(f"/api/projects/{pid}/voiceover",
+                         files={"file": ("v.m4a", voice.read_bytes(), "audio/mp4")})
+    assert r.status_code == 200, r.text
+    fit = auth_client.get(f"/api/projects/{pid}/voiceover/fit")
+    assert fit.status_code == 200, fit.text
+    body = fit.json()
+    assert body["fit"] == "no_plan" and body["cut_seconds"] == 0.0
+    assert "cut" not in body["fit_text"] and "storyboard" in body["fit_text"]
+    assert body["duration_seconds"] == pytest.approx(26.0, abs=0.2)
+    # The spoken-voice preview's fit says the same with no shots.
+    same = pipeline.voiceover_fit(SimpleNamespace(cta_text="Go", shots=[]), 26.0)
+    assert same["fit"] == "no_plan" and same["cut_seconds"] == 0.0
+
+
 def test_a_held_clip_is_not_held_again(tmp_path):
     """cover_voice on clips that already hold the last one (a hook-lab
     variant is composed from its base's held clips) holds it from the

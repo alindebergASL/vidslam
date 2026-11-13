@@ -277,7 +277,13 @@ export function AudioPanel({
               </button>
             </div>
           )}
-          {uploaded && uploadFit && (
+          {uploaded && uploadFit && uploadFit.fit === "no_plan" && (
+            <div className="text-xs mt-1 text-ink-400">
+              Your voiceover is {uploadFit.duration_seconds.toFixed(1)} s. How it fits the shots is shown once
+              there&apos;s a storyboard.
+            </div>
+          )}
+          {uploaded && uploadFit && uploadFit.fit !== "no_plan" && (
             <div
               className={clsx("text-xs mt-1", uploadFit.fit === "fits" ? "text-emerald-300" : "text-amber-300")}
             >
@@ -289,6 +295,9 @@ export function AudioPanel({
                   {" "}
                   Make the shots longer or upload a shorter file to keep all of it.
                 </span>
+              )}
+              {uploadFit.recompose_note && (
+                <div className="text-amber-300 mt-0.5">{uploadFit.recompose_note}</div>
               )}
             </div>
           )}
@@ -379,13 +388,20 @@ export function AudioPanel({
               {voiceover ? (
                 <>
                   <audio key={voiceover.url} controls src={api.mediaUrl(voiceover.url)} className="w-full h-8" />
-                  {voiceoverIsCurrent ? (
+                  {voiceoverIsCurrent && voiceover.fit === "no_plan" ? (
+                    <div className="text-xs text-ink-400">
+                      How the voiceover fits the shots is shown once there&apos;s a storyboard.
+                    </div>
+                  ) : voiceoverIsCurrent ? (
                     <div className={clsx("text-xs", voiceover.fit === "fits" ? "text-emerald-300" : "text-amber-300")}>
                       {voiceover.fit === "fits"
                         ? `Fits the ${voiceover.video_seconds.toFixed(1)} s of shots.`
                         : `The voiceover is ${voiceover.fit_text}.`}
                       {voiceover.fit !== "fits" && (
                         <span className="text-ink-400"> Change shot lengths or the spoken script to fix it.</span>
+                      )}
+                      {voiceover.recompose_note && (
+                        <div className="text-amber-300 mt-0.5">{voiceover.recompose_note}</div>
                       )}
                     </div>
                   ) : (
