@@ -44,6 +44,8 @@ export function JoinClipsDialog({
 }) {
   // Each row keeps its own key so a clip picked twice can be moved on its own.
   const [rows, setRows] = useState(() => initial.slice(0, JOIN_MAX_CLIPS).map((job, i) => ({ key: i, job })));
+  // Clips removed here, so one taken out by mistake can be added back (at the end).
+  const [removed, setRemoved] = useState<{ key: number; job: StudioJob }[]>([]);
   const [transition, setTransition] = useState<JoinTransition>("cut");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -85,7 +87,17 @@ export function JoinClipsDialog({
     const neighbour = rows[i + 1] ?? rows[i - 1];
     focusNext.current = neighbour ? `${neighbour.key}-remove` : "";
     setAnnounce(`Clip removed; ${rows.length - 1} left`);
+    setRemoved((cur) => [...cur, rows[i]]);
     setRows((cur) => cur.filter((_, k) => k !== i));
+  };
+  const addBack = (key: number) => {
+    const row = removed.find((r) => r.key === key);
+    if (!row || rows.length >= JOIN_MAX_CLIPS) return;
+    // Focus the added clip's remove button (the add-back button is gone).
+    focusNext.current = `${key}-remove`;
+    setAnnounce(`Clip added back at position ${rows.length + 1} of ${rows.length + 1}`);
+    setRemoved((cur) => cur.filter((r) => r.key !== key));
+    setRows((cur) => [...cur, row]);
   };
 
   const join = async () => {
@@ -167,6 +179,24 @@ export function JoinClipsDialog({
           </li>
         ))}
       </ol>
+      {removed.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="text-ink-400">Removed:</span>
+          {removed.map((r) => (
+            <button
+              key={r.key}
+              type="button"
+              className="chip text-xs max-w-full truncate disabled:opacity-40"
+              onClick={() => addBack(r.key)}
+              disabled={busy || rows.length >= JOIN_MAX_CLIPS}
+              aria-label={`Add back clip #${r.job.id}, ${r.job.label || r.job.prompt || "clip"}`}
+              title="Add this clip back, at the end"
+            >
+              + #{r.job.id} · {clockText(clipSeconds(r.job))}
+            </button>
+          ))}
+        </div>
+      )}
       <p className="sr-only" aria-live="polite">
         {announce}
       </p>

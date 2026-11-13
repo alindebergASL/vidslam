@@ -9,11 +9,11 @@ import { useToast } from "@/components/Toaster";
 import { sourceChipText } from "@/components/ImageOps";
 import { clockText } from "@/components/FrameFromVideo";
 
-/** One thing the viewer can show: a Studio result or a cast picture. */
 /** Operations made here without a model and without one original picture
  *  (a saved frame, joined clips): no Compare, no "Try another model". */
 const NO_ORIGINAL: string[] = ["extract_frame", "join_clips"];
 
+/** One thing the viewer can show: a Studio result or a cast picture. */
 export type ViewerItem = {
   key: string;
   kind: "asset" | "job";
