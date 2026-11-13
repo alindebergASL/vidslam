@@ -224,6 +224,25 @@ def test_matroska_picture_shorter_than_its_sound_is_measured_by_the_picture(tmp_
     assert streams["audio"] == pytest.approx(streams["video"], abs=0.05)
 
 
+def test_mkv_with_aac_priming_keeps_every_frame_over_twelve_clips(tmp_path):
+    """An ordinary .mkv with AAC sound starts its picture a fraction of a
+    frame after the file's start; 24 fps clips of 27 frames used to lose a
+    frame each at the 30 fps conversion, so the picture fell behind the
+    sound clip by clip."""
+    from app.services.renderer import FPS, join_clips_with_audio
+
+    clip = tmp_path / "clip24.mkv"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=gray:s=96x64:r=24:d=1.125",
+                    "-f", "lavfi", "-i", "sine=f=1000:d=1.125", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", str(clip)], check=True)
+    for transition, expected in (("cut", 12 * 34 / FPS), ("dissolve", 12 * 34 / FPS - 11 * 0.3)):
+        out, length, _ = join_clips_with_audio([clip] * 12, tmp_path / f"{transition}.mp4",
+                                               transition=transition, crossfade=0.3)
+        streams = _streams(out)
+        assert streams["video"] == pytest.approx(expected, abs=1 / FPS + 0.01), (transition, streams)
+        assert streams["audio"] == pytest.approx(streams["video"], abs=1 / FPS + 0.01), (transition, streams)
+
+
 def test_clips_off_the_30fps_grid_keep_sound_and_picture_together(tmp_path):
     """24 fps clips whose lengths aren't whole 30 fps frames: each clip is
     laid on the output frame grid once, for picture and sound alike, so

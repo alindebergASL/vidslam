@@ -1195,7 +1195,11 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
         tail_out = cf if (i < n - 1 and cf > 0) else 0.0  # dissolved into the next
         outs = ["b"] + (["h"] if head_in else []) + (["t"] if tail_out else [])
         labels = "".join(f"[{o}{i}]" for o in outs)
-        norm = f"{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},format=yuv420p"
+        # Timestamps from 0 first, so fps's rounding starts on the grid; one
+        # cloned frame at the end, so the trim below always finds every
+        # frame of L (its sound is cut to exactly L).
+        norm = (f"setpts=PTS-STARTPTS,{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},"
+                f"tpad=stop_mode=clone:stop=1,format=yuv420p")
         parts.append(f"[{i}:v]{norm},split={len(outs)}{labels}" if len(outs) > 1 else f"[{i}:v]{norm}[b{i}]")
         parts[-1] = parts[-1].replace(f"[b{i}]", f"[bb{i}]")
         parts.append(f"[bb{i}]{trim(head_in, L - tail_out)},setpts=PTS-STARTPTS[body{i}]")
