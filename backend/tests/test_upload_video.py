@@ -3,6 +3,7 @@
 continued, joined or have its frames saved."""
 from __future__ import annotations
 
+import io
 import json
 import math
 import subprocess
@@ -92,7 +93,7 @@ def test_upload_is_checked_then_kept_as_a_finished_free_clip(auth_client, tmp_pa
     assert (job["owner_kind"], job["owner_id"]) == ("avatar", aid)
     assert (job["result_width"], job["result_height"]) == (64, 96) and job["aspect_ratio"] == "9:16"
     assert job["result_duration_seconds"] == pytest.approx(12.0, abs=0.15)
-    assert job["options"] == {"upload": "holiday.mp4", "has_audio": True, "reencoded": False}
+    assert job["options"] == {"upload": "holiday.mp4", "has_audio": True, "reencoded": True}  # always
     assert job["prompt"] == "" and job["cost_usd"] is None
     assert sorted(mock_chat.PICTURE_CALLS) == [0, 1, 2]  # first, middle and last frames
     assert mock_chat.PICTURE_EXPLICIT_CALLS == []  # not a clean deployment
@@ -322,7 +323,7 @@ def test_the_prepared_copys_length_is_what_counts(auth_client, tmp_path, temp_ro
         return out
 
     monkeypatch.setattr(video_ops, "normalize_upload", norm)
-    for name, codec in (("a.mp4", "libx264"), ("b.webm", "libvpx-vp9")):  # copied, re-encoded
+    for name, codec in (("a.mp4", "libx264"), ("b.webm", "libvpx-vp9")):
         r = _upload(auth_client, _video(tmp_path / name, seconds=8.0, size=(32, 32), codec=codec), aid)
         assert r.status_code == 422 and "longer than" in r.json()["detail"], r.text
     assert all(s <= 4.5 for s in seen) and len(seen) == 2  # never decoded past the cap
@@ -357,6 +358,13 @@ def test_preparing_is_bounded_and_holds_no_database_connection(auth_client, tmp_
     raw = [(c, t) for c, t in runs if any("upload.mkv" in part for part in c)]
     assert raw and all(t is not None and t <= 400 for _c, t in raw)
     assert all(c[c.index("-f") + 1] == "matroska" and "-protocol_whitelist" in c for c, _t in raw)
+    # Each run over the raw upload uses at most 2 threads, and the re-encode
+    # never decodes a picture larger than 4K.
+    assert all(c[c.index("-threads") + 1] == "2" for c, _t in raw), raw
+    encodes = [c for c, _t in raw if c[0] == "ffmpeg"]
+    assert encodes and all(c[c.index("-max_pixels") + 1] == str(4096 * 2304)
+                           and c[c.index("-filter_threads") + 1] == "2"
+                           and c[len(c) - 1 - c[::-1].index("-threads") + 1] == "2" for c in encodes), encodes
     assert video_ops.UPLOAD_ENCODE_TIMEOUT < 600
 
     def slow(cmd, timeout=None, should_stop=None):
@@ -479,7 +487,7 @@ def _fps(path: str) -> float:
     return float(num) / float(den)
 
 
-def test_a_large_or_fast_h264_mp4_is_re_encoded_within_1080p_and_60fps(auth_client, tmp_path):
+def test_every_upload_is_re_encoded_within_1080p_and_60fps(auth_client, tmp_path):
     aid = _avatar(auth_client)
     big = _video(tmp_path / "big.mp4", seconds=0.5, size=(2560, 1440))
     job = _upload(auth_client, big, aid).json()
@@ -491,9 +499,138 @@ def test_a_large_or_fast_h264_mp4_is_re_encoded_within_1080p_and_60fps(auth_clie
     job = _upload(auth_client, fast, aid).json()
     assert job["options"]["reencoded"] is True, job
     assert _fps(job["result_path"]) <= 60.01
-    # An ordinary one is still kept as it is.
+    # An ordinary one is re-encoded too (never copied as it is), its size kept.
     job = _upload(auth_client, _video(tmp_path / "ok.mp4", size=(1080, 1920), seconds=0.5), aid).json()
-    assert job["options"]["reencoded"] is False
+    assert job["options"]["reencoded"] is True
+    assert (job["result_width"], job["result_height"]) == (1080, 1920)
+
+
+def _mono_png(path: Path, side: int) -> Path:
+    """A black side x side PNG, 1 bit a pixel: a few KB on disk, however
+    large its picture."""
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    z = zlib.compressobj(9)
+    row = b"\0" * (1 + (side + 7) // 8)
+    body = b"".join(z.compress(row) for _ in range(side)) + z.flush()
+    path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 1, 0, 0, 0, 0))
+                     + chunk(b"IDAT", body) + chunk(b"IEND", b""))
+    return path
+
+
+def test_a_huge_picture_or_a_non_video_codec_is_refused_before_it_is_decoded(auth_client, tmp_path, temp_root,
+                                                                             monkeypatch):
+    """A small MKV of 16000x16000 PNG frames (gigabytes once decoded) is
+    refused on what its headers say: never decoded, never prepared. So is
+    a picture over 4K either way, or one that isn't a video codec."""
+    from app.services import renderer, video_ops
+
+    aid = _avatar(auth_client)
+    runs: list[list[str]] = []
+    real = renderer._run
+
+    def spy(cmd, timeout=None, should_stop=None):
+        runs.append(cmd)
+        return real(cmd, timeout=timeout, should_stop=should_stop)
+
+    monkeypatch.setattr(renderer, "_run", spy)
+    prepared: list = []
+    monkeypatch.setattr(video_ops, "normalize_upload", lambda *a, **kw: prepared.append(a))
+    big = tmp_path / "big.mkv"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "image2", "-framerate", "30", "-loop", "1", "-t", "2",
+                    "-i", str(_mono_png(tmp_path / "big.png", 16000)), "-c:v", "copy", str(big)], check=True)
+    assert big.stat().st_size < 2_000_000
+    r = _upload(auth_client, big, aid, content_type="video/x-matroska")
+    assert r.status_code == 422 and "16000x16000" in r.json()["detail"], r.text
+    # Only its headers were read (ffprobe, nothing decoded).
+    assert runs and all(c[0] == "ffprobe" and "-nofind_stream_info" in c for c in runs), runs
+    # Over 4096 on one side, or more pixels than 4096x2304, is refused too.
+    wide = _video(tmp_path / "wide.mp4", seconds=0.3, size=(4104, 16))
+    r = _upload(auth_client, wide, aid)
+    assert r.status_code == 422 and "4104x16" in r.json()["detail"], r.text
+    # A small picture that isn't a video codec (PNG frames) is refused.
+    pngs = tmp_path / "pngs.mkv"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=5:duration=1",
+                    "-c:v", "png", str(pngs)], check=True)
+    r = _upload(auth_client, pngs, aid, content_type="video/x-matroska")
+    assert r.status_code == 422 and "png" in r.json()["detail"], r.text
+    assert prepared == [] and _uploads() == 0 and _clip_files() == [] and _left(temp_root) == []
+    assert video_ops.upload_refusal({"video": "h264", "size": (4096, 2304)}) is None
+    assert video_ops.upload_refusal({"video": "hevc", "size": (2304, 4096)}) is None
+    for size in ((4096, 2305), (4097, 10), (10, 4097), None, (0, 0)):
+        assert video_ops.upload_refusal({"video": "h264", "size": size}), size
+    assert video_ops.upload_refusal({"video": "", "size": (32, 32)})
+
+
+def _frames(path: str) -> tuple[set[tuple[int, int]], list[float]]:
+    """(each frame's size, each frame's time) of a video, every frame read."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-print_format", "json",
+                          "-show_entries", "frame=width,height,pts_time", path], capture_output=True, text=True,
+                         check=True).stdout
+    frames = json.loads(out)["frames"]
+    return {(f["width"], f["height"]) for f in frames}, sorted(float(f["pts_time"]) for f in frames)
+
+
+def test_a_stream_that_changes_size_midway_is_stored_within_1080p(auth_client, tmp_path, monkeypatch):
+    """An H.264 stream whose first picture is 320x240 and that turns 4K
+    midway (two raw streams one after the other) is stored with every
+    frame, and every frame checked, inside its recorded size."""
+    from PIL import Image
+
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    parts = []
+    for i, size in enumerate(("320x240", "3840x2160")):
+        part = tmp_path / f"part{i}.h264"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"testsrc=size={size}:rate=10:duration=1",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-f", "h264", str(part)],
+                       check=True)
+        parts.append(part.read_bytes())
+    both = tmp_path / "both.h264"
+    both.write_bytes(b"".join(parts))
+    video = tmp_path / "changes.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "h264", "-framerate", "10", "-i", str(both), "-c", "copy",
+                    str(video)], check=True)
+    checked: list[tuple[int, int]] = []
+    real = video_ops.check_uploaded_frames
+
+    def spy(frames, label, **kw):
+        for _path, data in frames:
+            with Image.open(io.BytesIO(data)) as im:
+                checked.append(im.size)
+        return real(frames, label, **kw)
+
+    monkeypatch.setattr(video_ops, "check_uploaded_frames", spy)
+    r = _upload(auth_client, video, aid)
+    assert r.status_code == 201, r.text
+    job = r.json()
+    assert (job["result_width"], job["result_height"]) == (320, 240)
+    assert checked and set(checked) == {(320, 240)}, checked
+    sizes, _times = _frames(job["result_path"])
+    assert sizes == {(320, 240)}, sizes
+
+
+def test_a_burst_of_frames_is_stored_at_60fps_at_most(auth_client, tmp_path):
+    """600 frames packed into the first second of a 19 s MP4 (its average
+    rate about 32 fps) are not stored as they are: the stored copy never
+    shows more than 60 frames a second."""
+    aid = _avatar(auth_client)
+    burst = tmp_path / "burst.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=30", "-frames:v",
+                    "610", "-vf", "setpts='if(lt(N,600),N/600,1+(N-600)*2)/TB'", "-fps_mode", "passthrough",
+                    "-enc_time_base", "1/6000", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    str(burst)], check=True)
+    assert _fps(str(burst)) <= 60  # its stated average rate is ordinary
+    r = _upload(auth_client, burst, aid)
+    assert r.status_code == 201, r.text
+    _sizes, times = _frames(r.json()["result_path"])
+    gaps = [b - a for a, b in zip(times[:-1], times[1:], strict=True)]
+    assert gaps and min(gaps) >= 1 / 60 - 1e-3, min(gaps)
 
 
 def test_every_step_after_preparing_is_bounded_too(auth_client, tmp_path, temp_root, monkeypatch):
