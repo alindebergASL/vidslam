@@ -18,7 +18,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator
 
-from ..services import prompting
+from ..services import explicit_check, prompting
 from ..services.ratelimit import rate_limit
 from ..services.safety import UnsafePromptError, UnsafeScriptError
 from ..services.spend import budget_guard
@@ -119,6 +119,8 @@ def enhance(body: EnhanceIn) -> dict:
     except prompting.EnhanceRefused as e:
         log.info("prompt enhance refused (%s) by %s", e.reason, e.model)
         raise HTTPException(422, _refused_message(e)) from None
+    except explicit_check.ExplicitContentError as e:  # a clean deployment: an explicit rewrite
+        raise HTTPException(422, f"{e} Your text is unchanged.") from None
     except UnsafeScriptError as e:  # a script the script check refuses (what generating it would do)
         raise HTTPException(422, f"This script was refused: {e}") from None
     except httpx.HTTPStatusError as e:

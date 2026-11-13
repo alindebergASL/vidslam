@@ -747,7 +747,7 @@ def _picture_route() -> tuple[str, str]:
     if not model:
         return "unavailable", ""
     try:
-        provider, _ = model_registry.route_info("chat", model)
+        provider, _ = model_registry.route_info("chat", model, picture_check=True)
     except Exception:  # noqa: BLE001
         provider = "unavailable"
     return provider, model

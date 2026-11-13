@@ -143,7 +143,7 @@ def default_model(kind: str) -> str:
 
 def active_model(kind: str) -> str:
     sel = selected(kind)
-    if sel is not None and not adult_only(sel):
+    if sel is not None and not adult_only(sel, kind):
         return sel
     return default_model(kind)
 
@@ -152,10 +152,16 @@ def active_model(kind: str) -> str:
 ADULT_BLOCK = "adult"
 
 
-def adult_only(model: Optional[str]) -> bool:
+def adult_only(model: Optional[str], kind: Optional[str] = None) -> bool:
     """An uncensored model on a clean deployment (ADULT_FEATURES=false):
     hidden from the pickers and refused when asked for by id. A saved pick
-    of one falls back to the default."""
+    of one falls back to the default. Ids are compared without case or an
+    OpenRouter variant suffix (":nitro" reaches the same model).
+
+    For text work (`kind` "chat") the whole family of the adult text models
+    is refused too (another DeepSeek version, say), not only the two ids.
+    The Cast picture check's model may be of that family: it only judges
+    pictures, so it is let through by route_info(picture_check=True)."""
     from . import content_mode
 
     if not model or content_mode.features():
@@ -167,12 +173,15 @@ def adult_only(model: Optional[str]) -> bool:
         return sogni.hidden(m)
     if content_mode.looks_adult(m) or content_mode.is_adult_text_model(m):
         return True
+    if kind == "chat" and content_mode.in_adult_text_family(m):
+        return True
     # Any other provider: what the stored catalog says about it (e.g. an
     # OpenRouter chat model whose name or description says "Uncensored").
     from .model_catalog import CATALOG_KEY
 
+    base = content_mode._base_id(m)
     for e in (get_setting(CATALOG_KEY) or {}).get("entries") or []:
-        if e.get("id") != m:
+        if content_mode._base_id(str(e.get("id") or "")) != base:
             continue
         # Runware's "uncensored" flag in a stored snapshot is from before
         # the switch (its open models stay, with the content check on).
@@ -207,8 +216,10 @@ ROUTED_PREFIXES = {SOGNI_PREFIX: "sogni", "runware/": "runware"}
 RESERVED_PREFIXES = {"replicate/": "replicate"}
 
 
-def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[str]]:
+def route_info(kind: str, model: Optional[str] = None, *,
+               picture_check: bool = False) -> tuple[str, Optional[str]]:
     """(provider, blocked) for `kind` with the active (or given) model.
+    picture_check: routing the Cast picture check's model (see adult_only).
     provider: "mock" | "openrouter" | "elevenlabs" | "gemini" | "sogni" |
     "runware" | "local" (picture operations run here) | "off" (no lip-sync)
     | "unavailable"; blocked names the provider that
@@ -222,7 +233,7 @@ def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[st
     if kind in OP_KINDS and m.startswith(LOCAL_PREFIX):
         # Runs here: nothing to switch off, nothing billed (mock mode too).
         return ("local", None) if m in LOCAL_MODELS.get(kind, ()) else ("unavailable", "local")
-    if adult_only(m):
+    if adult_only(m, None if picture_check else kind):
         return "unavailable", ADULT_BLOCK
     if s.mock_providers:
         return "mock", None

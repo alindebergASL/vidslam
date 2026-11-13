@@ -153,6 +153,11 @@ def generate_plan(
                                             project.title, project.cta_text) if x))
     except UnsafeScriptError as e:
         raise HTTPException(422, str(e)) from e
+    # A clean deployment: the script is voiced, so an explicit one is
+    # refused before planning (the planned script is checked again).
+    from ..services import explicit_check
+
+    explicit_check.check_or_422(project.original_script, project.cta_text)
     provider_gate.require_model("chat", content_mode.chat_model())
     job_id = _enqueue_claimed(db, project, "planning", "Already planning this storyboard",
                               generate_plan_job, project_id, preserve_edits=preserve_edits)

@@ -43,6 +43,14 @@ def _guard(prompt: str, negative: str, kind: str) -> None:
     check_generation(prompt or "", negative or "", kind=kind)
 
 
+def _explicit(text: str) -> None:
+    """A clean deployment: no explicit words are voiced or lip-synced,
+    whichever screen they came from (services/explicit_check.py)."""
+    from ..services import explicit_check
+
+    explicit_check.check(text or "")
+
+
 class GuardedImageProvider(_Guarded):
     def generate(self, *, model: str, prompt: str, references, negative_prompt: str = "",
                  settings: dict | None = None, **kw) -> bytes:
@@ -70,12 +78,14 @@ class GuardedAvatarProvider(_Guarded):
             check_prompt(motion_prompt)
         check_generation(" ".join(x for x in (motion_prompt or "", script or "") if x.strip()),
                          kind="lipsync")
+        _explicit(script)
         return self.inner.submit_avatar(script=script, motion_prompt=motion_prompt, **kw)
 
 
 class GuardedTTSProvider(_Guarded):
     def synthesize(self, *, text: str, voice_id: str, settings: dict | None = None, **kw) -> bytes:
         _guard(text, "", "script")
+        _explicit(text)
         return self.inner.synthesize(text=text, voice_id=voice_id, settings=settings, **kw)
 
 

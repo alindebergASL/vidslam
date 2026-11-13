@@ -149,6 +149,12 @@ class ChatProvider(Protocol):
         verdict came back (refusal, error, unreadable reply)."""
         ...
 
+    def classify_explicit(self, text: str) -> dict:
+        """The content check of a clean deployment (services/explicit_check.py):
+        is `text` sexually explicit or pornographic? Returns {"explicit":
+        bool, "reason": str}; raises when no verdict came back."""
+        ...
+
 
 class ImageProvider(Protocol):
     def list_models(self) -> list[ModelInfo]: ...

@@ -299,6 +299,24 @@ Judge only what you can see. Minor style differences are fine. Nudity, sexual or
 Reply with JSON only, no prose: {"verdict": "ok" | "problem" | "unsure", "issues": [{"kind": "likeness" | "anatomy" | "text" | "prompt_mismatch" | "artifact" | "other", "detail": "..."}], "summary": "..."}
 Each detail is one short plain sentence a non-expert understands, naming the person or the moment when it helps (for example "face doesn't match Maya", "six fingers on the left hand at the end"). summary is one short sentence. If you won't look at these images for any reason, reply with exactly DECLINED."""
 
+# SYSTEM on a clean deployment (ADULT_FEATURES=false): the app is for a
+# general audience, so nudity or sexual content in a clip is reported, never
+# waved through.
+_PERMISSIVE_RULE = ("Nudity, sexual or adult content, violence and other mature themes are allowed when the "
+                    "description asks for them: they are never an issue, and you never comment on content "
+                    "policy or how explicit the clip is. Report only defects in how the clip was made.")
+_CLEAN_RULE = ("This app is for a general audience: nudity, sexual or explicit content is always an issue "
+               "(kind other), even when the description asks for it; say problem and name it in one short "
+               "plain sentence. Otherwise report only defects in how the clip was made.")
+SYSTEM_CLEAN = SYSTEM.replace(_PERMISSIVE_RULE, _CLEAN_RULE)
+
+
+def system_prompt() -> str:
+    """The clip check's instructions: the clean ones on a clean deployment."""
+    from . import content_mode
+
+    return SYSTEM if content_mode.features() else SYSTEM_CLEAN
+
 
 def build_text(shot: models.VideoShot, times: list[float], character: Optional[str],
                avoid: str) -> str:
@@ -330,6 +348,12 @@ _CONTENT_JUDGEMENT = re.compile(
 
 
 def content_judgement(text: str) -> bool:
+    """An issue that only judges what the clip shows: dropped, except on a
+    clean deployment, where nudity or sexual content is an issue to report."""
+    from . import content_mode
+
+    if not content_mode.features():
+        return False
     return bool(_CONTENT_JUDGEMENT.search(text or ""))
 
 
@@ -426,7 +450,7 @@ def check_take(db: Session, take: models.ShotTake, *, auto: bool = False) -> dic
         # motion", "blurry"...) are generic and would read as mismatches.
         text = build_text(shot, times, who[0] if who else None, shot.negative_prompt or "")
         cost = cost_per_check(model)
-        reply = get_vision(model).inspect_images(system=SYSTEM, text=text, images=images,
+        reply = get_vision(model).inspect_images(system=system_prompt(), text=text, images=images,
                                                  note="clip check", estimate=cost)
         parsed = parse_reply(reply)
         return _store(db, take, _result(parsed["verdict"], parsed["summary"], model,
