@@ -549,9 +549,10 @@ export type StudioJob = {
   result_duration_seconds?: number | null;
   /** Ids in reference_asset_ids whose picture was deleted since. */
   missing_reference_ids?: number[];
-  /** "" = made from a prompt; else the picture operation that made it. */
-  operation?: "" | ImageOp;
-  /** The Studio picture an operation ran on ("from #12"). */
+  /** "" = made from a prompt; else the picture operation that made it
+   *  ("extract_frame": a frame saved from a clip or an uploaded video). */
+  operation?: "" | ImageOp | "extract_frame";
+  /** The Studio picture (or, for a saved frame, the clip) an operation ran on ("from #12"). */
   source_job_id?: number | null;
   /** The Cast/ingredient picture an operation ran on. */
   source_asset_id?: number | null;
@@ -589,6 +590,9 @@ export type SogniEditor = {
 export type WithPictures = { identity: SogniEditor | null; guide: SogniEditor | null };
 
 export type ImageOp = "remove_background" | "upscale";
+
+/** Which frame of a video to save as a picture: "first", "last" or a time in seconds. */
+export type FrameAt = "first" | "last" | number;
 
 /** GET /api/studio/operations/estimate: cost and output size before running. */
 export type ImageOpEstimate = {
@@ -1552,6 +1556,10 @@ export type Activity = {
   counts: { projects: number; ambient: number; studio: number; training: number; publish: number };
 };
 
+/** The largest video "Frame from a video" may upload, in MB: the same as the
+ *  server's MAX_UPLOAD_BYTES default (backend/app/config.py, 50 MB). */
+export const FRAME_VIDEO_MAX_MB = 50;
+
 export const api = {
   base: API_BASE,
 
@@ -2352,6 +2360,36 @@ export const api = {
     const path = op === "remove_background" ? "remove-background" : "upscale";
     const payload = op === "upscale" ? body : { model: body.model };
     return req<StudioJob>(`${base}/${path}`, { method: "POST", body: JSON.stringify(payload) });
+  },
+  /** A new Studio picture: a frame of a finished Studio clip (free; usually finished at once). */
+  frameToPicture: (jobId: number, at: FrameAt) =>
+    req<StudioJob>(`/api/studio/jobs/${jobId}/frame-to-picture`, { method: "POST", body: JSON.stringify({ at }) }),
+  /** A new Studio picture: a frame of a video from this device (the video isn't kept;
+   *  the picture safety check looks at the frame first). */
+  frameFromVideo: async (file: File, owner: { kind: "avatar" | "ingredient"; id: number }, at: FrameAt) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("owner_kind", owner.kind);
+    fd.append("owner_id", String(owner.id));
+    fd.append("at", typeof at === "number" ? at.toFixed(2) : at);
+    const r = await fetch(`${API_BASE}/api/studio/frame-from-video`, { method: "POST", credentials: "include", body: fd });
+    if (!r.ok) {
+      const text = await r.text();
+      // A proxy in front of the API may refuse a large upload with its own
+      // HTML page: never show that, say what went wrong instead.
+      let detail =
+        r.status === 413
+          ? `This video is larger than ${FRAME_VIDEO_MAX_MB} MB.`
+          : "Couldn't save the frame. Please try again.";
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed?.detail) detail = typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail);
+      } catch {
+        /* not JSON: keep the plain message */
+      }
+      throw new ApiError(`${r.status}: ${detail}`, r.status, detail, r.headers);
+    }
+    return (await r.json()) as StudioJob;
   },
   /** What an operation would cost and make (nothing is queued or billed). */
   imageOpEstimate: (op: ImageOp, opts: { model?: string; factor?: number; source?: ImageOpSource } = {}) => {

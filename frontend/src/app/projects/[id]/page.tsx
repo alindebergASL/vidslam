@@ -20,6 +20,7 @@ import { firstSentence, replaceFirstSentence } from "@/lib/hook";
 import { useKeyboardShortcuts } from "@/lib/useKeyboardShortcuts";
 import { usePoll } from "@/lib/usePoll";
 import { useEvents } from "@/components/NotificationsProvider";
+import { AutoTextarea } from "@/components/AutoTextarea";
 
 // Project states in which a render (or a re-plan) can be started.
 const CAN_GENERATE = ["planned", "failed", "completed", "cancelled"];
@@ -541,7 +542,8 @@ function Inner() {
             script only when you re-plan and choose to start fresh.
           </p>
         )}
-        <textarea
+        <AutoTextarea
+          maxHeight="60dvh"
           id="proj-voice-script"
           aria-label="Original script"
           className="input min-h-[100px]"
@@ -567,7 +569,7 @@ function Inner() {
           }}
         />
         <label className="label mt-4 block" htmlFor="proj-creative-direction">Creative direction</label>
-        <textarea
+        <AutoTextarea
           id="proj-creative-direction"
           aria-label="Creative direction"
           className="input min-h-[60px]"
@@ -1137,18 +1139,26 @@ function StoryboardScript({
           The first sentence people hear. It decides whether they keep watching. It is the start of the spoken
           script below.
         </p>
-        <input
+        <AutoTextarea
           id="proj-hook"
           className="input font-medium"
           value={hook}
           maxLength={300}
-          onChange={(e) => setHook(e.target.value)}
+          onChange={(e) => setHook(e.target.value.replace(/\s*\n\s*/g, " "))}
           onBlur={applyHook}
+          onKeyDown={(e) => {
+            // One sentence: Enter finishes it (and puts it in the script) instead of starting a new line.
+            if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              e.currentTarget.blur();
+            }
+          }}
           placeholder="Write a first sentence that stops the scroll"
         />
       </div>
       <label className="label" htmlFor="proj-spoken-script">Spoken script</label>
-      <textarea
+      <AutoTextarea
+        maxHeight="60dvh"
         id="proj-spoken-script"
         aria-label="Spoken script"
         className="input min-h-[90px]"
@@ -1400,7 +1410,7 @@ function ShotRow({
                 title="Hover to preview this shot's clip"
               />
             )}
-            <textarea
+            <AutoTextarea
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               onBlur={() => {

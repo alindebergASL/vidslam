@@ -7,6 +7,7 @@ import { Dropzone } from "@/components/Dropzone";
 import { AssignDialog, slotLabel } from "@/components/AssignDialog";
 import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
+import { AutoTextarea } from "@/components/AutoTextarea";
 import { PresetsMenu } from "@/components/PresetsMenu";
 import { StudioViewer, ViewerItem, downloadName, mayBeTransparent } from "@/components/StudioViewer";
 import {
@@ -22,6 +23,7 @@ import {
 } from "@/components/ImageOps";
 import { TileMenu, TileMenuItem } from "@/components/TileMenu";
 import { UseInProjectDialog } from "@/components/UseInProjectDialog";
+import { FrameFromVideoDialog } from "@/components/FrameFromVideo";
 import {
   BulkSaveDialog,
   CharacterSheetDialog,
@@ -44,6 +46,7 @@ import {
   errorText,
   Asset,
   Avatar,
+  FrameAt,
   ImageOp,
   ImageOpSource,
   Ingredient,
@@ -518,9 +521,24 @@ function Studio() {
     if (source) setUpscaling({ source, label: item.job ? `#${item.job.id}` : item.label });
   };
 
+  // Save a frame of a finished clip as a new picture (free, usually ready at once).
+  const saveFrame = async (job: StudioJob, at: FrameAt) => {
+    try {
+      const j = await api.frameToPicture(job.id, at);
+      addCreated(batchPlaceholders(j));
+      toast.success(FINISHED.includes(j.status) ? "Saved the frame as a picture" : "Saving the frame…");
+    } catch (e) {
+      toast.error(errorText(e, "Couldn't save the frame"));
+    }
+  };
+  // A frame of a video from this device.
+  const [framing, setFraming] = useState(false);
+
   // Rough price of running a job again with this model ("" = unknown).
   const modelOptionsFor = (job: StudioJob): ModelOption[] =>
-    job.operation
+    job.operation === "extract_frame"
+      ? [] // a saved frame has no model to pick
+      : job.operation
       ? opModels[job.operation].map((m) => withKnownPrice({ id: m.id, name: m.name, price_text: m.free ? "free" : m.price_text }))
       : job.output_kind === "image"
       ? imageModels
@@ -528,6 +546,7 @@ function Studio() {
       ? videoModels.filter((m) => m.first_frame)
       : videoModels;
   const retryPrice = (job: StudioJob): string => {
+    if (job.operation === "extract_frame") return "free";
     const m = modelOptionsFor(job).find((x) => x.id === job.provider_model);
     // With reference pictures a Sogni model runs again on its Sogni editor,
     // at that editor's price (as in Try another model); any other model's
@@ -900,6 +919,7 @@ function Studio() {
       onRemoveBackground={() => removeBackground(t)}
       onUpscale={() => startUpscale(t)}
       onOpenSource={() => t.job && openSource(t.job)}
+      onSaveFrame={(at) => t.job && saveFrame(t.job, at)}
       retryPrice={t.job ? retryPrice(t.job) : ""}
     />
   );
@@ -916,11 +936,20 @@ function Studio() {
 
   return (
     <div className="flex flex-col h-screen">
-      <header className="border-b border-ink-800 px-6 py-4 flex items-center gap-3">
-        <h1 className="text-lg font-semibold">Studio</h1>
-        <span className="text-xs text-ink-400 ml-2">
+      {/* On a phone the subtitle wraps to its own line under the title and the button. */}
+      <header className="border-b border-ink-800 px-6 py-4 flex flex-wrap items-center gap-x-3 gap-y-1">
+        <h1 className="text-lg font-semibold shrink-0">Studio</h1>
+        <span className="text-xs text-ink-400 min-w-0 order-last basis-full sm:order-none sm:basis-auto sm:flex-1 sm:ml-2">
           Browse your cast, generate new images and clips, save them back.
         </span>
+        <button
+          type="button"
+          className="btn-ghost text-xs ml-auto shrink-0"
+          onClick={() => setFraming(true)}
+          title="Save a frame of a video from this device as a picture (free)"
+        >
+          Frame from a video…
+        </button>
       </header>
 
       <div className="px-6 pt-4 flex flex-wrap gap-2">
@@ -935,7 +964,8 @@ function Studio() {
         ))}
       </div>
 
-      <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-4 pb-44">
+      {/* The bottom padding follows the prompt bar's real height (it grows with the prompt), so the last row of tiles stays visible above it. */}
+      <div className="flex-1 overflow-y-auto px-3 sm:px-6 py-4 pb-[calc(var(--studio-bar-h,10rem)+1rem)]">
         {showResults && (
           <div className="mb-3 flex flex-wrap items-center gap-2" role="toolbar" aria-label="Studio results">
             <input
@@ -1124,6 +1154,7 @@ function Studio() {
             onUpscale: startUpscale,
             sourceUrl,
             onOpenSource: openSource,
+            onSaveFrame: saveFrame,
           }}
         />
       )}
@@ -1140,6 +1171,20 @@ function Studio() {
       )}
 
       {placing && <UseInProjectDialog job={placing} onClose={() => setPlacing(null)} />}
+
+      {framing && (
+        <FrameFromVideoDialog
+          avatars={avatars}
+          ingredients={ingredients}
+          defaultOwner={ownerFilter || undefined}
+          onClose={() => setFraming(false)}
+          onSaved={(j) => {
+            setFraming(false);
+            addCreated(batchPlaceholders(j));
+            toast.success("Saved the frame as a picture");
+          }}
+        />
+      )}
 
       {retrying && (
         <ModelPickerDialog
@@ -1239,6 +1284,7 @@ function TileCard({
   onRemoveBackground,
   onUpscale,
   onOpenSource,
+  onSaveFrame,
   retryPrice,
 }: {
   tile: Tile;
@@ -1264,6 +1310,8 @@ function TileCard({
   onRemoveBackground: () => void;
   onUpscale: () => void;
   onOpenSource: () => void;
+  /** Finished clips: save a frame as a new picture. */
+  onSaveFrame: (at: FrameAt) => void;
   /** "about $0.04" for running it again with the same model; "" = unknown. */
   retryPrice: string;
 }) {
@@ -1299,11 +1347,17 @@ function TileCard({
     if (running) {
       menu.push({ label: "Cancel…", onSelect: onCancel, title: "Stop waiting for this result" });
     }
-    if (failed) {
+    // A frame of an uploaded video can't be grabbed again: the video wasn't kept.
+    if (failed && !(job.operation === "extract_frame" && !job.source_job_id)) {
       menu.push({
         label: retryPrice ? `Retry · ${retryPrice}` : "Retry",
         onSelect: onRetry,
-        title: job.operation ? "Run this step again on the same picture" : "Run this generation again with the same settings",
+        title:
+          job.operation === "extract_frame"
+            ? "Save the same frame of the clip again"
+            : job.operation
+            ? "Run this step again on the same picture"
+            : "Run this generation again with the same settings",
       });
     }
     if (finished && tile.imageUrl) {
@@ -1315,6 +1369,16 @@ function TileCard({
         label: "Use in project…",
         onSelect: onUseInProject,
         title: "Use this clip as a shot in a storyboard project (free)",
+      });
+      menu.push({
+        label: "Save last frame as picture · free",
+        onSelect: () => onSaveFrame("last"),
+        title: "Make a new picture from the clip's last frame (e.g. to start the next clip from it)",
+      });
+      menu.push({
+        label: "Save first frame · free",
+        onSelect: () => onSaveFrame("first"),
+        title: "Make a new picture from the clip's first frame",
       });
     }
     if (tile.status === "completed" && tile.imageUrl) {
@@ -1340,7 +1404,7 @@ function TileCard({
         title: "Load this result's prompt, avoid list, references, model and aspect into the prompt bar",
       });
     }
-    if (finished || failed) {
+    if ((finished || failed) && job.operation !== "extract_frame") {
       menu.push({
         label: "Try another model…",
         onSelect: onTryModel,
@@ -1608,7 +1672,7 @@ function PromptBar({
   const [aspect, setAspect] = useState<StudioAspect>("");
   const [variations, setVariations] = useState(1);
   const [sheetOpen, setSheetOpen] = useState(false);
-  const promptRef = useRef<HTMLInputElement>(null);
+  const promptRef = useRef<HTMLTextAreaElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
   // A model to select once the list for the (possibly new) output kind is
   // in place; otherwise switching kinds resets to that kind's first model.
@@ -1696,6 +1760,20 @@ function PromptBar({
   useEffect(() => {
     if (load) apply(load);
   }, [load?.nonce]);
+
+  // Tell the page how tall this bar is (it grows with the prompt and its extra rows),
+  // so the tile list above can keep its last row clear of it.
+  useEffect(() => {
+    const el = barRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const root = document.documentElement;
+    const ro = new ResizeObserver(() => root.style.setProperty("--studio-bar-h", `${el.offsetHeight}px`));
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      root.style.removeProperty("--studio-bar-h");
+    };
+  }, []);
 
   const applyPreset = (p: PromptPreset) =>
     apply({
@@ -2015,15 +2093,17 @@ function PromptBar({
           >
             📎
           </button>
-          <input
+          <AutoTextarea
             ref={promptRef}
             aria-label="Prompt"
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             placeholder="What do you want to create?"
-            className="flex-1 min-w-0 basis-full order-first bg-transparent outline-hidden text-sm px-2 py-2"
+            className="flex-1 min-w-0 basis-full order-first bg-transparent outline-hidden text-sm leading-5 px-2 py-2"
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              // Enter makes it, Shift+Enter adds a line. While an input method is still
+              // composing a word (Japanese, Chinese, Korean…), Enter picks the word instead.
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 submit();
               }

@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
 import { api, Project, RenderPlan, Voice, VoiceoverFit, VoiceoverPreview } from "@/lib/api";
+import { AutoTextarea } from "@/components/AutoTextarea";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
@@ -474,7 +475,7 @@ export function AudioPanel({
                   </button>
                 ))}
               </div>
-              <textarea
+              <AutoTextarea
                 className="input min-h-[64px] text-sm"
                 placeholder='e.g. "warm cinematic lo-fi with mellow piano, 80 bpm"'
                 value={musicPrompt}

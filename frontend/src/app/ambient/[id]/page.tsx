@@ -37,6 +37,7 @@ import {
   statusTone,
 } from "@/components/ambient/shared";
 import { api, AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, PhotoRewrite, Render, errorText } from "@/lib/api";
+import { AutoTextarea } from "@/components/AutoTextarea";
 
 export default function AmbientScenePage() {
   return (
@@ -999,7 +1000,7 @@ function SettingsPanel({
             <label className="label" htmlFor="set-prompt">
               Scene description
             </label>
-            <textarea
+            <AutoTextarea
               id="set-prompt"
               className="input min-h-[80px]"
               value={cfg.scene_prompt}

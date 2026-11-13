@@ -114,8 +114,12 @@ export const OP_TITLES: Record<ImageOp, string> = {
   upscale: "Upscale",
 };
 
-/** The source an operation job ran on, as a short chip text ("from #12", "from Cast #34"). */
-export function sourceChipText(job: Pick<StudioJob, "source_job_id" | "source_asset_id">): string | null {
+/** The source an operation job ran on, as a short chip text ("from #12", "from Cast #34",
+ *  "from clip #9", "from a video"). */
+export function sourceChipText(
+  job: Pick<StudioJob, "source_job_id" | "source_asset_id"> & Partial<Pick<StudioJob, "operation">>
+): string | null {
+  if (job.operation === "extract_frame") return job.source_job_id ? `from clip #${job.source_job_id}` : "from a video";
   if (job.source_job_id) return `from #${job.source_job_id}`;
   if (job.source_asset_id) return `from Cast #${job.source_asset_id}`;
   return null;

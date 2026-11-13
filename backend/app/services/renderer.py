@@ -340,6 +340,33 @@ def _mux_audio_captions_overlays(
     return log
 
 
+# How far before a clip's end "the last frame" is taken: a seek to the very
+# end finds no frame to decode.
+LAST_FRAME_MARGIN = 0.05
+
+
+def extract_frame_at(src: Path, dst: Path, t: float) -> float:
+    """Write the frame `t` seconds into the video `src` to `dst` (a PNG, at
+    the video's own size, rotation applied). `t` is kept within
+    [0, length - LAST_FRAME_MARGIN]. Returns the time used. Raises
+    RuntimeError when the file isn't a video ffmpeg can read."""
+    duration = _probe_duration(src)
+    if duration <= 0:
+        raise RuntimeError("couldn't read that video")
+    t = min(max(float(t), 0.0), max(duration - LAST_FRAME_MARGIN, 0.0))
+    # Some files stop a little before their stated length: step back
+    # until a frame comes out, and last of all take the first one.
+    tries = [t] + [x for x in (t - 0.25, t - 1.0, 0.0) if 0.0 <= x < t]
+    log = ""
+    for at in tries:
+        dst.unlink(missing_ok=True)
+        rc, log = _run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.3f}", "-i", str(src),
+                        "-frames:v", "1", "-an", str(dst)])
+        if rc == 0 and dst.exists() and dst.stat().st_size > 0:
+            return round(at, 3)
+    raise RuntimeError(f"ffmpeg frame grab failed: {log[-2000:]}")
+
+
 def _make_thumbnail(src: Path, dst: Path) -> str:
     cmd = [
         "ffmpeg", "-y", "-i", str(src), "-ss", "1.0", "-frames:v", "1",
