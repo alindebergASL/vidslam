@@ -314,8 +314,8 @@ def test_the_prepared_copys_length_is_what_counts(auth_client, tmp_path, temp_ro
     seen: list[float] = []
     real_norm = video_ops.normalize_upload
 
-    def norm(src, dst, streams):
-        out = real_norm(src, dst, streams)
+    def norm(src, dst, streams, **kw):
+        out = real_norm(src, dst, streams, **kw)
         from app.services.renderer import _probe_clip
 
         seen.append(_probe_clip(dst)[0])
@@ -396,3 +396,211 @@ def test_a_scene_can_own_an_uploaded_video(auth_client, tmp_path):
     r = _upload(auth_client, _video(tmp_path / "a.mp4"), iid, owner_kind="ingredient")
     assert r.status_code == 201, r.text
     assert (r.json()["owner_kind"], r.json()["owner_id"]) == ("ingredient", iid)
+
+
+# ---------- review fixes ----------
+
+
+def test_a_live_webm_with_no_stated_length_is_measured_and_kept(auth_client, tmp_path):
+    """A browser recording (MediaRecorder: live WebM) states no length; it
+    is measured instead of being refused as not a video."""
+    aid = _avatar(auth_client)
+    webm = tmp_path / "recording.webm"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=3",
+                    "-c:v", "libvpx", "-f", "webm", "-live", "1", str(webm)], check=True)
+    from app.services import video_ops
+
+    assert video_ops._probe_upload(webm, "matroska")["seconds"] == 0.0  # really no stated length
+    r = _upload(auth_client, webm, aid, content_type="video/webm")
+    assert r.status_code == 201, r.text
+    assert r.json()["result_duration_seconds"] == pytest.approx(3.0, abs=0.25)
+
+
+def test_a_live_webm_too_long_is_refused_before_it_is_prepared(auth_client, tmp_path, monkeypatch):
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SECONDS", 2.0)
+    webm = tmp_path / "recording.webm"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=10:duration=5",
+                    "-c:v", "libvpx", "-f", "webm", "-live", "1", str(webm)], check=True)
+    prepared: list = []
+    monkeypatch.setattr(video_ops, "normalize_upload", lambda *a: prepared.append(a))
+    r = _upload(auth_client, webm, aid, content_type="video/webm")
+    assert r.status_code == 422 and "long" in r.json()["detail"], r.text
+    assert prepared == []
+
+
+def _without_ftyp(src: Path, dst: Path) -> Path:
+    """The same QuickTime file starting with its second atom (a "wide" atom,
+    or "moov" with fast start) instead of "ftyp": the two swap places and
+    "ftyp" becomes a "free" atom of its size, so every later byte (the media
+    data the movie header points into) stays where it was."""
+    data = src.read_bytes()
+    n = int.from_bytes(data[:4], "big")
+    assert data[4:8] == b"ftyp"
+    m = int.from_bytes(data[n:n + 4], "big")
+    dst.write_bytes(data[n:n + m] + n.to_bytes(4, "big") + b"free" + b"\0" * (n - 8) + data[n + m:])
+    return dst
+
+
+@pytest.mark.parametrize("faststart,first", [(False, b"wide"), (True, b"moov")])
+def test_a_mov_starting_with_another_atom_is_read(auth_client, tmp_path, faststart, first):
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    mov = tmp_path / "a.mov"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", *(["-movflags", "+faststart"] if faststart else []),
+                    "-f", "mov", str(mov)], check=True)
+    bare = _without_ftyp(mov, tmp_path / "bare.mov")
+    assert bare.read_bytes()[4:8] == first
+    assert video_ops.sniffed_extension(bare) == ".mp4"
+    r = _upload(auth_client, bare, aid, content_type="video/quicktime")
+    assert r.status_code == 201, r.text
+    assert r.json()["result_duration_seconds"] == pytest.approx(2.0, abs=0.2)
+
+
+def test_sniffing_keeps_to_the_known_containers(tmp_path):
+    from app.services import video_ops
+
+    for head, ext in ((b"\0\0\0\x08free", ".mp4"), (b"\0\0\0\x08skip", ".mp4"), (b"\0\0\0\x08pnot", ".mp4"),
+                      (b"\0\0\0\x08mdat", ".mp4"), (b"\0\0\0\x08junk", ""), (b"#EXTM3U\nhttp", "")):
+        p = tmp_path / "f"
+        p.write_bytes(head + b"\0" * 16)
+        assert video_ops.sniffed_extension(p) == ext, head
+
+
+def _fps(path: str) -> float:
+    out = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
+                          "-show_entries", "stream=avg_frame_rate", path], capture_output=True, text=True,
+                         check=True)
+    num, den = json.loads(out.stdout)["streams"][0]["avg_frame_rate"].split("/")
+    return float(num) / float(den)
+
+
+def test_a_large_or_fast_h264_mp4_is_re_encoded_within_1080p_and_60fps(auth_client, tmp_path):
+    aid = _avatar(auth_client)
+    big = _video(tmp_path / "big.mp4", seconds=0.5, size=(2560, 1440))
+    job = _upload(auth_client, big, aid).json()
+    assert job["options"]["reencoded"] is True, job
+    assert (job["result_width"], job["result_height"]) == (1920, 1080)
+    fast = tmp_path / "fast.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=120:duration=1",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(fast)], check=True)
+    job = _upload(auth_client, fast, aid).json()
+    assert job["options"]["reencoded"] is True, job
+    assert _fps(job["result_path"]) <= 60.01
+    # An ordinary one is still kept as it is.
+    job = _upload(auth_client, _video(tmp_path / "ok.mp4", size=(1080, 1920), seconds=0.5), aid).json()
+    assert job["options"]["reencoded"] is False
+
+
+def test_every_step_after_preparing_is_bounded_too(auth_client, tmp_path, temp_root, monkeypatch):
+    """The probes and frame grabs on the prepared copy have time limits as
+    well, and one that runs out is "took too long", never a hang."""
+    from app.services import renderer, video_ops
+
+    aid = _avatar(auth_client)
+    runs: list[tuple] = []
+    real = renderer._run
+
+    def spy(cmd, timeout=None, should_stop=None):
+        runs.append((cmd, timeout))
+        return real(cmd, timeout=timeout, should_stop=should_stop)
+
+    monkeypatch.setattr(renderer, "_run", spy)
+    r = _upload(auth_client, _video(tmp_path / "a.mp4"), aid)
+    assert r.status_code == 201, r.text
+    assert runs and all(t is not None for _c, t in runs), [c for c, t in runs if t is None]
+    after = [t for c, t in runs if "clip.mp4" in " ".join(c) and "upload.mp4" not in " ".join(c)]
+    assert after and sum(after) < 600 - video_ops.UPLOAD_ENCODE_TIMEOUT
+
+    def stuck(cmd, timeout=None, should_stop=None):
+        if "clip.mp4" in " ".join(cmd) and "-frames:v" in cmd:
+            return -1, f"timed out after {timeout}s"
+        return real(cmd, timeout=timeout, should_stop=should_stop)
+
+    monkeypatch.setattr(renderer, "_run", stuck)
+    r = _upload(auth_client, _video(tmp_path / "b.mp4", size=(32, 32)), aid)
+    assert r.status_code == 422 and "too long to prepare" in r.json()["detail"], r.text
+    assert _left(temp_root) == []
+
+
+# ---------- an uploaded clip used in a project ----------
+
+
+def _project_shot(client, aid: int, seconds: float) -> tuple[int, int]:
+    from .test_studio_fixes import _body_shot, _planned_project
+
+    pid = _planned_project(client, aid)
+    return pid, _body_shot(client, pid, duration=seconds)
+
+
+def _takes(sid: int) -> int:
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        return db.query(models.ShotTake).filter(models.ShotTake.shot_id == sid).count()
+
+
+def test_an_uploaded_clip_used_in_a_shot_has_every_stretch_used_checked(auth_client, tmp_path):
+    from app.providers import mock_chat
+
+    aid = _avatar(auth_client)
+    up = _upload(auth_client, _video(tmp_path / "a.mp4", seconds=12.0), aid).json()
+    pid, sid = _project_shot(auth_client, aid, 6.0)
+    url = f"/api/projects/{pid}/shots/{sid}/takes/from-studio"
+    seen: list = []
+    mock_chat.PICTURE_REPLY = lambda i: seen.append(i)
+    r = auth_client.post(url, json={"studio_job_id": up["id"]})
+    assert r.status_code == 201, r.text
+    # About one frame a second over the 6 s used (frames seen at upload are remembered).
+    assert len(seen) >= 4
+    # A frame judged under 18 anywhere in it refuses it; no take is made.
+    before = _takes(sid)
+    pid2, sid2 = _project_shot(auth_client, aid, 6.0)
+    up2 = _upload(auth_client, _video(tmp_path / "b.mp4", seconds=12.0, size=(64, 64)), aid).json()
+    mock_chat.PICTURE_REPLY = {"minor": True, "reason": "A child."}
+    r = auth_client.post(f"/api/projects/{pid2}/shots/{sid2}/takes/from-studio", json={"studio_job_id": up2["id"]})
+    assert r.status_code == 422 and "under 18" in r.json()["detail"], r.text
+    assert _takes(sid2) == 0 and _takes(sid) == before
+
+
+@pytest.mark.parametrize("reply,status", [(RuntimeError("down"), 503), ({"minor": True, "reason": "x"}, 422)])
+def test_a_join_containing_an_upload_is_checked_before_it_is_used_in_a_shot(auth_client, tmp_path, reply, status):
+    from app.providers import mock_chat
+
+    from .test_continue_clip import _clip
+
+    aid = _avatar(auth_client)
+    up = _upload(auth_client, _video(tmp_path / "a.mp4", seconds=2.0), aid).json()
+    made = _clip(auth_client, aid)
+    joined = auth_client.post("/api/studio/join-clips", json={"job_ids": [made["id"], up["id"]]}).json()
+    pid, sid = _project_shot(auth_client, aid, 30.0)
+    mock_chat.PICTURE_REPLY = reply
+    r = auth_client.post(f"/api/projects/{pid}/shots/{sid}/takes/from-studio", json={"studio_job_id": joined["id"]})
+    assert r.status_code == status, r.text
+    assert _takes(sid) == 0
+    # A generated clip is used as before, unchecked.
+    calls = len(mock_chat.PICTURE_CALLS)
+    r = auth_client.post(f"/api/projects/{pid}/shots/{sid}/takes/from-studio", json={"studio_job_id": made["id"]})
+    assert r.status_code == 201, r.text
+    assert len(mock_chat.PICTURE_CALLS) == calls
+
+
+def test_a_clean_deployment_checks_an_uploaded_clips_frames_for_nudity_before_a_shot(auth_client, tmp_path,
+                                                                                     monkeypatch):
+    from app.providers import mock_chat
+
+    from .test_adult_features_off import _clean
+
+    aid = _avatar(auth_client)
+    _clean(monkeypatch)
+    up = _upload(auth_client, _video(tmp_path / "a.mp4", seconds=4.0), aid).json()
+    pid, sid = _project_shot(auth_client, aid, 4.0)
+    mock_chat.PICTURE_EXPLICIT_REPLY = {"explicit": True, "reason": "Nudity."}
+    r = auth_client.post(f"/api/projects/{pid}/shots/{sid}/takes/from-studio", json={"studio_job_id": up["id"]})
+    assert r.status_code == 422, r.text
+    assert _takes(sid) == 0

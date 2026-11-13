@@ -496,3 +496,34 @@ def test_continuation_frame_and_join_are_never_cast_exempt(auth_client):
             assert pipeline.avatar_adult_ok(avatar_id, source, marked) is False
         ref = pipeline.studio_first_frame(db, db.get(models.AssetGenerationJob, cont["id"]))
         assert ref is not None and ref.adult_ok is False and ref.role == "scene"
+
+
+def test_two_retries_of_a_failed_auto_join_link_only_one(auth_client):
+    """Two Retries of the same failed auto-join at once: each read the
+    continuation still pointing at the failed join before either stored its
+    own; only the first to store is linked, the other stays a plain join."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    original = _clip(auth_client, aid)
+    cont = _job(auth_client, _continue(auth_client, original["id"]).json()["id"])
+    old_id = cont["options"]["join_job_id"]
+    with SessionLocal() as db:
+        row = db.get(models.AssetGenerationJob, old_id)
+        row.status, row.error = "failed", "Stopped unexpectedly"
+        db.commit()
+    a, b = _join_row(aid, original["id"]), _join_row(aid, original["id"])
+    with SessionLocal() as one, SessionLocal() as two:
+        # Both requests have read the old join and the continuation.
+        old1, old2 = one.get(models.AssetGenerationJob, old_id), two.get(models.AssetGenerationJob, old_id)
+        held = [s.get(models.AssetGenerationJob, cont["id"]) for s in (one, two)]
+        assert all(h.options_json["join_job_id"] == old_id for h in held)
+        video_ops.relink_auto_join(one, old1, one.get(models.AssetGenerationJob, a))
+        one.commit()
+        video_ops.relink_auto_join(two, old2, two.get(models.AssetGenerationJob, b))
+        two.commit()
+    assert _job(auth_client, cont["id"])["options"]["join_job_id"] == a
+    assert _job(auth_client, a)["options"].get("auto_join_for") == cont["id"]
+    assert "auto_join_for" not in _job(auth_client, b)["options"]

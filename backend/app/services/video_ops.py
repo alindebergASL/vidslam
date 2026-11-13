@@ -33,6 +33,12 @@ Which checks apply:
   (explicit_check.check_picture), failing closed the same way. The stored
   frame belongs to no Cast card, so it never skips the content filter
   either.
+- A clip with pictures of an uploaded video used whole in a project (a
+  shot's take, "Use in project"): frames across the stretch used, about
+  one a second, get the same checks first (check_clip_used_whole). Every
+  other place a Studio result goes (a scene's picture, a Cast picture,
+  "Animate this", remove background, upscale) takes pictures only, and a
+  picture of such a clip was checked as it was saved (checked_grab).
 """
 from __future__ import annotations
 
@@ -128,15 +134,16 @@ def ffmpeg_here() -> bool:
     return shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
 
 
-def grab(video: Path, at: At) -> tuple[bytes, float]:
+def grab(video: Path, at: At, *, timeout: Optional[float] = None) -> tuple[bytes, float]:
     """(PNG bytes, the time used) of the frame of `video` at `at`. Raises
-    RuntimeError when it can't be read."""
+    RuntimeError when it can't be read; with `timeout` (each ffmpeg run),
+    TimeoutError when it takes longer."""
     from .renderer import extract_frame_at
 
     t = seconds_for(at)
     with tempfile.TemporaryDirectory(prefix="frame-") as tmp:
         out = Path(tmp) / "frame.png"
-        used = extract_frame_at(video, out, 1e9 if math.isinf(t) else t)
+        used = extract_frame_at(video, out, 1e9 if math.isinf(t) else t, timeout=timeout)
         return out.read_bytes(), used
 
 
@@ -210,6 +217,49 @@ def checked_grab(db: Session, src: models.AssetGenerationJob, at: At) -> tuple[b
     return data, used
 
 
+# A clip used whole elsewhere (a project shot's take, copied into the
+# project and so into renders and uploads): when it has pictures of an
+# uploaded video, only a few of which were checked when it was uploaded,
+# frames across the stretch used (about one a second, at most
+# CLIP_CHECK_MAX_FRAMES, all judged in one call) get the checks a frame of
+# an uploaded video gets, before anything of it is used. Frames judged
+# before are remembered by the checks, so a clip used again is cheap.
+CLIP_CHECK_EVERY = 1.0  # seconds
+CLIP_CHECK_MAX_FRAMES = 40  # minor_check.PICTURE_LIMIT: never more than one call judges
+CLIP_UNREADABLE = "This clip can't be read, so it can't be used here."
+
+
+def clip_check_times(seconds: float) -> list[float]:
+    """The times of the frames checked over the first `seconds` of a clip:
+    the first, the end, and about one every CLIP_CHECK_EVERY seconds
+    between (2 to CLIP_CHECK_MAX_FRAMES in all)."""
+    seconds = max(float(seconds), 0.0)
+    n = min(CLIP_CHECK_MAX_FRAMES, max(2, math.ceil(seconds / CLIP_CHECK_EVERY) + 1))
+    return [round(seconds * i / (n - 1), 3) for i in range(n)]
+
+
+def check_clip_used_whole(db: Session, src: models.AssetGenerationJob, seconds: float) -> None:
+    """Before the first `seconds` of the Studio clip `src` are used whole
+    (see above): nothing when it has no picture of an uploaded video
+    (has_upload; unknown counts as having one), else frames across that
+    stretch go through check_uploaded_frames. Fails closed: OpError (422
+    refused or unreadable, 503 the check couldn't run)."""
+    if not has_upload(db, src):
+        return
+    path = Path(src.result_path or "")
+    with tempfile.TemporaryDirectory(prefix="clip-check-") as tmp:
+        frames: list[tuple[Path, bytes]] = []
+        for i, t in enumerate(clip_check_times(seconds)):
+            try:
+                data, _used = grab(path, t, timeout=UPLOAD_STEP_TIMEOUT)
+            except (RuntimeError, TimeoutError):
+                raise OpError(422, CLIP_UNREADABLE) from None
+            frame = Path(tmp) / f"frame{i}.png"
+            frame.write_bytes(data)
+            frames.append((frame, data))
+        check_uploaded_frames(frames, f"clip #{src.id}", video=True)
+
+
 def grab_for_job(db: Session, job: models.AssetGenerationJob) -> tuple[bytes, float]:
     """The worker's side (a queued frame job): grab the frame again from the
     job's clip (checked as checked_grab does). ValueError when the clip was
@@ -244,14 +294,21 @@ def looks_like_video(content_type: str, filename: str) -> bool:
     return ct.startswith("video/") or Path(filename or "").suffix.lower() in VIDEO_EXTENSIONS
 
 
+# The top-level atoms an MP4/MOV/3GP file may start with: "ftyp" in MP4 and
+# most MOV files, but older or camera-made QuickTime files often start with
+# their movie header, media data, or a filler/preview atom instead.
+QUICKTIME_FIRST_ATOMS = (b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot")
+
+
 def sniffed_extension(path: Path) -> str:
     """A fixed extension for a saved upload, from its first bytes (never the
-    name the uploader gave it): ".mp4" for the MP4/MOV/3GP family, ".mkv" for
-    Matroska/WebM, ".avi" for AVI, "" otherwise (ffmpeg reads the content
-    either way; the extension is only a hint)."""
+    name the uploader gave it): ".mp4" for the MP4/MOV/3GP family (any of
+    QUICKTIME_FIRST_ATOMS at offset 4), ".mkv" for Matroska/WebM, ".avi" for
+    AVI, "" otherwise (ffmpeg reads the content either way; the extension
+    is only a hint)."""
     with open(path, "rb") as f:
         head = f.read(12)
-    if head[4:8] == b"ftyp":
+    if head[4:8] in QUICKTIME_FIRST_ATOMS:
         return ".mp4"
     if head[:4] == b"\x1a\x45\xdf\xa3":
         return ".mkv"
@@ -579,7 +636,9 @@ def run_join(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerat
 # (None, None) for it, so it, its frames and anything made from them keep
 # the content filter. The temporary files are removed on every path. Only
 # those frames were checked, so any frame saved from it later (or from a
-# join it is part of) is checked again as it is saved (checked_grab).
+# join it is part of) is checked again as it is saved (checked_grab), and
+# the stretch of it used in a project shot is checked about once a second
+# first (check_clip_used_whole).
 
 UPLOAD_OP = "upload_video"
 UPLOAD_MODEL = "local/upload"
@@ -606,6 +665,16 @@ UPLOAD_DEMUXERS = {".mp4": "mov", ".mkv": "matroska", ".avi": "avi"}
 # the proxy's 600 s read timeout (nginx) with the picture checks after it.
 UPLOAD_PROBE_TIMEOUT = 60.0
 UPLOAD_ENCODE_TIMEOUT = 360.0
+# Once prepared, each probe or frame grab of the copy (each ffmpeg run) has
+# this long, and all the ffmpeg work of one upload (raw probe, measuring,
+# re-encode, the copy's probe and grabs) must end within UPLOAD_DEADLINE of
+# its start, leaving the picture checks room inside the proxy's 600 s.
+UPLOAD_STEP_TIMEOUT = 20.0
+UPLOAD_DEADLINE = 480.0
+# The stored copy is at most 1080p (renderer.JOIN_MAX_LONG x JOIN_MAX_SHORT,
+# either way round) and at most this many frames a second; a larger or
+# faster H.264 MP4 is re-encoded, not kept as it is.
+UPLOAD_MAX_FPS = 60
 # Uploads being prepared at once in one API process (each is a full
 # re-encode on the API's CPU); more are refused (429) rather than queued
 # behind them on the request threads.
@@ -621,20 +690,35 @@ def _input(path: Path, demuxer: str) -> list[str]:
     return ["-protocol_whitelist", "file", "-f", demuxer, "-i", str(path)]
 
 
+def _rate(value: object) -> float:
+    """An ffprobe frame rate ("30000/1001", "60/1", "0/0") as a number; 0.0
+    when unknown."""
+    try:
+        num, _, den = str(value or "").partition("/")
+        rate = float(num) / float(den or 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+    return rate if math.isfinite(rate) and rate > 0 else 0.0
+
+
 def _probe_upload(path: Path, demuxer: str) -> dict:
     """What the raw upload claims to be, read with `demuxer` only (bounded
     by UPLOAD_PROBE_TIMEOUT): {"video": codec, "pix_fmt", "audio": codec or
-    "", "size": (w, h) or None, "seconds": its stated length}; {} when it
-    has no readable picture. The stated length comes from the file, which
-    the uploader controls: only the prepared copy's length is trusted."""
+    "", "size": (w, h) or None, "fps": frames a second (0.0 unknown),
+    "seconds": its stated length (0.0: it states none, as a browser's live
+    WebM recording doesn't)}; {} when it has no readable picture. The stated
+    length comes from the file, which the uploader controls: only the
+    prepared copy's length is trusted. TimeoutError past the limit."""
     import json
 
     from .renderer import _run, stream_size
 
     rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries",
-                    "stream=codec_type,codec_name,pix_fmt,width,height,duration:stream_side_data=rotation:"
-                    "stream_tags=rotate:format=duration", *_input(path, demuxer)],
+                    "stream=codec_type,codec_name,pix_fmt,width,height,duration,avg_frame_rate,r_frame_rate:"
+                    "stream_side_data=rotation:stream_tags=rotate:format=duration", *_input(path, demuxer)],
                    timeout=UPLOAD_PROBE_TIMEOUT)
+    if rc == -1:
+        raise TimeoutError(log)
     if rc != 0:
         return {}
     try:
@@ -647,6 +731,7 @@ def _probe_upload(path: Path, demuxer: str) -> dict:
         if st.get("codec_type") == "video" and "video" not in out:
             out["video"], out["pix_fmt"] = st.get("codec_name") or "", st.get("pix_fmt") or ""
             out["size"] = stream_size(st)
+            out["fps"] = _rate(st.get("avg_frame_rate")) or _rate(st.get("r_frame_rate"))
             try:
                 seconds = float(st.get("duration") or 0.0)
             except (TypeError, ValueError):
@@ -664,22 +749,74 @@ def _probe_upload(path: Path, demuxer: str) -> dict:
     return out
 
 
+def _measure_upload(path: Path, demuxer: str) -> float:
+    """How long the raw upload plays, from its picture's packets (read, not
+    decoded; bounded by UPLOAD_PROBE_TIMEOUT), for a file that states no
+    length. Only the first UPLOAD_MAX_SECONDS and a little more are read:
+    a longer one measures past the most. 0.0 when it has no packets.
+    TimeoutError past the limit."""
+    from .renderer import _run
+
+    rc, log = _run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-read_intervals",
+                    f"%+{UPLOAD_MAX_SECONDS + 2:.0f}", "-show_entries", "packet=pts_time,duration_time",
+                    "-of", "csv=p=0", *_input(path, demuxer)], timeout=UPLOAD_PROBE_TIMEOUT)
+    if rc == -1:
+        raise TimeoutError(log)
+    if rc != 0:
+        return 0.0
+    first = end = None
+    for line in log.splitlines():
+        parts = line.split(",")
+        try:
+            pts = float(parts[0])
+        except (ValueError, IndexError):
+            continue
+        try:
+            dur = float(parts[1]) if len(parts) > 1 else 0.0
+        except ValueError:
+            dur = 0.0
+        if not math.isfinite(pts):
+            continue
+        first = pts if first is None else min(first, pts)
+        stop = pts + (dur if math.isfinite(dur) and dur > 0 else 0.0)
+        end = stop if end is None else max(end, stop)
+    if first is None or end is None:
+        return 0.0
+    return max(0.0, end - first)
+
+
+def within_1080p(size: Optional[tuple[int, int]]) -> bool:
+    """Whether a picture size fits the 1080p box (either way round)."""
+    from .renderer import JOIN_MAX_LONG, JOIN_MAX_SHORT
+
+    if not size:
+        return False
+    w, h = size
+    long_max, short_max = (JOIN_MAX_LONG, JOIN_MAX_SHORT) if w >= h else (JOIN_MAX_SHORT, JOIN_MAX_LONG)
+    return 0 < w <= long_max and 0 < h <= short_max
+
+
 def plays_everywhere(path: Path, streams: dict) -> bool:
     """Whether an upload already is an ordinary MP4 every later step (the
-    browser, joins, frame grabs, providers) reads: H.264 in 4:2:0, AAC
-    sound or none, in an MP4 file."""
+    browser, joins, frame grabs, providers) reads, of a size and frame rate
+    kept as it is: H.264 in 4:2:0, AAC sound or none, in an MP4 file, at
+    most 1080p and UPLOAD_MAX_FPS (a known rate)."""
+    fps = float(streams.get("fps") or 0.0)
     return (sniffed_extension(path) == ".mp4" and streams.get("video") == "h264"
-            and streams.get("pix_fmt") in ("yuv420p", "yuvj420p") and streams.get("audio") in ("", "aac"))
+            and streams.get("pix_fmt") in ("yuv420p", "yuvj420p") and streams.get("audio") in ("", "aac")
+            and within_1080p(streams.get("size")) and 0 < fps <= UPLOAD_MAX_FPS + 0.01)
 
 
-def normalize_upload(src: Path, dst: Path, streams: dict) -> bool:
+def normalize_upload(src: Path, dst: Path, streams: dict, *, timeout: float = UPLOAD_ENCODE_TIMEOUT) -> bool:
     """Write `src` (an upload `_probe_upload` read as `streams`) to `dst` as
     an ordinary H.264/AAC MP4 (only its first picture and sound streams,
     fast start), never longer than UPLOAD_MAX_SECONDS and a second, however
-    long it claims to be. Copied when it already is one, else re-encoded
-    (at most 1080p, even sides). Returns whether it was re-encoded.
-    RuntimeError when ffmpeg can't; TimeoutError when it takes longer than
-    UPLOAD_ENCODE_TIMEOUT."""
+    long it claims to be. Copied when it already is one (plays_everywhere),
+    else re-encoded (at most 1080p, even sides, at most UPLOAD_MAX_FPS).
+    Returns whether it was re-encoded. RuntimeError when ffmpeg can't;
+    TimeoutError when it takes longer than `timeout` (UPLOAD_ENCODE_TIMEOUT
+    at most)."""
+    timeout = min(timeout, UPLOAD_ENCODE_TIMEOUT)
     from .renderer import _run, join_size
 
     demuxer = UPLOAD_DEMUXERS[sniffed_extension(src)]
@@ -687,7 +824,7 @@ def normalize_upload(src: Path, dst: Path, streams: dict) -> bool:
     maps = ["-map", "0:v:0"] + (["-map", "0:a:0"] if streams.get("audio") else [])
     if plays_everywhere(src, streams):
         rc, _ = _run(["ffmpeg", "-y", "-v", "error", *_input(src, demuxer), *cap, *maps, "-c", "copy",
-                      "-movflags", "+faststart", str(dst)], timeout=UPLOAD_ENCODE_TIMEOUT)
+                      "-movflags", "+faststart", str(dst)], timeout=timeout)
         if rc == 0 and dst.exists() and dst.stat().st_size > 0:
             return False
         if rc == -1:
@@ -696,14 +833,50 @@ def normalize_upload(src: Path, dst: Path, streams: dict) -> bool:
     w, h = join_size(size) if size else (0, 0)
     vf = ["-vf", f"scale={w}:{h}"] if w and h else ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
     audio = ["-c:a", "aac", "-b:a", "160k"] if streams.get("audio") else []
-    rc, log = _run(["ffmpeg", "-y", "-v", "error", *_input(src, demuxer), *cap, *maps, *vf, "-c:v", "libx264",
-                    "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", *audio,
-                    "-movflags", "+faststart", str(dst)], timeout=UPLOAD_ENCODE_TIMEOUT)
+    rc, log = _run(["ffmpeg", "-y", "-v", "error", *_input(src, demuxer), *cap, *maps, *vf,
+                    "-fpsmax", str(UPLOAD_MAX_FPS), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-pix_fmt", "yuv420p", *audio, "-movflags", "+faststart", str(dst)], timeout=timeout)
     if rc == -1:
         raise TimeoutError("timed out")
     if rc != 0 or not dst.exists() or dst.stat().st_size == 0:
         raise RuntimeError(f"couldn't re-encode the video: {log[-500:]}")
     return True
+
+
+def _probe_prepared(path: Path, timeout: float) -> tuple[float, bool, Optional[tuple[int, int]]]:
+    """(length, whether it has sound, size) of the prepared copy (an MP4
+    made here), in one ffprobe run bounded by `timeout`; the length is the
+    picture's own when known, else the file's (as renderer._probe_clip).
+    (0.0, False, None) when it can't be read; TimeoutError past `timeout`."""
+    import json
+
+    from .renderer import _run, stream_size
+
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries",
+                    "stream=codec_type,width,height,duration:stream_side_data=rotation:stream_tags=rotate:"
+                    "format=duration", *_input(path, "mov")], timeout=timeout)
+    if rc == -1:
+        raise TimeoutError(log)
+    try:
+        info = json.loads(log) if rc == 0 else {}
+    except ValueError:
+        info = {}
+    length, size, has_audio = 0.0, None, False
+    for st in info.get("streams") or []:
+        if st.get("codec_type") == "audio":
+            has_audio = True
+        elif st.get("codec_type") == "video" and size is None:
+            size = stream_size(st)
+            try:
+                length = float(st.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                length = 0.0
+    if not (length > 0 and math.isfinite(length)):
+        try:
+            length = float((info.get("format") or {}).get("duration") or 0.0)
+        except (TypeError, ValueError):
+            length = 0.0
+    return (length if math.isfinite(length) else 0.0), has_audio, size
 
 
 def aspect_for(size: Optional[tuple[int, int]]) -> str:
@@ -740,27 +913,46 @@ def video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
 
 def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
                        limit: int) -> models.AssetGenerationJob:
+    import time
+
     from . import events, storage
-    from .renderer import _probe_clip, _probe_size
+
+    started = 0.0  # set once the file is in
+
+    def step(limit: float) -> float:
+        """The time limit for the next ffmpeg run: `limit`, or what is left
+        of UPLOAD_DEADLINE when less; "took too long" when nothing is."""
+        left = UPLOAD_DEADLINE - (time.monotonic() - started)
+        if left < 1.0:
+            raise OpError(422, UPLOAD_TOO_SLOW)
+        return min(limit, left)
 
     name = Path(filename or "video").name[:60] or "video"
     with tempfile.TemporaryDirectory(prefix="upload-video-") as tmp:
         raw = Path(tmp) / "upload"
         save_upload(file, raw, limit)
+        started = time.monotonic()  # the time limits count from here (the file is in)
         # The client's own suffix is never used for the file on disk; only
         # the containers sniffed here are read at all.
         ext = sniffed_extension(raw)
         if ext not in UPLOAD_DEMUXERS:
             raise OpError(422, NOT_A_VIDEO)
         video = raw.rename(raw.with_name("upload" + ext))
-        streams = _probe_upload(video, UPLOAD_DEMUXERS[ext])
+        try:
+            streams = _probe_upload(video, UPLOAD_DEMUXERS[ext])
+            if streams and streams["seconds"] <= 0:
+                # No stated length (a browser's live WebM recording):
+                # measured from its packets instead.
+                streams["seconds"] = _measure_upload(video, UPLOAD_DEMUXERS[ext])
+        except TimeoutError:
+            raise OpError(422, UPLOAD_TOO_SLOW) from None
         if not streams or streams["seconds"] <= 0:
             raise OpError(422, NOT_A_VIDEO)
         if streams["seconds"] > UPLOAD_MAX_SECONDS:
             raise _too_long(streams["seconds"])
         out = Path(tmp) / "clip.mp4"
         try:
-            reencoded = normalize_upload(video, out, streams)
+            reencoded = normalize_upload(video, out, streams, timeout=step(UPLOAD_ENCODE_TIMEOUT))
         except TimeoutError:
             raise OpError(422, UPLOAD_TOO_SLOW) from None
         except RuntimeError:
@@ -768,8 +960,10 @@ def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
         video.unlink(missing_ok=True)
         # The length that counts is the prepared copy's (the file's own
         # claim may be anything; the copy is cut a second past the most).
-        length, has_audio, _ = _probe_clip(out)
-        size = _probe_size(out)
+        try:
+            length, has_audio, size = _probe_prepared(out, step(UPLOAD_STEP_TIMEOUT))
+        except TimeoutError:
+            raise OpError(422, UPLOAD_TOO_SLOW) from None
         if length <= 0 or not size:
             raise OpError(422, NOT_A_VIDEO)
         if length > UPLOAD_MAX_SECONDS + 0.5:
@@ -778,7 +972,9 @@ def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
         frames: list[tuple[Path, bytes]] = []
         for i, t in enumerate(upload_frame_times(length)):
             try:
-                data, _used = grab(out, "last" if math.isinf(t) else t)
+                data, _used = grab(out, "last" if math.isinf(t) else t, timeout=step(UPLOAD_STEP_TIMEOUT))
+            except TimeoutError:
+                raise OpError(422, UPLOAD_TOO_SLOW) from None
             except RuntimeError:
                 raise OpError(422, NOT_A_VIDEO) from None
             frame = Path(tmp) / f"frame{i}.png"
@@ -925,25 +1121,42 @@ def plan_auto_join(db: Session, job: models.AssetGenerationJob) -> Optional[mode
     return join
 
 
-def relink_auto_join(db: Session, old: models.AssetGenerationJob, new: models.AssetGenerationJob) -> None:
+RELINK_TRIES = 3
+
+
+def relink_auto_join(db: Session, old: models.AssetGenerationJob, new: models.AssetGenerationJob) -> bool:
     """A failed auto-join run again (Retry): the new join is the
     continuation's join from now on (auto_join_for on it, join_job_id on
     the continuation), when the continuation still points at the old one.
-    In the caller's transaction."""
+    Two Retries at once: the continuation is claimed with a compare-and-set
+    on its updated_at (an UPDATE that only matches the row as it was read),
+    so only one relinks; the other, reading it again, sees it no longer
+    points at the old join and stays a plain join. Returns whether `new`
+    was linked. In the caller's transaction."""
+    Job = models.AssetGenerationJob
     for_id = (old.options_json or {}).get(AUTO_JOIN_FOR)
     if not for_id or old.status != "failed":
-        return
+        return False
     try:
-        cont = db.get(models.AssetGenerationJob, int(for_id))
+        cont_id = int(for_id)
     except (TypeError, ValueError):
-        return
-    if cont is None or cont.status == STUDIO_DELETED:
-        return
-    opts = dict(cont.options_json or {})
-    if opts.get(JOIN_JOB) != old.id:
-        return
-    new.options_json = {**(new.options_json or {}), AUTO_JOIN_FOR: cont.id}
-    cont.options_json = {**opts, JOIN_JOB: new.id}
+        return False
+    for _ in range(RELINK_TRIES):
+        cont = db.query(Job).filter(Job.id == cont_id).populate_existing().one_or_none()
+        if cont is None or cont.status == STUDIO_DELETED:
+            return False
+        opts = dict(cont.options_json or {})
+        if opts.get(JOIN_JOB) != old.id:
+            return False
+        seen = cont.updated_at
+        claimed = db.query(Job).filter(Job.id == cont_id, Job.updated_at == seen).update(
+            {Job.options_json: {**opts, JOIN_JOB: new.id}, Job.updated_at: datetime.utcnow()},
+            synchronize_session=False)
+        if claimed == 1:
+            db.expire(cont)
+            new.options_json = {**(new.options_json or {}), AUTO_JOIN_FOR: cont_id}
+            return True
+    return False
 
 
 def queue_join(db: Session, join: models.AssetGenerationJob) -> None:
