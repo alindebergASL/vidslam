@@ -55,6 +55,12 @@ ELEVENLABS_DEFAULT_VOICE_ID=...
 Each channel (chat / image / video / tts) is mocked independently when its key is
 missing — partial configs work fine. `GET /api/providers/status` reflects what's live.
 
+Set `ADULT_FEATURES=false` for a clean deployment with no adult content: adult mode
+stays off, every content filter is on and uncensored models are hidden (see `.env.example`). Start
+it from an empty database and data directory, not a copy of a deployment that allowed adult
+content: what was made there (Studio results, renders, prompts) would still be shown. The app
+logs a warning at startup when the database has saved Adult content settings.
+
 ---
 
 ## Architecture

@@ -51,9 +51,10 @@ OK_TTL = timedelta(days=30)
 LRU_SIZE = 2000
 
 REFUSED = "This prompt was refused by the safety check: it may involve a minor in a sexual context."
-UNAVAILABLE = ("The safety check couldn't run, so this prompt is paused until it's available (check the "
-               "planner model in Settings → Models). In Adult mode every picture, clip and lip-sync waits for "
-               "it; turn Adult mode off to keep working with the provider filters on.")
+UNAVAILABLE_CLEAN = ("The safety check couldn't run, so this prompt is paused until it's available (check the "
+                     "planner model in Settings → Models).")
+UNAVAILABLE = (UNAVAILABLE_CLEAN + " In Adult mode every picture, clip and lip-sync waits for it; turn Adult "
+               "mode off to keep working with the provider filters on.")
 DECLINED = ("This prompt was refused: the safety check model declined to judge it, which counts as a no. "
             "A different planner model (Settings → Models) may answer.")
 TOO_LONG = ("This prompt was refused: with its avoid list it is longer than the safety check can read "
@@ -144,13 +145,23 @@ def availability() -> dict:
                 pictures == "mock" and bool(get_settings().mock_providers))}
 
 
+def _unavailable() -> str:
+    """The paused-prompt message; a clean deployment (ADULT_FEATURES=false)
+    has no adult mode to mention."""
+    from .content_mode import features
+
+    return UNAVAILABLE if features() else UNAVAILABLE_CLEAN
+
+
 def _note(available: bool) -> str:
     """One plain sentence for the Settings line: what the check does, or
     what waits while it can't run (see _fails_closed)."""
     if available:
         return "It checks prompts for minors before they're sent (about $0.0005 per new prompt)."
-    from .content_mode import adult_mode
+    from .content_mode import adult_mode, features
 
+    if not features():  # a clean deployment: no adult mode or ticks to mention
+        return "It can't run right now, so sexual prompts are paused until it can."
     if adult_mode():
         return ("It can't run right now, so no pictures, clips or lip-syncs are made until it can (Adult mode "
                 "turns the provider filters off; turn it off to keep working), and no Cast character can be "
@@ -467,7 +478,7 @@ def check_generation(prompt: str, negative: str = "", *, kind: str) -> None:
     except CheckUnavailable as e:
         if _fails_closed(prompt, negative, kind):
             log.warning("safety check unavailable (%s): sexual %s prompt paused", e, kind)
-            raise UnsafePromptError(UNAVAILABLE) from None
+            raise UnsafePromptError(_unavailable()) from None
         log.info("safety check unavailable (%s): non-sexual %s prompt allowed", e, kind)
         return
     _store(key, "minor_sexual" if minor_sexual else "ok", model, reason)

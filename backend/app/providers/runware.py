@@ -27,7 +27,9 @@ are refused before anything is sent (services/safety.check_prompt). In adult
 mode, vendor safety settings are loosened only where a model's schema offers
 them (_PERMISSIVE; none of the curated models does). Vendor models (Google,
 Kling, Alibaba Wan, ...) stay moderated by their vendor. A content refusal is
-final (RunwareError.refused): no other model is tried in its place.
+final (RunwareError.refused): no other model is tried in its place. With
+ADULT_FEATURES=false (a clean deployment) adult mode is always off, so the
+check is on for every request and vendor safety settings are never loosened.
 """
 from __future__ import annotations
 
@@ -789,7 +791,13 @@ def _bases(sch: dict, task_type: str, model_air: str, prompt: str, negative: str
     neg = _fit_text(negative, props.get("negativePrompt"), terms=True)
     if neg and "negativePrompt" in props and _allowed(props["negativePrompt"], neg) and len(neg) >= 2:
         task["negativePrompt"] = neg
-    if not _put(task, props, ("safety", "checkContent"), bool(check_content)) and (cast or pictures):
+    has_check = _put(task, props, ("safety", "checkContent"), bool(check_content))
+    if not has_check and not _features():
+        # A clean deployment: every request goes through Runware's check, so
+        # a model without one is never sent anything (refused, final).
+        raise RunwareError(f"{model_air} has no content check, so it can't be used on this deployment",
+                           refused=True, final=True)
+    if not has_check and (cast or pictures):
         # Rule: a Cast member's picture (unless marked "adult content
         # allowed", in adult mode), or any picture with a sexual prompt
         # (in adult mode only when the minors rules want the check), never
@@ -1188,6 +1196,12 @@ def _adult_mode() -> bool:
     return adult_mode()
 
 
+def _features() -> bool:
+    from ..services.content_mode import features
+
+    return features()
+
+
 def check_content_default() -> bool:
     """Runware's content check: always on unless adult mode is; then as set
     in Settings (else RUNWARE_CHECK_CONTENT)."""
@@ -1216,6 +1230,8 @@ def _content_check(explicit: Optional[bool], cast: bool, sent: str, negative: st
 
     check_prompt(sent)
     default = check_content_default() if explicit is None else explicit
+    if not _features():  # a clean deployment: checked, whatever the caller asked
+        default = True
     return bool(default or cast or mentions_minor(sent) or steers_young(sent, negative))
 
 
@@ -1301,6 +1317,7 @@ def catalog_entries(usable: bool) -> list[dict]:
     unusable = set(b.get("unusable") or [])
     bundled_index = {r.get("air") for r in b["index"]}
     checked = _checked()
+    features = _features()
     # Hidden: models the snapshot or check_new_models found the app can't
     # drive. Not checked yet: shown, as before (a refresh checks them).
     later = [a for a in rows if a not in b["schemas"] and a not in unusable
@@ -1312,13 +1329,21 @@ def catalog_entries(usable: bool) -> list[dict]:
         if kind is None:
             continue
         model = f"{PREFIX}{a}"
+        if not features and kind not in OP_KIND_OF.values():
+            # A clean deployment: a model whose (known) schema has no content
+            # check can't be used, so it isn't offered.
+            known = sch or schema(model, fetch=False)
+            if known is not None and not has_content_check(known):
+                continue
         open_ = is_open(a, row.get("arch"))
         name = (sch or {}).get("name") or row.get("name") or a
         tag = "open" if open_ else "moderated"
+        about = ("Runware-hosted open weights: no vendor moderation." if features else
+                 "Runware-hosted open weights, checked by Runware's content check.")
         e: dict = {"id": model, "kind": kind, "name": f"{name} · Runware {tag}", "provider": "runware",
-                   "description": ("Runware-hosted open weights: no vendor moderation." if open_ else
+                   "description": (about if open_ else
                                    "Runs on the vendor's API through Runware (the vendor moderates it)."),
-                   "uncensored": open_, "suggested": a in curated, "usable": usable}
+                   "uncensored": open_ and features, "suggested": a in curated, "usable": usable}
         if kind in OP_KIND_OF.values():
             out.append(_op_entry(a, model, kind, name, sch, a in curated, usable))
             continue
@@ -1386,6 +1411,14 @@ def _op_entry(a: str, model: str, kind: str, name: str, sch: Optional[dict], sug
     else:
         e["notes"], e["price_text"] = "", ""
     return e
+
+
+def has_content_check(sch: Optional[dict]) -> bool:
+    """True when the model's request schema lets us turn on Runware's
+    content check (safety.checkContent)."""
+    if not sch or not sch.get("request"):
+        return False
+    return _allowed(_sub(_props(sch), "safety", "checkContent"), True)
 
 
 def _model_infos(kind: str) -> list[ModelInfo]:

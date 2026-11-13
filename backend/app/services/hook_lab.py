@@ -744,7 +744,8 @@ def _planner_refused(why: str) -> HookLabError:
     if why == "minor":
         return HookLabError("No openings were suggested: the planner refused this script, as it appears "
                             "to involve a minor in a sexual context.", 422)
-    hint = "" if content_mode.adult_mode() else " For adult scripts, turn on Adult mode in Settings."
+    hint = ("" if content_mode.adult_mode() or not content_mode.features()
+            else " For adult scripts, turn on Adult mode in Settings.")
     return HookLabError("The planner declined to suggest openings for this script. Write your own "
                         f"opening.{hint}", 422)
 

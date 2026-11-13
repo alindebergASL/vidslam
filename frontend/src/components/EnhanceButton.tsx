@@ -3,6 +3,7 @@ import { useState } from "react";
 import clsx from "clsx";
 import { api, EnhanceKind } from "@/lib/api";
 import { useToast } from "@/components/Toaster";
+import { useAdultFeatures } from "@/components/AdultModePanel";
 
 /** Turns an API error into one plain sentence for a toast. */
 export function enhanceErrorMessage(e: unknown): string {
@@ -30,7 +31,7 @@ function shortModel(id: string): string {
 }
 
 /**
- * "✨ Enhance": asks the text model (the planner; DeepSeek in Adult mode) to improve `text` for its `kind`, shows
+ * "✨ Enhance": asks the text model (the planner; the adult text model in Adult mode) to improve `text` for its `kind`, shows
  * the suggestion inline with Use it / Keep mine, and after Use it offers Undo
  * (restores the text from before) for as long as the text is unchanged.
  *
@@ -55,6 +56,8 @@ export function EnhanceButton({
   buttonClassName?: string;
 }) {
   const toast = useToast();
+  // Adult content on this deployment: only then does the title mention Adult mode.
+  const adult = useAdultFeatures();
   const [busy, setBusy] = useState(false);
   const [suggestion, setSuggestion] = useState<string | null>(null);
   const [byModel, setByModel] = useState("");
@@ -93,7 +96,9 @@ export function EnhanceButton({
           onClick={run}
           disabled={disabled || empty || busy}
           className={clsx("chip text-xs disabled:opacity-50", buttonClassName)}
-          title={`Rewrite this ${KIND_LABEL[kind]} with the text model (the planner, or DeepSeek in Adult mode). You can keep yours.`}
+          title={`Rewrite this ${KIND_LABEL[kind]} with the text model (${
+            adult === true ? "the planner, or DeepSeek in Adult mode" : "the planner"
+          }). You can keep yours.`}
           aria-label={`Enhance ${KIND_LABEL[kind]}`}
         >
           {busy ? "Enhancing…" : "✨ Enhance"}

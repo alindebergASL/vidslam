@@ -251,7 +251,7 @@ def _sogni_entries() -> list[dict]:
             "id": f"{sogni.PREFIX}{m.selector}", "kind": "image", "name": sogni.display_name(m),
             "provider": "sogni", "description": m.note, "family": m.family,
             "notes": " · ".join([*tags, f"~{m.spark:g} Spark (${usd:.3f}) per image"]),
-            "pricing": {"image": usd}, "usable": usable,
+            "pricing": {"image": usd}, "uncensored": m.uncensored, "usable": usable,
         })
     for v in sogni.video_models():
         caps = sogni.model_capabilities(v)
@@ -266,7 +266,7 @@ def _sogni_entries() -> list[dict]:
             "durations": caps.durations, "max_seconds": caps.max_seconds, "frame_images": frames,
             "resolutions": [], "aspect_ratios": [], "generate_audio": None,
             "pricing_skus": {}, "price_per_second": round(v.spark_per_second * sogni.SPARK_USD, 4),
-            "usable": usable,
+            "uncensored": v.uncensored, "usable": usable,
         })
     return out
 
@@ -452,8 +452,25 @@ def _with_sogni(snap: Optional[dict]) -> Optional[dict]:
             "new_count": sum(1 for e in merged if e.get("new"))}
 
 
+def _clean(snap: Optional[dict]) -> Optional[dict]:
+    """A clean deployment (ADULT_FEATURES=false) lists no uncensored model,
+    from any provider (an OpenRouter chat model named "Uncensored" too),
+    stored snapshots from before included."""
+    from ..providers import sogni
+    from . import content_mode
+
+    if not snap or content_mode.features():
+        return snap
+    kept = [e for e in snap.get("entries") or []
+            if not content_mode.adult_entry(e)
+            and not (e.get("provider") == "sogni" and sogni.adult_only(e.get("id") or ""))]
+    return {**snap, "entries": kept,
+            "counts": {k: sum(1 for e in kept if e.get("kind") == k) for k in reg.KINDS},
+            "new_count": sum(1 for e in kept if e.get("new"))}
+
+
 def get_snapshot() -> Optional[dict]:
-    return _live_usable(_with_sogni(reg.get_setting(CATALOG_KEY)))
+    return _live_usable(_clean(_with_sogni(reg.get_setting(CATALOG_KEY))))
 
 
 def find(kind: str, model_id: str) -> Optional[dict]:

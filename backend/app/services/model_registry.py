@@ -143,9 +143,43 @@ def default_model(kind: str) -> str:
 
 def active_model(kind: str) -> str:
     sel = selected(kind)
-    if sel is not None:
+    if sel is not None and not adult_only(sel):
         return sel
     return default_model(kind)
+
+
+# route_info's "blocked" for a model turned off for this deployment.
+ADULT_BLOCK = "adult"
+
+
+def adult_only(model: Optional[str]) -> bool:
+    """An uncensored model on a clean deployment (ADULT_FEATURES=false):
+    hidden from the pickers and refused when asked for by id. A saved pick
+    of one falls back to the default."""
+    from . import content_mode
+
+    if not model or content_mode.features():
+        return False
+    m = str(model)
+    if m.startswith(SOGNI_PREFIX):
+        from ..providers import sogni
+
+        return sogni.hidden(m)
+    if content_mode.looks_adult(m) or content_mode.is_adult_text_model(m):
+        return True
+    # Any other provider: what the stored catalog says about it (e.g. an
+    # OpenRouter chat model whose name or description says "Uncensored").
+    from .model_catalog import CATALOG_KEY
+
+    for e in (get_setting(CATALOG_KEY) or {}).get("entries") or []:
+        if e.get("id") != m:
+            continue
+        # Runware's "uncensored" flag in a stored snapshot is from before
+        # the switch (its open models stay, with the content check on).
+        if content_mode.looks_adult(e.get("name"), e.get("description")) or (
+                e.get("uncensored") and e.get("provider") != "runware"):
+            return True
+    return False
 
 
 def active_options(kind: str) -> dict:
@@ -188,6 +222,8 @@ def route_info(kind: str, model: Optional[str] = None) -> tuple[str, Optional[st
     if kind in OP_KINDS and m.startswith(LOCAL_PREFIX):
         # Runs here: nothing to switch off, nothing billed (mock mode too).
         return ("local", None) if m in LOCAL_MODELS.get(kind, ()) else ("unavailable", "local")
+    if adult_only(m):
+        return "unavailable", ADULT_BLOCK
     if s.mock_providers:
         return "mock", None
     for prefix, name in RESERVED_PREFIXES.items():
@@ -259,6 +295,8 @@ def unavailable(kind: str, model: Optional[str] = None, blocked: Optional[str] =
     from .provider_keys import KEYS, ProviderUnavailable, has
 
     m = active_model(kind) if model is None else model
+    if blocked == ADULT_BLOCK:
+        return ProviderUnavailable(m.split("/", 1)[0] if "/" in m else "provider", kind=kind, model=m, reason="adult")
     if kind in OP_KINDS and (blocked is None or blocked == "local"):
         # An id no picture-operation provider serves.
         name = "local" if blocked == "local" else (m.split("/", 1)[0] if "/" in m else "provider")

@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { useToast } from "@/components/Toaster";
+import { useAdultFeatures } from "@/components/AdultModePanel";
 import { checkCostText } from "@/components/InspectionChip";
 import { api, ClipCheckModel, ClipCheckSettings } from "@/lib/api";
 
@@ -8,6 +9,9 @@ import { api, ClipCheckModel, ClipCheckSettings } from "@/lib/api";
 export function ClipCheckPanel() {
   const toast = useToast();
   const [s, setS] = useState<ClipCheckSettings | null>(null);
+  // Adult content on this deployment. The server never reports adult_mode on
+  // a clean deployment, so the note also shows while this is still unknown.
+  const adult = useAdultFeatures();
   const [models, setModels] = useState<ClipCheckModel[] | null>(null);
   const [custom, setCustom] = useState("");
   const [busy, setBusy] = useState(false);
@@ -51,7 +55,7 @@ export function ClipCheckPanel() {
         !error && <div className="h-16 skeleton mt-3" aria-busy="true" />
       ) : (
         <div className="mt-3 space-y-4">
-          {s.adult_mode && (
+          {adult !== false && s.adult_mode && (
             <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-200">
               Clips aren&apos;t checked while adult mode is on: the vision models refuse adult frames (and still
               charge for it) or judge the content instead of the clip.

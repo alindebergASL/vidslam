@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { api, ContentMode } from "@/lib/api";
 import { useToast } from "@/components/Toaster";
@@ -8,6 +8,56 @@ import { SafetyMemory } from "@/components/SafetyMemory";
 /** "deepseek/deepseek-v4-flash" → "deepseek-v4-flash". */
 export function shortModel(id: string): string {
   return id.replace(/^~/, "").split("/").pop() || id;
+}
+
+/** The first read when the page opens is shared: the Settings page and the
+ * Cast page read this setting in several places at once. Every later read
+ * (after a change, a retry or a poll) asks the server again, and becomes the
+ * one a panel opened after it shares, so nobody joins a read sent before a
+ * save. Panels re-reading for the same event (all listeners run together)
+ * share that one new read. */
+let shared: Promise<ContentMode> | null = null;
+let sameEvent: Promise<ContentMode> | null = null;
+function fetchContentMode(fresh: boolean): Promise<ContentMode> {
+  if (fresh && sameEvent) return sameEvent;
+  if (fresh || !shared) {
+    const p: Promise<ContentMode> = api.getContentMode().finally(() => {
+      if (shared === p) shared = null;
+    });
+    shared = p;
+    if (fresh) {
+      sameEvent = p;
+      queueMicrotask(() => {
+        if (sameEvent === p) sameEvent = null;
+      });
+    }
+  }
+  return shared;
+}
+
+/** Reads the setting for one component. `load(false)` on mount joins the
+ * shared first read; `load(true)` always asks again. An answer older than
+ * the one already shown is dropped, so a slow read sent before a save can't
+ * put back what the save changed. */
+function useContentModeLoader(onLoad: (m: ContentMode) => void, onFail: (e: any) => void) {
+  const sent = useRef(0);
+  const shown = useRef(0);
+  const cbs = useRef({ onLoad, onFail });
+  cbs.current = { onLoad, onFail };
+  return useCallback((fresh: boolean) => {
+    const n = ++sent.current;
+    fetchContentMode(fresh).then(
+      (m) => {
+        if (n < shown.current) return;
+        shown.current = n;
+        cbs.current.onLoad(m);
+      },
+      (e) => {
+        if (n < shown.current) return;
+        cbs.current.onFail(e);
+      }
+    );
+  }, []);
 }
 
 /**
@@ -23,19 +73,21 @@ export function AdultModePanel() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = () => {
-    setError(null);
-    api
-      .getContentMode()
-      .then(setMode)
-      .catch((e) => setError(e.message || "Couldn't load the adult content setting"));
-  };
+  const read = useContentModeLoader(
+    (m) => {
+      setMode(m);
+      setError(null);
+    },
+    (e) => setError(e?.message || "Couldn't load the adult content setting")
+  );
+  const load = () => read(true);
   useEffect(() => {
-    load();
+    read(false);
     // The planner changed in Models (or the switch elsewhere): re-read.
-    window.addEventListener("content-mode-changed", load);
-    return () => window.removeEventListener("content-mode-changed", load);
-  }, []);
+    const again = () => read(true);
+    window.addEventListener("content-mode-changed", again);
+    return () => window.removeEventListener("content-mode-changed", again);
+  }, [read]);
 
   const toggle = async () => {
     if (!mode || busy) return;
@@ -65,6 +117,8 @@ export function AdultModePanel() {
   };
 
   const on = Boolean(mode?.adult);
+  // Turned off for this deployment: the page shows SafetyCheckCard instead.
+  if (mode?.available === false) return null;
   return (
     <section className="card p-4 mb-6" aria-labelledby="adult-heading">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -155,29 +209,7 @@ export function AdultModePanel() {
 
       {mode && <WhereTextGoes mode={mode} />}
 
-      {mode?.safety_check && (
-        <p className="mt-3 text-xs text-ink-300" data-testid="safety-check-line">
-          {/* The sentence comes from the server (safety_check.note): what waits
-              while the check can't run depends on the mode. */}
-          {mode.safety_check.available ? (
-            <>
-              Safety check (<b>{shortModel(mode.safety_check.model)}</b>):{" "}
-              {mode.safety_check.note ||
-                "It checks prompts for minors before they're sent (about $0.0005 per new prompt)."}
-            </>
-          ) : (
-            <span className="text-amber-200">
-              Safety check (<b>{shortModel(mode.safety_check.model) || "the planner"}</b>):{" "}
-              {mode.safety_check.note || "It can't run right now, so sexual prompts are paused until it can."} Check
-              the planner in{" "}
-              <a href="/settings#models" className="underline">
-                Settings → Models
-              </a>
-              .
-            </span>
-          )}
-        </p>
-      )}
+      {mode?.safety_check && <SafetyCheckLine check={mode.safety_check} />}
       {mode?.safety_check?.picture_model !== undefined && (
         <p className="mt-1 text-xs text-ink-300" data-testid="picture-check-line">
           {mode.safety_check.picture_available === false ? (
@@ -198,6 +230,53 @@ export function AdultModePanel() {
           )}
         </p>
       )}
+      <SafetyMemory />
+    </section>
+  );
+}
+
+/** Whether the planner can check prompts for minors right now. The sentence
+ * comes from the server (safety_check.note): what waits while the check
+ * can't run depends on the mode (and on this deployment). */
+function SafetyCheckLine({ check }: { check: { model: string; available: boolean; note?: string } }) {
+  return (
+    <p className="mt-3 text-xs text-ink-300" data-testid="safety-check-line">
+      {check.available ? (
+        <>
+          Safety check (<b>{shortModel(check.model)}</b>):{" "}
+          {check.note || "It checks prompts for minors before they're sent (about $0.0005 per new prompt)."}
+        </>
+      ) : (
+        <span className="text-amber-200">
+          Safety check (<b>{shortModel(check.model) || "the planner"}</b>):{" "}
+          {check.note || "It can't run right now, so sexual prompts are paused until it can."} Check the planner in{" "}
+          <a href="/settings#models" className="underline">
+            Settings → Models
+          </a>
+          .
+        </span>
+      )}
+    </p>
+  );
+}
+
+/**
+ * Settings when adult content is turned off for this deployment: no switch,
+ * just whether the minors check can run and the refusals it remembers.
+ */
+export function SafetyCheckCard() {
+  const { mode } = useContentModeState();
+  if (!mode?.safety_check) return null;
+  return (
+    <section className="card p-4 mb-6" aria-labelledby="safety-heading">
+      <h2 id="safety-heading" className="text-lg font-medium">
+        Safety
+      </h2>
+      <p className="text-xs text-ink-400">
+        Runware&rsquo;s content check and Sogni&rsquo;s safe filter are always on, and prompts that sexualise minors
+        are refused.
+      </p>
+      <SafetyCheckLine check={mode.safety_check} />
       <SafetyMemory />
     </section>
   );
@@ -254,29 +333,57 @@ function WhereTextGoes({ mode }: { mode: ContentMode }) {
   );
 }
 
+/** The content settings couldn't be read. Neutral words on purpose: a clean
+ * deployment (no adult content) can fail to load too. */
+export function ContentLoadError({ onRetry, className }: { onRetry: () => void; className?: string }) {
+  return (
+    <div className={clsx("text-xs text-ink-400", className)} role="status" data-testid="content-load-error">
+      Couldn&rsquo;t load these settings.{" "}
+      <button type="button" className="underline" onClick={onRetry}>
+        Retry
+      </button>
+    </div>
+  );
+}
+
 /** The Adult mode setting, kept current when the switch (or a Cast mark) is
  * changed on the page. A failed refetch keeps the last good value. */
 export function useContentModeState(): { mode: ContentMode | null; failed: boolean; reload: () => void } {
   const [mode, setMode] = useState<ContentMode | null>(null);
   const [failed, setFailed] = useState(false);
-  const reload = () => {
-    api
-      .getContentMode()
-      .then((m) => {
-        setMode(m);
-        setFailed(false);
-      })
-      .catch(() => setFailed(true));
-  };
+  const read = useContentModeLoader(
+    (m) => {
+      setMode(m);
+      setFailed(false);
+    },
+    () => setFailed(true)
+  );
+  const reload = useCallback(() => read(true), [read]);
   useEffect(() => {
-    reload();
+    read(false);
     window.addEventListener("content-mode-changed", reload);
     return () => window.removeEventListener("content-mode-changed", reload);
-  }, []);
+  }, [read, reload]);
   return { mode, failed, reload };
 }
 
 /** The current Adult mode setting (null while loading or unavailable). */
 export function useContentMode(): ContentMode | null {
   return useContentModeState().mode;
+}
+
+/**
+ * Whether this deployment has adult content at all (ADULT_FEATURES): true or
+ * false once known, null while loading or when the setting can't be read.
+ * Show adult settings and hints only when it's true, so nothing flashes; hide
+ * shared controls (the API key switches, say) only when it's false.
+ */
+export function useAdultFeatures(): boolean | null {
+  const { mode } = useContentModeState();
+  return adultFeatures(mode);
+}
+
+/** The same, for a component that already reads the setting. */
+export function adultFeatures(mode: ContentMode | null): boolean | null {
+  return mode ? mode.available !== false : null;
 }

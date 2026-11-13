@@ -1,7 +1,13 @@
 "use client";
 import { useEffect, useState } from "react";
 import { AuthGate } from "@/components/AuthGate";
-import { AdultModePanel } from "@/components/AdultModePanel";
+import {
+  AdultModePanel,
+  adultFeatures,
+  ContentLoadError,
+  SafetyCheckCard,
+  useContentModeState,
+} from "@/components/AdultModePanel";
 import { ApiKeysPanel } from "@/components/ApiKeysPanel";
 import { ClipCheckPanel } from "@/components/ClipCheckPanel";
 import { ModelsPanel } from "@/components/ModelsPanel";
@@ -28,6 +34,10 @@ function Inner() {
   const [health, setHealth] = useState<Health | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Adult content on this deployment (null while loading or after a failed
+  // read: nothing adult shows, and a failed read offers a neutral retry).
+  const content = useContentModeState();
+  const adult = adultFeatures(content.mode);
 
   useEffect(() => {
     api.systemInfo().then(setInfo).catch((e) => setError(e.message));
@@ -57,7 +67,7 @@ function Inner() {
         className="sticky top-0 z-10 -mx-4 sm:mx-0 px-4 sm:px-0 py-2 mb-4 bg-ink-950/90 backdrop-blur-sm flex gap-2 overflow-x-auto"
       >
         {[
-          ["adult", "Adult content"],
+          ...(adult === true ? [["adult", "Adult content"]] : []),
           ["models", "Models"],
           ["clip-check", "Clip check"],
           ["prompting", "Prompting"],
@@ -75,9 +85,19 @@ function Inner() {
 
       {error && <div className="text-sm text-accent mb-4">{error}</div>}
 
-      <div id="adult" className="scroll-mt-16">
-        <AdultModePanel />
-      </div>
+      {adult === true && (
+        <div id="adult" className="scroll-mt-16">
+          <AdultModePanel />
+        </div>
+      )}
+      {adult === false && <SafetyCheckCard />}
+      {adult === null && content.failed && (
+        // Every panel that reads this setting tries again.
+        <ContentLoadError
+          onRetry={() => window.dispatchEvent(new Event("content-mode-changed"))}
+          className="card p-4 mb-6"
+        />
+      )}
 
       <div id="models" className="scroll-mt-16">
         <ModelsPanel />

@@ -185,6 +185,8 @@ class ProviderUnavailable(Exception):
             msg = f"{label} is turned off in Settings → API keys"
         elif reason == "unsupported":
             msg = f"{label} models aren't supported by this version of the app"
+        elif reason == "adult":
+            msg = "This model is turned off for this deployment (adult content)"
         else:
             msg = f"{label} isn't set up yet (no API key in Settings → API keys)"
         super().__init__(msg + (f" ({model})" if model else "") + ".")
@@ -253,7 +255,7 @@ def _row(name: str) -> dict:
         "name": spec.name,
         "label": spec.label,
         "env_var": spec.env_var,
-        "powers": spec.powers,
+        "powers": spec.powers if _adult_features() else spec.powers.split(", incl. uncensored")[0],
         "docs_url": spec.docs_url,
         "set": False,
         "source": "none",
@@ -276,9 +278,15 @@ def _row(name: str) -> dict:
     row["enabled"] = enabled(name)
     row["enabled_default"] = spec.default_enabled  # True, or None: on once a key is set
     row["enabled_explicit"] = exp is not None
-    if spec.options:
+    if spec.options and _adult_features():  # a clean deployment: no switch to show
         row["options"] = {opt: option(name, opt) for opt, _ in spec.options}
     return row
+
+
+def _adult_features() -> bool:
+    from .content_mode import features
+
+    return features()
 
 
 def option(name: str, opt: str) -> bool:
@@ -288,6 +296,8 @@ def option(name: str, opt: str) -> bool:
     fields = dict(spec.options)
     if opt not in fields:
         raise KeyError(f"unknown option {opt!r} for {name}")
+    if opt in ("check_content", "safe_filter") and not _adult_features():
+        return True  # a clean deployment: Runware's content check and Sogni's safe filter are always on
     from .model_registry import get_setting
 
     rec = get_setting(OPTIONS_PREFIX + name)

@@ -18,10 +18,15 @@ picture of a Cast character keeps Sogni's safe filter and Runware's content
 check on, unless adult mode is on and the character is marked "adult
 content allowed" (then the pictures on its card that the safety check
 looked at skip them, however they were made).
+
+ADULT_FEATURES=false (a clean deployment): adult mode is locked off, ticks
+are ignored (and no picture check is queued for them), every filter is on
+and the API refuses to turn any of it on.
 """
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Iterable, Optional
@@ -57,7 +62,56 @@ def explicit() -> Optional[bool]:
     return bool(rec["enabled"]) if isinstance(rec, dict) and "enabled" in rec else None
 
 
+def features() -> bool:
+    """False on a clean deployment (ADULT_FEATURES=false): no adult content
+    at all, whatever ADULT_MODE or the saved switch say."""
+    return bool(get_settings().adult_features)
+
+
+# Words a model's id, name or description uses when it is made for adult
+# content (e.g. a chat model that calls itself "Uncensored").
+_ADULT_WORDS = re.compile(r"\b(uncensored|nsfw|spicy|abliterated|erotic)\b", re.I)
+
+
+def looks_adult(*texts: Optional[str]) -> bool:
+    """True when any of `texts` says the model is uncensored or adult-only."""
+    return any(t and _ADULT_WORDS.search(str(t)) for t in texts)
+
+
+def _base_id(model_id: str) -> str:
+    """A model id compared the way providers route it: case-insensitive and
+    without an OpenRouter variant suffix (":nitro", ":floor", ":free"...),
+    which reaches the same model."""
+    return (model_id or "").strip().lower().split(":", 1)[0]
+
+
+def adult_text_ids() -> frozenset[str]:
+    """The text models adult mode switches to (ADULT_TEXT_MODEL and
+    ADULT_TEXT_FALLBACK_MODEL), as base ids (see _base_id), empty ones left
+    out. On a clean deployment they are adult-only even though their names
+    don't say so."""
+    s = get_settings()
+    return frozenset(_base_id(m) for m in (s.adult_text_model, s.adult_text_fallback_model)
+                     if m and m.strip())
+
+
+def is_adult_text_model(model_id: Optional[str]) -> bool:
+    """One of the adult text models, whatever its case or variant suffix."""
+    return bool(model_id) and _base_id(str(model_id)) in adult_text_ids()
+
+
+def adult_entry(e: dict) -> bool:
+    """A catalog entry marked uncensored, or whose id, name or description
+    says so, or one of the adult text models. Hidden and refused on a clean
+    deployment."""
+    return (bool(e.get("uncensored"))
+            or looks_adult(e.get("id"), e.get("name"), e.get("description"))
+            or is_adult_text_model(e.get("id")))
+
+
 def adult_mode() -> bool:
+    if not features():
+        return False
     exp = explicit()
     return bool(get_settings().adult_mode) if exp is None else exp
 
@@ -108,7 +162,10 @@ CHECKING_TTL_SECONDS = 15 * 60
 
 def _tick_rows() -> dict[int, dict]:
     """Every tick row that is switched on, by character id. A failed read
-    marks nobody (filters stay on)."""
+    marks nobody (filters stay on), and so does a clean deployment
+    (ADULT_FEATURES=false)."""
+    if not features():
+        return {}
     from .. import models
     from ..db import SessionLocal
 
@@ -194,7 +251,10 @@ def tick_pictures(avatar) -> list:  # noqa: ANN001 — models.Avatar
 
 def tick_row(avatar_id: int) -> Optional[dict]:
     """This character's tick row when it is switched on (held or not), else
-    None. A failed read is None."""
+    None. A failed read is None, and so is every row on a clean deployment
+    (ADULT_FEATURES=false)."""
+    if not features():
+        return None
     from .model_registry import get_setting
 
     try:
@@ -359,6 +419,8 @@ def tick_if_unchanged(avatar_id: int, before: Optional[dict], *, card: str, asse
     from ..db import SessionLocal
     from .model_registry import put_setting
 
+    if not features():  # a clean deployment: nothing can be ticked
+        return False
     key = f"{ADULT_OK_PREFIX}{int(avatar_id)}"
     ids = {int(a) for a in assets}
     value = {"enabled": True, "at": datetime.now(timezone.utc).isoformat(), "card": card,
@@ -474,7 +536,20 @@ def status() -> dict:
     from .model_registry import active_model
 
     s = get_settings()
+    if not features():  # a clean deployment: nothing to show or switch
+        return {
+            "available": False,
+            "adult": False,
+            "default": False,
+            "explicit": False,
+            "text_model": "",
+            "planner": active_model("chat"),
+            "safety_check": _safety_check(),
+            "adult_ok_avatars": [], "adult_ok_unchecked": {}, "adult_ok_declined": {},
+            "adult_ok_checking": [], "adult_ok_notices": {}, "adult_ok_stale": [],
+        }
     return {
+        "available": True,
         "adult": adult_mode(),
         "default": bool(s.adult_mode),
         "explicit": explicit() is not None,

@@ -691,6 +691,8 @@ export type EnhanceKind = "image" | "video" | "script" | "scene";
 
 /** Adult mode (Settings → Adult content). */
 export type ContentMode = {
+  /** false: adult content is turned off for this deployment (ADULT_FEATURES=false); hide every adult setting. */
+  available?: boolean;
   adult: boolean;
   /** ADULT_MODE: what null goes back to. */
   default: boolean;

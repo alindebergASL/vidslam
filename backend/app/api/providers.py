@@ -122,7 +122,14 @@ def _merged(kind: str, provider_list) -> list[dict]:
     extra = [m for m in _catalog_entries(kind) if m["id"] not in seen]
     if not base and not extra and not switched_off:
         raise HTTPException(502, f"failed to list {kind} models")
-    return _priced(kind, base + extra)
+    entries = base + extra
+    from ..services import content_mode
+
+    if not content_mode.features():
+        # A clean deployment lists no adult-only model, including the ones a
+        # provider reports live (they would be refused anyway).
+        entries = [m for m in entries if not content_mode.adult_entry(m)]
+    return _priced(kind, entries)
 
 
 @router.get("/openrouter/video-models")

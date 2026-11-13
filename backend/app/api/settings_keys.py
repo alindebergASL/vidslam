@@ -30,6 +30,12 @@ USER_AGENT = "vidslam/1.0"
 _PROBE_TIMEOUT = 15.0
 
 
+def _bool_or_null(v: object) -> bool:
+    """True for a real JSON true/false or null. Numbers such as 0 and 1 are
+    refused: Python treats 1 as equal to True, which would let them through."""
+    return v is None or type(v) is bool
+
+
 def _known(name: str) -> str:
     if name not in provider_keys.KEYS:
         raise HTTPException(404, "unknown provider key")
@@ -75,7 +81,7 @@ async def put_enabled(name: str, request: Request) -> dict:
         body = json.loads((await request.body()) or b"null")
     except (ValueError, UnicodeDecodeError):
         body = None
-    if not isinstance(body, dict) or "enabled" not in body or body["enabled"] not in (True, False, None):
+    if not isinstance(body, dict) or "enabled" not in body or not _bool_or_null(body["enabled"]):
         raise HTTPException(422, 'body must be JSON: {"enabled": true | false | null}')
     row = provider_keys.set_enabled(name, body["enabled"])
     row["in_use"] = _in_use(name) if row["enabled"] is False else []
@@ -94,8 +100,13 @@ async def put_options(name: str, request: Request) -> dict:
     except (ValueError, UnicodeDecodeError):
         body = None
     if not isinstance(body, dict) or not body or any(
-            k not in allowed or v not in (True, False, None) for k, v in body.items()):
+            k not in allowed or not _bool_or_null(v) for k, v in body.items()):
         raise HTTPException(422, f"body must be JSON with options {sorted(allowed) or '(none)'}: true | false | null")
+    if body.get("check_content") is False or body.get("safe_filter") is False:
+        from ..services import content_mode
+
+        if not content_mode.features():
+            raise HTTPException(403, "Adult content is turned off for this deployment.")
     row: dict = {}
     for k, v in body.items():
         row = provider_keys.set_option(name, k, v)

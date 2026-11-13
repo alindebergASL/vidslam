@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
-import { useContentMode } from "@/components/AdultModePanel";
+import { adultFeatures, useContentMode } from "@/components/AdultModePanel";
 import { api, ActiveModel, CatalogEntry, ModelCatalog, ModelKind } from "@/lib/api";
 
 const KINDS: { id: ModelKind; label: string; hint: string }[] = [
@@ -271,7 +271,7 @@ export function ModelsPanel() {
               Only usable with my keys
             </label>
           </div>
-          {kind === "chat" && contentMode?.adult && (
+          {kind === "chat" && adultFeatures(contentMode) === true && contentMode?.adult && (
             <p role="note" className="text-[11px] text-amber-300 mb-2">
               Adult mode is on: storyboard planning, ✨ Enhance and scene rewrites use {contentMode.text_model}. The
               planner chosen here applies while Adult mode is off (Settings → Adult content).
