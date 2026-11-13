@@ -87,7 +87,8 @@ function Inner() {
 
       {adult === true && (
         <div id="adult" className="scroll-mt-16">
-          <AdultModePanel />
+          {/* Reuses this page's read so the card doesn't wait for a second one. */}
+          <AdultModePanel initial={content.mode} />
         </div>
       )}
       {adult === false && <SafetyCheckCard />}

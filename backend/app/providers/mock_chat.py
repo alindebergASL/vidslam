@@ -39,6 +39,11 @@ VISION_CALLS: list[tuple[str, int]] = []
 MINOR_REPLY: dict | BaseException | None = None
 # Every mock safety-check call (the text sent), for tests.
 MINOR_CALLS: list[str] = []
+# The mock content check of a clean deployment: a verdict dict ({"explicit":
+# True, "reason": ...}) or an exception tests set; None = a word list
+# (safety.is_hard_sexual). Every text it was asked about, for tests.
+EXPLICIT_REPLY: dict | BaseException | None = None
+EXPLICIT_CALLS: list[str] = []
 # The mock picture check (Cast pictures before a tick, and pictures added
 # to a ticked card): the asset ids it was asked about, and a reply tests
 # can set ({"minor": bool, "reason"}, an exception, or a function of the
@@ -89,6 +94,20 @@ class MockChatProvider(ChatProvider):
         if MINOR_REPLY is not None:
             return dict(MINOR_REPLY)
         return mock_minor_verdict(text)
+
+    def classify_explicit(self, text: str) -> dict:
+        """Deterministic: explicit when a plainly sexual word is in the text
+        (safety.is_hard_sexual), unless EXPLICIT_REPLY is set."""
+        from ..services.safety import is_hard_sexual
+
+        EXPLICIT_CALLS.append(text)
+        if isinstance(EXPLICIT_REPLY, BaseException):
+            raise EXPLICIT_REPLY
+        if EXPLICIT_REPLY is not None:
+            return dict(EXPLICIT_REPLY)
+        if is_hard_sexual(text):
+            return {"explicit": True, "reason": "A sexual word."}
+        return {"explicit": False, "reason": "Nothing sexual."}
 
     def inspect_images(self, *, system: str, text: str, images: list[str],
                        note: str = "clip check", estimate: float = 0.0) -> str:

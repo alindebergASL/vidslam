@@ -49,6 +49,8 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     _mcheck.reset_cache()
     _mc.MINOR_REPLY = None
     _mc.MINOR_CALLS.clear()
+    _mc.EXPLICIT_REPLY = None
+    _mc.EXPLICIT_CALLS.clear()
     _mc.PICTURE_REPLY = None
     _mc.PICTURE_CALLS.clear()
 

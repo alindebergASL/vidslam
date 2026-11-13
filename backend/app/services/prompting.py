@@ -305,4 +305,10 @@ def enhance(text: str, kind: str, model: str = "") -> dict:
         _check(kind, out, rewrite=True)
     except ValueError:
         raise EnhanceRefused(used, "unsafe_rewrite", adult) from None
+    if kind == "script":
+        # A clean deployment: a rewritten script is voiced, so an explicit
+        # one is refused (explicit_check.ExplicitContentError: a plain 422).
+        from . import explicit_check
+
+        explicit_check.check(out)
     return {"text": out, "model": used}

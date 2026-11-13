@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { api, ContentMode } from "@/lib/api";
 import { useToast } from "@/components/Toaster";
 import { SafetyMemory } from "@/components/SafetyMemory";
+import { createLoadOrder } from "@/lib/loadOrder";
 
 /** "deepseek/deepseek-v4-flash" → "deepseek-v4-flash". */
 export function shortModel(id: string): string {
@@ -40,21 +41,19 @@ function fetchContentMode(fresh: boolean): Promise<ContentMode> {
  * the one already shown is dropped, so a slow read sent before a save can't
  * put back what the save changed. */
 function useContentModeLoader(onLoad: (m: ContentMode) => void, onFail: (e: any) => void) {
-  const sent = useRef(0);
-  const shown = useRef(0);
+  const order = useRef<ReturnType<typeof createLoadOrder> | null>(null);
+  if (!order.current) order.current = createLoadOrder();
   const cbs = useRef({ onLoad, onFail });
   cbs.current = { onLoad, onFail };
   return useCallback((fresh: boolean) => {
-    const n = ++sent.current;
+    const o = order.current!;
+    const n = o.next();
     fetchContentMode(fresh).then(
       (m) => {
-        if (n < shown.current) return;
-        shown.current = n;
-        cbs.current.onLoad(m);
+        if (o.acceptSuccess(n)) cbs.current.onLoad(m);
       },
       (e) => {
-        if (n < shown.current) return;
-        cbs.current.onFail(e);
+        if (o.acceptFailure(n)) cbs.current.onFail(e);
       }
     );
   }, []);
@@ -67,9 +66,12 @@ function useContentModeLoader(onLoad: (m: ContentMode) => void, onFail: (e: any)
  * the planner and the filters on. Also says where prompts are sent. Other
  * panels listen for "content-mode-changed".
  */
-export function AdultModePanel() {
+export function AdultModePanel({ initial = null }: { initial?: ContentMode | null } = {}) {
   const toast = useToast();
-  const [mode, setMode] = useState<ContentMode | null>(null);
+  // The page that shows this panel has usually just read the setting: start
+  // from that answer instead of reading it again, so the card is complete
+  // from the first paint.
+  const [mode, setMode] = useState<ContentMode | null>(initial);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -81,8 +83,9 @@ export function AdultModePanel() {
     (e) => setError(e?.message || "Couldn't load the adult content setting")
   );
   const load = () => read(true);
+  const hadInitial = useRef(initial !== null);
   useEffect(() => {
-    read(false);
+    if (!hadInitial.current) read(false);
     // The planner changed in Models (or the switch elsewhere): re-read.
     const again = () => read(true);
     window.addEventListener("content-mode-changed", again);

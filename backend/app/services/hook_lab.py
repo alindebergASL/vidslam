@@ -209,6 +209,15 @@ def check_opening(db: Session, base: models.Render, hook: str, window: Optional[
         heard_checks(db, base, hook, window)
     except UnsafeScriptError as e:
         raise HookLabError(f"This opening can't be used: {e} {HEARD_NOTE}", 422) from None
+    from . import explicit_check
+
+    if explicit_check.active():
+        # A clean deployment: no explicit opening, and nothing explicit in
+        # the original voiceover heard after it.
+        try:
+            explicit_check.check(f"{hook or ''} {base_script(db, base)}")
+        except UnsafeScriptError as e:
+            raise HookLabError(f"This opening can't be used: {e}", 422) from None
 
 
 def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> None:

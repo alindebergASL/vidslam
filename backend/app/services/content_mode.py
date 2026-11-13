@@ -78,11 +78,48 @@ def looks_adult(*texts: Optional[str]) -> bool:
     return any(t and _ADULT_WORDS.search(str(t)) for t in texts)
 
 
+# Providers whose model ids use ":" inside the id itself (Runware's
+# "runware/runware:107@1"), so it isn't a variant suffix there.
+_OWN_COLON_PREFIXES = ("runware/", "sogni/")
+
+
 def _base_id(model_id: str) -> str:
     """A model id compared the way providers route it: case-insensitive and
     without an OpenRouter variant suffix (":nitro", ":floor", ":free"...),
     which reaches the same model."""
-    return (model_id or "").strip().lower().split(":", 1)[0]
+    m = (model_id or "").strip().lower()
+    if m.startswith(_OWN_COLON_PREFIXES):
+        return m
+    return m.split(":", 1)[0]
+
+
+def _family(model_id: Optional[str]) -> str:
+    """The provider and model family of an id, e.g. "deepseek/deepseek" for
+    "deepseek/deepseek-v4.1-flash:nitro" ("" when it has no "provider/")."""
+    provider, _, name = _base_id(str(model_id or "")).lstrip("~").partition("/")
+    head = re.split(r"[-._: ]", name, maxsplit=1)[0]
+    return f"{provider}/{head}" if provider and head else ""
+
+
+def adult_text_families() -> frozenset[str]:
+    """The model families of ADULT_TEXT_MODEL and ADULT_TEXT_FALLBACK_MODEL,
+    and of their built-in defaults (so blanking a setting doesn't bring the
+    default family back)."""
+    from ..config import Settings
+
+    s = get_settings()
+    fields = Settings.model_fields
+    ids = (s.adult_text_model, s.adult_text_fallback_model,
+           fields["adult_text_model"].default, fields["adult_text_fallback_model"].default)
+    return frozenset(f for f in (_family(m) for m in ids if m and str(m).strip()) if f)
+
+
+def in_adult_text_family(model_id: Optional[str]) -> bool:
+    """Another model of the adult text models' family (any version or size).
+    On a clean deployment none of them may write text: it is the same
+    family that wrote adult prompts where other planners refused."""
+    fam = _family(model_id)
+    return bool(fam) and fam in adult_text_families()
 
 
 def adult_text_ids() -> frozenset[str]:

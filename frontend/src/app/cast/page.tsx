@@ -973,7 +973,15 @@ function AdultOkCard({ avatarId, name }: { avatarId: number; name: string }) {
   // Shown only once the server says this deployment has adult features:
   // while that is unknown nothing about it appears, so a clean deployment
   // never mentions it. A failed read offers a retry in neutral words.
-  if (!mode) return failed ? <ContentLoadError onRetry={reload} className="card p-4 mb-4" /> : null;
+  // Retry asks every reader on the page again (the card text editor's tick
+  // hint too), as the Settings page's retry does, not only this card.
+  if (!mode)
+    return failed ? (
+      <ContentLoadError
+        onRetry={() => window.dispatchEvent(new Event("content-mode-changed"))}
+        className="card p-4 mb-4"
+      />
+    ) : null;
   if (adultFeatures(mode) !== true) return null;
   const pictureModel = shortModel(mode.safety_check?.picture_model || "") || "the picture model";
   const planner = shortModel(mode.safety_check?.model || mode.planner) || "the planner";

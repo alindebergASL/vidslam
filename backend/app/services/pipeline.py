@@ -314,6 +314,26 @@ def _check_plan(plan: StoryboardPlan) -> None:
             seen.add(key)
             check_generation(key[0], key[1], kind="video")
     check_generation(plan.cleaned_voice_script or "", kind="script")
+    # A clean deployment: no explicit words in the video, whatever the
+    # planner wrote.
+    from . import explicit_check
+
+    if explicit_check.active():
+        explicit_check.check(*explicit_check.plan_texts(plan.model_dump()))
+
+
+def _check_kept_edits(project: models.VideoProject) -> None:
+    """"Keep my edits" keeps the Voiceover & captions card's words and the
+    shots' captions over the new plan: on a clean deployment they get the
+    explicit-content check too (they may have been saved before it)."""
+    from . import explicit_check
+
+    if not explicit_check.active():
+        return
+    old = project.generated_plan_json or {}
+    kept = {k: old[k] for k in ("cleaned_voice_script", "hook", "end_card_text", "caption_chunks") if k in old}
+    explicit_check.check(*explicit_check.plan_texts(kept),
+                         "\n".join(s.caption_text or "" for s in project.shots))
 
 
 def claim_held(db: Session, project_id: int, claim: str, token: Optional[str] = None) -> bool:
@@ -403,6 +423,8 @@ def generate_plan(
         cast = _build_cast_context(db, project)
         plan = chat.generate_storyboard(project=_project_dict(project), cast=cast)
         _check_plan(plan)
+        if preserve_edits:
+            _check_kept_edits(project)
     except Exception as e:  # noqa: BLE001
         db.rollback()
         # Cancelled (or replaced) while the planner ran: leave that state.
@@ -2109,6 +2131,18 @@ def _compose(
     from .renderer import _probe_duration
 
     look = settings if settings is not None else compose_settings(db, project, plan)
+    # A clean deployment, a last check before anything is drawn: the end
+    # card, the disclosure and the captions may have been changed since the
+    # plan was checked. Fails the render when refused.
+    from . import explicit_check
+
+    if explicit_check.active():
+        # The spoken script too: a Re-compose reuses an older voiceover (no
+        # new voice is made, so the voice check never runs) and says what
+        # that audio says, which may differ from the captions.
+        spoken = script if script is not None else (plan.cleaned_voice_script if plan is not None else "")
+        explicit_check.check(look["cta_text"], look["disclosure_text"], hook_text,
+                             "\n".join(t.text for t in timed), spoken or "")
     project_dir = storage.render_subdir(project.id)
     look = keep_music(look, project_dir, render.id)
     voice = voice_identity(db, project, audio, voice_fingerprint)

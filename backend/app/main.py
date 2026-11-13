@@ -111,29 +111,85 @@ def _repair_image_types() -> None:
             cast_pictures.picture_added(avatar_id)
 
 
+def _adult_leftovers(db) -> tuple[list[str], list[str]]:
+    """What in this database was set up for adult content and is still on:
+    the Adult content switch turned on, character ticks that still hold,
+    saved model picks that are adult-only, and provider content filters
+    switched off. Each named, for the startup warning. Returns (found,
+    parts that could not be checked); one failing part never hides the
+    others."""
+    from . import models
+    from .services import content_mode, model_registry, provider_keys
+
+    found: list[str] = []
+    skipped: list[str] = []
+
+    def switch() -> None:
+        if get_settings().adult_mode:
+            found.append("ADULT_MODE is set in the environment (ignored here)")
+        row = db.get(models.AppSetting, content_mode.KEY)
+        if row and isinstance(row.value, dict) and row.value.get("enabled") is True:
+            found.append("the Adult content switch in Settings is on")
+
+    def ticks() -> None:
+        prefix = content_mode.ADULT_OK_PREFIX
+        rows: dict[int, dict] = {}
+        for r in db.query(models.AppSetting).filter(models.AppSetting.key.like(f"{prefix}%")).all():
+            tail = r.key[len(prefix):]
+            if tail.isdigit() and isinstance(r.value, dict) and r.value.get("enabled") is True:
+                rows[int(tail)] = r.value
+        held = content_mode._holding(rows)[0] if rows else {}
+        if held:
+            names = {a.id: a.name for a in db.query(models.Avatar).filter(models.Avatar.id.in_(list(held))).all()}
+            found.extend(f"character {names.get(i) or '?'} (id {i}) is ticked for adult content"
+                         for i in sorted(held))
+
+    def picks() -> None:
+        for kind in model_registry.KINDS:
+            rec = db.get(models.AppSetting, f"model.{kind}")
+            sel = rec.value.get("model") if rec and isinstance(rec.value, dict) else None
+            if sel and model_registry.adult_only(sel, kind):
+                found.append(f"the saved {kind} model {sel} is adult-only")
+
+    def filters() -> None:
+        for name, opt, label in (("runware", "check_content", "Runware content check"),
+                                 ("sogni", "safe_filter", "Sogni safe filter")):
+            rec = db.get(models.AppSetting, provider_keys.OPTIONS_PREFIX + name)
+            if rec and isinstance(rec.value, dict) and rec.value.get(opt) is False:
+                found.append(f"the {label} is saved as off")
+
+    for label, part in (("adult switch", switch), ("character ticks", ticks),
+                        ("model picks", picks), ("provider filters", filters)):
+        try:
+            part()
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            skipped.append(f"{label} ({e})")
+    return found, skipped
+
+
 def _warn_adult_leftovers() -> None:
     """On a clean deployment (ADULT_FEATURES=false), warn when the database
-    was used with adult content before (it has saved Adult content settings):
-    its pictures, videos and prompts stay visible. A clean deployment should
+    was set up for adult content before (see _adult_leftovers): its
+    pictures, videos and prompts stay visible. A clean deployment should
     start from an empty database and data folder. A warning only; never
     blocks startup."""
     try:
         if get_settings().adult_features:
             return
-        from . import models
-
         db = SessionLocal()
         try:
-            n = (db.query(models.AppSetting)
-                 .filter(models.AppSetting.key.like("content.adult%")).count())
+            found, skipped = _adult_leftovers(db)
         finally:
             db.close()
-        if n:
+        if found:
             log.warning(
-                "ADULT_FEATURES=false, but this database has %d saved Adult content setting(s): "
-                "it was used with adult content, and the pictures, videos and prompts made then "
-                "are still shown. A clean deployment should start from an empty database and "
-                "data folder, not a copy of one that allowed adult content.", n)
+                "ADULT_FEATURES=false, but this database was set up for adult content: %s. "
+                "The pictures, videos and prompts made then are still shown. A clean deployment "
+                "should start from an empty database and data folder, not a copy of one that "
+                "allowed adult content.", "; ".join(found))
+        if skipped:
+            log.warning("adult content leftover check skipped: %s", "; ".join(skipped))
     except Exception as e:  # noqa: BLE001
         log.warning("adult content leftover check skipped: %s", e)
 

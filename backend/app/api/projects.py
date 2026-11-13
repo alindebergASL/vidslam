@@ -177,6 +177,28 @@ def _adopt_old_voiceover(db: Session, project: models.VideoProject) -> None:
     adopt_unfingerprinted_voiceover(db, project)
 
 
+def _check_shown_words(project: models.VideoProject, body: ProjectUpdate) -> None:
+    """A clean deployment: the end card, the disclosure and a whole posted
+    storyboard (its script, opening, end card and captions) are shown in the
+    video or voiced, so a changed one gets the explicit-content check (a 422)."""
+    from ..services import explicit_check
+
+    if not explicit_check.active():
+        return
+    texts: list[str] = []
+    for field in ("cta_text", "disclosure_text"):
+        new = getattr(body, field)
+        if new is not None and new != getattr(project, field):
+            texts.append(new)
+    plan = body.generated_plan_json
+    if plan is not None and plan != project.generated_plan_json:
+        texts.extend(explicit_check.plan_texts(plan))
+        if isinstance(plan.get("disclosure_text"), str):
+            texts.append(plan["disclosure_text"])
+    if texts:
+        explicit_check.check_or_422(*texts)
+
+
 @router.patch("/projects/{project_id}", response_model=ProjectOut)
 def update_project(
     project_id: int, body: ProjectUpdate, db: Session = Depends(get_db)
@@ -185,6 +207,7 @@ def update_project(
     if p is None:
         raise HTTPException(404, "project not found")
     _refuse_clip_changes_while_busy(db, p, body)
+    _check_shown_words(p, body)
     _adopt_old_voiceover(db, p)
     for k, v in body.model_dump(exclude_none=True).items():
         if k != "voice_id":
@@ -233,6 +256,11 @@ def update_shot(
         prompt = changes.get("prompt", s.prompt) or ""
         negative = changes.get("negative_prompt", s.negative_prompt) or ""
         check_or_422(prompt, effective_negative("video", negative), kind="video")
+    if changes.get("caption_text") and changes["caption_text"] != s.caption_text:
+        # A clean deployment: the caption is shown and may be lip-synced.
+        from ..services import explicit_check
+
+        explicit_check.check_or_422(changes["caption_text"])
     if "duration_seconds" in changes and float(changes["duration_seconds"]) != float(s.duration_seconds or 0):
         # A new length moves every later shot's slice of the voiceover.
         refuse_while_busy(db, s.project, "Shot lengths")
@@ -262,6 +290,9 @@ def edit_plan(
         from ..services.minor_check import check_or_422
 
         check_or_422(script, kind="script")  # it is voiced and lip-synced
+        from ..services import explicit_check
+
+        explicit_check.check_or_422(script)  # a clean deployment: no explicit voiceover
         refuse_while_busy(db, project, "The spoken script")  # the voiceover is made from it
         _adopt_old_voiceover(db, project)
     if script is not None:
@@ -270,9 +301,17 @@ def edit_plan(
         plan.cleaned_voice_script = script
         plan.hook = first_sentence(script)
     if body.end_card_text is not None:
+        if body.end_card_text != plan.end_card_text:
+            from ..services import explicit_check
+
+            explicit_check.check_or_422(body.end_card_text)  # a clean deployment: shown on screen
         plan.end_card_text = body.end_card_text
         project.cta_text = body.end_card_text  # keep the project's end card in sync
     if body.disclosure_text is not None:
+        if body.disclosure_text != plan.disclosure_text:
+            from ..services import explicit_check
+
+            explicit_check.check_or_422(body.disclosure_text)  # a clean deployment: shown on screen
         plan.disclosure_text = body.disclosure_text
     project.generated_plan_json = plan.model_dump()
     if body.resync_captions:
