@@ -1161,12 +1161,30 @@ def extract_frame(src: Path, dst: Path, *, last: bool) -> Path:
     return dst
 
 
+def _frame_at(seconds: float) -> int:
+    """The first output frame (at FPS) whose time is not before `seconds`:
+    trimming by frame number, so a time on the frame grid (written with a
+    few decimals) never keeps or drops a frame by rounding."""
+    return max(0, math.ceil(seconds * FPS - 1e-6))
+
+
+def on_frame_grid(seconds: float) -> float:
+    """`seconds` rounded to whole output frames (at least one)."""
+    return max(1, round(seconds * FPS)) / FPS
+
+
 def join_graph(lengths: list[float], *, crossfade: float, width: int, height: int,
                sizes: Optional[list[Optional[tuple[int, int]]]] = None) -> str:
     """filter_complex text joining len(lengths) inputs with rounded linear
     dissolves of `crossfade` seconds; output label [out]. `sizes` (each
-    input's width x height, if known) lets near-frame shapes fill (fit_vf)."""
+    input's width x height, if known) lets near-frame shapes fill (fit_vf).
+    Trims are by output frame: a length on the FPS grid gives exactly
+    that many frames."""
     cf = crossfade
+
+    def trim(start: float, end: float) -> str:
+        return f"trim=start_frame={_frame_at(start)}:end_frame={_frame_at(end)}"
+
     n = len(lengths)
     sizes = list(sizes or []) + [None] * (n - len(sizes or []))
     parts: list[str] = []
@@ -1180,11 +1198,11 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
         norm = f"{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},format=yuv420p"
         parts.append(f"[{i}:v]{norm},split={len(outs)}{labels}" if len(outs) > 1 else f"[{i}:v]{norm}[b{i}]")
         parts[-1] = parts[-1].replace(f"[b{i}]", f"[bb{i}]")
-        parts.append(f"[bb{i}]trim=start={head_in:.4f}:end={L - tail_out:.4f},setpts=PTS-STARTPTS[body{i}]")
+        parts.append(f"[bb{i}]{trim(head_in, L - tail_out)},setpts=PTS-STARTPTS[body{i}]")
         if head_in:
-            parts.append(f"[h{i}]trim=start=0:end={cf:.4f},setpts=PTS-STARTPTS[head{i}]")
+            parts.append(f"[h{i}]{trim(0.0, cf)},setpts=PTS-STARTPTS[head{i}]")
         if tail_out:
-            parts.append(f"[t{i}]trim=start={L - cf:.4f}:end={L:.4f},setpts=PTS-STARTPTS[tail{i}]")
+            parts.append(f"[t{i}]{trim(L - cf, L)},setpts=PTS-STARTPTS[tail{i}]")
     for i in range(n):
         order.append(f"[body{i}]")
         if i < n - 1 and cf > 0:
@@ -1360,7 +1378,12 @@ def join_clips_with_audio(
     if size is None:
         raise RuntimeError("the first clip's size can't be read")
     width, height = join_size(size)
+    # Each clip laid on the output frame grid once: picture, sound and the
+    # dissolve all use these lengths, so the sound can't drift from the
+    # picture by a part-frame per clip.
+    lengths = [on_frame_grid(length) for length in lengths]
     cf = join_crossfade(lengths, transition, crossfade)
+    cf = on_frame_grid(cf) if cf > 0 else 0.0
     graph = join_graph(lengths, crossfade=cf, width=width, height=height,
                        sizes=[_probe_size(p) for p in clips])
     audio = any(has_audio)

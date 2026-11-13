@@ -38,6 +38,7 @@ import hashlib
 import math
 import shutil
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import BinaryIO, Optional, Union
@@ -364,13 +365,35 @@ def join_sources(db: Session, job_ids: list[int]) -> list[models.AssetGeneration
     return sources
 
 
-def join_busy(db: Session) -> bool:
-    """Whether JOIN_MAX_RUNNING joins are already queued or running."""
+def join_stale_after() -> timedelta:
+    """How long a join may stay queued or running: its ffmpeg time limit
+    for the longest join, and a margin. Older, it was orphaned (a killed
+    worker): it no longer holds one of the JOIN_MAX_RUNNING places, and
+    the sweeper fails it (sweepers.sweep_studio)."""
+    from .renderer import join_timeout
+
+    return timedelta(seconds=join_timeout(JOIN_MAX_SECONDS)) + timedelta(minutes=5)
+
+
+def joins_running(db: Session, *, up_to_id: Optional[int] = None, now: Optional[datetime] = None) -> int:
+    """Joins queued or running (touched within join_stale_after()); with
+    `up_to_id`, only those with that id or a lower one (queued before it)."""
+    from sqlalchemy import func
+
     from .pipeline import STUDIO_RUNNING
 
     Job = models.AssetGenerationJob
-    running = db.query(Job).filter(Job.operation == JOIN_OP, Job.status.in_(STUDIO_RUNNING)).count()
-    return running >= JOIN_MAX_RUNNING
+    since = (now or datetime.utcnow()) - join_stale_after()
+    q = db.query(Job).filter(Job.operation == JOIN_OP, Job.status.in_(STUDIO_RUNNING),
+                             func.coalesce(Job.updated_at, Job.created_at) >= since)
+    if up_to_id is not None:
+        q = q.filter(Job.id <= up_to_id)
+    return q.count()
+
+
+def join_busy(db: Session) -> bool:
+    """Whether JOIN_MAX_RUNNING joins are already queued or running."""
+    return joins_running(db) >= JOIN_MAX_RUNNING
 
 
 def parse_crossfade(transition: str, crossfade: Optional[float]) -> float:

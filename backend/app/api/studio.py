@@ -898,10 +898,20 @@ def _join(db: Session, job_ids: list[int], transition: str, crossfade: float, re
     first = sources[0]
     if not _owner_exists(db, first.owner_kind, first.owner_id):
         raise HTTPException(404, "owner not found")
+    busy = HTTPException(429, f"{video_ops.JOIN_MAX_RUNNING} joins are already running; "
+                              "try again when one has finished")
     if video_ops.join_busy(db):
-        raise HTTPException(429, f"{video_ops.JOIN_MAX_RUNNING} joins are already running; "
-                                 "try again when one has finished")
+        raise busy
     job = video_ops.new_join_job(sources, transition, crossfade)
+    # Stored first, then counted with the joins queued before it: of two
+    # requests that both passed the check above, the later one is over the
+    # cap and is removed before it is ever queued.
+    db.add(job)
+    db.commit()
+    if video_ops.joins_running(db, up_to_id=job.id) > video_ops.JOIN_MAX_RUNNING:
+        db.delete(job)
+        db.commit()
+        raise busy
     _enqueue_jobs(db, [job])
     db.refresh(job)
     response.status_code = 202

@@ -99,6 +99,27 @@ def test_sound_starting_after_the_picture_stays_in_sync(tmp_path):
     assert _mean_volume(out, 6.8, 1.0) > -40
 
 
+def test_clips_off_the_30fps_grid_keep_sound_and_picture_together(tmp_path):
+    """24 fps clips whose lengths aren't whole 30 fps frames: each clip is
+    laid on the output frame grid once, for picture and sound alike, so
+    the two don't drift apart over many joined clips."""
+    from app.services.renderer import FPS, _probe_clip, join_clips_with_audio
+
+    frames = [121, 50, 121, 79, 121, 50, 121, 79, 121, 50]  # at 24 fps
+    clips = {n: _video(tmp_path / f"c{n}.mp4", seconds=round(n / 24, 4), rate=24, audio=True)
+             for n in set(frames)}
+    lengths = [round(_probe_clip(clips[n])[0] * FPS) / FPS for n in frames]
+    assert all(abs(L * 24 - round(L * 24)) < 1e-3 and abs(L * FPS - round(L * FPS)) > 0.1
+               for L in (_probe_clip(c)[0] for c in clips.values()))  # not whole 30 fps frames
+    for transition, cf in (("cut", 0.0), ("dissolve", 0.5)):
+        out, seconds, _ = join_clips_with_audio([clips[n] for n in frames], tmp_path / f"{transition}.mp4",
+                                                transition=transition, crossfade=cf)
+        streams = _streams(out)
+        expected = sum(lengths) - (len(frames) - 1) * cf
+        assert streams["video"] == pytest.approx(expected, abs=1 / FPS + 0.01)
+        assert abs(streams["audio"] - streams["video"]) < 1 / FPS + 0.01, (transition, streams)
+
+
 def test_no_sound_anywhere_means_no_sound_track(tmp_path):
     from app.services.renderer import _probe_size, join_clips_with_audio
 
@@ -359,3 +380,105 @@ def test_joined_clip_is_at_most_1080p_and_ffmpeg_is_time_limited(tmp_path, monke
     with pytest.raises(RuntimeError, match="timed out"):
         renderer.join_clips_with_audio([big, big], tmp_path / "t.mp4")
     assert seen["timeout"] == 120
+
+
+def _join_row(owner_id: int, clip: int, *, status: str = "pending", age=None) -> int:
+    """A join job queued or running, last touched `age` ago (now if None)."""
+    from datetime import datetime
+
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        job = models.AssetGenerationJob(
+            owner_kind="avatar", owner_id=owner_id, output_kind="video_clip", prompt="Joined 2 clips",
+            negative_prompt="", reference_asset_ids_json=[], provider="local", provider_model="local/join",
+            operation="join_clips", options_json={"job_ids": [clip, clip]}, status=status)
+        if age is not None:
+            job.created_at = job.updated_at = datetime.utcnow() - age
+        db.add(job)
+        db.commit()
+        return job.id
+
+
+def _join_rows() -> int:
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        return db.query(models.AssetGenerationJob).filter(
+            models.AssetGenerationJob.operation == "join_clips").count()
+
+
+def test_two_requests_passing_the_check_together_queue_only_up_to_two(auth_client, tmp_path, monkeypatch):
+    """The busy check and the insert aren't one step: a request whose check
+    passed while another was being stored is counted again once stored, and
+    removed (429) when it is past the cap; nothing of it is queued."""
+    from app.api import studio
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4"), aid)
+    first = auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]}).json()
+    _join_row(aid, a)
+    _join_row(aid, a)  # two others were stored after this request's check
+    monkeypatch.setattr(video_ops, "join_busy", lambda db: False)
+    queued: list = []
+    monkeypatch.setattr(studio, "enqueue", lambda fn, *args: queued.append(args) or "q1")
+    rows = _join_rows()
+    r = auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]})
+    assert r.status_code == 429, r.text
+    assert auth_client.post(f"/api/studio/jobs/{first['id']}/retry").status_code == 429
+    assert _join_rows() == rows and queued == []
+
+
+def test_a_join_orphaned_by_a_killed_worker_stops_holding_a_place(auth_client, tmp_path):
+    from datetime import timedelta
+
+    from app.services.video_ops import join_stale_after
+
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4"), aid)
+    assert join_stale_after() == timedelta(minutes=65)
+    _join_row(aid, a, status="submitted", age=timedelta(hours=2))
+    _join_row(aid, a, status="pending", age=timedelta(hours=3))
+    _join_row(aid, a, status="submitted", age=timedelta(minutes=30))  # still running
+    assert auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]}).status_code == 202
+    _join_row(aid, a, status="submitted", age=timedelta(minutes=50))
+    assert auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]}).status_code == 429
+
+
+def test_sweeper_fails_an_orphaned_join_well_before_the_general_limit(auth_client, tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+
+    from app import models
+    from app.db import SessionLocal
+    from app.services import sweepers
+    from app.workers import queue
+
+    # The queued join's entry still waits (a busy worker): the general
+    # pending rule would leave it alone however long it waits.
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "queued")
+
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4"), aid)
+    orphan = _join_row(aid, a, status="submitted", age=timedelta(minutes=70))
+    queued = _join_row(aid, a, status="pending", age=timedelta(minutes=70))
+    running = _join_row(aid, a, status="submitted", age=timedelta(minutes=40))
+    with SessionLocal() as db:
+        other = models.AssetGenerationJob(  # a generated clip, not a join
+            owner_kind="avatar", owner_id=aid, output_kind="video_clip", prompt="x", negative_prompt="",
+            reference_asset_ids_json=[], provider="mock", provider_model="mock/video", status="submitted",
+            created_at=datetime.utcnow() - timedelta(minutes=70),
+            updated_at=datetime.utcnow() - timedelta(minutes=70))
+        db.add(other)
+        db.commit()
+        other_id = other.id
+    with SessionLocal() as db:
+        sweepers.sweep_studio(db)
+        status = {j.id: (j.status, j.error) for j in db.query(models.AssetGenerationJob).filter(
+            models.AssetGenerationJob.id.in_([orphan, queued, running, other_id]))}
+    assert status[orphan] == ("failed", "Stopped unexpectedly")
+    assert status[queued] == ("failed", "Stopped unexpectedly")
+    assert status[running][0] == "submitted"
+    assert status[other_id][0] == "submitted"  # not a join: the general limit
