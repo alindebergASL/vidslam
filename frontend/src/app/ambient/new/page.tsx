@@ -35,6 +35,7 @@ import {
   CostEstimate,
   DEFAULT_AMBIENT_CONFIG,
 } from "@/lib/api";
+import { AutoTextarea } from "@/components/AutoTextarea";
 
 const PREVIEW_RUN_KEY = "avs:preset-previews";
 // Stop waiting after this long (about 2 minutes per preview on the best model).
@@ -381,7 +382,7 @@ function Inner() {
             <label className="label mt-5" htmlFor="amb-prompt">
               {picture ? "Describe the motion (optional)" : "Scene description"}
             </label>
-            <textarea
+            <AutoTextarea
               id="amb-prompt"
               className="input min-h-[88px]"
               value={cfg.scene_prompt}
@@ -649,7 +650,7 @@ function Inner() {
                 <label className="label mt-4" htmlFor="amb-music-prompt">
                   Music prompt <span className="text-ink-400 normal-case tracking-normal">(optional)</span>
                 </label>
-                <input
+                <AutoTextarea
                   id="amb-music-prompt"
                   className="input"
                   value={cfg.music_prompt}

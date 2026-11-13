@@ -340,6 +340,87 @@ def _mux_audio_captions_overlays(
     return log
 
 
+# How far before a clip's end "the last frame" is taken: a seek to the very
+# end finds no frame to decode.
+LAST_FRAME_MARGIN = 0.05
+
+
+def _probe_video_duration(path: Path) -> float:
+    """Length of the first video stream; the file's length when the stream
+    doesn't say. Audio can outlast the picture, so the file's length alone
+    can point past the final frame."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
+                    "-show_entries", "stream=duration:stream_tags=DURATION", str(path)])
+    if rc == 0:
+        try:
+            stream = (json.loads(log).get("streams") or [{}])[0]
+        except ValueError:
+            stream = {}
+        raw = stream.get("duration")
+        if raw not in (None, "N/A"):
+            try:
+                if float(raw) > 0:
+                    return float(raw)
+            except ValueError:
+                pass
+        tag = (stream.get("tags") or {}).get("DURATION")  # Matroska keeps it here
+        if tag:
+            try:
+                h, m, sec = tag.split(":")
+                value = int(h) * 3600 + int(m) * 60 + float(sec)
+                if value > 0:
+                    return value
+            except ValueError:
+                pass
+    return _probe_duration(path)
+
+
+def extract_frame_at(src: Path, dst: Path, t: float) -> float:
+    """Write the frame `t` seconds into the video `src` to `dst` (a PNG, at
+    the video's own size, rotation applied). `t` is kept within
+    [0, video length - LAST_FRAME_MARGIN]. Returns the time used. Raises
+    RuntimeError when the file isn't a video ffmpeg can read."""
+    duration = _probe_video_duration(src)
+    if duration <= 0:
+        raise RuntimeError("couldn't read that video")
+    t = min(max(float(t), 0.0), max(duration - LAST_FRAME_MARGIN, 0.0))
+    # Some files stop a little before their stated length: step back a
+    # little, then decode up to `t` and keep the last frame that came out.
+    log = ""
+    for at in [t] + [x for x in (t - 0.25,) if x >= 0.0]:
+        dst.unlink(missing_ok=True)
+        rc, log = _run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.3f}", "-i", str(src),
+                        "-frames:v", "1", "-an", str(dst)])
+        if rc == 0 and dst.exists() and dst.stat().st_size > 0:
+            return round(at, 3)
+    dst.unlink(missing_ok=True)
+    rc, log = _run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-t", f"{t + LAST_FRAME_MARGIN:.3f}",
+                    "-an", "-update", "1", str(dst)])
+    if rc == 0 and dst.exists() and dst.stat().st_size > 0:
+        last = _probe_last_frame_time(src, t + LAST_FRAME_MARGIN)
+        return round(last if last is not None else t, 3)
+    raise RuntimeError(f"ffmpeg frame grab failed: {log[-2000:]}")
+
+
+def _probe_last_frame_time(src: Path, until: float) -> Optional[float]:
+    """Time of the last video frame at or before `until`, or None."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-read_intervals", f"%{until:.3f}",
+                    "-show_entries", "frame=pts_time,best_effort_timestamp_time", "-of", "csv=p=0", str(src)])
+    if rc != 0:
+        return None
+    best = None
+    for line in log.splitlines():
+        for part in line.split(","):
+            try:
+                v = float(part)
+            except ValueError:
+                continue
+            if v <= until and (best is None or v > best):
+                best = v
+            break
+    return best
+
+
 def _make_thumbnail(src: Path, dst: Path) -> str:
     cmd = [
         "ffmpeg", "-y", "-i", str(src), "-ss", "1.0", "-frames:v", "1",

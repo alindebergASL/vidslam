@@ -6,6 +6,7 @@ import { useToast } from "@/components/Toaster";
 import { checkBlockedWhy, checkCostText, InspectionChip, useClipCheckSettings } from "@/components/InspectionChip";
 import { shotTypeLabel } from "@/lib/labels";
 import { AddShotType, api, Project, Shot, ShotEdit, ShotEditImpact, Take, errorText } from "@/lib/api";
+import { AutoTextarea } from "@/components/AutoTextarea";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 const ADD_TYPES: AddShotType[] = ["b_roll", "hero", "talking_head", "transition"];
@@ -130,7 +131,7 @@ export function AddShotDialog({
       </div>
       <div>
         <label className="label" htmlFor="add-shot-prompt">Prompt</label>
-        <textarea
+        <AutoTextarea
           id="add-shot-prompt"
           className="input min-h-[80px]"
           value={prompt}

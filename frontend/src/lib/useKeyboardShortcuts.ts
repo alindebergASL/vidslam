@@ -33,6 +33,9 @@ const TYPING_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
 export function useKeyboardShortcuts(shortcuts: Shortcut[], deps: unknown[] = []): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // A key that confirms an input method's text (e.g. Enter while typing
+      // Japanese) belongs to that text, not to a shortcut.
+      if (e.isComposing) return;
       const target = e.target as HTMLElement | null;
       const typing =
         !!target &&

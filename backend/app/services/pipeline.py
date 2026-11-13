@@ -268,7 +268,10 @@ def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob]) ->
     else (None, None): a picture made in Studio is a new picture, not the
     character's. When the starting picture was deleted since, the
     operation's owner (copied from its source when it was made) says whose
-    it was, and the picture is None."""
+    it was, and the picture is None. A saved frame of a clip
+    ("extract_frame") leads back to the clip, a new picture like any
+    other: (None, None). One from an uploaded video has no source: its
+    owner, with no picture, so it never skips the filter either."""
     seen: set[int] = set()
     while job is not None and job.operation and job.id not in seen:
         seen.add(job.id)
@@ -2710,12 +2713,20 @@ def _finish_studio_image(db: Session, job: models.AssetGenerationJob, data: byte
 
 def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerationJob:
     """Remove the background of, or upscale, the job's source picture (a
-    Studio result or a Cast picture). No prompt, so no safety check: the
-    operation makes nothing new, it only cuts out or enlarges."""
+    Studio result or a Cast picture), or save a frame of a Studio clip. No
+    prompt, so no safety check: the operation makes nothing new, it only
+    cuts out, enlarges or copies a frame of a clip made from a checked
+    prompt (a frame of an uploaded video is checked before it is stored,
+    in the API: services/video_ops.py)."""
     from ..providers import get_image_op
-    from . import image_ops
+    from . import image_ops, video_ops
     from . import model_registry as reg
 
+    if job.operation == video_ops.OP:
+        # A frame of a Studio clip, queued because the API couldn't grab it
+        # itself (no ffmpeg there), or run again: grabbed here, free.
+        data, seconds = video_ops.grab_for_job(db, job)
+        return video_ops.finish(db, job, data, seconds)
     kind = image_ops.kind_for(job.operation)
     model = job.provider_model or reg.active_model(kind)
     provider = get_image_op(kind, model)

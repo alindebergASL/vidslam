@@ -22,6 +22,7 @@ import {
 } from "@/lib/api";
 import { fmtPrice, splitFirstSentence } from "@/lib/hook";
 import { usePoll } from "@/lib/usePoll";
+import { AutoTextarea } from "@/components/AutoTextarea";
 
 /**
  * Hook lab: other openings of a finished storyboard video. The first spoken
@@ -793,7 +794,7 @@ function LocalCard({
       <label className="sr-only" htmlFor={`text-${item.key}`}>
         Opening line
       </label>
-      <textarea
+      <AutoTextarea
         id={`text-${item.key}`}
         className="input min-h-[72px]"
         maxLength={300}
@@ -958,7 +959,7 @@ function DraftCard({
       <label className="sr-only" htmlFor={`text-${v.id}`}>
         Opening {v.label}
       </label>
-      <textarea
+      <AutoTextarea
         id={`text-${v.id}`}
         className="input min-h-[72px]"
         maxLength={300}
@@ -1171,7 +1172,7 @@ function Shot1Choice({
           <label className="text-[11px] text-ink-400 block" htmlFor={`prompt-${v.id}`}>
             What shot 1 should show
           </label>
-          <textarea
+          <AutoTextarea
             id={`prompt-${v.id}`}
             className="input min-h-[64px] text-xs"
             maxLength={2000}

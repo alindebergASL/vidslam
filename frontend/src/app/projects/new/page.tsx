@@ -5,6 +5,7 @@ import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { api, Avatar, BrandKit, CastMember, Ingredient, errorText } from "@/lib/api";
+import { AutoTextarea } from "@/components/AutoTextarea";
 
 const MODES = [
   { id: "reel_montage", label: "Reel Montage", desc: "2–5 short cuts (most reliable)" },
@@ -228,7 +229,8 @@ function Inner() {
 
         <div className="card p-4">
           <label className="label" htmlFor="new-project-script">Script</label>
-          <textarea
+          <AutoTextarea
+            maxHeight="60dvh"
             id="new-project-script"
             className="input min-h-[140px]"
             value={script}
@@ -261,7 +263,7 @@ function Inner() {
               </button>
             ))}
           </div>
-          <textarea
+          <AutoTextarea
             className="input min-h-[80px]"
             value={creativeDirection}
             onChange={(e) => setCreativeDirection(e.target.value)}

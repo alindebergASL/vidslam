@@ -50,6 +50,11 @@ EXPLICIT_CALLS: list[str] = []
 # asset id returning one of those or None). None: every picture is an adult.
 PICTURE_CALLS: list[int] = []
 PICTURE_REPLY = None
+# The mock picture content check of a clean deployment (a frame grabbed
+# from an uploaded video): a reply tests can set ({"explicit": bool,
+# "reason"} or an exception). None: nothing explicit. Every call counted.
+PICTURE_EXPLICIT_CALLS: list[str] = []
+PICTURE_EXPLICIT_REPLY: dict | BaseException | None = None
 
 # Signs of a child's look or setting that, with undressing or anything
 # sexual, mean a minor in a sexual context even with no minor word.

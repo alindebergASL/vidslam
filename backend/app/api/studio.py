@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
@@ -25,6 +25,7 @@ from ..schemas.api import (
     StudioBulkIds,
     StudioBulkSave,
     StudioBulkSaveOut,
+    StudioFrameRequest,
     StudioJobUpdate,
     StudioRemoveBackgroundRequest,
     StudioRetryRequest,
@@ -536,7 +537,7 @@ def bulk_favorite(body: StudioBulkFavorite, db: Session = Depends(get_db)) -> St
 
 @router.post("/jobs/{job_id}/retry", response_model=StudioJobOut, status_code=202,
              dependencies=[Depends(rate_limit("generation"))])
-def retry_job(job_id: int, body: Optional[StudioRetryRequest] = Body(None),
+def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest] = Body(None),
               db: Session = Depends(get_db)) -> StudioJobOut:
     """Run a job again as a new job (failed or completed alike), with any
     of model, prompt, avoid text and aspect changed."""
@@ -546,6 +547,13 @@ def retry_job(job_id: int, body: Optional[StudioRetryRequest] = Body(None),
     body = body or StudioRetryRequest()
     if not _owner_exists(db, src.owner_kind, src.owner_id):
         raise HTTPException(404, "owner not found")
+    if src.operation == "extract_frame":
+        # Grabs the same frame of the same clip again (free, no model).
+        if src.source_job_id is None:
+            raise HTTPException(409, "The uploaded video isn't kept; upload it again to save another frame")
+        from ..services import video_ops
+
+        return _frame_from_clip(db, src.source_job_id, video_ops.at_of(src), response)
     if src.operation:
         # Runs the same operation again on the same picture (the prompt,
         # avoid text and aspect don't apply); a model given replaces it.
@@ -773,3 +781,88 @@ def operation_models(op: Literal["remove_background", "upscale"]) -> list[ImageO
     from ..services import image_ops
 
     return [ImageOpModelOut(**m) for m in image_ops.models_for(op)]
+
+
+# ---------- save a frame of a video as a picture ----------
+
+
+def _frame_from_clip(db: Session, job_id: int, at, response: Response) -> StudioJobOut:
+    """A new Studio picture: the frame of a finished Studio clip at `at`.
+    Grabbed here and finished before answering (ffmpeg is in the API
+    image), else queued for the worker (202). Free: no model, no spend, no
+    budget cap. No new safety check: see services/video_ops.py."""
+    from ..services import video_ops
+
+    try:
+        src = video_ops.source_clip(db, job_id)
+    except video_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+    if not _owner_exists(db, src.owner_kind, src.owner_id):
+        raise HTTPException(404, "owner not found")
+    if not video_ops.ffmpeg_here():
+        job = video_ops.new_clip_job(db, src, at)
+        _enqueue_jobs(db, [job])
+        response.status_code = 202
+    else:
+        try:
+            data, seconds = video_ops.grab(Path(src.result_path), at)
+        except RuntimeError as e:
+            raise HTTPException(422, "Couldn't read a frame from that clip") from e
+        job = video_ops.new_clip_job(db, src, at, seconds=seconds)
+        job.status = "submitted"
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job = video_ops.finish(db, job, data, seconds)
+        response.status_code = 201
+    out = _with_costs(db, [job])[0]
+    out.batch_ids = [job.id]
+    return out
+
+
+@router.post("/jobs/{job_id}/frame-to-picture", response_model=StudioJobOut, status_code=201,
+             dependencies=[Depends(rate_limit("generation"))])
+def frame_to_picture(job_id: int, response: Response, body: Optional[StudioFrameRequest] = Body(None),
+                     db: Session = Depends(get_db)) -> StudioJobOut:
+    """Save a frame of a finished Studio clip ("first", "last" or a time in
+    seconds) as a new Studio picture owned by the clip's owner (free)."""
+    from ..services import video_ops
+
+    body = body or StudioFrameRequest()
+    try:
+        at = video_ops.parse_at(body.at)
+    except video_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+    return _frame_from_clip(db, job_id, at, response)
+
+
+@router.post("/frame-from-video", response_model=StudioJobOut, status_code=201,
+             dependencies=[Depends(rate_limit("generation"))])
+def frame_from_video(
+    file: UploadFile = File(...),
+    owner_kind: Literal["avatar", "ingredient"] = Form(...),
+    owner_id: int = Form(...),
+    at: str = Form("first", max_length=20),
+    db: Session = Depends(get_db),
+) -> StudioJobOut:
+    """Save a frame of a video uploaded from this device ("first", "last" or
+    a time in seconds) as a new Studio picture owned by `owner` (free).
+    The video isn't kept. The frame comes from outside the app, so the
+    picture safety check runs on it before it is stored, and refuses it
+    when it can't run (see services/video_ops.py)."""
+    from ..config import get_settings
+    from ..services import video_ops
+
+    if not _owner_exists(db, owner_kind, owner_id):
+        raise HTTPException(404, "owner not found")
+    if not video_ops.looks_like_video(file.content_type or "", file.filename or ""):
+        raise HTTPException(422, video_ops.NOT_A_VIDEO)
+    try:
+        job = video_ops.frame_from_upload(
+            db, owner_kind=owner_kind, owner_id=owner_id, file=file.file, filename=file.filename or "",
+            at=video_ops.parse_at(at), limit=get_settings().max_upload_bytes)
+    except video_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
+    out = _with_costs(db, [job])[0]
+    out.batch_ids = [job.id]
+    return out

@@ -2,11 +2,12 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import clsx from "clsx";
-import type { Asset, StudioJob } from "@/lib/api";
+import type { Asset, FrameAt, StudioJob } from "@/lib/api";
 import { costText, ranOnText, studioStatusLabel } from "@/components/StudioLibrary";
 import { downloadFile, extFromMime, extFromPath } from "@/lib/download";
 import { useToast } from "@/components/Toaster";
 import { sourceChipText } from "@/components/ImageOps";
+import { clockText } from "@/components/FrameFromVideo";
 
 /** One thing the viewer can show: a Studio result or a cast picture. */
 export type ViewerItem = {
@@ -51,6 +52,8 @@ export type ViewerActions = {
   sourceUrl?: (job: StudioJob) => string | null;
   /** Operation results: show the picture it was made from. */
   onOpenSource?: (job: StudioJob) => void;
+  /** Finished clips: save a frame ("first", "last" or the playhead's time) as a new picture. */
+  onSaveFrame?: (job: StudioJob, at: FrameAt) => void;
 };
 
 /** Transparent pictures (cutouts) get a checkerboard behind them. */
@@ -121,12 +124,20 @@ export function StudioViewer({
   const [compare, setCompare] = useState(false);
   // An original that wouldn't load (deleted since): no Compare for it.
   const [brokenOriginal, setBrokenOriginal] = useState<string | null>(null);
+  // A clip paused here: the time "Save this frame" saves (null while it plays).
+  const [frameTime, setFrameTime] = useState<number | null>(null);
+  // Phone: the first/last frame buttons are shown.
+  const [moreFrames, setMoreFrames] = useState(false);
   // The key shown now, for returning focus to its tile on close.
   const keyRef = useRef(openKey);
   keyRef.current = openKey;
 
   const idx = items.findIndex((i) => i.key === openKey);
   const item = idx >= 0 ? items[idx] : null;
+  useEffect(() => {
+    setFrameTime(null);
+    setMoreFrames(false);
+  }, [openKey]);
   const prev = idx > 0 ? items[idx - 1] : null;
   const next = idx >= 0 && idx < items.length - 1 ? items[idx + 1] : null;
 
@@ -232,7 +243,10 @@ export function StudioViewer({
   const act = "chip text-xs py-1.5";
   const checker = mayBeTransparent(item);
   const fromText = job ? sourceChipText(job) : null;
-  const sourceOf = job?.operation && finished && actions.sourceUrl ? actions.sourceUrl(job) : null;
+  // A saved frame's source is a clip (or a video that wasn't kept): there is
+  // no picture to compare it with.
+  const sourceOf =
+    job?.operation && job.operation !== "extract_frame" && finished && actions.sourceUrl ? actions.sourceUrl(job) : null;
   const originalUrl = sourceOf && sourceOf !== brokenOriginal ? sourceOf : null;
   const showCompare = compare && Boolean(originalUrl) && Boolean(item.imageUrl);
   const isPicture = !isVideo && Boolean(item.imageUrl) && (item.kind === "asset" || finished);
@@ -347,6 +361,9 @@ export function StudioViewer({
           <video
             ref={videoRef}
             key={item.key}
+            onPause={(e) => setFrameTime(e.currentTarget.currentTime)}
+            onSeeked={(e) => e.currentTarget.paused && setFrameTime(e.currentTarget.currentTime)}
+            onPlay={() => setFrameTime(null)}
             // #t=0.1: a frame shows on iPhones even before it plays.
             src={`${item.videoUrl}#t=0.1`}
             className="max-w-full max-h-full object-contain"
@@ -506,7 +523,45 @@ export function StudioViewer({
               Remix
             </button>
           )}
-          {job && finished && (
+          {job && finished && isVideo && actions.onSaveFrame && (
+            <>
+              <button
+                onClick={() => {
+                  const v = videoRef.current;
+                  v?.pause();
+                  actions.onSaveFrame!(job, v ? Math.round(v.currentTime * 100) / 100 : "first");
+                }}
+                className={act}
+                title="Make a new picture from the frame showing now (free); pause where you want first"
+              >
+                Save this frame{frameTime !== null ? ` (${clockText(frameTime)})` : ""}
+              </button>
+              {/* On a phone the other frame buttons wait under More. */}
+              <button
+                type="button"
+                onClick={() => setMoreFrames((v) => !v)}
+                aria-expanded={moreFrames}
+                className={clsx(act, "sm:hidden")}
+              >
+                {moreFrames ? "Less" : "More…"}
+              </button>
+              <button
+                onClick={() => actions.onSaveFrame!(job, "last")}
+                className={clsx(act, !moreFrames && "max-sm:hidden")}
+                title="Make a new picture from the clip's last frame (free), e.g. to start the next clip from it"
+              >
+                Save last frame as picture
+              </button>
+              <button
+                onClick={() => actions.onSaveFrame!(job, "first")}
+                className={clsx(act, !moreFrames && "max-sm:hidden")}
+                title="Make a new picture from the clip's first frame (free)"
+              >
+                Save first frame
+              </button>
+            </>
+          )}
+          {job && finished && job.operation !== "extract_frame" && (
             <button onClick={closeThen(() => actions.onTryModel(job))} className={act}>
               Try another model…
             </button>

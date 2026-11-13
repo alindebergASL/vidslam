@@ -536,8 +536,10 @@ class StudioJobOut(BaseModel):
     missing_reference_ids: list[int] = Field(default_factory=list)
     # Picture operations: "" = generated from the prompt, else
     # "remove_background" | "upscale", made from a Studio picture
-    # (source_job_id) or a Cast picture (source_asset_id); options holds
-    # e.g. {"factor": 2}.
+    # (source_job_id) or a Cast picture (source_asset_id), or
+    # "extract_frame", a frame of a Studio clip (source_job_id) or of an
+    # uploaded video (no source: the video isn't kept); options holds
+    # e.g. {"factor": 2} or {"at": "last", "seconds": 4.95}.
     operation: str = ""
     source_job_id: Optional[int] = None
     source_asset_id: Optional[int] = None
@@ -647,6 +649,12 @@ class StudioUpscaleRequest(BaseModel):
     """Body for POST .../upscale; no model = the active one."""
     factor: Literal[2, 4] = 2
     model: Optional[str] = Field(None, max_length=300)
+
+
+class StudioFrameRequest(BaseModel):
+    """Body for POST .../frame-to-picture: which frame of the clip to save,
+    "first", "last" or a time in seconds (kept within the clip)."""
+    at: Literal["first", "last"] | float = "last"
 
 
 class ImageOpEstimateOut(BaseModel):
