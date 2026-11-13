@@ -35,7 +35,12 @@ from ..schemas.api import (
 )
 from ..services import provider_gate
 from ..services.model_registry import LOCAL_PREFIX
-from ..services.pipeline import STUDIO_DELETED, save_studio_result_as_asset
+from ..services.pipeline import (
+    STUDIO_DELETED,
+    options_with_audio,
+    save_studio_result_as_asset,
+    studio_clip_audio,
+)
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from ..services.storage import drop_reference_copy
@@ -152,6 +157,8 @@ def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int)
             provider_model=body.model or "",
             first_frame_job_id=body.first_frame_job_id,
             first_frame_asset_id=body.first_frame_asset_id,
+            # A clip keeps its sound choice (Retry and Try another model reuse it).
+            options_json=options_with_audio(None, body.audio) if output_kind == "video_clip" else None,
             status="pending",
         )
         for _ in range(count)
@@ -540,7 +547,7 @@ def bulk_favorite(body: StudioBulkFavorite, db: Session = Depends(get_db)) -> St
 def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest] = Body(None),
               db: Session = Depends(get_db)) -> StudioJobOut:
     """Run a job again as a new job (failed or completed alike), with any
-    of model, prompt, avoid text and aspect changed."""
+    of model, prompt, avoid text, aspect and (a clip's) sound changed."""
     src = _live_job(db, job_id)
     if src is None:
         raise HTTPException(404, "job not found")
@@ -581,6 +588,9 @@ def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest
         provider_model=model,
         first_frame_job_id=src.first_frame_job_id,
         first_frame_asset_id=src.first_frame_asset_id,
+        # A clip asks for sound as the one it remakes did, unless the body says.
+        options_json=(options_with_audio(None, studio_clip_audio(src) if body.audio is None else body.audio)
+                      if src.output_kind == "video_clip" else None),
         status="pending",
     )
     _check_safety(job.prompt, job.negative_prompt, job.output_kind)

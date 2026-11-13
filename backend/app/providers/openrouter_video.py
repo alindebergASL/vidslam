@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Optional
 
 import httpx
 
@@ -31,6 +32,13 @@ _models_cache: tuple[float, list[dict]] | None = None
 def _reset_models_cache() -> None:
     global _models_cache
     _models_cache = None
+
+
+def audio_support(row: Optional[dict]) -> Optional[bool]:
+    """Whether a model can make sound, from its /videos/models row
+    (`generate_audio`); None when the row doesn't say."""
+    value = (row or {}).get("generate_audio")
+    return value if isinstance(value, bool) else None
 
 
 class OpenRouterVideoProvider(VideoProvider):
@@ -125,6 +133,18 @@ class OpenRouterVideoProvider(VideoProvider):
                 )
         return fallback
 
+    def makes_audio(self, model: str) -> Optional[bool]:
+        """Whether `model` can make sound, per OpenRouter's model list; None
+        when the list can't be read or doesn't say."""
+        try:
+            rows = self._video_models()
+        except Exception as e:  # noqa: BLE001 — unknown, as with no listing
+            log.info("video model discovery failed: %s", e)
+            return None
+        model = model or self.model
+        row = next((m for m in rows if m.get("id") == model or m.get("canonical_slug") == model), None)
+        return audio_support(row)
+
     # ---- generation ----
 
     def submit(
@@ -174,15 +194,25 @@ class OpenRouterVideoProvider(VideoProvider):
                 ]
         if settings:
             body.update({k: v for k, v in settings.items() if v not in (None, "")})
-        if model in _ALWAYS_AUDIO:
-            body.pop("generate_audio", None)
+        if "generate_audio" in body:
+            body["generate_audio"] = want = bool(body["generate_audio"])
+            # Sound on is asked only of a model the list says can make it
+            # (others make what they make by default, which for one that
+            # can is sound); off goes to every model that may make sound.
+            # Never to one that can't, nor to one found to always make it.
+            can = self.makes_audio(model)
+            if can is False or model in _ALWAYS_AUDIO or (want and can is not True):
+                body.pop("generate_audio")
         with httpx.Client(timeout=120.0) as client:
             r = client.post(f"{self._base}/videos", headers=self._headers(), json=body)
-            if r.status_code == 400 and body.get("generate_audio") is False and "generate_audio" in r.text:
+            if r.status_code == 400 and "generate_audio" in body and "generate_audio" in r.text:
                 # Some models (Gemini Omni) always make audio and reject
-                # generate_audio=false. The clip's audio is never used (the
-                # renderer lays in voice/music/sound), so send it without.
-                _ALWAYS_AUDIO.add(model)
+                # generate_audio=false: a storyboard clip's audio is never
+                # used (the renderer lays in voice/music/sound), and a
+                # Studio clip gets the model's sound. A model refusing the
+                # field altogether makes what it makes by default.
+                if body["generate_audio"] is False:
+                    _ALWAYS_AUDIO.add(model)
                 body.pop("generate_audio")
                 r = client.post(f"{self._base}/videos", headers=self._headers(), json=body)
             if r.status_code >= 400:

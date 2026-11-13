@@ -271,6 +271,8 @@ export function StudioViewer({
       details.push("Image");
     }
     if (job.provider_model) details.push(job.provider_model);
+    // Sound was turned off for this clip.
+    if (isVideo && job.audio === false) details.push("no sound");
     // Reference pictures sent a Sogni model to one of Sogni's editors.
     const ranOn = ranOnText(job);
     if (ranOn) details.push(ranOn);

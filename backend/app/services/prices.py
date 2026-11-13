@@ -24,19 +24,42 @@ def money(usd: Optional[float]) -> str:
     return f"${x:.4f}"
 
 
-def _per_second(entry: dict) -> Optional[float]:
+def _sku_audio(key: str) -> Optional[bool]:
+    """Whether a pricing SKU is for video with sound (True), without it
+    (False), or doesn't say (None)."""
+    k = key.lower()
+    if "audio" not in k:
+        return None
+    return not any(w in k for w in ("without", "no_audio", "no-audio", "noaudio", "silent", "mute"))
+
+
+def _per_second(entry: dict, audio: Optional[bool] = None) -> Optional[float]:
+    """Price per second of video. `audio` picks the price with (True) or
+    without (False) sound where the catalog has both; None: the lowest."""
+    if audio:
+        rate = entry.get("audio_price_per_second")
+        if isinstance(rate, (int, float)) and rate > 0:
+            return float(rate)
     rate = entry.get("price_per_second")
     if isinstance(rate, (int, float)) and rate > 0:
         return float(rate)
-    rates = []
+    rates: list[tuple[float, Optional[bool]]] = []
     for k, v in (entry.get("pricing_skus") or {}).items():
         try:
             f = float(v)
         except (TypeError, ValueError):
             continue
         if f > 0 and ("second" in k.lower() or k.lower() in ("duration", "per_second")):
-            rates.append(f)
-    return min(rates) if rates else None
+            rates.append((f, _sku_audio(k)))
+    if not rates:
+        return None
+    if audio is not None:
+        # The SKU for this choice; else one that doesn't mention sound.
+        for says in (bool(audio), None):
+            hit = [f for f, a in rates if a is says]
+            if hit:
+                return min(hit)
+    return min(f for f, _ in rates)
 
 
 def image_price(entry: dict) -> Optional[float]:
@@ -88,8 +111,10 @@ def _sogni_price_text(model: str, kind: str) -> str:
     return text
 
 
-def price_text(entry: Optional[dict], kind: str) -> str:
-    """"about $0.04 per image" / "about $0.30 per 5 s" for a catalog entry."""
+def price_text(entry: Optional[dict], kind: str, *, audio: Optional[bool] = None) -> str:
+    """"about $0.04 per image" / "about $0.30 per 5 s" for a catalog entry.
+    A video's `audio`: priced with (True) or without (False) sound where
+    that differs (Sogni's doesn't); None: the lowest price."""
     if not entry:
         return ""
     if entry.get("price_text"):
@@ -101,7 +126,7 @@ def price_text(entry: Optional[dict], kind: str) -> str:
         shown = money(usd) if usd else ""
         return f"about {shown} per image" if shown else ""
     if kind == "video":
-        rate = _per_second(entry)
+        rate = _per_second(entry, audio)
         shown = money(rate * 5) if rate else ""
         return f"about {shown} per 5 s" if shown else ""
     return ""

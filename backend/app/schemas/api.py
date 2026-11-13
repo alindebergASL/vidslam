@@ -484,6 +484,9 @@ class StudioRequest(BaseModel):
     # Cast picture (at most one). 422 when the video model can't.
     first_frame_job_id: Optional[int] = None
     first_frame_asset_id: Optional[int] = None
+    # Clips only: ask the video model for its own sound. Only models that
+    # can make sound use it (others make a silent clip either way).
+    audio: bool = True
 
 
 class StudioSaveRequest(BaseModel):
@@ -553,6 +556,9 @@ class StudioJobOut(BaseModel):
     # "identity" when one is a Cast character's picture (not its logo),
     # else "guide"; null for a picture without references.
     ref_intent: Optional[Literal["identity", "guide"]] = None
+    # A clip: whether sound was asked for (options["audio"]); null for a
+    # picture, or a clip made before the choice existed.
+    audio: Optional[bool] = None
 
     @field_validator("options", mode="before")
     @classmethod
@@ -565,6 +571,8 @@ class StudioJobOut(BaseModel):
         if isinstance(ran, dict):
             self.ran_on_name = self.ran_on_name or str(ran.get("name") or "") or None
             self.ran_on_editor = self.ran_on_editor or str(ran.get("model") or "") or None
+        if self.audio is None and isinstance(self.options.get("audio"), bool):
+            self.audio = self.options["audio"]
         return self
 
     @field_validator("operation", mode="before")
@@ -693,6 +701,7 @@ class StudioRetryRequest(BaseModel):
     prompt: Optional[str] = Field(None, min_length=1)
     negative_prompt: Optional[str] = None
     aspect_ratio: Optional[Literal["9:16", "16:9", "1:1"]] = None
+    audio: Optional[bool] = None  # a clip's sound choice (left out: the source's)
 
 
 # Character-sheet views: id → (label, aspect, what the picture shows).
