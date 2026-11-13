@@ -366,29 +366,34 @@ def join_sources(db: Session, job_ids: list[int]) -> list[models.AssetGeneration
 
 
 def join_stale_after() -> timedelta:
-    """How long a join may stay queued or running: its ffmpeg time limit
-    for the longest join, and a margin. Older, it was orphaned (a killed
-    worker): it no longer holds one of the JOIN_MAX_RUNNING places, and
-    the sweeper fails it (sweepers.sweep_studio)."""
+    """How long a join may run once a worker has claimed it ('submitted'):
+    its ffmpeg time limit for the longest join, and a margin. Older, it
+    was orphaned (a killed worker): it no longer holds one of the
+    JOIN_MAX_RUNNING places, and the sweeper fails it
+    (sweepers.sweep_studio). A join still waiting in the queue ('pending')
+    may wait longer, behind long renders on the one worker: it keeps its
+    place, and only the general pending rule (its queue entry gone) fails
+    it."""
     from .renderer import join_timeout
 
     return timedelta(seconds=join_timeout(JOIN_MAX_SECONDS)) + timedelta(minutes=5)
 
 
-def joins_running(db: Session, *, up_to_id: Optional[int] = None, now: Optional[datetime] = None) -> int:
-    """Joins queued or running (touched within join_stale_after()); with
-    `up_to_id`, only those with that id or a lower one (queued before it)."""
-    from sqlalchemy import func
+def joins_running(db: Session, *, now: Optional[datetime] = None) -> int:
+    """Joins holding a place: every one still queued ('pending'), and those
+    a worker is running that were touched within join_stale_after()."""
+    from sqlalchemy import and_, func, or_
 
     from .pipeline import STUDIO_RUNNING
 
     Job = models.AssetGenerationJob
     since = (now or datetime.utcnow()) - join_stale_after()
-    q = db.query(Job).filter(Job.operation == JOIN_OP, Job.status.in_(STUDIO_RUNNING),
-                             func.coalesce(Job.updated_at, Job.created_at) >= since)
-    if up_to_id is not None:
-        q = q.filter(Job.id <= up_to_id)
-    return q.count()
+    return (db.query(Job)
+            .filter(Job.operation == JOIN_OP, Job.status.in_(STUDIO_RUNNING),
+                    or_(Job.status == "pending",
+                        and_(Job.status != "pending",
+                             func.coalesce(Job.updated_at, Job.created_at) >= since)))
+            .count())
 
 
 def join_busy(db: Session) -> bool:

@@ -1254,37 +1254,54 @@ def join_segments(
     return dst, _probe_duration(dst)
 
 
-def _probe_clip(path: Path) -> tuple[float, bool]:
-    """(video length in seconds, whether the file has an audio stream).
-    The length is the video stream's own when ffprobe knows it (a sound
-    track a little longer than the picture would otherwise stretch it),
-    else the container's; 0.0 when the file can't be read."""
-    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json",
-                    "-show_entries", "stream=codec_type,duration:format=duration", str(path)])
+def _probe_clip(path: Path) -> tuple[float, bool, float]:
+    """(video length in seconds, whether the file has an audio stream,
+    when the picture starts in the file). The length is the video stream's
+    own when ffprobe knows it (a sound track a little longer than the
+    picture would otherwise stretch it), else the container's; 0.0 when
+    the file can't be read. The picture's start is its stream start_time
+    measured from the file's own start (the earliest stream's, which is
+    where ffmpeg puts 0 when it reads the file), at least 0: a picture
+    starting after its sound (start_time > 0, or a sound starting before 0
+    with AAC priming) has its sound laid on the picture's own timeline
+    (join_audio_graph)."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries",
+                    "stream=codec_type,duration,start_time:format=duration,start_time", str(path)])
     if rc != 0:
-        return 0.0, False
+        return 0.0, False, 0.0
     try:
         info = json.loads(log)
     except ValueError:
-        return 0.0, False
+        return 0.0, False, 0.0
     streams = info.get("streams") or []
     has_audio = any(s.get("codec_type") == "audio" for s in streams)
-    length = 0.0
+    length = start = 0.0
     for s in streams:
         if s.get("codec_type") == "video":
             try:
                 length = float(s.get("duration") or 0.0)
             except (TypeError, ValueError):
                 length = 0.0
+            try:
+                start = float(s.get("start_time") or 0.0)
+            except (TypeError, ValueError):
+                start = 0.0
             break
     else:
-        return 0.0, has_audio  # no picture: not a clip
+        return 0.0, has_audio, 0.0  # no picture: not a clip
+    try:
+        start -= float((info.get("format") or {}).get("start_time") or 0.0)
+    except (TypeError, ValueError):
+        pass
+    start = max(start, 0.0) if math.isfinite(start) else 0.0
     if length <= 0:
+        # The container's length runs from the file's start: the picture's
+        # is what is left of it from where the picture starts.
         try:
-            length = float((info.get("format") or {}).get("duration") or 0.0)
+            length = float((info.get("format") or {}).get("duration") or 0.0) - start
         except (TypeError, ValueError):
             length = 0.0
-    return max(length, 0.0), has_audio
+    return max(length, 0.0), has_audio, start
 
 
 # Below this a dissolve is too short to see (and leaves no whole frame to
@@ -1323,20 +1340,30 @@ def join_crossfade(lengths: list[float], transition: str, crossfade: float) -> f
     return round(cf, 3) if cf >= MIN_DISSOLVE else 0.0
 
 
-def join_audio_graph(lengths: list[float], has_audio: list[bool], *, crossfade: float) -> str:
+def join_audio_graph(lengths: list[float], has_audio: list[bool], *, crossfade: float,
+                     video_starts: Optional[list[float]] = None) -> str:
     """filter_complex text for the joined sound (output label [aout]): each
     clip's own, or silence for a clip without any, fitted to exactly that
     clip's picture length, then joined back to back (`crossfade` > 0: each
-    join crossfades over the same span as the picture's dissolve)."""
+    join crossfades over the same span as the picture's dissolve).
+    `video_starts`: when each clip's picture starts in its file (>= 0);
+    its sound is taken from that moment on, so it plays on the picture's
+    own timeline."""
     fmt = "aformat=sample_fmts=fltp:channel_layouts=stereo"
+    starts = video_starts if video_starts is not None else [0.0] * len(lengths)
     parts: list[str] = []
-    for i, (L, audio) in enumerate(zip(lengths, has_audio, strict=True)):
-        # A clip's sound can start after its picture (its first pts > 0):
-        # async/first_pts=0 fills that gap with silence so the sound stays
-        # on the clip's own timeline before it is padded and trimmed to L.
-        src = (f"[{i}:a]aresample={JOIN_AUDIO_RATE}:async=1:first_pts=0," if audio
-               else f"anullsrc=r={JOIN_AUDIO_RATE}:cl=stereo,")
-        parts.append(f"{src}{fmt},apad,atrim=start=0:end={L:.4f},asetpts=PTS-STARTPTS[a{i}]")
+    for i, (L, audio, vs) in enumerate(zip(lengths, has_audio, starts, strict=True)):
+        if audio:
+            # On the file's timeline from 0: a sound starting after 0 gets
+            # that gap filled with silence (async/first_pts=0), and one
+            # starting a little before it (AAC priming) loses that part.
+            # Then the part before the picture starts is cut off, so the
+            # sound lines up with the picture's first frame.
+            src = (f"[{i}:a]aresample={JOIN_AUDIO_RATE}:async=1:first_pts=0,"
+                   f"atrim=start={max(vs, 0.0):.4f},asetpts=PTS-STARTPTS,")
+        else:
+            src = f"anullsrc=r={JOIN_AUDIO_RATE}:cl=stereo,"
+        parts.append(f"{src}{fmt},apad,atrim=end={L:.4f},asetpts=PTS-STARTPTS[a{i}]")
     n = len(lengths)
     if crossfade > 0 and n > 1:
         prev = "a0"
@@ -1370,8 +1397,9 @@ def join_clips_with_audio(
     if len(clips) < 2:
         raise ValueError("join needs at least two clips")
     probed = [_probe_clip(p) for p in clips]
-    lengths = [length for length, _ in probed]
-    has_audio = [audio for _, audio in probed]
+    lengths = [length for length, _, _ in probed]
+    has_audio = [audio for _, audio, _ in probed]
+    video_starts = [start for _, _, start in probed]
     if any(length <= 0 for length in lengths):
         raise RuntimeError("a clip to join can't be read")
     size = _probe_size(clips[0])
@@ -1388,7 +1416,7 @@ def join_clips_with_audio(
                        sizes=[_probe_size(p) for p in clips])
     audio = any(has_audio)
     if audio:
-        graph += ";" + join_audio_graph(lengths, has_audio, crossfade=cf)
+        graph += ";" + join_audio_graph(lengths, has_audio, crossfade=cf, video_starts=video_starts)
     cmd = ["ffmpeg", "-y"]
     for p in clips:
         cmd += ["-i", str(p)]

@@ -903,12 +903,15 @@ def _join(db: Session, job_ids: list[int], transition: str, crossfade: float, re
     if video_ops.join_busy(db):
         raise busy
     job = video_ops.new_join_job(sources, transition, crossfade)
-    # Stored first, then counted with the joins queued before it: of two
-    # requests that both passed the check above, the later one is over the
-    # cap and is removed before it is ever queued.
+    # Stored first, then all the joins holding a place counted again (this
+    # one among them): of requests that passed the check above together,
+    # any that sees the cap passed is removed before it is ever queued.
+    # Counting every join, not only those with a lower id (on Postgres ids
+    # aren't handed out in commit order), two racing requests may both be
+    # refused; never both queued past the cap.
     db.add(job)
     db.commit()
-    if video_ops.joins_running(db, up_to_id=job.id) > video_ops.JOIN_MAX_RUNNING:
+    if video_ops.joins_running(db) > video_ops.JOIN_MAX_RUNNING:
         db.delete(job)
         db.commit()
         raise busy

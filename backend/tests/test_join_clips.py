@@ -99,6 +99,82 @@ def test_sound_starting_after_the_picture_stays_in_sync(tmp_path):
     assert _mean_volume(out, 6.8, 1.0) > -40
 
 
+def _flash_clip(path: Path, tmp: Path, *, video_offset: float = 0.0) -> Path:
+    """A 2 s black clip with a white flash 1.0 s into its picture and a
+    beep at that same moment in the file; the picture starts
+    `video_offset` late in the file (video start_time > 0)."""
+    v = tmp / f"{path.stem}-v.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "color=black:size=96x64:rate=30:duration=2,"
+                    "drawbox=c=white:t=fill:enable='between(t,1.0,1.09)'", "-pix_fmt", "yuv420p", str(v)],
+                   check=True)
+    beep = 1.0 + video_offset  # the flash's time in the file
+    a = tmp / f"{path.stem}-a.wav"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    f"aevalsrc='if(between(t,{beep},{beep + 0.1}),sin(2*PI*1000*t),0)'"
+                    f":s=48000:d={2.0 + video_offset}", str(a)], check=True)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-itsoffset", f"{video_offset}", "-i", str(v),
+                    "-i", str(a), "-map", "0", "-map", "1",
+                    "-c:v", "copy", "-c:a", "aac", str(path)], check=True)
+    return path
+
+
+def _start_times(path: Path) -> dict[str, float]:
+    out = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries",
+                          "stream=codec_type,start_time", str(path)], capture_output=True, text=True, check=True)
+    return {s["codec_type"]: float(s["start_time"]) for s in json.loads(out.stdout)["streams"]}
+
+
+def _flashes(path: Path) -> list[float]:
+    """When each white flash starts (the first bright frame of each)."""
+    out = subprocess.run(["ffprobe", "-v", "quiet", "-f", "lavfi", "-i", f"movie={path},signalstats",
+                          "-show_entries", "frame=pts_time:frame_tags=lavfi.signalstats.YAVG", "-of", "json"],
+                         capture_output=True, text=True, check=True)
+    times, bright = [], False
+    for f in json.loads(out.stdout)["frames"]:
+        now = float(f["tags"]["lavfi.signalstats.YAVG"]) > 128
+        if now and not bright:
+            times.append(float(f["pts_time"]))
+        bright = now
+    return times
+
+
+def _beeps(path: Path) -> list[float]:
+    """When each beep starts (where silencedetect's silences end, but for
+    the one the end of the file closes)."""
+    out = subprocess.run(["ffmpeg", "-v", "info", "-i", str(path), "-vn", "-af",
+                          "silencedetect=noise=-30dB:d=0.05", "-f", "null", "-"],
+                         capture_output=True, text=True)
+    ends = [float(line.split("silence_end:")[1].split("|")[0]) for line in out.stderr.splitlines()
+            if "silence_end:" in line]
+    return [t for t in ends if t < _streams(path)["audio"] - 0.1]
+
+
+def test_picture_starting_after_its_sound_keeps_the_beep_on_the_flash(tmp_path):
+    """A clip whose picture starts after its sound in the file (video
+    start_time > 0, audio 0): the sound is laid on the picture's own
+    timeline, so a beep made at the flash still plays on it once joined,
+    and the sound isn't cut short. A sound starting slightly before 0
+    (AAC priming) is fine too."""
+    from app.services.renderer import FPS, _probe_clip, join_clips_with_audio
+
+    late = _flash_clip(tmp_path / "late.mp4", tmp_path, video_offset=0.2)
+    starts = _start_times(late)
+    assert starts["video"] == pytest.approx(0.2, abs=0.01) and starts["audio"] == pytest.approx(0.0, abs=0.01)
+    assert _probe_clip(late)[0] == pytest.approx(2.0, abs=0.05)
+    primed = _flash_clip(tmp_path / "primed.mkv", tmp_path)  # Matroska keeps AAC's priming
+    assert -0.05 < _start_times(primed)["audio"] < 0
+    for clips in ([late, late, late], [primed, late, primed]):
+        out, _, _ = join_clips_with_audio(clips, tmp_path / "out.mp4")
+        flashes, beeps = _flashes(out), _beeps(out)
+        assert flashes == pytest.approx([1.0, 3.0, 5.0], abs=1 / FPS + 0.01), flashes
+        assert len(beeps) == 3, beeps
+        for f, b in zip(flashes, beeps, strict=True):
+            assert abs(b - f) <= 1 / FPS, (flashes, beeps)
+        streams = _streams(out)
+        assert streams["audio"] == pytest.approx(streams["video"], abs=0.1)
+
+
 def test_clips_off_the_30fps_grid_keep_sound_and_picture_together(tmp_path):
     """24 fps clips whose lengths aren't whole 30 fps frames: each clip is
     laid on the output frame grid once, for picture and sound alike, so
@@ -432,19 +508,61 @@ def test_two_requests_passing_the_check_together_queue_only_up_to_two(auth_clien
     assert _join_rows() == rows and queued == []
 
 
+def test_racing_requests_count_every_join_not_only_lower_ids(auth_client, tmp_path, monkeypatch):
+    """On Postgres ids aren't handed out in commit order: a request with a
+    lower id may count again after one with a higher id was stored. Every
+    join holding a place is counted, whatever its id, so the third is
+    refused (both may be, which is safe) and never queued."""
+    from app.api import studio
+    from app.db import SessionLocal
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    a = _clip_job(_video(tmp_path / "a.mp4"), aid)
+    _join_row(aid, a)  # one join already queued
+    monkeypatch.setattr(video_ops, "join_busy", lambda db: False)  # both passed the first check
+    queued: list = []
+    monkeypatch.setattr(studio, "enqueue", lambda fn, *args: queued.append(args) or "q1")
+    real = video_ops.joins_running
+    later: list[int] = []
+
+    def recount(db, **kw):
+        # The other request, stored after this one (a higher id), commits
+        # before this one counts again.
+        if not later:
+            later.append(_join_row(aid, a))
+        return real(db, **kw)
+
+    monkeypatch.setattr(video_ops, "joins_running", recount)
+    rows = _join_rows()
+    r = auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]})
+    assert r.status_code == 429, r.text
+    assert len(later) == 1
+    assert _join_rows() == rows + 1 and queued == []  # only the other request's row is left
+    with SessionLocal() as db:
+        assert real(db) == video_ops.JOIN_MAX_RUNNING  # the other one, counting again, may stay
+
+
 def test_a_join_orphaned_by_a_killed_worker_stops_holding_a_place(auth_client, tmp_path):
+    """Only a join a worker claimed ('submitted') stops holding a place
+    after join_stale_after(); one still queued, however long it waits
+    behind other work, keeps it."""
     from datetime import timedelta
 
-    from app.services.video_ops import join_stale_after
+    from app.db import SessionLocal
+    from app.services.video_ops import join_stale_after, joins_running
 
     aid = _avatar(auth_client)
     a = _clip_job(_video(tmp_path / "a.mp4"), aid)
     assert join_stale_after() == timedelta(minutes=65)
-    _join_row(aid, a, status="submitted", age=timedelta(hours=2))
-    _join_row(aid, a, status="pending", age=timedelta(hours=3))
-    _join_row(aid, a, status="submitted", age=timedelta(minutes=30))  # still running
-    assert auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]}).status_code == 202
-    _join_row(aid, a, status="submitted", age=timedelta(minutes=50))
+    _join_row(aid, a, status="submitted", age=timedelta(hours=2))  # orphaned
+    _join_row(aid, a, status="pending", age=timedelta(hours=3))  # waiting in the queue
+    with SessionLocal() as db:
+        assert joins_running(db) == 1
+    assert auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]}).status_code == 202  # (runs inline)
+    _join_row(aid, a, status="submitted", age=timedelta(minutes=50))  # still running
+    with SessionLocal() as db:
+        assert joins_running(db) == 2
     assert auth_client.post("/api/studio/join-clips", json={"job_ids": [a, a]}).status_code == 429
 
 
@@ -456,8 +574,9 @@ def test_sweeper_fails_an_orphaned_join_well_before_the_general_limit(auth_clien
     from app.services import sweepers
     from app.workers import queue
 
-    # The queued join's entry still waits (a busy worker): the general
-    # pending rule would leave it alone however long it waits.
+    # The queued join's entry still waits (a busy worker, say a 70-minute
+    # render): the general pending rule leaves it alone however long it
+    # waits, and so does the join rule, which is only for running joins.
     monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "queued")
 
     aid = _avatar(auth_client)
@@ -479,6 +598,10 @@ def test_sweeper_fails_an_orphaned_join_well_before_the_general_limit(auth_clien
         status = {j.id: (j.status, j.error) for j in db.query(models.AssetGenerationJob).filter(
             models.AssetGenerationJob.id.in_([orphan, queued, running, other_id]))}
     assert status[orphan] == ("failed", "Stopped unexpectedly")
-    assert status[queued] == ("failed", "Stopped unexpectedly")
+    assert status[queued][0] == "pending"  # only waiting behind other work: kept, and holds its place
     assert status[running][0] == "submitted"
+    from app.services.video_ops import joins_running
+
+    with SessionLocal() as db:
+        assert joins_running(db) == 2  # the queued one and the one running
     assert status[other_id][0] == "submitted"  # not a join: the general limit

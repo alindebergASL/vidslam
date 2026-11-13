@@ -103,17 +103,18 @@ def sweep_studio(db: Session, *, now: Optional[datetime] = None) -> dict:
         if _fail_studio(db, jid, "submitted", "Stopped unexpectedly"):
             out["failed"] += 1
 
-    # A join (made here by ffmpeg, time-limited) queued or running past its
-    # longest run: orphaned by a killed worker. Failed now rather than after
-    # the general limits, as it no longer holds a join place (join_busy).
+    # A join (made here by ffmpeg, time-limited) a worker claimed and still
+    # running past its longest run: orphaned by a killed worker. Failed now
+    # rather than after the general limit, as it no longer holds a join
+    # place (join_busy). A join still queued is left to the pending rule
+    # above: it may wait behind long renders, and keeps its place.
     from . import video_ops
 
-    for (jid, status) in (db.query(Job.id, Job.status)
-                          .filter(Job.operation == video_ops.JOIN_OP, Job.status.in_(("pending", "submitted")),
-                                  func.coalesce(Job.updated_at, Job.created_at)
-                                  <= now - video_ops.join_stale_after())
-                          .order_by(Job.id).limit(50).all()):
-        if _fail_studio(db, jid, status, "Stopped unexpectedly"):
+    for (jid,) in (db.query(Job.id)
+                   .filter(Job.operation == video_ops.JOIN_OP, Job.status == "submitted",
+                           func.coalesce(Job.updated_at, Job.created_at) <= now - video_ops.join_stale_after())
+                   .order_by(Job.id).limit(50).all()):
+        if _fail_studio(db, jid, "submitted", "Stopped unexpectedly"):
             out["failed"] += 1
 
     # polling: a clip at the provider. Its video job finishes it, unless the
