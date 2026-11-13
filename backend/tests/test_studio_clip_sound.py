@@ -192,6 +192,25 @@ def test_openrouter_resends_without_a_refused_sound_field(openrouter):
     assert _sent(openrouter, "google/veo-3.1-fast", False)[0]["generate_audio"] is False
 
 
+@pytest.mark.parametrize("audio", [True, False])
+def test_openrouter_submit_reads_an_unreadable_model_list_once(openrouter, audio):
+    # A failed read isn't cached: a submit must not pay its timeout twice
+    # (once for the clip's capabilities, again for the sound flag).
+    bodies = []
+    with respx.mock() as router:
+        models = router.get(f"{OR_BASE}/videos/models").mock(return_value=httpx.Response(503))
+        router.post(f"{OR_BASE}/videos").mock(
+            side_effect=lambda req: bodies.append(json.loads(req.content)) or httpx.Response(202, json={"id": "j1"}))
+        openrouter.submit(model="google/veo-3.1", prompt="waves", references=[], duration_seconds=5,
+                          settings={"aspect_ratio": "9:16", "generate_audio": audio})
+    assert models.call_count == 1
+    # Unknown: sound on is the model's own default (not asked); off is still asked.
+    if audio:
+        assert "generate_audio" not in bodies[0]
+    else:
+        assert bodies[0]["generate_audio"] is False
+
+
 def test_openrouter_audio_flag_from_its_listing():
     from app.providers.openrouter_video import audio_support
 

@@ -109,41 +109,44 @@ class OpenRouterVideoProvider(VideoProvider):
             )
         return out
 
-    def capabilities(self, model: str) -> VideoCapabilities:
+    def _model_row(self, model: str) -> Optional[dict]:
+        """`model`'s /videos/models row; None when it isn't listed or the list
+        can't be read. A failed read isn't cached, so a submit reads the list
+        once (here) and takes both its capabilities and its sound flag from
+        the one row, rather than waiting out the fetch timeout twice."""
+        try:
+            rows = self._video_models()
+        except Exception as e:  # noqa: BLE001 — never block a render on discovery
+            log.warning("video model discovery failed: %s", e)
+            return None
+        model = model or self.model
+        return next((m for m in rows if m.get("id") == model or m.get("canonical_slug") == model), None)
+
+    @staticmethod
+    def _capabilities_from(row: Optional[dict]) -> VideoCapabilities:
         fallback = VideoCapabilities(
             durations=sorted({5, max(5, get_settings().ambient_default_max_clip_seconds)}),
             first_frame=True,
             last_frame=False,
             known=False,
         )
-        try:
-            rows = self._video_models()
-        except Exception as e:  # noqa: BLE001 — never block a render on discovery
-            log.warning("video model discovery failed: %s", e)
+        if row is None:
             return fallback
-        model = model or self.model
-        for m in rows:
-            if m.get("id") == model or m.get("canonical_slug") == model:
-                durations = expand_durations(m.get("supported_durations")) or fallback.durations
-                frames = m.get("supported_frame_images") or []
-                return VideoCapabilities(
-                    durations=durations,
-                    first_frame="first_frame" in frames,
-                    last_frame="last_frame" in frames,
-                )
-        return fallback
+        durations = expand_durations(row.get("supported_durations")) or fallback.durations
+        frames = row.get("supported_frame_images") or []
+        return VideoCapabilities(
+            durations=durations,
+            first_frame="first_frame" in frames,
+            last_frame="last_frame" in frames,
+        )
+
+    def capabilities(self, model: str) -> VideoCapabilities:
+        return self._capabilities_from(self._model_row(model))
 
     def makes_audio(self, model: str) -> Optional[bool]:
         """Whether `model` can make sound, per OpenRouter's model list; None
         when the list can't be read or doesn't say."""
-        try:
-            rows = self._video_models()
-        except Exception as e:  # noqa: BLE001 — unknown, as with no listing
-            log.info("video model discovery failed: %s", e)
-            return None
-        model = model or self.model
-        row = next((m for m in rows if m.get("id") == model or m.get("canonical_slug") == model), None)
-        return audio_support(row)
+        return audio_support(self._model_row(model))
 
     # ---- generation ----
 
@@ -164,7 +167,8 @@ class OpenRouterVideoProvider(VideoProvider):
         check_prompt(prompt)  # minors: refused here too, not only by the vendor
         if negative_prompt:
             check_prompt(negative_prompt)  # sent too, as "Avoid: …"
-        caps = self.capabilities(model)
+        row = self._model_row(model)  # one read of the list for caps and sound
+        caps = self._capabilities_from(row)
         # Providers 400 on any duration outside supported_durations; snap
         # up to the nearest accepted length (or the model's max).
         body: dict = {
@@ -200,7 +204,7 @@ class OpenRouterVideoProvider(VideoProvider):
             # (others make what they make by default, which for one that
             # can is sound); off goes to every model that may make sound.
             # Never to one that can't, nor to one found to always make it.
-            can = self.makes_audio(model)
+            can = audio_support(row)
             if can is False or model in _ALWAYS_AUDIO or (want and can is not True):
                 body.pop("generate_audio")
         with httpx.Client(timeout=120.0) as client:
