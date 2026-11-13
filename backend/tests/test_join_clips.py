@@ -175,6 +175,55 @@ def test_picture_starting_after_its_sound_keeps_the_beep_on_the_flash(tmp_path):
         assert streams["audio"] == pytest.approx(streams["video"], abs=0.1)
 
 
+def test_sound_ending_before_the_picture_starts_gives_silence_not_an_error(tmp_path):
+    """A clip whose short sound ends before its picture starts in the file:
+    that clip contributes silence of its full length; the join neither
+    fails nor comes out short."""
+    from app.services.renderer import join_clips_with_audio
+
+    v = tmp_path / "pic.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=gray:size=96x64:rate=30:duration=2",
+                    "-pix_fmt", "yuv420p", str(v)], check=True)
+    a = tmp_path / "short.wav"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=500:duration=0.3",
+                    str(a)], check=True)
+    early = tmp_path / "early.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-itsoffset", "0.6", "-i", str(v), "-i", str(a),
+                    "-map", "0", "-map", "1", "-c:v", "copy", "-c:a", "aac", str(early)], check=True)
+    other = _flash_clip(tmp_path / "other.mp4", tmp_path, video_offset=0.2)
+    for clips in ([early, other], [other, early, other], [other, early]):
+        out, length, has_audio = join_clips_with_audio(clips, tmp_path / "out.mp4")
+        streams = _streams(out)
+        assert has_audio and streams["video"] == pytest.approx(2.0 * len(clips), abs=0.05)
+        assert streams["audio"] == pytest.approx(streams["video"], abs=0.05)
+
+
+def test_matroska_picture_shorter_than_its_sound_is_measured_by_the_picture(tmp_path):
+    """Matroska has no per-stream duration: the picture's length comes from
+    its own packets, not the container (which the longer sound stretches),
+    so joined clips stay in sync."""
+    from app.services.renderer import FPS, _probe_clip, join_clips_with_audio
+
+    v = tmp_path / "f-v.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "color=black:size=96x64:rate=30:duration=2,"
+                    "drawbox=c=white:t=fill:enable='between(t,1.0,1.09)'", "-pix_fmt", "yuv420p", str(v)],
+                   check=True)
+    a = tmp_path / "f-a.wav"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "aevalsrc='if(between(t,1.2,1.3),sin(2*PI*1000*t),0)':s=48000:d=2.7", str(a)], check=True)
+    mkv = tmp_path / "long_sound.mkv"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-itsoffset", "0.2", "-i", str(v), "-i", str(a),
+                    "-map", "0", "-map", "1", "-c:v", "copy", "-c:a", "aac", str(mkv)], check=True)
+    assert _probe_clip(mkv)[0] == pytest.approx(2.0, abs=1 / FPS + 0.01)
+    out, _, _ = join_clips_with_audio([mkv, mkv, mkv], tmp_path / "out.mp4")
+    flashes, beeps = _flashes(out), _beeps(out)
+    assert flashes == pytest.approx([1.0, 3.0, 5.0], abs=1 / FPS + 0.01), flashes
+    assert len(beeps) == 3 and all(abs(b - f) <= 1 / FPS + 0.01 for f, b in zip(flashes, beeps, strict=True)), beeps
+    streams = _streams(out)
+    assert streams["audio"] == pytest.approx(streams["video"], abs=0.05)
+
+
 def test_clips_off_the_30fps_grid_keep_sound_and_picture_together(tmp_path):
     """24 fps clips whose lengths aren't whole 30 fps frames: each clip is
     laid on the output frame grid once, for picture and sound alike, so

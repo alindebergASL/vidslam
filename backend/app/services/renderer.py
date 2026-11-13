@@ -1295,13 +1295,41 @@ def _probe_clip(path: Path) -> tuple[float, bool, float]:
         pass
     start = max(start, 0.0) if math.isfinite(start) else 0.0
     if length <= 0:
-        # The container's length runs from the file's start: the picture's
-        # is what is left of it from where the picture starts.
+        # No stream duration (Matroska/WebM): measure the picture itself,
+        # from its first packet to the end of its last. The container's
+        # length would include a sound track that outlasts the picture.
+        length = _video_packets_span(path)
+    if length <= 0:
         try:
             length = float((info.get("format") or {}).get("duration") or 0.0) - start
         except (TypeError, ValueError):
             length = 0.0
     return max(length, 0.0), has_audio, start
+
+
+def _video_packets_span(path: Path) -> float:
+    """Seconds from the first video packet's start to the last one's end,
+    or 0.0 when they can't be read."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-show_entries",
+                    "packet=pts_time,duration_time", "-of", "csv=p=0", str(path)])
+    if rc != 0:
+        return 0.0
+    first = last_end = None
+    for line in log.splitlines():
+        bits = line.strip().split(",")
+        try:
+            pts = float(bits[0])
+        except (IndexError, ValueError):
+            continue
+        try:
+            dur = float(bits[1]) if len(bits) > 1 else 0.0
+        except ValueError:
+            dur = 0.0
+        first = pts if first is None else min(first, pts)
+        last_end = pts + dur if last_end is None else max(last_end, pts + dur)
+    if first is None or last_end is None:
+        return 0.0
+    return max(last_end - first, 0.0)
 
 
 # Below this a dissolve is too short to see (and leaves no whole frame to
@@ -1359,11 +1387,14 @@ def join_audio_graph(lengths: list[float], has_audio: list[bool], *, crossfade: 
             # starting a little before it (AAC priming) loses that part.
             # Then the part before the picture starts is cut off, so the
             # sound lines up with the picture's first frame.
-            src = (f"[{i}:a]aresample={JOIN_AUDIO_RATE}:async=1:first_pts=0,"
-                   f"atrim=start={max(vs, 0.0):.4f},asetpts=PTS-STARTPTS,")
+            # Padded before the cut, so a sound that ends before the
+            # picture starts still gives L seconds (of silence).
+            vs = max(vs, 0.0)
+            parts.append(f"[{i}:a]aresample={JOIN_AUDIO_RATE}:async=1:first_pts=0,{fmt},apad,"
+                         f"atrim=start={vs:.4f}:end={vs + L:.4f},asetpts=PTS-STARTPTS[a{i}]")
         else:
-            src = f"anullsrc=r={JOIN_AUDIO_RATE}:cl=stereo,"
-        parts.append(f"{src}{fmt},apad,atrim=end={L:.4f},asetpts=PTS-STARTPTS[a{i}]")
+            parts.append(f"anullsrc=r={JOIN_AUDIO_RATE}:cl=stereo,{fmt},"
+                         f"atrim=end={L:.4f},asetpts=PTS-STARTPTS[a{i}]")
     n = len(lengths)
     if crossfade > 0 and n > 1:
         prev = "a0"
