@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shutil
 import subprocess
 import time
@@ -62,11 +63,20 @@ def textfile_arg(path: Path) -> str:
 def _run(cmd: list[str], timeout: Optional[float] = None) -> tuple[int, str]:
     """(exit code, output) of a tool. Past `timeout` seconds the tool is
     killed and FFmpegTimeout is raised."""
+    rc, out, err = _run_parts(cmd, timeout)
+    return rc, out + err
+
+
+def _run_parts(cmd: list[str], timeout: Optional[float] = None) -> tuple[int, str, str]:
+    """(exit code, stdout, stderr) of a tool, as _run. Output that is
+    parsed (ffprobe's JSON) is read from stdout alone: the error lines a
+    damaged or cut-off file logs ("partial file", "non-existing PPS")
+    go to stderr and would make it unreadable."""
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired:
         raise FFmpegTimeout(f"{Path(cmd[0]).name} took longer than {timeout:g} s") from None
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
 def _dims_for_aspect(aspect: str, resolution: str = "1080p") -> tuple[int, int]:
@@ -360,8 +370,12 @@ def _mux_audio_captions_overlays(
 #      as an 8-bit PNG (HDR tone-mapped first).
 # A seek that lands in the wrong place (a file without an index, MPEG-TS)
 # is noticed (no frame at or before t, or not the exact frame) and that
-# step is decoded from the start instead. Times count from the start of the
-# file. The frame paths read videos uploaded from outside the app inside an
+# step is decoded from the start instead. When ffprobe can't list the
+# frames at all (a damaged or cut-off file), ffmpeg decodes from the start
+# up to t (to the end for the last frame) and the last frame it gets to is
+# the one; only a file ffmpeg can't decode at all is refused. ffprobe's
+# listings are read from its stdout alone (its error lines go to stderr).
+# Times count from the start of the file. The frame paths read videos uploaded from outside the app inside an
 # API request, so all the ffprobe/ffmpeg runs for one frame share
 # FRAME_TIMEOUT: past it the tool is killed and FFmpegTimeout is raised.
 
@@ -428,14 +442,14 @@ def _fraction(value: object) -> Optional[Fraction]:
 def _probe_video(path: Path, deadline: Optional[_Deadline] = None) -> Optional[_VideoInfo]:
     """What a frame grab needs to know about `path`'s first video stream;
     None when ffprobe can't read it or it has no video."""
-    rc, log = _run(["ffprobe", "-v", "error", "-print_format", "json", "-select_streams", "v:0",
-                    "-show_entries", "stream=duration,start_time,avg_frame_rate,r_frame_rate,pix_fmt,"
-                    "color_transfer:stream_tags=DURATION:format=start_time,duration", str(path)],
-                   timeout=deadline.left() if deadline else None)
+    rc, out, _err = _run_parts(["ffprobe", "-v", "error", "-print_format", "json", "-select_streams", "v:0",
+                                "-show_entries", "stream=duration,start_time,avg_frame_rate,r_frame_rate,pix_fmt,"
+                                "color_transfer:stream_tags=DURATION:format=start_time,duration", str(path)],
+                               timeout=deadline.left() if deadline else None)
     if rc != 0:
         return None
     try:
-        data = json.loads(log)
+        data = json.loads(out)
     except ValueError:
         return None
     streams = data.get("streams") or []
@@ -481,9 +495,10 @@ def _frame_times(src: Path, deadline: _Deadline, start: Optional[Fraction],
         # Always with an end: an open "START%" can list nothing at all.
         cmd += ["-read_intervals", ("" if start is None else f"{math.floor(float(start) * 1e6) / 1e6:.6f}")
                 + ("%+1000000" if end is None else f"%{math.ceil(float(end) * 1e6) / 1e6:.6f}")]
-    rc, log = _run(cmd + [str(src)], timeout=deadline.left())
+    # The frames listed before an error (a cut-off file) still count.
+    _rc, out, _err = _run_parts(cmd + [str(src)], timeout=deadline.left())
     try:
-        data = json.loads(log)
+        data = json.loads(out)
     except ValueError:
         return []
     tb = _fraction(((data.get("streams") or [{}])[0]).get("time_base"))
@@ -531,6 +546,43 @@ def _write_frame(src: Path, dst: Path, info: _VideoInfo, at: Fraction, deadline:
     return False
 
 
+def _target(info: _VideoInfo, t: float) -> Fraction:
+    """`t` seconds in, in the file's own time: to the microsecond, rounded
+    down (never past the frame on screen)."""
+    return info.start + Fraction(math.floor(t * 1_000_000 + 1e-6), 1_000_000)
+
+
+_SHOWINFO_TB = re.compile(r"config in time_base:\s*(\d+)/(\d+)")
+_SHOWINFO_PTS = re.compile(r"\bn:\s*\d+\s+pts:\s*(-?\d+)")
+
+
+def _last_decoded(src: Path, info: _VideoInfo, until: Optional[Fraction], deadline: _Deadline) -> Optional[Fraction]:
+    """Timestamp (in the file's own time, as _frame_times) of the last
+    video frame ffmpeg itself decodes, from the start, at or before
+    `until` (None: to the end). The last resort when ffprobe couldn't list
+    the frames (a damaged or cut-off file: an interrupted recording or
+    copy stops before its stated length, and ffmpeg still decodes it up to
+    the cut). Decoded to ffmpeg's null output, so no picture is made per
+    frame; _write_frame then writes the one found. None when no frame came
+    out."""
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-copyts"]
+    vf = "showinfo"
+    if until is not None:
+        cmd += ["-t", f"{max(float(until - info.file_start), 0.0) + 1.0:.6f}"]
+        vf = f"select=lte(t\\,{float(until):.6f}),showinfo"
+    _rc, _out, err = _run_parts(cmd + ["-i", str(src), "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf,
+                                       "-f", "null", "-"], timeout=deadline.left())
+    tb: Optional[Fraction] = None
+    last: Optional[Fraction] = None
+    for line in err.splitlines():
+        if m := _SHOWINFO_TB.search(line):
+            tb = Fraction(int(m[1]), int(m[2])) if int(m[2]) else None
+        elif tb and (m := _SHOWINFO_PTS.search(line)):
+            ts = int(m[1]) * tb
+            last = ts if last is None else max(last, ts)
+    return last
+
+
 def _find_frame(src: Path, info: _VideoInfo, t: float, deadline: _Deadline) -> Optional[Fraction]:
     """Timestamp of the frame shown at `t` seconds (math.inf: the last
     frame): the last one at or before it, the first one when `t` is before
@@ -542,8 +594,7 @@ def _find_frame(src: Path, info: _VideoInfo, t: float, deadline: _Deadline) -> O
             if times:
                 return max(times)
         return None
-    # Microseconds, rounded down: never past the frame on screen.
-    target = info.start + Fraction(math.floor(t * 1_000_000 + 1e-6), 1_000_000)
+    target = _target(info, t)
     if info.end is not None:
         target = min(target, info.end)
     ahead = max(FRAME_LOOKAHEAD, 16 / info.fps) if info.fps else 2 * FRAME_LOOKAHEAD
@@ -576,7 +627,14 @@ def extract_frame_at(src: Path, dst: Path, t: float, *, timeout: Optional[float]
     at = _find_frame(src, info, t, deadline)
     if at is not None and _write_frame(src, dst, info, at, deadline):
         return max(round(float(at - info.start), 3), 0.0)
-    # No timestamps to go by: ffmpeg's own seek (the frame at or after the
+    # ffprobe couldn't list the frames there: ffmpeg decodes from the start
+    # up to the time (to the end for the last frame, or for a time past
+    # where a cut-off file stops) and the last frame that came out is it.
+    found = _last_decoded(src, info, _target(info, t) if math.isfinite(t) else None, deadline)
+    if found is not None and found != at and _write_frame(src, dst, info, found, deadline):
+        return max(round(float(found - info.start), 3), 0.0)
+    # No frame at or before the time (it comes before the first one) or no
+    # timestamps to go by: ffmpeg's own seek (the frame at or after the
     # time), as close to the end as it gets for the last frame.
     fmt = "rgba" if _has_alpha(info.pix_fmt) else "rgb24"
     log = ""

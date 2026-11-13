@@ -109,6 +109,10 @@ def delete_avatar(avatar_id: int, db: Session = Depends(get_db)) -> None:
     db.query(models.VideoProject).filter(
         models.VideoProject.primary_avatar_id == avatar_id
     ).update({models.VideoProject.primary_avatar_id: None}, synchronize_session=False)
+    # Its pictures go with it: clips made from them remember they were its.
+    from ..services.pipeline import remember_deleted_pictures
+
+    remember_deleted_pictures(db, list(a.assets))
     db.delete(a)
     db.commit()
     from ..services import content_mode

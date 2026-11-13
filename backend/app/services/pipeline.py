@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -270,9 +271,12 @@ def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob],
     frame ("extract_frame") of a clip animated from it or made with it as a
     reference, followed back through each step (a cutout of a frame of a
     clip animated from an upscale of the picture still counts). When the
-    starting picture was deleted since, the step's owner (a cutout's is
-    copied from its source; a clip's is its Studio owner) says whose it
-    was, and the picture is None: never covered by a tick. A frame of a
+    starting picture was deleted since, the picture is None (never covered
+    by a tick) and whose it was comes from the step: a cutout's owner
+    (copied from its source), what a clip recorded when the picture was
+    deleted (_deleted_picture), else the clip's owner when a character,
+    else UNKNOWN_CAST, so a frame of a clip whose picture is gone keeps
+    the filter whoever owns the clip. A frame of a
     clip made from more than one Cast picture: with `marked` (the ticks
     now, content_mode.adult_ok_avatars()), the first of them a tick doesn't
     cover (so the filter stays on), else the first; without, the first
@@ -292,6 +296,57 @@ def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob],
 
 def _owner_avatar(job: models.AssetGenerationJob) -> list[tuple[int, Optional[int]]]:
     return [(int(job.owner_id), None)] if job.owner_kind == "avatar" and job.owner_id is not None else []
+
+
+# A Cast character no longer known (studio_cast_source): a clip's starting
+# or reference picture that is gone with nothing recorded about it, on a
+# clip whose owner isn't a character (a scene's clip may start from
+# anyone's Cast picture). Never an avatar's id and never covered by a tick:
+# frames of the clip keep the content filter, sent as a character's.
+UNKNOWN_CAST = 0
+# options_json of a Studio clip: {"<asset id>": the character whose Cast
+# picture it was, or None} for each picture it was made from that has been
+# deleted since (remember_deleted_pictures).
+DELETED_PICTURES = "deleted_pictures"
+
+
+def remember_deleted_pictures(db: Session, assets: list[models.Asset]) -> None:
+    """Call before `assets` are deleted: every Studio clip animated from one
+    of them or made with one as a reference records whose Cast picture it
+    was (None: not a Cast picture), so its frames are still that
+    character's picture once it is gone (_deleted_picture). Committed with
+    the delete."""
+    gone = {int(a.id): cast_avatar_of(a) for a in assets if a.id is not None}
+    if not gone:
+        return
+    Job = models.AssetGenerationJob
+    clips = (db.query(Job)
+             .filter(Job.output_kind == "video_clip",
+                     or_(Job.first_frame_asset_id.in_(list(gone)), Job.reference_asset_ids_json.is_not(None)))
+             .all())
+    for clip in clips:
+        used = [x for x in dict.fromkeys([clip.first_frame_asset_id, *_asset_ids(clip.reference_asset_ids_json)])
+                if x in gone]
+        if not used:
+            continue
+        options = dict(clip.options_json or {})
+        record = options.get(DELETED_PICTURES)
+        options[DELETED_PICTURES] = {**(record if isinstance(record, dict) else {}),
+                                     **{str(x): gone[x] for x in used}}
+        clip.options_json = options
+
+
+def _deleted_picture(clip: models.AssetGenerationJob, asset_id: int) -> list[tuple[int, Optional[int]]]:
+    """Whose Cast picture the deleted picture `asset_id` a clip was made
+    from was, with no picture (never covered by a tick): as the clip
+    recorded when it was deleted (none when it wasn't a Cast picture), else
+    the clip's owner when a character, else UNKNOWN_CAST."""
+    record = (clip.options_json or {}).get(DELETED_PICTURES)
+    if isinstance(record, dict) and str(asset_id) in record:
+        avatar_id = record[str(asset_id)]
+        ok = isinstance(avatar_id, int) and not isinstance(avatar_id, bool)
+        return [(avatar_id, None)] if ok else []
+    return _owner_avatar(clip) or [(UNKNOWN_CAST, None)]
 
 
 def _cast_sources(db: Session, job: Optional[models.AssetGenerationJob],
@@ -323,15 +378,16 @@ def _clip_cast_sources(db: Session, clip: models.AssetGenerationJob,
     """The Cast pictures a clip was made from (its frames are copies of
     them): the picture it was animated from (followed back as
     _cast_sources) and its character reference pictures. A picture deleted
-    since counts as its owner's (when that is a character)."""
+    since: _deleted_picture."""
     found: list[tuple[int, Optional[int]]] = []
     if clip.first_frame_job_id:
         src = db.get(models.AssetGenerationJob, clip.first_frame_job_id)  # tombstones keep their sources
-        found += _cast_sources(db, src, seen) if src is not None else _owner_avatar(clip)
+        found += (_cast_sources(db, src, seen) if src is not None
+                  else _owner_avatar(clip) or [(UNKNOWN_CAST, None)])
     elif clip.first_frame_asset_id:
         asset = db.get(models.Asset, clip.first_frame_asset_id)
         if asset is None:
-            found += _owner_avatar(clip)
+            found += _deleted_picture(clip, clip.first_frame_asset_id)
         elif (avatar_id := cast_avatar_of(asset)) is not None:
             found.append((avatar_id, int(asset.id)))
     ids = _asset_ids(clip.reference_asset_ids_json)
@@ -340,7 +396,7 @@ def _clip_cast_sources(db: Session, clip: models.AssetGenerationJob,
         for aid in dict.fromkeys(ids):
             row = rows.get(aid)
             if row is None:
-                found += _owner_avatar(clip)
+                found += _deleted_picture(clip, aid)
             elif (avatar_id := cast_avatar_of(row)) is not None:
                 found.append((avatar_id, int(row.id)))
     return found

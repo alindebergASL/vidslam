@@ -594,10 +594,95 @@ def test_an_uploaded_frame_is_refused_past_the_budget_before_its_paid_check(auth
     assert mock_chat.PICTURE_CALLS == [] and _frame_jobs() == 0
 
 
+# ---------- damaged and cut-off files ----------
+
+
+def _cut_videos(tmp_path: Path) -> dict[str, tuple[Path, str]]:
+    """Coded 25 fps videos, 5 s long as made, then damaged: (path, the
+    upload's content type)."""
+    def cut(path: Path, keep: float, name: str, head: bool = False) -> Path:
+        data = path.read_bytes()
+        n = int(len(data) * keep)
+        out = tmp_path / name
+        # An MPEG-TS whose start is lost: whole 188-byte packets, from mid-GOP.
+        out.write_bytes(data[len(data) - n // 188 * 188:] if head else data[:n])
+        return out
+
+    mp4 = _coded_video(tmp_path, "25", 5.0, "whole.mp4",
+                       ("-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"))
+    webm = _coded_video(tmp_path, "25", 5.0, "whole.webm",
+                        ("-c:v", "libvpx", "-b:v", "1M", "-live", "1", "-f", "webm"))
+    ts = _coded_video(tmp_path, "25", 5.0, "whole.ts", ("-c:v", "libx264", "-g", "50", "-pix_fmt", "yuv420p"))
+    return {
+        # An interrupted recording or copy: the index says 5 s, the picture stops before.
+        "mp4": (cut(mp4, 0.8, "cut.mp4"), "video/mp4"),
+        # A browser recording (no stated length) cut off: "File ended prematurely".
+        "webm": (cut(webm, 0.9, "cut.webm"), "video/webm"),
+        # Every read logs "non-existing PPS" errors.
+        "ts": (cut(ts, 0.8, "cut.ts", head=True), "video/mp2t"),
+    }
+
+
+def _check_frame(png: Path, seconds: float) -> int:
+    """The saved picture is the frame at the time given (25 fps, timed from
+    the file's start): how many frames the file's start is past frame 0 of
+    the video as made (mod 36, the frame code's range; 0 unless its start
+    was cut off)."""
+    n = round(seconds * 25)
+    assert abs(n / 25 - seconds) < 1e-6, seconds
+    r, b = _frame_number(png)
+    return (r + 6 * b - n) % 36
+
+
+@pytest.mark.parametrize("kind", ["mp4", "webm", "ts"])
+def test_a_cut_off_or_damaged_video_gives_the_frames_it_has(auth_client, tmp_path, kind):
+    """ffprobe's error lines are never read as part of its listing: a file
+    that logs errors is still read, and the last frame of a cut-off file
+    (also for a time past where it stops) is the last one ffmpeg decodes."""
+    from app.services import renderer
+
+    path, content_type = _cut_videos(tmp_path)[kind]
+    _rc, out, err = renderer._run_parts(["ffprobe", "-v", "error", "-show_entries", "frame=pts", "-of", "json",
+                                         str(path)])
+    assert err.strip() and out.strip().startswith("{")  # errors logged next to the listing
+    aid = _avatar(auth_client)
+    seconds, offsets = {}, set()
+    for at in ("first", "1.05", "last", "4.9"):
+        r = _upload(auth_client, path, aid, at=at, content_type=content_type)
+        assert r.status_code == 201, (at, r.text)
+        seconds[at] = r.json()["options"]["seconds"]
+        offsets.add(_check_frame(Path(r.json()["result_path"]), seconds[at]))
+    assert len(offsets) == 1 and (kind == "ts" or offsets == {0})  # each frame at the time it was saved with
+    assert seconds["first"] < 0.2 and 1.01 <= seconds["1.05"] <= 1.05  # the frame on screen at 1.05 s
+    assert seconds["last"] == seconds["4.9"] >= 3.0
+    if kind != "ts":
+        assert seconds["first"] == 0.0 and seconds["1.05"] == 1.04
+
+
+def test_the_last_frame_is_still_found_when_ffprobe_cant_list_the_frames(tmp_path, monkeypatch):
+    """The last resort: ffmpeg decodes from the start up to the time (to
+    the end for the last frame) and the last frame that comes out is the
+    one, for a cut-off MP4 and for a cut-off WebM with no stated length."""
+    from app.services import renderer
+
+    videos = _cut_videos(tmp_path)
+    out = tmp_path / "f.png"
+    expected = {kind: renderer.extract_frame_at(videos[kind][0], out, math.inf) for kind in ("mp4", "webm")}
+    monkeypatch.setattr(renderer, "_frame_times", lambda *a, **k: [])
+    for kind, last in expected.items():
+        path = videos[kind][0]
+        assert last >= 3.0
+        for t, want in ((math.inf, last), (9.0, last), (1.05, 1.04), (0, 0.0)):
+            # Past where it stops: the last frame; 1.05 s: the frame on
+            # screen then, not the next one.
+            assert renderer.extract_frame_at(path, out, t) == want, (kind, t)
+            assert _check_frame(out, want) == 0, (kind, t)
+
+
 # ---------- a frame of a clip made from a Cast picture ----------
 
 
-def _clip_row(tmp_path: Path, owner: int, size=(96, 64), **fields) -> int:
+def _clip_row(tmp_path: Path, owner: int, size=(96, 64), owner_kind="avatar", **fields) -> int:
     """A finished Studio clip (a real video file) made from whatever
     `fields` say (first_frame_asset_id, first_frame_job_id,
     reference_asset_ids_json)."""
@@ -606,7 +691,7 @@ def _clip_row(tmp_path: Path, owner: int, size=(96, 64), **fields) -> int:
 
     video = _video(tmp_path, size=size, seconds=1.0, name=f"clip{len(list(tmp_path.glob('clip*.mp4')))}.mp4")
     with SessionLocal() as db:
-        job = models.AssetGenerationJob(owner_kind="avatar", owner_id=owner, output_kind="video_clip", prompt="p",
+        job = models.AssetGenerationJob(owner_kind=owner_kind, owner_id=owner, output_kind="video_clip", prompt="p",
                                         status="completed", result_path=str(video),
                                         **{"reference_asset_ids_json": [], **fields})
         db.add(job)
@@ -629,7 +714,7 @@ def _source(job_id: int, marked=None) -> tuple:
         return pipeline.studio_cast_source(db, db.get(models.AssetGenerationJob, job_id), marked)
 
 
-def _animated_from(client, frame_id: int, owner: int):
+def _animated_from(client, frame_id: int, owner: int, owner_kind="avatar"):
     """"Animate this" on a saved frame: the first-frame reference the video
     provider gets."""
     from app.providers import mock_video
@@ -643,7 +728,7 @@ def _animated_from(client, frame_id: int, owner: int):
 
     mock_video.MockVideoProvider.submit = spy
     try:
-        r = client.post("/api/studio/generate-clip", json={"owner_kind": "avatar", "owner_id": owner,
+        r = client.post("/api/studio/generate-clip", json={"owner_kind": owner_kind, "owner_id": owner,
                                                            "prompt": "she turns", "first_frame_job_id": frame_id})
     finally:
         mock_video.MockVideoProvider.submit = real
@@ -652,17 +737,30 @@ def _animated_from(client, frame_id: int, owner: int):
     return ref
 
 
+def _ambient_mark(client, frame: int) -> dict:
+    """How the content filter sees an ambient scene whose picture is the
+    saved frame `frame`."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    from .test_ambient import SHORT
+
+    sid = client.post("/api/ambient", json={"config": SHORT, "generate": False}).json()["id"]
+    r = client.post(f"/api/ambient/{sid}/picture/from", json={"studio_job_id": frame})
+    assert r.status_code == 200, r.text
+    with SessionLocal() as db:
+        return ambient._picture_mark(db, db.get(models.VideoProject, sid))
+
+
 def test_a_saved_frame_of_an_animated_cast_picture_is_still_that_characters_picture(auth_client, tmp_path):
     """Adult mode, Bob not ticked: the first frame of a clip animated from
     his Cast picture is (nearly) that picture, so animating the saved frame
     forces his content filter, as animating the picture itself does; so
     does an ambient scene made from the frame. Anna, ticked: her checked
     picture's frames skip it; one added since keeps it."""
-    from app import models
-    from app.db import SessionLocal
-    from app.services import ambient, content_mode
+    from app.services import content_mode
 
-    from .test_ambient import SHORT
     from .test_content_mode import _asset, _tick_now
     from .test_content_mode import _avatar as _avatar_row
 
@@ -685,15 +783,8 @@ def test_a_saved_frame_of_an_animated_cast_picture_is_still_that_characters_pict
         assert content_mode.forces_filter(ref) is not adult_ok
 
     # An ambient scene whose picture is the frame: still Bob's picture.
-    def mark(frame: int) -> dict:
-        sid = auth_client.post("/api/ambient", json={"config": SHORT, "generate": False}).json()["id"]
-        r = auth_client.post(f"/api/ambient/{sid}/picture/from", json={"studio_job_id": frame})
-        assert r.status_code == 200, r.text
-        with SessionLocal() as db:
-            return ambient._picture_mark(db, db.get(models.VideoProject, sid))
-
-    assert mark(bob_frame) == {"cast_picture": True, "adult_ok": False}
-    assert mark(anna_frame) == {"cast_picture": True, "adult_ok": True}
+    assert _ambient_mark(auth_client, bob_frame) == {"cast_picture": True, "adult_ok": False}
+    assert _ambient_mark(auth_client, anna_frame) == {"cast_picture": True, "adult_ok": True}
 
 
 def test_the_cast_link_is_followed_through_every_copy_and_reference(auth_client, tmp_path):
@@ -730,3 +821,74 @@ def test_the_cast_link_is_followed_through_every_copy_and_reference(auth_client,
     # Not a likeness: a logo, a new Studio picture, a prompt alone.
     for fields in ({"first_frame_asset_id": logo}, {"first_frame_job_id": _job(bob)}, {}):
         assert _source(_frame_of(auth_client, _clip_row(tmp_path, bob, **fields))) == (None, None), fields
+
+
+def _ingredient_with_picture(name: str) -> tuple[int, int]:
+    """(an ingredient, a picture on it)."""
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        ing = models.Ingredient(name=name, kind="scene")
+        db.add(ing)
+        db.flush()
+        pic = models.Asset(owner_kind="ingredient", ingredient_id=ing.id, asset_type="reference",
+                           file_path="/tmp/x.png", mime_type="image/png")
+        db.add(pic)
+        db.commit()
+        return ing.id, pic.id
+
+
+def test_a_scenes_clip_keeps_the_cast_link_once_its_cast_picture_is_deleted(auth_client, tmp_path):
+    """Adult mode, Bob not ticked. A scene's clip (owned by "Beach", not a
+    character) animated from Bob's Cast picture, or made with his picture
+    as a reference, gives frames that are his picture, also once that
+    picture is deleted: the clip remembers whose it was, so animating a
+    frame or making an ambient scene of it still forces his filter. Same
+    when a ticked character is deleted with her pictures. A deleted
+    picture that wasn't a Cast picture leaves a new picture; one gone with
+    nothing remembered (deleted before clips recorded it) keeps the filter
+    whoever owns the clip."""
+    from app.services import content_mode, pipeline
+
+    from .test_content_mode import _asset, _tick_now
+    from .test_content_mode import _avatar as _avatar_row
+
+    bob, anna = _avatar_row("Bob"), _avatar_row("Anna")
+    bob_pic, bob_ref, anna_pic = _asset(bob), _asset(bob), _asset(anna)
+    beach, beach_pic = _ingredient_with_picture("Beach")
+    _tick_now(anna)
+    content_mode.set_adult_mode(True)
+
+    big = (640, 480)  # big enough for an ambient scene's picture
+
+    def clip(**fields) -> int:
+        return _clip_row(tmp_path, beach, big, owner_kind="ingredient", **fields)
+
+    started, referenced = clip(first_frame_asset_id=bob_pic), clip(reference_asset_ids_json=[bob_ref])
+    scenery, anna_clip = clip(first_frame_asset_id=beach_pic), clip(first_frame_asset_id=anna_pic)
+    frames = {c: _frame_of(auth_client, c) for c in (started, referenced, scenery, anna_clip)}
+    assert [_source(frames[c]) for c in (started, referenced, scenery, anna_clip)] == [
+        (bob, bob_pic), (bob, bob_ref), (None, None), (anna, anna_pic)]
+    assert _animated_from(auth_client, frames[anna_clip], beach, "ingredient").adult_ok is True
+
+    for pic in (bob_pic, bob_ref, beach_pic):
+        assert auth_client.delete(f"/api/assets/{pic}").status_code == 204
+    assert auth_client.delete(f"/api/avatars/{anna}").status_code == 204
+    later = _frame_of(auth_client, referenced, at="last")  # a frame saved after the delete
+    assert [_source(f) for f in (frames[started], frames[referenced], later, frames[anna_clip])] == [
+        (bob, None), (bob, None), (bob, None), (anna, None)]
+    assert _source(frames[scenery]) == (None, None)  # a scene's own picture: still a new picture
+    for frame in (frames[started], later, frames[anna_clip]):
+        ref = _animated_from(auth_client, frame, beach, "ingredient")
+        assert (ref.role, ref.adult_ok) == ("character", False) and content_mode.forces_filter(ref), frame
+    assert _ambient_mark(auth_client, frames[started]) == {"cast_picture": True, "adult_ok": False}
+    ref = _animated_from(auth_client, frames[scenery], beach, "ingredient")
+    assert ref.role == "scene" and not content_mode.forces_filter(ref)
+
+    # Gone with nothing remembered: whose it was isn't known, so the filter stays on.
+    unknown = _frame_of(auth_client, clip(first_frame_asset_id=99999, reference_asset_ids_json=[99998]))
+    assert _source(unknown) == (pipeline.UNKNOWN_CAST, None)
+    ref = _animated_from(auth_client, unknown, beach, "ingredient")
+    assert ref.role == "character" and content_mode.forces_filter(ref)
+    assert _ambient_mark(auth_client, unknown) == {"cast_picture": True, "adult_ok": False}
