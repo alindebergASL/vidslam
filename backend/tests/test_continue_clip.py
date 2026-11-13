@@ -193,6 +193,93 @@ def test_retry_of_a_failed_auto_join_joins_again(auth_client):
     assert r.status_code == 202, r.text
     again = _job(auth_client, r.json()["id"])
     assert again["status"] == "completed" and again["options"]["job_ids"] == [original["id"], cont["id"]]
+    # The new join is the continuation's join from now on.
+    assert again["options"]["auto_join_for"] == cont["id"]
+    assert _job(auth_client, cont["id"])["options"]["join_job_id"] == again["id"]
+    # Running a finished (not failed) join again doesn't move the link.
+    r = auth_client.post(f"/api/studio/jobs/{again['id']}/retry")
+    assert r.status_code == 202, r.text
+    assert "auto_join_for" not in _job(auth_client, r.json()["id"])["options"]
+    assert _job(auth_client, cont["id"])["options"]["join_job_id"] == again["id"]
+
+
+def test_continue_falls_back_to_the_default_when_the_clips_own_provider_is_off(auth_client, monkeypatch):
+    from app import models, providers
+    from app.db import SessionLocal
+    from app.providers.base import VideoCapabilities
+    from app.services import provider_gate
+    from app.services.provider_keys import ProviderUnavailable
+
+    aid = _avatar(auth_client)
+    original = _clip(auth_client, aid)
+    default = original["provider_model"]
+    with SessionLocal() as db:  # made with another provider's model
+        db.get(models.AssetGenerationJob, original["id"]).provider_model = "openrouter/some-video"
+        db.commit()
+    monkeypatch.setattr(providers, "video_capabilities",
+                        lambda model: VideoCapabilities(durations=[5], first_frame=True))
+    real = provider_gate.require_model
+
+    def gate(kind, model=None, db=None):
+        if model == "openrouter/some-video":
+            raise ProviderUnavailable("openrouter", kind=kind, model=model)
+        return real(kind, model, db)
+
+    monkeypatch.setattr(provider_gate, "require_model", gate)
+    assert auth_client.get(f"/api/studio/jobs/{original['id']}/continue").json()["model"] == default
+    r = _continue(auth_client, original["id"])
+    assert r.status_code == 202, r.text
+    assert _job(auth_client, r.json()["id"])["provider_model"] == default
+    # Picked on purpose, the switched-off model is still a plain 409.
+    assert _continue(auth_client, original["id"], model="openrouter/some-video").status_code == 409
+
+
+def test_a_continue_that_fails_after_the_frame_leaves_no_frame_behind(auth_client, monkeypatch):
+    from app.api import studio
+    from app.workers import queue
+
+    aid = _avatar(auth_client)
+    original = _clip(auth_client, aid)
+    frames = len([f for f in _rows(operation="extract_frame") if f[1] != "deleted"])
+    clips = len(_rows(output_kind="video_clip"))
+
+    def down(*a, **kw):
+        raise queue.QueueUnavailable("down")
+
+    monkeypatch.setattr(queue, "enqueue", down)
+    monkeypatch.setattr(studio, "enqueue", down)
+    for _ in range(2):
+        r = _continue(auth_client, original["id"])
+        assert r.status_code >= 500, r.text  # the queue is down
+    listed = auth_client.get("/api/studio/jobs", params={"limit": 200}).json()
+    assert [j for j in listed if j["operation"] == "extract_frame"] == []
+    assert len([j for j in listed if j["output_kind"] == "video_clip"]) == 1  # only the original
+    assert len([f for f in _rows(operation="extract_frame") if f[1] != "deleted"]) == frames
+    assert len(_rows(output_kind="video_clip")) == clips + 2  # tombstoned, never shown
+
+
+def test_a_failed_join_insert_rolls_back_only_the_join(auth_client, tmp_path, monkeypatch):
+    """The join row can't be inserted (a constraint, a lost serialization):
+    only the join is rolled back, and the paid clip still completes."""
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    original = _clip_job(_video(tmp_path / "o.mp4"), aid)
+    jid, vid = _polling_continuation(auth_client, aid, original, tmp_path)
+    real = video_ops.new_join_job
+
+    def broken(sources, transition, crossfade):
+        join = real(sources, transition, crossfade)
+        join.result_asset_id = 999999  # no such asset: the flush fails in the database (FK)
+        return join
+
+    monkeypatch.setattr(video_ops, "new_join_job", broken)
+    _apply(vid)
+    cont = _job(auth_client, jid)
+    assert cont["status"] == "completed", cont
+    assert cont["options"]["join_note"] == "Not joined: something went wrong"
+    assert "join_job_id" not in cont["options"]
+    assert _rows(operation="join_clips") == []
 
 
 # ---------- the join, exactly once ----------

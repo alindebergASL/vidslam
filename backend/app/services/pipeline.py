@@ -2720,7 +2720,8 @@ def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models
     prompt, so no safety check: the operation makes nothing new, it only
     cuts out, enlarges or copies a frame of a clip made from a checked
     prompt, or joins such clips (a frame of an uploaded video is checked
-    before it is stored, in the API: services/video_ops.py)."""
+    before it is stored, in the API, and so is a frame of a clip with
+    pictures of one: video_ops.checked_grab)."""
     from ..providers import get_image_op
     from . import image_ops, video_ops
     from . import model_registry as reg
@@ -3117,14 +3118,18 @@ def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
 
 def _plan_auto_join(db: Session, job: models.AssetGenerationJob) -> Optional[models.AssetGenerationJob]:
     """video_ops.plan_auto_join, but a fault in it never costs the paid clip:
-    it is noted on the clip instead (the clip still completes)."""
+    it runs in a savepoint, so a failed insert (a constraint, a lost
+    serialization) rolls back only the join, and it is noted on the clip
+    instead (the clip still completes in the caller's transaction)."""
     from . import video_ops
 
     try:
-        return video_ops.plan_auto_join(db, job)
+        with db.begin_nested():
+            return video_ops.plan_auto_join(db, job)
     except Exception:  # noqa: BLE001
         log.exception("studio job %s: couldn't plan the join with the original", job.id)
-        job.options_json = {**(job.options_json or {}), video_ops.JOIN_NOTE: "Not joined: something went wrong"}
+        opts = {k: v for k, v in (job.options_json or {}).items() if k != video_ops.JOIN_JOB}
+        job.options_json = {**opts, video_ops.JOIN_NOTE: "Not joined: something went wrong"}
         return None
 
 

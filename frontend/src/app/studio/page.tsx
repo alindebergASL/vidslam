@@ -463,6 +463,13 @@ function Studio() {
       const seen = new Map(fresh.map((j) => [j.id, j]));
       for (const j of fresh) latest.current.set(j.id, j);
       const done = new Set(ids.filter((id) => !seen.has(id) || TERMINAL.includes(seen.get(id)!.status)));
+      // A continuation this session watched finish was joined with its
+      // original on the server: a list load (with the current filters and
+      // order) brings the new join in, and tracks it while it runs.
+      const joined = fresh.filter(
+        (j) => done.has(j.id) && j.options?.join_job_id && !jobsRef.current.some((x) => x.id === j.options!.join_job_id)
+      );
+      if (joined.length > 0) loadJobs().catch(() => undefined);
       if (fresh.length > 0) setJobs((cur) => cur.map((j) => (seen.has(j.id) ? { ...j, ...seen.get(j.id)! } : j)));
       // Deleted elsewhere: drop the tile too.
       const gone = ids.filter((id) => !seen.has(id));
@@ -552,27 +559,13 @@ function Studio() {
   const continueStarted = (j: StudioJob) => {
     setContinuing(null);
     addCreated(batchPlaceholders(j));
+    // The clip's last frame was saved as a Studio picture too: a list load
+    // (with the current filters) shows it where it belongs.
+    loadJobs().catch(() => undefined);
     toast.success(
       j.options?.auto_join ? "Making the next clip; it's joined with the original when done" : "Making the next clip…"
     );
   };
-  // A finished continuation's join with its original: shown as soon as it
-  // exists (it is made on the server when the continuation finishes).
-  const askedJoins = useRef(new Set<number>());
-  useEffect(() => {
-    for (const j of jobs) {
-      const joinId = j.options?.join_job_id;
-      if (!joinId || askedJoins.current.has(joinId) || jobs.some((x) => x.id === joinId)) continue;
-      askedJoins.current.add(joinId);
-      api
-        .getStudioJob(joinId)
-        .then((join) => {
-          setJobs((cur) => (cur.some((x) => x.id === join.id) ? cur : [join, ...cur]));
-          if (!TERMINAL.includes(join.status)) setPendingJobIds((cur) => Array.from(new Set([...cur, join.id])));
-        })
-        .catch(() => undefined); // deleted since
-    }
-  }, [jobs]);
 
   // Rough price of running a job again with this model ("" = unknown).
   const modelOptionsFor = (job: StudioJob): ModelOption[] =>
@@ -1799,8 +1792,12 @@ function TileCard({
               type="button"
               onClick={onOpenSource}
               className="pointer-events-auto chip text-[10px] py-0.5 bg-ink-900/85 hover:text-white truncate max-w-full"
-              title="Show the picture this was made from"
-              aria-label={`Show the original picture (${fromText})`}
+              title={job?.options?.continues_job_id ? "Show the clip this one continues" : "Show the picture this was made from"}
+              aria-label={
+                job?.options?.continues_job_id
+                  ? `Show the clip this continues (${fromText})`
+                  : `Show the original picture (${fromText})`
+              }
             >
               {fromText}
             </button>

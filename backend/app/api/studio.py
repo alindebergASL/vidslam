@@ -568,7 +568,7 @@ def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest
 
         ids, transition, crossfade = video_ops.join_options(src)
         try:
-            return _join(db, ids, transition, crossfade, response)
+            return _join(db, ids, transition, crossfade, response, replaces=src)
         except HTTPException as e:
             if e.status_code == 404:
                 # A clip it joined was deleted since: it can't be made again.
@@ -815,7 +815,8 @@ def _frame_from_clip(db: Session, job_id: int, at, response: Response) -> Studio
     """A new Studio picture: the frame of a finished Studio clip at `at`.
     Grabbed here and finished before answering (ffmpeg is in the API
     image), else queued for the worker (202). Free: no model, no spend, no
-    budget cap. No new safety check: see services/video_ops.py."""
+    budget cap. No new safety check, except for a clip with pictures of an
+    uploaded video (video_ops.checked_grab)."""
     from ..services import video_ops
 
     try:
@@ -842,9 +843,11 @@ def _grab_now(db: Session, src: models.AssetGenerationJob, at) -> models.AssetGe
     from ..services import video_ops
 
     try:
-        data, seconds = video_ops.grab(Path(src.result_path), at)
+        data, seconds = video_ops.checked_grab(db, src, at)
     except RuntimeError as e:
         raise HTTPException(422, "Couldn't read a frame from that clip") from e
+    except video_ops.OpError as e:
+        raise HTTPException(e.status, e.message) from e
     job = video_ops.new_clip_job(db, src, at, seconds=seconds)
     job.status = "submitted"
     db.add(job)
@@ -904,11 +907,13 @@ def frame_from_video(
 # ---------- join clips ----------
 
 
-def _join(db: Session, job_ids: list[int], transition: str, crossfade: float, response: Response) -> StudioJobOut:
+def _join(db: Session, job_ids: list[int], transition: str, crossfade: float, response: Response, *,
+          replaces: Optional[models.AssetGenerationJob] = None) -> StudioJobOut:
     """Check the clips and queue one job that joins them (202): a new
     Studio clip owned by the first clip's owner. Free: no model, no spend,
     no budget cap, but at most JOIN_MAX_RUNNING at once (429). No new
-    safety check: see services/video_ops.py."""
+    safety check: see services/video_ops.py. `replaces`: the failed join
+    this one retries; a continuation's auto-join stays linked to it."""
     from ..services import video_ops
 
     try:
@@ -935,6 +940,9 @@ def _join(db: Session, job_ids: list[int], transition: str, crossfade: float, re
         db.delete(job)
         db.commit()
         raise busy
+    if replaces is not None:
+        # Committed with the queueing below.
+        video_ops.relink_auto_join(db, replaces, job)
     _enqueue_jobs(db, [job])
     db.refresh(job)
     response.status_code = 202
@@ -963,21 +971,33 @@ def join_clips(body: StudioJoinRequest, response: Response, db: Session = Depend
 
 def _continue_model(db: Session, src: models.AssetGenerationJob) -> str:
     """The model a continuation of `src` uses when none is picked: the model
-    of the clip it follows on from when that one can start from a picture,
-    else the default video model when it can; "" when neither can."""
+    of the clip it follows on from when that one can start from a picture
+    and its provider is on, else the default video model when it can; ""
+    when neither can start from a picture. (A default whose provider is off
+    is still answered, so the request gets the plain "switched off" 409.)"""
     from ..providers import video_capabilities
     from ..services import video_ops
+    from ..services.provider_keys import ProviderUnavailable
+
+    def first_frame(model: str) -> bool:
+        try:
+            return bool(video_capabilities(_video_model(db, model)).first_frame)
+        except Exception:  # noqa: BLE001 — an old or unknown model: not usable
+            return False
+
+    def gate_open(model: str) -> bool:
+        try:
+            provider_gate.require_model("video", model, db)
+        except ProviderUnavailable:
+            return False
+        return True
 
     origin = video_ops.continue_origin(db, src)
     own = (origin.provider_model if origin is not None else "") or ""
-    if own and not own.startswith(LOCAL_PREFIX):
-        try:
-            if video_capabilities(_video_model(db, own)).first_frame:
-                return own
-        except Exception:  # noqa: BLE001 — an old or unknown model: the default instead
-            pass
+    if own and not own.startswith(LOCAL_PREFIX) and first_frame(own) and gate_open(own):
+        return own
     default = _video_model(db, None)
-    return default if video_capabilities(default).first_frame else ""
+    return default if first_frame(default) else ""
 
 
 def _continue_source(db: Session, job_id: int) -> models.AssetGenerationJob:
@@ -1033,15 +1053,39 @@ def continue_clip(job_id: int, body: StudioContinueRequest, db: Session = Depend
     if not video_ops.ffmpeg_here():
         raise HTTPException(503, video_ops.NO_FFMPEG)
     frame = _grab_now(db, src, "last")
-    if frame.status not in ("completed", "saved"):
-        raise HTTPException(409, "Couldn't save the clip's last frame; try again")
-    request = StudioRequest(
-        owner_kind=src.owner_kind, owner_id=src.owner_id, output_kind="video_clip", prompt=body.prompt,
-        negative_prompt=body.negative_prompt, model=model, duration_seconds=body.duration_seconds,
-        aspect_ratio=video_ops.continue_aspect(src) or None, first_frame_job_id=frame.id,
-    )
-    return _create_jobs(db, request, "video_clip", 1,
-                        options=video_ops.continue_options(src.id, body.auto_join))
+    try:
+        if frame.status not in ("completed", "saved"):
+            raise HTTPException(409, "Couldn't save the clip's last frame; try again")
+        request = StudioRequest(
+            owner_kind=src.owner_kind, owner_id=src.owner_id, output_kind="video_clip", prompt=body.prompt,
+            negative_prompt=body.negative_prompt, model=model, duration_seconds=body.duration_seconds,
+            aspect_ratio=video_ops.continue_aspect(src) or None, first_frame_job_id=frame.id,
+        )
+        return _create_jobs(db, request, "video_clip", 1,
+                            options=video_ops.continue_options(src.id, body.auto_join))
+    except Exception:
+        # Nothing was started (a check refused it, the queue is down): the
+        # frame saved for it, and a continuation stored but never queued,
+        # are removed, so a retry doesn't leave one more frame behind.
+        _drop_continue_frame(db, frame.id)
+        raise
+
+
+def _drop_continue_frame(db: Session, frame_id: int) -> None:
+    """Tombstone the frame a failed Continue saved and the clip stored from
+    it in that request when it was never run (its queue entry was refused,
+    so it is marked failed). Kept as they are when that clip was queued."""
+    db.rollback()
+    Job = models.AssetGenerationJob
+    clips = db.query(Job).filter(Job.first_frame_job_id == frame_id, Job.status != STUDIO_DELETED).all()
+    if any(c.status != "failed" for c in clips):
+        return
+    frame = _live_job(db, frame_id)
+    files: list[str] = []
+    for j in clips + ([frame] if frame is not None else []):
+        files += _tombstone(db, j)
+    db.commit()
+    _remove_files(db, files)
 
 
 # ---------- a video uploaded as a clip ----------

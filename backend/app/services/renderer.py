@@ -119,8 +119,17 @@ def _probe_size(path: Path) -> Optional[tuple[int, int]]:
         return None
     try:
         st = json.loads(log)["streams"][0]
-        w, h = int(st["width"]), int(st["height"])
     except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return stream_size(st)
+
+
+def stream_size(st: dict) -> Optional[tuple[int, int]]:
+    """(width, height) of one ffprobe video stream entry (width, height and
+    its rotation side data or tag), rotation applied, or None."""
+    try:
+        w, h = int(st["width"]), int(st["height"])
+    except (KeyError, TypeError, ValueError):
         return None
     rotation = 0.0
     try:

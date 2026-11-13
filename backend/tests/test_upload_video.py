@@ -121,10 +121,41 @@ def test_uploaded_clip_can_be_continued_joined_and_framed(auth_client, tmp_path)
     assert cont["status"] == "completed" and cont["aspect_ratio"] == "16:9"
     join = auth_client.get(f"/api/studio/jobs/{cont['options']['join_job_id']}").json()
     assert join["status"] == "completed" and join["options"]["job_ids"] == [up["id"], cont["id"]]
-    # Its frames are frames of a Studio clip now: no new check.
+    # A frame already checked at upload (the first) is a cache hit.
     frame = auth_client.post(f"/api/studio/jobs/{up['id']}/frame-to-picture", json={"at": "first"})
     assert frame.status_code == 201
     assert len(mock_chat.PICTURE_CALLS) == calls
+
+
+def test_any_frame_saved_from_an_uploaded_clip_or_its_join_is_checked(auth_client, tmp_path):
+    """Only 3 to 8 frames were checked at upload: a frame saved from it
+    later, or from a join it is part of, is checked as it is saved."""
+    from app.providers import mock_chat
+
+    from .test_continue_clip import _clip
+
+    aid = _avatar(auth_client)
+    up = _upload(auth_client, _video(tmp_path / "a.mp4", seconds=2.0), aid).json()
+    calls = len(mock_chat.PICTURE_CALLS)
+    r = auth_client.post(f"/api/studio/jobs/{up['id']}/frame-to-picture", json={"at": 0.5})
+    assert r.status_code == 201, r.text
+    assert len(mock_chat.PICTURE_CALLS) == calls + 1  # a frame never seen before: checked
+    made = _clip(auth_client, aid)
+    joined = auth_client.post("/api/studio/join-clips", json={"job_ids": [made["id"], up["id"]]}).json()
+    # A frame judged under 18 is refused, from the upload or the join alike.
+    mock_chat.PICTURE_REPLY = {"minor": True, "reason": "A child."}
+    for jid, at in ((up["id"], 1.5), (joined["id"], 6.3)):
+        r = auth_client.post(f"/api/studio/jobs/{jid}/frame-to-picture", json={"at": at})
+        assert r.status_code == 422 and "under 18" in r.json()["detail"], r.text
+    # Continuing it is refused before anything is made.
+    before = auth_client.get("/api/studio/jobs", params={"limit": 200}).json()
+    r = auth_client.post(f"/api/studio/jobs/{joined['id']}/continue", json={"prompt": "on she goes"})
+    assert r.status_code == 422, r.text
+    assert len(auth_client.get("/api/studio/jobs", params={"limit": 200}).json()) == len(before)
+    # A generated clip's frames are not checked.
+    calls = len(mock_chat.PICTURE_CALLS)
+    r = auth_client.post(f"/api/studio/jobs/{made['id']}/frame-to-picture", json={"at": 0.5})
+    assert r.status_code == 201 and len(mock_chat.PICTURE_CALLS) == calls
 
 
 def test_other_formats_are_re_encoded_to_h264_aac_mp4(auth_client, tmp_path):
@@ -246,6 +277,117 @@ def test_bad_files_and_limits(auth_client, tmp_path, temp_root, monkeypatch):
     r = _upload(auth_client, _video(tmp_path / "a.mp4"), aid)
     assert r.status_code == 413
     assert _uploads() == 0 and _clip_files() == [] and _left(temp_root) == []
+
+
+def test_only_sniffed_containers_are_read(auth_client, tmp_path, temp_root):
+    """An animated GIF or an MPEG-TS sent as video/mp4 isn't one of the
+    containers sniffed (MP4/MOV, Matroska/WebM, AVI): refused unread."""
+    aid = _avatar(auth_client)
+    gif = tmp_path / "x.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=5:duration=2",
+                    "-f", "gif", str(gif)], check=True)
+    ts = tmp_path / "y.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=5:duration=2",
+                    "-c:v", "libx264", "-f", "mpegts", str(ts)], check=True)
+    for path in (gif, ts):
+        r = _upload(auth_client, path, aid)
+        assert r.status_code == 422 and "isn't a video" in r.json()["detail"], r.text
+    assert _uploads() == 0 and _left(temp_root) == []
+    # A Matroska file (WebM) and an AVI are read, each with its own demuxer.
+    avi = _video(tmp_path / "z.avi", codec="mpeg4")
+    assert _upload(auth_client, avi, aid, content_type="video/x-msvideo").status_code == 201
+
+
+def test_the_prepared_copys_length_is_what_counts(auth_client, tmp_path, temp_root, monkeypatch):
+    """A file that claims to be shorter than it plays (its own metadata) is
+    measured again once prepared, cut a second past the most, and refused."""
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SECONDS", 3.0)
+    real = video_ops._probe_upload
+
+    def lies(path, demuxer):
+        return {**real(path, demuxer), "seconds": 1.0}
+
+    monkeypatch.setattr(video_ops, "_probe_upload", lies)
+    seen: list[float] = []
+    real_norm = video_ops.normalize_upload
+
+    def norm(src, dst, streams):
+        out = real_norm(src, dst, streams)
+        from app.services.renderer import _probe_clip
+
+        seen.append(_probe_clip(dst)[0])
+        return out
+
+    monkeypatch.setattr(video_ops, "normalize_upload", norm)
+    for name, codec in (("a.mp4", "libx264"), ("b.webm", "libvpx-vp9")):  # copied, re-encoded
+        r = _upload(auth_client, _video(tmp_path / name, seconds=8.0, size=(32, 32), codec=codec), aid)
+        assert r.status_code == 422 and "longer than" in r.json()["detail"], r.text
+    assert all(s <= 4.5 for s in seen) and len(seen) == 2  # never decoded past the cap
+    assert _uploads() == 0 and _clip_files() == [] and _left(temp_root) == []
+
+
+def test_preparing_is_bounded_and_holds_no_database_connection(auth_client, tmp_path, temp_root, monkeypatch):
+    from app.services import renderer, video_ops
+
+    aid = _avatar(auth_client)
+    # Every ffmpeg/ffprobe run on the raw upload has a time limit, well
+    # inside the proxy's read timeout; a re-encode past it is refused.
+    runs: list[tuple] = []
+    real = renderer._run
+
+    def spy(cmd, timeout=None, should_stop=None):
+        runs.append((cmd, timeout))
+        return real(cmd, timeout=timeout, should_stop=should_stop)
+
+    monkeypatch.setattr(renderer, "_run", spy)
+    in_tx: list[bool] = []
+    real_vfu = video_ops._video_from_upload
+
+    def watch(db, **kw):
+        in_tx.append(db.in_transaction())
+        return real_vfu(db, **kw)
+
+    monkeypatch.setattr(video_ops, "_video_from_upload", watch)
+    r = _upload(auth_client, _video(tmp_path / "a.webm", codec="libvpx-vp9"), aid, content_type="video/webm")
+    assert r.status_code == 201, r.text
+    assert in_tx == [False]
+    raw = [(c, t) for c, t in runs if any("upload.mkv" in part for part in c)]
+    assert raw and all(t is not None and t <= 400 for _c, t in raw)
+    assert all(c[c.index("-f") + 1] == "matroska" and "-protocol_whitelist" in c for c, _t in raw)
+    assert video_ops.UPLOAD_ENCODE_TIMEOUT < 600
+
+    def slow(cmd, timeout=None, should_stop=None):
+        if cmd[0] == "ffmpeg" and "libx264" in cmd:
+            return -1, "timed out after 360s"
+        return real(cmd, timeout=timeout, should_stop=should_stop)
+
+    monkeypatch.setattr(renderer, "_run", slow)
+    r = _upload(auth_client, _video(tmp_path / "b.webm", codec="libvpx-vp9", size=(32, 32)), aid,
+                content_type="video/webm")
+    assert r.status_code == 422 and "too long to prepare" in r.json()["detail"], r.text
+    assert _left(temp_root) == []
+
+
+def test_too_many_uploads_at_once_are_refused(auth_client, tmp_path, monkeypatch):
+    import threading
+
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    monkeypatch.setattr(video_ops, "_upload_slots", threading.BoundedSemaphore(1))
+    assert video_ops._upload_slots.acquire(blocking=False)  # another upload being prepared
+    r = _upload(auth_client, _video(tmp_path / "a.mp4"), aid)
+    assert r.status_code == 429, r.text
+    video_ops._upload_slots.release()
+    assert _upload(auth_client, _video(tmp_path / "a.mp4"), aid).status_code == 201
+    # The place is given back on every path, a refusal included.
+    fake = tmp_path / "notes.mp4"
+    fake.write_bytes(b"hello")
+    assert _upload(auth_client, fake, aid).status_code == 422
+    assert _upload(auth_client, _video(tmp_path / "b.mp4"), aid).status_code == 201
 
 
 def test_a_scene_can_own_an_uploaded_video(auth_client, tmp_path):
