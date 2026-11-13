@@ -302,6 +302,15 @@ def test_the_fit_says_what_a_recompose_with_a_stale_clip_does(auth_client, tmp_p
         assert expected_cut > 1.0
         assert fit["recompose_cut_seconds"] == pytest.approx(expected_cut, abs=0.15)
         assert fit["recompose_note"].startswith("Fits after Generate video; a Re-compose with the current clips cuts")
+        # When a Re-compose would play a different recording (an older
+        # voiceover the lip-synced clips still follow), nothing is predicted.
+        real = pipeline._recompose_voiceover
+        pipeline._recompose_voiceover = lambda _db, _p: (voice, "an-older-voiceover")
+        try:
+            other = auth_client.get(f"/api/projects/{pid}/voiceover/fit").json()
+        finally:
+            pipeline._recompose_voiceover = real
+        assert other["fit"] == "fits" and other["recompose_fit"] is None and other["recompose_note"] == ""
         # The Re-compose itself cuts what the fit said it would.
         db.expire_all()
         render = pipeline.recompose_project(db, pid)

@@ -1184,7 +1184,8 @@ def _fit_verdict(shots: float, end_card: float, audio_seconds: float) -> dict:
             "fit_text": text, "cut_seconds": cut}
 
 
-def voiceover_fit(project: models.VideoProject, audio_seconds: float) -> dict:
+def voiceover_fit(project: models.VideoProject, audio_seconds: float,
+                  db: Optional[Session] = None) -> dict:
     """The voiceover's real length against the shots' total time, in plain
     words that say what the render does with it (cover_voice). Counts the
     clips' real lengths where they are made: a clip shorter than its shot
@@ -1194,7 +1195,10 @@ def voiceover_fit(project: models.VideoProject, audio_seconds: float) -> dict:
     at its shot's length). A Re-compose reuses the clips as they are: when
     that gives a different result, the recompose_* fields say what it does
     and recompose_note says both in one plain sentence. With no storyboard
-    yet there are no shots to fit: fit is "no_plan"."""
+    yet there are no shots to fit: fit is "no_plan". With `db`, the
+    Re-compose prediction is left out when a Re-compose would play a
+    different recording (it keeps the older voiceover the lip-synced clips
+    follow), since this length says nothing about that one."""
     audio_seconds = float(audio_seconds or 0.0)
     if not _body_shots(project):
         return {"audio_seconds": round(audio_seconds, 2), "video_seconds": 0.0,
@@ -1209,6 +1213,8 @@ def voiceover_fit(project: models.VideoProject, audio_seconds: float) -> dict:
            "recompose_cut_seconds": None, "recompose_note": ""}
     again = _recompose_seconds(project)
     if again is None or abs(again - out["video_seconds"]) <= 0.05:
+        return out
+    if db is not None and not _recompose_plays_current_voice(db, project):
         return out
     re = _fit_verdict(again, end_card, audio_seconds)
     if re["fit"] == out["fit"] and abs(re["cut_seconds"] - out["cut_seconds"]) < 0.1:
@@ -1225,6 +1231,16 @@ def voiceover_fit(project: models.VideoProject, audio_seconds: float) -> dict:
                recompose_video_seconds=re["video_seconds"], recompose_cut_seconds=re["cut_seconds"],
                recompose_note=f"{after}; {now}.")
     return out
+
+
+def _recompose_plays_current_voice(db: Session, project: models.VideoProject) -> bool:
+    """Whether a Re-compose would play the voiceover being checked (the
+    current one), not an older one it keeps for the lip-synced clips."""
+    try:
+        _audio, fp = _recompose_voiceover(db, project)
+    except Exception:  # noqa: BLE001 — unknown: don't predict
+        return False
+    return fp == fingerprints.voice_fingerprint(db, project)
 
 
 def make_voiceover_preview(db: Session, project: models.VideoProject) -> dict:

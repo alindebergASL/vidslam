@@ -121,7 +121,7 @@ def uploaded_voiceover_fit(project_id: int, db: Session = Depends(get_db)) -> di
     path = Path(project.voiceover_upload_path)
     if not path.is_file():
         raise HTTPException(404, "voiceover file missing")
-    fit = pipeline.voiceover_fit(project, float(_probe_duration(path) or 0.0))
+    fit = pipeline.voiceover_fit(project, float(_probe_duration(path) or 0.0), db)
     return _fit_out(fit)
 
 
@@ -212,7 +212,7 @@ def generate_music(
 
 
 def _preview_out(db: Session, project: models.VideoProject, info: dict, *, reused: bool = False) -> dict:
-    fit = pipeline.voiceover_fit(project, float(info.get("duration_seconds") or 0.0))
+    fit = pipeline.voiceover_fit(project, float(info.get("duration_seconds") or 0.0), db)
     fp = str(info.get("fingerprint") or "")
     return {
         "url": f"/api/projects/{project.id}/voiceover/preview/audio?v={fp[:12] or 'x'}",
