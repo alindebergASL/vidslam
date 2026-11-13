@@ -2137,8 +2137,12 @@ def _compose(
     from . import explicit_check
 
     if explicit_check.active():
+        # The spoken script too: a Re-compose reuses an older voiceover (no
+        # new voice is made, so the voice check never runs) and says what
+        # that audio says, which may differ from the captions.
+        spoken = script if script is not None else (plan.cleaned_voice_script if plan is not None else "")
         explicit_check.check(look["cta_text"], look["disclosure_text"], hook_text,
-                             "\n".join(t.text for t in timed))
+                             "\n".join(t.text for t in timed), spoken or "")
     project_dir = storage.render_subdir(project.id)
     look = keep_music(look, project_dir, render.id)
     voice = voice_identity(db, project, audio, voice_fingerprint)

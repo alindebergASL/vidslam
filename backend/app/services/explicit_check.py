@@ -66,8 +66,12 @@ def parts(text: str) -> list[str]:
         out.append(text[start:end].strip())
         if end >= len(text):
             break
-        back = text.rfind(" ", end - OVERLAP, end)
-        start = back + 1 if back > start else end
+        # Start the next part about OVERLAP characters back, at the word
+        # boundary nearest that point, so a phrase across the cut is read
+        # whole in one of the two parts.
+        target = max(start + 1, end - OVERLAP)
+        back = text.find(" ", target, end)
+        start = back + 1 if back != -1 and back + 1 < end else target
     return [p for p in out if p]
 
 

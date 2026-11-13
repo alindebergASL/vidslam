@@ -1053,6 +1053,9 @@ def test_clean_check_reads_long_scripts_in_overlapping_parts(monkeypatch):
     assert " ".join(parts).count("word1500") >= 1 and parts[-1].endswith("she is naked")
     for a, b in zip(parts, parts[1:], strict=False):  # each part starts inside the one before
         assert b.split()[0] in a.split()
+        # ...about OVERLAP characters back, not just the last word.
+        shared = a[a.index(" " + b.split()[0] + " ") + 1:]
+        assert len(shared) >= explicit_check.OVERLAP - 20, len(shared)
     with pytest.raises(explicit_check.ExplicitContentError):
         explicit_check.check(words + " she is naked")
 
@@ -1353,3 +1356,31 @@ console.log(JSON.stringify(res));
         (_FRONTEND / "src/components/AdultModePanel.tsx").read_text(), "function useContentModeLoader("
     )
     assert "acceptSuccess(n)" in loader and "acceptFailure(n)" in loader
+
+
+def test_clean_recompose_checks_the_words_the_reused_voiceover_says(auth_client, monkeypatch):
+    """A Re-compose reuses an older voiceover (no new voice is made, so the
+    voice check never runs): the last check before drawing also reads what
+    that audio says, not only the captions."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import pipeline
+
+    from .test_render_fixes import _rendered
+
+    pid = _rendered(auth_client)
+    _clean(monkeypatch)
+    monkeypatch.setattr(pipeline, "_spoken_texts", lambda *a, **k: {"script": _EXPLICIT, "hook_text": ""})
+    db = SessionLocal()
+    try:
+        with pytest.raises(Exception, match="general audience|explicit"):
+            pipeline.recompose_project(db, pid)
+    finally:
+        db.close()
+    db = SessionLocal()
+    try:
+        last = (db.query(models.Render).filter(models.Render.project_id == pid)
+                .order_by(models.Render.id.desc()).first())
+        assert last.status != "completed" or not last.final_video_path
+    finally:
+        db.close()
