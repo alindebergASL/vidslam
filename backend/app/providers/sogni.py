@@ -203,6 +203,13 @@ _IMAGES: tuple[ImageModel, ...] = (
     ImageModel("seedream-5-0-pro-uncensored", "Seedream 5.0 Pro (uncensored)", "Premium Spark; needs the "
                "one-time likeness agreement in the Sogni app. Estimate ~10 Spark.", 10.0, premium=True,
                family=VENDOR, uncensored=True, keep=True),
+    # Also not in the published schema: Sogni's client library (5.81.0,
+    # 2026-11-13) names it, aliases "seedream-5.5-uncensored" / "-spicy".
+    # Live 2026-11-13: edit_image with a reference kept the exact place in
+    # 21 s, quoted 8.4 Spark, billed 7.98 (Premium Spark).
+    ImageModel("seedream-5-5-uncensored", "Seedream 5.5 (uncensored)", "Premium Spark; needs the one-time "
+               "likeness agreement in the Sogni app. ~8.4 Spark per image (live).", 8.4, premium=True,
+               family=VENDOR, uncensored=True, keep=True),
     # community checkpoints (SDXL / Pony / Illustrious): ~1 Spark each (documented tier)
     ImageModel("one-obsession-v22", "One Obsession v2.2", "Anime community checkpoint. 1.07 Spark "
                "(documented).", 1.07, family=COMMUNITY),
@@ -719,11 +726,16 @@ _EDITS: tuple[EditModel, ...] = (
     # Live 2026-11-12: edit_image kept a reference's exact place (12.8 Spark).
     EditModel("seedream-5-0-pro-uncensored", "Seedream 5.0 Pro (uncensored) edit", 13.5, 0.9, 10, premium=True,
               naming="image"),
+    # Same limits as 5.0 in Sogni's client library (1-10 reference
+    # pictures). Live 2026-11-13: one reference, 8.4 Spark quoted, 7.98
+    # billed; the extra-picture price is an estimate (5.0's).
+    EditModel("seedream-5-5-uncensored", "Seedream 5.5 (uncensored) edit", 8.4, 0.9, 10, premium=True,
+              naming="image"),
 )
 _EDIT_INFO = {m.selector: m for m in _EDITS}
 # Editors Sogni takes on edit_image but leaves out of its published list
 # (the protocol's enum lags its models): offered as well.
-_UNLISTED_EDITS = ("seedream-5-0-pro-uncensored",)
+_UNLISTED_EDITS = ("seedream-5-0-pro-uncensored", "seedream-5-5-uncensored")
 # A picked image model's own edit version. Identity twins only keep a
 # likeness; for a place or a guide picture they give way to the scene default.
 _EDIT_TWIN = {
@@ -733,6 +745,7 @@ _EDIT_TWIN = {
     "gpt-image-2.5-flare": "gpt-image-2.5-flare", "gpt-image-2.6-sunburst": "gpt-image-2.6-sunburst",
     "gpt-image-2.6-flare": "gpt-image-2.6-flare",
     "seedream-5-0-pro-uncensored": "seedream-5-0-pro-uncensored",
+    "seedream-5-5-uncensored": "seedream-5-5-uncensored",
 }
 INTENTS = ("same_place", "identity", "guide")
 
