@@ -58,7 +58,8 @@ const NOTIFY_KEY = "avs:notify";
 const BASE_TITLE = "AvatarVideoStudio";
 const TITLE_PREFIX = /^\(\d+\)\s+/;
 // Finished work: what toasts, notifies and counts as unread.
-const FINISHED = ["completed", "failed"];
+// needs_look: a batch scene's loop jumps at the join, so it wasn't rendered.
+const FINISHED = ["completed", "failed", "needs_look"];
 const STUDIO_GROUP_MS = 1500;
 
 function matches(f: EventFilter, ev: AppEvent): boolean {

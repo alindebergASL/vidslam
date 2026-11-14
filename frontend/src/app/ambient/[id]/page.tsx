@@ -3,7 +3,7 @@ import Link from "next/link";
 import { usePoll } from "@/lib/usePoll";
 import { useEvents } from "@/components/NotificationsProvider";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import clsx from "clsx";
 import { AuthGate } from "@/components/AuthGate";
 import { RenderHistory } from "@/components/RenderHistory";
@@ -27,6 +27,8 @@ import {
   MUSIC_LENGTHS,
   PlanSummary,
   previewSrc,
+  SeamBadge,
+  seamBlendHint,
   SceneArt,
   fmtDuration,
   presetFor,
@@ -36,7 +38,19 @@ import {
   VarietyControls,
   statusTone,
 } from "@/components/ambient/shared";
-import { api, AmbientConfig, AmbientPresets, AmbientScene, LoopPlan, PhotoRewrite, Render, errorText } from "@/lib/api";
+import {
+  api,
+  AmbientConfig,
+  AmbientPresets,
+  AmbientScene,
+  LoopPlan,
+  PhotoRewrite,
+  Render,
+  SeamJump,
+  errorText,
+  seamJumpOf,
+} from "@/lib/api";
+import { Dialog } from "@/components/Dialog";
 import { AutoTextarea } from "@/components/AutoTextarea";
 
 export default function AmbientScenePage() {
@@ -129,6 +143,37 @@ function Inner() {
     } finally {
       setBusy(null);
     }
+  };
+
+  // Render: a loop whose join jumps visibly comes back 409 seam_jump, and
+  // the dialog asks what to do (null: nothing happened yet).
+  const [seamAsk, setSeamAsk] = useState<SeamJump | null>(null);
+  const startRender = async () => {
+    try {
+      return await api.renderAmbient(id);
+    } catch (e) {
+      const jump = seamJumpOf(e);
+      if (!jump) throw e;
+      setSeamAsk(jump);
+      return null;
+    }
+  };
+  const renderWithBlend = (seconds: number) => {
+    setSeamAsk(null);
+    const cfg = scene?.config;
+    if (!cfg) return;
+    run(
+      "render",
+      async () => {
+        await api.updateAmbient(id, { config: { ...cfg, seam_mode: "blend", crossfade_seconds: seconds } });
+        return api.renderAmbient(id);
+      },
+      `Render started with a ${seconds} s blend`
+    );
+  };
+  const renderAnyway = () => {
+    setSeamAsk(null);
+    run("render", () => api.renderAmbient(id, true), "Render started");
   };
 
   if (notFound) {
@@ -254,7 +299,12 @@ function Inner() {
 
       {/* Step strip */}
       <ol className="grid grid-cols-3 gap-2 mb-6" aria-label="Progress">
-        <Step n={1} label="Loop clip" state={loopReady ? "done" : loopGenerating ? "active" : scene.loop_status === "failed" ? "failed" : "todo"} />
+        <Step
+          n={1}
+          label="Loop clip"
+          state={loopReady ? "done" : loopGenerating ? "active" : scene.loop_status === "failed" ? "failed" : "todo"}
+          badge={loopReady ? <SeamBadge treatment={scene.seam_treatment} /> : null}
+        />
         <Step
           n={2}
           label="Music bed"
@@ -329,7 +379,7 @@ function Inner() {
                     type="button"
                     className="btn-ghost text-sm mt-3"
                     disabled={!loopReady || busy !== null}
-                    onClick={() => run("render", () => api.renderAmbient(id), "Render started")}
+                    onClick={() => run("render", startRender, "Render started")}
                   >
                     Try again
                   </button>
@@ -352,7 +402,10 @@ function Inner() {
           <section className="card overflow-hidden">
             <div className="p-4 flex items-center justify-between gap-3 border-b border-ink-800">
               <div>
-                <h2 className="text-base font-medium">Loop clip</h2>
+                <h2 className="text-base font-medium flex flex-wrap items-center gap-2">
+                  Loop clip
+                  {loopReady && <SeamBadge treatment={scene.seam_treatment} />}
+                </h2>
                 <div className="mt-1.5">
                   <PlanSummary plan={plan} total={scene.total_seconds} compact />
                 </div>
@@ -470,17 +523,19 @@ function Inner() {
               </div>
             )}
             <div className="px-4 py-3 border-t border-ink-800">
-              <PlanSummary plan={plan} total={scene.total_seconds} />
+              <PlanSummary plan={plan} total={scene.total_seconds} treatment={loopReady ? scene.seam_treatment : null} />
             </div>
             {loopReady && (
               <LoopHealthCard
                 scene={scene}
                 disabled={inFlight}
-                onMeasured={(r) =>
+                onMeasured={(r) => {
                   setScene((prev) =>
                     prev ? { ...prev, loop_health: r.loop_health, variant_loop_health: r.variant_loop_health } : prev
-                  )
-                }
+                  );
+                  // The blend, the verdict and the plan follow the new reading.
+                  reload();
+                }}
               />
             )}
             {scene.loop_shot?.prompt && (
@@ -587,7 +642,7 @@ function Inner() {
                 type="button"
                 className="btn-primary disabled:opacity-50"
                 disabled={!loopReady || inFlight || busy !== null}
-                onClick={() => run("render", () => api.renderAmbient(id), "Render started")}
+                onClick={() => run("render", startRender, "Render started")}
               >
                 Render {fmtDuration(scene.total_seconds)}
               </button>
@@ -599,7 +654,7 @@ function Inner() {
                 type="button"
                 className="btn-ghost text-sm"
                 disabled={!loopReady || inFlight || busy !== null}
-                onClick={() => run("render", () => api.renderAmbient(id), "Render started")}
+                onClick={() => run("render", startRender, "Render started")}
               >
                 Re-render {fmtDuration(scene.total_seconds)}
               </button>
@@ -629,6 +684,29 @@ function Inner() {
           <RenderHistory projectId={id} />
         </div>
 
+        {seamAsk && (
+          <Dialog title="The loop jumps at the join" onClose={() => setSeamAsk(null)}>
+            <p className="text-sm text-ink-200">
+              The loop jumps every {fmtSeconds(seamAsk.repeat_every_seconds)}
+              {seamAsk.ratio ? ` (the join is ${seamAsk.ratio}× a normal frame step)` : ""}: a{" "}
+              {fmtSeconds(seamAsk.blend_seconds)} blend won&apos;t hide it. A longer blend turns the jump into a slow
+              dissolve. Watch the seam under Loop health to judge.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" className="btn-primary text-sm" disabled={busy !== null} onClick={() => renderWithBlend(2)}>
+                Blend 2 s
+              </button>
+              <button type="button" className="btn-primary text-sm" disabled={busy !== null} onClick={() => renderWithBlend(4)}>
+                Blend 4 s
+              </button>
+              <span className="self-center text-xs text-ink-400">free</span>
+              <button type="button" className="btn-ghost text-sm ml-auto" disabled={busy !== null} onClick={renderAnyway}>
+                Render anyway
+              </button>
+            </div>
+          </Dialog>
+        )}
+
         {/* ---- Settings ---- */}
         <aside className="space-y-4 lg:sticky lg:top-6 self-start">
           <SettingsPanel
@@ -652,8 +730,14 @@ function Inner() {
   );
 }
 
+/** "12.5 s", "2 s". */
+function fmtSeconds(n: number): string {
+  return `${Number.isInteger(n) ? n : n.toFixed(1)} s`;
+}
+
 /** "1 h · 1080p · seamless loop · 3 clips" from the render log's summary line
- *  (`ambient: clips=3 unit=28.50s repeats=127 total=3600s res=1080p seam=closed`). */
+ *  (`ambient: clips=3 unit=28.50s repeats=127 total=3600s res=1080p seam=slight_jump blend=1.5s`;
+ *  older renders logged seam=closed / seam=crossfade). */
 function renderSummary(log: string | undefined, fallback: string): string {
   const line = (log || "").split("\n")[0] || "";
   if (!line.startsWith("ambient:")) return fallback;
@@ -662,7 +746,11 @@ function renderSummary(log: string | undefined, fallback: string): string {
   );
   const parts = [fallback];
   if (kv.res) parts.push(kv.res);
-  if (kv.seam) parts.push(kv.seam === "closed" ? "seamless loop" : "crossfaded loop");
+  const blend = kv.blend ? ` over ${kv.blend.replace(/s$/, " s")}` : "";
+  if (kv.seam === "seamless" || kv.seam === "closed" || kv.seam === "drift") parts.push("seamless loop");
+  else if (kv.seam === "slight_jump") parts.push(`slight jump, blended${blend}`);
+  else if (kv.seam === "visible_jump") parts.push(`visible jump, blended${blend}`);
+  else if (kv.seam) parts.push(`crossfaded loop${blend}`);
   if (kv.clips && Number(kv.clips) > 1) parts.push(`${kv.clips} clips`);
   return parts.join(" · ");
 }
@@ -684,10 +772,12 @@ function Step({
   n,
   label,
   state,
+  badge,
 }: {
   n: number;
   label: string;
   state: "todo" | "active" | "done" | "failed" | "skipped";
+  badge?: ReactNode;
 }) {
   return (
     <li
@@ -710,6 +800,7 @@ function Step({
         {state === "done" ? "✓" : state === "skipped" ? "–" : n}
       </span>
       <span className="truncate">{label}</span>
+      {badge && <span className="ml-auto shrink-0 hidden sm:inline-flex">{badge}</span>}
     </li>
   );
 }
@@ -916,10 +1007,17 @@ function SettingsPanel({
             onChange={(e) => set("crossfade_seconds", Number(e.target.value))}
             className="w-full accent-iris disabled:opacity-40"
           />
-          {scene.plan.closed && cfg.source === "video" && (
-            <p className="text-[11px] text-ink-400 mt-1">
-              Closed loop: only {scene.plan.seam_crossfade}s is used at the seam.
-            </p>
+          <p className="text-[11px] text-ink-400 mt-1">{seamBlendHint(cfg, scene.seam_treatment)}</p>
+          {cfg.source === "video" && (
+            <label className="mt-1.5 flex items-start gap-1.5 text-[11px] text-ink-300">
+              <input
+                type="checkbox"
+                className="mt-0.5 accent-iris"
+                checked={(cfg.seam_mode ?? "auto") === "auto"}
+                onChange={(e) => set("seam_mode", e.target.checked ? "auto" : "blend")}
+              />
+              <span>Size the blend from the measured join, and ask before rendering a loop that jumps</span>
+            </label>
           )}
         </div>
         <div>

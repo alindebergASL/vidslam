@@ -19,6 +19,7 @@ import {
   type ModelOption,
   OverlayControls,
   PlanSummary,
+  seamBlendHint,
   SceneArt,
   SoundControls,
   VarietyControls,
@@ -726,7 +727,7 @@ function Inner() {
                   <p className="text-xs text-ink-400 mt-1">
                     {cfg.source === "image_drift"
                       ? "Not needed — the drift is periodic and already seamless."
-                      : "How much of the clip's tail blends into its head to hide the seam."}
+                      : `How much of the clip's tail blends into its head to hide the seam. ${seamBlendHint(cfg, null)}`}
                   </p>
                 </div>
                 <div>

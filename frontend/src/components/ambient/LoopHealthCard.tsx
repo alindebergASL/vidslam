@@ -96,10 +96,12 @@ export function LoopHealthCard({
   const health = healths[idx] ?? null;
   const clipReady = (i: number) => !!shots[i]?.clip_path && (i === 0 || shots[i]?.status === "completed");
 
-  // A different variation or a new reading: start the seam player closed again.
+  // A different variation or a new reading: open the seam player when the
+  // join isn't seamless (that's what to look at), else start it closed.
+  const seamVerdict = health?.seam.verdict;
   useEffect(() => {
-    setShowSeam(false);
-  }, [idx, health?.measured_at]);
+    setShowSeam(!!seamVerdict && seamVerdict !== "seamless");
+  }, [idx, health?.measured_at, seamVerdict]);
 
   const measure = async () => {
     setBusy(true);
