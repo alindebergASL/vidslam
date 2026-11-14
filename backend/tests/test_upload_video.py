@@ -1055,18 +1055,22 @@ def test_ordinary_1080p_uploads_are_kept_under_the_memory_cap(auth_client, tmp_p
     assert (r.json()["result_width"], r.json()["result_height"]) == (1920, 1080)
 
 
-def _squared(size: str, sar: str) -> tuple[int, int]:
+def _squared(size: str, sar: str) -> tuple[int, int, float]:
     """The size square_pixels_vf makes of one size x size frame with that
-    sample aspect ratio."""
+    sample aspect ratio, and the shape that frame is shown at. The shape is
+    read from the SAR the frame really carries: FFmpeg versions differ in
+    how they reduce an extreme ratio."""
     import re
 
     from app.services import video_ops
 
     out = subprocess.run(["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", f"color=size={size}:rate=1:duration=1,"
-                          f"setsar={sar}", "-vf", video_ops.square_pixels_vf() + ",showinfo", "-frames:v", "1",
-                          "-f", "null", "-"], capture_output=True, text=True, check=True).stderr
-    w, h = re.search(r" s:(\d+)x(\d+)", out).groups()
-    return int(w), int(h)
+                          f"setsar=r={sar}:max=1000,showinfo", "-vf", video_ops.square_pixels_vf() + ",showinfo",
+                          "-frames:v", "1", "-f", "null", "-"], capture_output=True, text=True, check=True).stderr
+    frames = re.findall(r"sar:(\d+)/(\d+) s:(\d+)x(\d+)", out)
+    (num, den, iw, ih), (_, _, w, h) = frames[0], frames[-1]
+    sar_in = int(num) / int(den) if int(num) and int(den) else 1.0
+    return int(w), int(h), int(iw) * sar_in / int(ih)
 
 
 def test_square_pixels_keep_the_shape_within_4k_by_area_too():
@@ -1080,11 +1084,15 @@ def test_square_pixels_keep_the_shape_within_4k_by_area_too():
     cases = {("1024x4096", "4"): 1.0, ("2048x2048", "100"): 100.0, ("512x4096", "1/4"): 1 / 32,
              ("4096x16", "1/1000"): 0.256, ("720x576", "64/45"): 1024 / 576, ("64x48", "1"): 64 / 48}
     for (size, sar), shape in cases.items():
-        w, h = _squared(size, sar)
+        w, h, shown = _squared(size, sar)
         assert w % 2 == 0 and h % 2 == 0 and w <= 4096 and h <= 4096 and w * h <= most, (size, sar, w, h)
-        assert w / h == pytest.approx(shape, rel=0.06), (size, sar, w, h)
-    assert _squared("720x576", "64/45") == (1024, 576)  # PAL 16:9 as before
-    assert _squared("1024x4096", "4") == (3072, 3072)
+        # The shape the frame is really shown at (an FFmpeg that drops an
+        # extreme ratio shows it as stored); the planned shape when kept.
+        assert w / h == pytest.approx(shown, rel=0.06), (size, sar, w, h, shown)
+        if shown != pytest.approx(int(size.split("x")[0]) / int(size.split("x")[1])):
+            assert shown == pytest.approx(shape, rel=0.06), (size, sar, shown)
+    assert _squared("720x576", "64/45")[:2] == (1024, 576)  # PAL 16:9 as before
+    assert _squared("1024x4096", "4")[:2] == (3072, 3072)
     # The shown size read from the headers agrees: taller when below 1.
     assert video_ops.display_size({"width": 720, "height": 576, "sample_aspect_ratio": "64:45"}) == (1024, 576)
     assert video_ops.display_size({"width": 512, "height": 1024, "sample_aspect_ratio": "1:2"}) == (512, 2048)
