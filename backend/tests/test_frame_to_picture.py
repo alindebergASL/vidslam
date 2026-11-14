@@ -441,9 +441,9 @@ def test_frame_from_a_video_goes_the_same_safe_way_as_upload_a_video(auth_client
     calls: list = []
     real = video_ops.prepare_upload
 
-    def spy(raw, out, step):
+    def spy(raw, out, step, **kw):
         calls.append(raw)
-        return real(raw, out, step)
+        return real(raw, out, step, **kw)
 
     monkeypatch.setattr(video_ops, "prepare_upload", spy)
     monkeypatch.setattr(video_ops, "UPLOAD_MAX_SIDE", 64)
@@ -454,3 +454,49 @@ def test_frame_from_a_video_goes_the_same_safe_way_as_upload_a_video(auth_client
     r = _upload(auth_client, _video(tmp_path, seconds=4.0, name="long.mp4"), aid, at="last")
     assert r.status_code == 422 and "long" in r.json()["detail"], r.text
     assert len(calls) == 2 and _frame_jobs() == 0
+
+
+def test_a_frame_near_the_start_prepares_only_up_to_it(auth_client, tmp_path, monkeypatch):
+    """"first" or a time t re-encodes only up to t and a second (never the
+    whole upload); "last" prepares the capped whole. The 10-minute rule
+    applies only to a time past it."""
+    import time
+
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    long = tmp_path / "long.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=5:duration=120",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(long)], check=True)
+    caps: list[str] = []
+    real_raw = video_ops._run_raw
+
+    def spy(cmd, timeout):
+        if cmd[0] == "ffmpeg":
+            caps.append(cmd[cmd.index("-t") + 1])
+        return real_raw(cmd, timeout)
+
+    monkeypatch.setattr(video_ops, "_run_raw", spy)
+    begun = time.monotonic()
+    r = _upload(auth_client, long, aid, at="first")
+    assert r.status_code == 201, r.text
+    assert caps == ["1"] and r.json()["options"]["seconds"] == 0.0
+    assert time.monotonic() - begun < 30
+    r = _upload(auth_client, long, aid, at="30")
+    assert r.status_code == 201, r.text
+    assert caps[-1] == "31" and r.json()["options"]["seconds"] == pytest.approx(30.0, abs=0.25)
+    r = _upload(auth_client, long, aid, at="last")
+    assert r.status_code == 201, r.text
+    assert caps[-1] == "601" and r.json()["options"]["seconds"] >= 119.0
+    # Past the most: only a time past it (or "last") is refused for length.
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SECONDS", 60.0)
+    caps.clear()
+    r = _upload(auth_client, long, aid, at="first")
+    assert r.status_code == 201, r.text
+    r = _upload(auth_client, long, aid, at="45")
+    assert r.status_code == 201, r.text
+    assert caps == ["1", "46"]
+    for at in ("90", "last"):
+        r = _upload(auth_client, long, aid, at=at)
+        assert r.status_code == 422 and "minutes" in r.json()["detail"], (at, r.text)
+    assert caps == ["1", "46"]  # neither was prepared

@@ -338,12 +338,18 @@ def test_preparing_is_bounded_and_holds_no_database_connection(auth_client, tmp_
     # inside the proxy's read timeout; a re-encode past it is refused.
     runs: list[tuple] = []
     real = renderer._run
+    real_raw = video_ops._run_raw
 
     def spy(cmd, timeout=None, should_stop=None):
         runs.append((cmd, timeout))
         return real(cmd, timeout=timeout, should_stop=should_stop)
 
+    def spy_raw(cmd, timeout):
+        runs.append((cmd, timeout))
+        return real_raw(cmd, timeout)
+
     monkeypatch.setattr(renderer, "_run", spy)
+    monkeypatch.setattr(video_ops, "_run_raw", spy_raw)
     in_tx: list[bool] = []
     real_vfu = video_ops._video_from_upload
 
@@ -361,18 +367,22 @@ def test_preparing_is_bounded_and_holds_no_database_connection(auth_client, tmp_
     # Each run over the raw upload uses at most 2 threads, and the re-encode
     # never decodes a picture larger than 4K.
     assert all(c[c.index("-threads") + 1] == "2" for c, _t in raw), raw
+    # Each also runs with no single allocation past 512 MB (ffmpeg's own
+    # -max_alloc, before the input).
+    assert all(c.index("-max_alloc") < c.index("-i") and c[c.index("-max_alloc") + 1] == "536870912"
+               for c, _t in raw), raw
     encodes = [c for c, _t in raw if c[0] == "ffmpeg"]
     assert encodes and all(c[c.index("-max_pixels") + 1] == str(4096 * 2304)
                            and c[c.index("-filter_threads") + 1] == "2"
                            and c[len(c) - 1 - c[::-1].index("-threads") + 1] == "2" for c in encodes), encodes
     assert video_ops.UPLOAD_ENCODE_TIMEOUT < 600
 
-    def slow(cmd, timeout=None, should_stop=None):
+    def slow(cmd, timeout):
         if cmd[0] == "ffmpeg" and "libx264" in cmd:
-            return -1, "timed out after 360s"
-        return real(cmd, timeout=timeout, should_stop=should_stop)
+            return -1, "", "timed out after 360s"
+        return real_raw(cmd, timeout)
 
-    monkeypatch.setattr(renderer, "_run", slow)
+    monkeypatch.setattr(video_ops, "_run_raw", slow)
     r = _upload(auth_client, _video(tmp_path / "b.webm", codec="libvpx-vp9", size=(32, 32)), aid,
                 content_type="video/webm")
     assert r.status_code == 422 and "too long to prepare" in r.json()["detail"], r.text
@@ -500,13 +510,18 @@ def test_many_tiny_packets_are_never_walked_on_the_raw_upload(auth_client, tmp_p
     assert mkv.stat().st_size < 50 * 1024 * 1024
     assert video_ops._probe_upload(mkv, "matroska")["seconds"] == 0.0  # really no stated length
     runs: list[list[str]] = []
-    real = renderer._run
+    real, real_raw = renderer._run, video_ops._run_raw
 
     def spy(cmd, timeout=None, should_stop=None):
         runs.append(cmd)
         return real(cmd, timeout=timeout, should_stop=should_stop)
 
+    def spy_raw(cmd, timeout):
+        runs.append(cmd)
+        return real_raw(cmd, timeout)
+
     monkeypatch.setattr(renderer, "_run", spy)
+    monkeypatch.setattr(video_ops, "_run_raw", spy_raw)
     begun = time.monotonic()
     r = _upload(auth_client, mkv, aid, content_type="video/webm")
     took = time.monotonic() - begun
@@ -645,13 +660,18 @@ def test_a_huge_picture_or_a_non_video_codec_is_refused_before_it_is_decoded(aut
 
     aid = _avatar(auth_client)
     runs: list[list[str]] = []
-    real = renderer._run
+    real, real_raw = renderer._run, video_ops._run_raw
 
     def spy(cmd, timeout=None, should_stop=None):
         runs.append(cmd)
         return real(cmd, timeout=timeout, should_stop=should_stop)
 
+    def spy_raw(cmd, timeout):
+        runs.append(cmd)
+        return real_raw(cmd, timeout)
+
     monkeypatch.setattr(renderer, "_run", spy)
+    monkeypatch.setattr(video_ops, "_run_raw", spy_raw)
     prepared: list = []
     monkeypatch.setattr(video_ops, "normalize_upload", lambda *a, **kw: prepared.append(a))
     big = tmp_path / "big.mkv"
@@ -855,3 +875,208 @@ def test_a_clean_deployment_checks_an_uploaded_clips_frames_for_nudity_before_a_
     r = auth_client.post(f"/api/projects/{pid}/shots/{sid}/takes/from-studio", json={"studio_job_id": up["id"]})
     assert r.status_code == 422, r.text
     assert _takes(sid) == 0
+
+
+# ---------- final hardening: memory, shape, output size, sound ----------
+
+
+def _sample_table_bomb(path: Path, tmp: Path, samples: int = 80_000_000) -> Path:
+    """A tiny 1-frame MP4 whose sample tables (stts, stsz, stsc) claim
+    `samples` samples: a few KB on disk, gigabytes of index once read."""
+    import struct
+
+    one = tmp / "one-frame.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=gray:size=64x64:rate=1:duration=1",
+                    "-frames:v", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(one)], check=True)
+    data = bytearray(one.read_bytes())
+
+    def body(name: bytes) -> int:
+        i = data.find(name)
+        assert i > 0 and data.count(name) == 1, name
+        return i + 4 + 4  # past the name, version and flags
+
+    stts = body(b"stts")  # entry count 1: (sample count, delta)
+    assert struct.unpack_from(">I", data, stts)[0] == 1
+    struct.pack_into(">I", data, stts + 4, samples)
+    stsz = body(b"stsz")  # (sample size, count, sizes...): one constant size for them all
+    size, count = struct.unpack_from(">II", data, stsz)
+    if size == 0:
+        assert count == 1
+        size = struct.unpack_from(">I", data, stsz + 8)[0]
+    struct.pack_into(">II", data, stsz, size, samples)
+    stsc = body(b"stsc")  # entry count 1: (first chunk, samples per chunk, description)
+    assert struct.unpack_from(">I", data, stsc)[0] == 1
+    struct.pack_into(">I", data, stsc + 8, samples)
+    path.write_bytes(bytes(data))
+    return path
+
+
+_PEAK_SCRIPT = """
+import resource, sys
+from pathlib import Path
+from app.services import video_ops
+from app.services.image_ops import OpError
+try:
+    video_ops.prepare_upload(Path(sys.argv[1]), Path(sys.argv[2]), lambda limit: limit)
+    print("kept")
+except OpError as e:
+    print("refused", e.status)
+print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * 1024)
+"""
+
+
+def test_a_sample_table_bomb_is_refused_and_its_runs_stay_under_the_memory_cap(auth_client, tmp_path, temp_root):
+    """A 1-frame MP4 whose tables claim 80 million samples (unchecked,
+    reading it took about 1.9 GB): every run over it stays under the
+    address-space cap, and the upload is refused."""
+    import sys
+
+    from app.services import video_ops
+
+    bomb = _sample_table_bomb(tmp_path / "bomb.mp4", tmp_path)
+    assert bomb.stat().st_size < 10_000
+    # The whole preparation, in a process of its own so its children's peak
+    # memory is theirs alone.
+    work = tmp_path / "work"
+    work.mkdir()
+    raw = work / "upload"
+    raw.write_bytes(bomb.read_bytes())
+    out = subprocess.run([sys.executable, "-c", _PEAK_SCRIPT, str(raw), str(work / "prepared.mp4")],
+                         capture_output=True, text=True, timeout=300, cwd=str(Path(__file__).resolve().parents[1]))
+    assert out.returncode == 0, out.stderr[-2000:]
+    verdict, peak = out.stdout.strip().splitlines()[-2:]
+    assert verdict == "refused 422", out.stdout
+    assert int(peak) < video_ops.UPLOAD_MEMORY_LIMIT, int(peak) // (1024 * 1024)
+    aid = _avatar(auth_client)
+    r = _upload(auth_client, bomb, aid)
+    assert r.status_code == 422, r.text
+    assert _uploads() == 0 and _clip_files() == [] and _left(temp_root) == []
+
+
+def test_raw_runs_have_their_memory_capped_and_running_out_is_a_plain_refusal(tmp_path):
+    import sys
+
+    from app.services import video_ops
+    from app.services.image_ops import OpError
+
+    assert video_ops.UPLOAD_MEMORY_LIMIT == 1536 * 1024 * 1024
+    rc, printed, _log = video_ops._run_raw(
+        [sys.executable, "-c", "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])"], timeout=30)
+    assert rc == 0 and int(printed) == video_ops.UPLOAD_MEMORY_LIMIT
+    # Killed (as the kernel does when memory runs out), or saying it ran out.
+    for code in ("import os, signal; os.kill(os.getpid(), signal.SIGKILL)",
+                 "import sys; sys.stderr.write('[h264] Cannot allocate memory'); sys.exit(1)"):
+        with pytest.raises(OpError) as e:
+            video_ops._run_raw([sys.executable, "-c", code], timeout=30)
+        assert (e.value.status, e.value.message) == (422, "That video needs too much memory to read")
+
+
+def test_raw_runs_keep_only_the_tail_of_a_huge_log(tmp_path):
+    import sys
+
+    from app.services import video_ops
+
+    code = ("import sys; sys.stdout.write('o' * 5_000_000); "
+            "[sys.stderr.write('x' * 1_000_000) for _ in range(20)]; sys.stderr.write('THE END')")
+    rc, printed, log = video_ops._run_raw([sys.executable, "-c", code], timeout=60)
+    assert rc == 0
+    assert len(log) <= video_ops.RAW_LOG_TAIL and log.endswith("THE END")
+    assert len(printed) <= video_ops.RAW_OUTPUT_MAX
+
+
+@pytest.mark.parametrize("name,codec", [("hd.mp4", "libx264"), ("hd.webm", "libvpx-vp9")])
+def test_ordinary_1080p_uploads_are_kept_under_the_memory_cap(auth_client, tmp_path, name, codec):
+    aid = _avatar(auth_client)
+    video = tmp_path / name
+    extra = ["-deadline", "realtime", "-cpu-used", "8"] if codec == "libvpx-vp9" else ["-preset", "ultrafast"]
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=1",
+                    "-c:v", codec, *extra, "-pix_fmt", "yuv420p", str(video)], check=True)
+    r = _upload(auth_client, video, aid, content_type="video/webm" if name.endswith(".webm") else "video/mp4")
+    assert r.status_code == 201, r.text
+    assert (r.json()["result_width"], r.json()["result_height"]) == (1920, 1080)
+
+
+def _squared(size: str, sar: str) -> tuple[int, int]:
+    """The size square_pixels_vf makes of one size x size frame with that
+    sample aspect ratio."""
+    import re
+
+    from app.services import video_ops
+
+    out = subprocess.run(["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", f"color=size={size}:rate=1:duration=1,"
+                          f"setsar={sar}", "-vf", video_ops.square_pixels_vf() + ",showinfo", "-frames:v", "1",
+                          "-f", "null", "-"], capture_output=True, text=True, check=True).stderr
+    w, h = re.search(r" s:(\d+)x(\d+)", out).groups()
+    return int(w), int(h)
+
+
+def test_square_pixels_keep_the_shape_within_4k_by_area_too():
+    """Widened (ratio above 1) or made taller (below 1), then fitted so
+    neither side passes 4096 and width x height stays within 4K's pixels,
+    the shape kept: a tall picture whose ratio says 4:1, and an extreme
+    100:1, no longer grow to 4096x4096 or lose their shape."""
+    from app.services import video_ops
+
+    most = video_ops.UPLOAD_MAX_PIXELS
+    cases = {("1024x4096", "4"): 1.0, ("2048x2048", "100"): 100.0, ("512x4096", "1/4"): 1 / 32,
+             ("4096x16", "1/1000"): 0.256, ("720x576", "64/45"): 1024 / 576, ("64x48", "1"): 64 / 48}
+    for (size, sar), shape in cases.items():
+        w, h = _squared(size, sar)
+        assert w % 2 == 0 and h % 2 == 0 and w <= 4096 and h <= 4096 and w * h <= most, (size, sar, w, h)
+        assert w / h == pytest.approx(shape, rel=0.06), (size, sar, w, h)
+    assert _squared("720x576", "64/45") == (1024, 576)  # PAL 16:9 as before
+    assert _squared("1024x4096", "4") == (3072, 3072)
+    # The shown size read from the headers agrees: taller when below 1.
+    assert video_ops.display_size({"width": 720, "height": 576, "sample_aspect_ratio": "64:45"}) == (1024, 576)
+    assert video_ops.display_size({"width": 512, "height": 1024, "sample_aspect_ratio": "1:2"}) == (512, 2048)
+
+
+def test_sound_in_an_unlisted_codec_is_dropped_not_refused(auth_client, tmp_path):
+    from app.services import video_ops
+
+    for codec in ("aac", "mp3", "opus", "vorbis", "flac", "ac3", "eac3", "alac", "pcm_s16le", "pcm_f32le"):
+        assert video_ops.audio_kept(codec), codec
+    for codec in ("wmav2", "cook", "", None):
+        assert not video_ops.audio_kept(codec), codec
+    aid = _avatar(auth_client)
+    video = tmp_path / "wma.mkv"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    "-c:a", "wmav2", str(video)], check=True)
+    assert video_ops._probe_upload(video, "matroska")["audio"] == "wmav2"
+    r = _upload(auth_client, video, aid, content_type="video/x-matroska")
+    assert r.status_code == 201, r.text
+    job = r.json()
+    assert job["options"]["has_audio"] is False
+    assert _codecs(job["result_path"]) == {"video": ("h264", "yuv420p")}
+
+
+def test_the_re_encode_is_rate_capped_and_an_output_reaching_its_size_limit_is_refused(auth_client, tmp_path,
+                                                                                      temp_root, monkeypatch):
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    runs: list[list[str]] = []
+    real_raw = video_ops._run_raw
+
+    def spy(cmd, timeout):
+        runs.append(cmd)
+        return real_raw(cmd, timeout)
+
+    monkeypatch.setattr(video_ops, "_run_raw", spy)
+    noise = tmp_path / "noise.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "nullsrc=size=320x240:rate=10:duration=3,geq=random(1)*255:128:128", "-c:v", "libx264",
+                    "-crf", "0", "-pix_fmt", "yuv420p", str(noise)], check=True)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_OUTPUT_BYTES", 200_000)
+    r = _upload(auth_client, noise, aid)
+    assert r.status_code == 422 and "too large" in r.json()["detail"], r.text
+    encode = [c for c in runs if c[0] == "ffmpeg"][-1]
+    assert (encode[encode.index("-maxrate") + 1], encode[encode.index("-bufsize") + 1]) == ("12M", "24M")
+    assert encode[encode.index("-fs") + 1] == "200000"
+    assert _uploads() == 0 and _clip_files() == [] and _left(temp_root) == []
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_OUTPUT_BYTES", 200 * 1000 * 1000)
+    r = _upload(auth_client, noise, aid)
+    assert r.status_code == 201, r.text
+    encode = [c for c in runs if c[0] == "ffmpeg"][-1]
+    assert encode[encode.index("-fs") + 1] == "200000000"

@@ -44,7 +44,10 @@ from __future__ import annotations
 
 import hashlib
 import math
+import resource
 import shutil
+import signal
+import subprocess
 import tempfile
 import threading
 from datetime import datetime, timedelta
@@ -383,7 +386,10 @@ def frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
     decoding when it should be, then a capped, limited re-encode), and the
     frame grabbed from that prepared copy, so a browser's live WebM (no
     stated length) works and the same limits apply as for "Upload a
-    video" (429 while too many are being prepared)."""
+    video" (429 while too many are being prepared). For "first" or a time
+    t only the start of the video, up to t and a second, is prepared (and
+    only a time past UPLOAD_MAX_SECONDS is refused for length); "last"
+    prepares the whole of it, capped, as Upload a video does."""
     if not ffmpeg_here():
         raise OpError(503, NO_FFMPEG)
     if not _upload_slots.acquire(blocking=False):
@@ -405,7 +411,11 @@ def _frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
         save_upload(file, raw, limit)
         step = _upload_clock()
         prepared = Path(tmp) / "prepared.mp4"
-        prepare_upload(raw, prepared, step)
+        until = None if at == "last" else seconds_for(at)
+        if until is not None and until > UPLOAD_MAX_SECONDS:
+            raise OpError(422, f"Pick a time in the first {int(UPLOAD_MAX_SECONDS // 60)} minutes; videos are "
+                               f"read up to {int(UPLOAD_MAX_SECONDS // 60)} minutes")
+        prepare_upload(raw, prepared, step, until=until)
         try:
             data, used = grab(prepared, at, timeout=step(UPLOAD_STEP_TIMEOUT))
         except TimeoutError:
@@ -712,6 +722,30 @@ UPLOAD_MAX_PIXELS = 4096 * 2304
 UPLOAD_CODECS = frozenset({"h264", "hevc", "vp8", "vp9", "av1", "mpeg4", "mpeg2video", "prores", "mjpeg",
                            "theora"})
 UPLOAD_THREADS = 2
+# Every ffmpeg/ffprobe run over the raw upload also runs with at most this
+# much address space (RLIMIT_AS, set in the child before it starts: an
+# ordinary 4K or 1080p upload needs about 1 GB of it, most of that the
+# libraries), and ffmpeg itself refuses any single allocation larger than
+# UPLOAD_MAX_ALLOC (-max_alloc): a small file whose tables claim millions
+# of samples can't make it take gigabytes. A run that runs out is refused
+# (UPLOAD_TOO_MUCH_MEMORY).
+UPLOAD_MEMORY_LIMIT = 1536 * 1024 * 1024
+UPLOAD_MAX_ALLOC = 512 * 1024 * 1024
+UPLOAD_TOO_MUCH_MEMORY = "That video needs too much memory to read"
+# What is kept of a raw run's output: its error log's last RAW_LOG_TAIL
+# bytes (written to a temporary file, never held whole), and at most
+# RAW_OUTPUT_MAX bytes of what it prints (ffprobe's JSON).
+RAW_LOG_TAIL = 64 * 1024
+RAW_OUTPUT_MAX = 1024 * 1024
+# The re-encode's bit rate is capped (a picture of pure noise can't make it
+# huge), and its output may be at most UPLOAD_MAX_OUTPUT_BYTES: one that
+# reaches it is refused (UPLOAD_TOO_LARGE).
+UPLOAD_MAXRATE, UPLOAD_BUFSIZE = "12M", "24M"
+UPLOAD_MAX_OUTPUT_BYTES = 200 * 1000 * 1000
+UPLOAD_TOO_LARGE = "That video is too large once prepared; upload a shorter or simpler one"
+# Sound in one of these codecs (or any PCM) is kept (re-encoded to AAC);
+# any other sound is dropped, not refused: the clip is kept without it.
+UPLOAD_AUDIO_CODECS = frozenset({"aac", "mp3", "opus", "vorbis", "flac", "ac3", "eac3", "alac"})
 # Uploads being prepared at once in one API process (each is a full
 # re-encode on the API's CPU); more are refused (429) rather than queued
 # behind them on the request threads.
@@ -727,12 +761,65 @@ def _input(path: Path, demuxer: str) -> list[str]:
 
 
 def _raw_input(path: Path, demuxer: str, *, decode: bool = False) -> list[str]:
-    """Input options for a run over the raw upload: `demuxer` only, at most
-    UPLOAD_THREADS threads, and when it decodes (ffmpeg), no picture larger
-    than UPLOAD_MAX_PIXELS (ffprobe's runs decode nothing, and with that
-    limit ffprobe wouldn't even read an oversized picture's headers)."""
+    """Input options for a run over the raw upload: no single allocation
+    past UPLOAD_MAX_ALLOC, `demuxer` only, at most UPLOAD_THREADS threads,
+    and when it decodes (ffmpeg), no picture larger than UPLOAD_MAX_PIXELS
+    (ffprobe's runs decode nothing, and with that limit ffprobe wouldn't
+    even read an oversized picture's headers). Run it with _run_raw."""
     limit = ["-max_pixels", str(UPLOAD_MAX_PIXELS)] if decode else []
-    return ["-threads", str(UPLOAD_THREADS), *limit, *_input(path, demuxer)]
+    return ["-max_alloc", str(UPLOAD_MAX_ALLOC), "-threads", str(UPLOAD_THREADS), *limit, *_input(path, demuxer)]
+
+
+# How a run that ran out of memory shows: killed or crashed (a failed
+# allocation inside a library), or saying so in its log.
+_MEMORY_SIGNALS = frozenset({signal.SIGKILL, signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS})
+_MEMORY_WORDS = ("cannot allocate memory", "out of memory", "malloc of size", "bad_alloc",
+                 "failed to map segment")
+
+
+def _memory_limit() -> int:
+    """UPLOAD_MEMORY_LIMIT, kept within this process's own hard limit."""
+    _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    return UPLOAD_MEMORY_LIMIT if hard == resource.RLIM_INFINITY else min(UPLOAD_MEMORY_LIMIT, hard)
+
+
+def _ran_out_of_memory(rc: int, log: str) -> bool:
+    if rc < 0 and -rc in _MEMORY_SIGNALS:
+        return True
+    text = log.lower()
+    return rc != 0 and any(word in text for word in _MEMORY_WORDS)
+
+
+def _run_raw(cmd: list[str], timeout: float) -> tuple[int, str, str]:
+    """Run one ffmpeg/ffprobe command over a raw upload: (exit code, what it
+    printed (at most RAW_OUTPUT_MAX bytes), the last RAW_LOG_TAIL bytes of
+    its error log). Its address space is capped at UPLOAD_MEMORY_LIMIT
+    (RLIMIT_AS, set in the child); its output and log go to temporary
+    files, so however much it prints, only that much is kept. Past
+    `timeout` it is killed: (-1, "", "timed out ..."). OpError 422
+    (UPLOAD_TOO_MUCH_MEMORY) when it ran out of memory."""
+    limit = _memory_limit()
+
+    def cap() -> None:  # in the child, before the command starts: nothing that locks
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=err, preexec_fn=cap)
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            return -1, "", f"timed out after {timeout:.0f}s"
+        out.seek(0)
+        printed = out.read(RAW_OUTPUT_MAX)
+        size = err.seek(0, 2)
+        err.seek(max(0, size - RAW_LOG_TAIL))
+        tail = err.read()
+    log = tail.decode("utf-8", "replace")
+    if _ran_out_of_memory(rc, log):
+        raise OpError(422, UPLOAD_TOO_MUCH_MEMORY)
+    return rc, printed.decode("utf-8", "replace"), log
 
 
 def _rate(value: object) -> float:
@@ -757,18 +844,19 @@ def _probe_upload(path: Path, demuxer: str) -> dict:
     the container's headers only: nothing is decoded (an upload is refused
     on what is read here, upload_refusal, before any decoding). The stated
     length, size and rate come from the file, which the uploader controls:
-    only the prepared copy is trusted. TimeoutError past the limit."""
+    only the prepared copy is trusted. TimeoutError past the limit; OpError
+    422 when reading the headers needs too much memory (_run_raw)."""
     import json
 
-    from .renderer import _run, stream_size
+    from .renderer import stream_size
 
-    rc, log = _run(["ffprobe", "-v", "quiet", "-nofind_stream_info", "-print_format", "json", "-show_entries",
+    rc, log, err = _run_raw(["ffprobe", "-v", "error", "-nofind_stream_info", "-print_format", "json", "-show_entries",
                     "stream=codec_type,codec_name,pix_fmt,width,height,sample_aspect_ratio,duration,avg_frame_rate,"
                     "r_frame_rate:"
                     "stream_side_data=rotation:stream_tags=rotate:format=duration", *_raw_input(path, demuxer)],
-                   timeout=UPLOAD_PROBE_TIMEOUT)
+                            timeout=UPLOAD_PROBE_TIMEOUT)
     if rc == -1:
-        raise TimeoutError(log)
+        raise TimeoutError(err)
     if rc != 0:
         return {}
     try:
@@ -813,9 +901,11 @@ def _sar(value: object) -> float:
 
 def display_size(st: dict) -> Optional[tuple[int, int]]:
     """(width, height) of one ffprobe video stream entry as it is shown:
-    its pixels made square (width times its sample aspect ratio, to an even
-    number, as normalize_upload's first scale does), then rotation applied
-    (as renderer.stream_size); None when its size isn't stated."""
+    its pixels made square (its sample aspect ratio applied: wider when
+    above 1, taller when below, to even numbers, as square_pixels_vf), then
+    rotation applied (as renderer.stream_size); None when its size isn't
+    stated. Not fitted within any limit: upload_refusal refuses one past
+    4K before anything is decoded."""
     from .renderer import stream_size
 
     try:
@@ -824,8 +914,25 @@ def display_size(st: dict) -> Optional[tuple[int, int]]:
         return None
     if w <= 0 or h <= 0:
         return None
-    shown = max(2, int(w * _sar(st.get("sample_aspect_ratio")) / 2) * 2)
-    return stream_size({**st, "width": shown, "height": h})
+    sar = _sar(st.get("sample_aspect_ratio"))
+    if sar >= 1:
+        w = max(2, int(w * sar / 2) * 2)
+    else:
+        h = max(2, int(h / sar / 2) * 2)
+    return stream_size({**st, "width": w, "height": h})
+
+
+def square_pixels_vf() -> str:
+    """The filter that makes every frame's pixels square (each frame's own
+    sample aspect ratio applied: a stream may change it midway), its shape
+    kept: wider when the ratio is above 1, taller when below, then fitted
+    (only ever made smaller) so neither side passes UPLOAD_MAX_SIDE and
+    width x height stays within UPLOAD_MAX_PIXELS. Even sides."""
+    sw = "if(gte(sar,1),iw*sar,iw)"
+    sh = "if(gte(sar,1),ih,ih/sar)"
+    k = (f"min(1,min({UPLOAD_MAX_SIDE}/({sw}),min({UPLOAD_MAX_SIDE}/({sh}),"
+         f"sqrt({UPLOAD_MAX_PIXELS}/(({sw})*({sh}))))))")
+    return f"scale=w='max(2,trunc(({sw})*{k}/2)*2)':h='max(2,trunc(({sh})*{k}/2)*2)',setsar=1"
 
 
 def upload_refusal(streams: dict) -> Optional[str]:
@@ -847,7 +954,8 @@ def upload_refusal(streams: dict) -> Optional[str]:
     return None
 
 
-def normalize_upload(src: Path, dst: Path, streams: dict, *, timeout: float = UPLOAD_ENCODE_TIMEOUT) -> bool:
+def normalize_upload(src: Path, dst: Path, streams: dict, *, timeout: float = UPLOAD_ENCODE_TIMEOUT,
+                     until: Optional[float] = None) -> bool:
     """Write `src` (an upload `_probe_upload` read as `streams`) to `dst` as
     an ordinary H.264/AAC MP4 (only its first picture and sound streams,
     fast start), never longer than UPLOAD_MAX_SECONDS and a second, however
@@ -856,42 +964,60 @@ def normalize_upload(src: Path, dst: Path, streams: dict, *, timeout: float = UP
     whatever its first picture and average rate say): every frame's
     pixels are first made square (its own sample aspect ratio applied, so
     an anamorphic 720x576 16:9 picture becomes 1024x576, never stored
-    squashed), then it is scaled into the size its first picture is shown
-    at ("display") fitted to 1080p (even sides, shape kept, padded if a
-    later picture's shape differs), at a steady rate of at most
-    UPLOAD_MAX_FPS. Returns True (it was re-encoded).
-    RuntimeError when ffmpeg can't; TimeoutError when it takes longer than
-    `timeout` (UPLOAD_ENCODE_TIMEOUT at most)."""
+    squashed; within 4K: square_pixels_vf), then it is scaled into the
+    size its first picture is shown at ("display") fitted to 1080p (even
+    sides, shape kept, padded if a later picture's shape differs), at a
+    steady rate of at most UPLOAD_MAX_FPS, its bit rate capped
+    (UPLOAD_MAXRATE). Sound is kept only in one of UPLOAD_AUDIO_CODECS
+    (else dropped). `until`: only the first `until` seconds and one more
+    are prepared (a frame near the start needs no more). Returns True (it
+    was re-encoded). RuntimeError when ffmpeg can't; TimeoutError when it
+    takes longer than `timeout` (UPLOAD_ENCODE_TIMEOUT at most); OpError
+    422 when it needs too much memory or its output reaches
+    UPLOAD_MAX_OUTPUT_BYTES."""
     from fractions import Fraction
 
-    from .renderer import _run, join_size
+    from .renderer import join_size
 
     timeout = min(timeout, UPLOAD_ENCODE_TIMEOUT)
     demuxer = UPLOAD_DEMUXERS[sniffed_extension(src)]
-    cap = ["-t", f"{UPLOAD_MAX_SECONDS + 1:.0f}"]
-    maps = ["-map", "0:v:0"] + (["-map", "0:a:0"] if streams.get("audio") else [])
+    seconds = UPLOAD_MAX_SECONDS if until is None else min(max(float(until), 0.0), UPLOAD_MAX_SECONDS)
+    cap = ["-t", f"{seconds + 1:g}"]
+    keep_audio = audio_kept(streams.get("audio"))
+    maps = ["-map", "0:v:0"] + (["-map", "0:a:0"] if keep_audio else [])
     size = streams.get("display") or streams.get("size")
     if not size:
         raise RuntimeError("the picture's size isn't known")
     w, h = join_size(size)
     stated = float(streams.get("fps") or 0.0)
     rate = Fraction(stated).limit_denominator(1001) if 0 < stated <= UPLOAD_MAX_FPS else Fraction(UPLOAD_MAX_FPS)
-    # The square-pixel width is kept within UPLOAD_MAX_SIDE (a stream may
-    # change its sample aspect ratio midway), so no frame grows past 4K.
-    vf = ["-vf", f"fps={rate.numerator}/{rate.denominator},"
-                 f"scale=w='min(trunc(iw*sar/2)*2,{UPLOAD_MAX_SIDE})':h=ih,setsar=1,"
+    # Square pixels first, within 4K (a stream may change its sample
+    # aspect ratio midway), so no frame grows past it.
+    vf = ["-vf", f"fps={rate.numerator}/{rate.denominator},{square_pixels_vf()},"
                  f"scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
                  f"pad={w}:{h}:-1:-1,setsar=1"]
-    audio = ["-c:a", "aac", "-b:a", "160k"] if streams.get("audio") else []
-    rc, log = _run(["ffmpeg", "-y", "-v", "error", *_raw_input(src, demuxer, decode=True), *cap, *maps,
-                    "-filter_threads", str(UPLOAD_THREADS), *vf, "-fpsmax", str(UPLOAD_MAX_FPS),
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", str(UPLOAD_THREADS),
-                    "-pix_fmt", "yuv420p", *audio, "-movflags", "+faststart", str(dst)], timeout=timeout)
+    audio = ["-c:a", "aac", "-b:a", "160k"] if keep_audio else ["-an"]
+    rc, _printed, log = _run_raw(
+        ["ffmpeg", "-y", "-v", "error", *_raw_input(src, demuxer, decode=True), *cap, *maps,
+         "-filter_threads", str(UPLOAD_THREADS), *vf, "-fpsmax", str(UPLOAD_MAX_FPS),
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-maxrate", UPLOAD_MAXRATE,
+         "-bufsize", UPLOAD_BUFSIZE, "-threads", str(UPLOAD_THREADS), "-pix_fmt", "yuv420p", *audio,
+         "-fs", str(UPLOAD_MAX_OUTPUT_BYTES), "-movflags", "+faststart", str(dst)], timeout=timeout)
     if rc == -1:
         raise TimeoutError("timed out")
     if rc != 0 or not dst.exists() or dst.stat().st_size == 0:
         raise RuntimeError(f"couldn't re-encode the video: {log[-500:]}")
+    if dst.stat().st_size >= UPLOAD_MAX_OUTPUT_BYTES:
+        # ffmpeg stopped at -fs: what was written is cut short.
+        raise OpError(422, UPLOAD_TOO_LARGE)
     return True
+
+
+def audio_kept(codec: object) -> bool:
+    """Whether an upload's sound in `codec` is kept: one of
+    UPLOAD_AUDIO_CODECS or any PCM."""
+    name = str(codec or "")
+    return name in UPLOAD_AUDIO_CODECS or name.startswith("pcm_")
 
 
 def _probe_prepared(path: Path, timeout: float) -> tuple[float, bool, Optional[tuple[int, int]]]:
@@ -979,7 +1105,8 @@ def _upload_clock():
     return step
 
 
-def prepare_upload(raw: Path, out: Path, step) -> tuple[float, bool, tuple[int, int]]:
+def prepare_upload(raw: Path, out: Path, step, *,
+                   until: Optional[float] = None) -> tuple[float, bool, tuple[int, int]]:
     """The one safe way an uploaded video (`raw`, saved as it came) is read:
     its container sniffed (only UPLOAD_DEMUXERS are read), its headers
     probed and refused before anything is decoded (upload_refusal, or a
@@ -990,7 +1117,10 @@ def prepare_upload(raw: Path, out: Path, step) -> tuple[float, bool, tuple[int, 
     recording) goes straight to the capped re-encode: the raw file's
     packets are never walked here. `raw` is removed once prepared. Returns
     the copy's (length, has sound, size). OpError for anything refused or
-    unreadable, or past the time limits (`step`, _upload_clock)."""
+    unreadable, or past the time or memory limits (`step`, _upload_clock,
+    _run_raw). `until` (a frame near the start): only the first `until`
+    seconds and one more are prepared, and no length is refused (the
+    caller refuses a time past the most)."""
     # The client's own suffix is never used for the file on disk; only the
     # containers sniffed here are read at all.
     ext = sniffed_extension(raw)
@@ -1007,10 +1137,10 @@ def prepare_upload(raw: Path, out: Path, step) -> tuple[float, bool, tuple[int, 
     refusal = upload_refusal(streams)
     if refusal:
         raise OpError(422, refusal)
-    if streams["seconds"] > UPLOAD_MAX_SECONDS:
+    if until is None and streams["seconds"] > UPLOAD_MAX_SECONDS:
         raise _too_long(streams["seconds"])
     try:
-        normalize_upload(video, out, streams, timeout=step(UPLOAD_ENCODE_TIMEOUT))
+        normalize_upload(video, out, streams, timeout=step(UPLOAD_ENCODE_TIMEOUT), until=until)
     except TimeoutError:
         raise OpError(422, UPLOAD_TOO_SLOW) from None
     except RuntimeError:
@@ -1025,7 +1155,7 @@ def prepare_upload(raw: Path, out: Path, step) -> tuple[float, bool, tuple[int, 
         raise OpError(422, UPLOAD_TOO_SLOW) from None
     if length <= 0 or not size:
         raise OpError(422, NOT_A_VIDEO)
-    if length > UPLOAD_MAX_SECONDS + 0.5:
+    if until is None and length > UPLOAD_MAX_SECONDS + 0.5:
         raise OpError(422, f"That video is longer than {int(UPLOAD_MAX_SECONDS // 60)} minutes; "
                            f"the most is {int(UPLOAD_MAX_SECONDS // 60)} minutes")
     return length, has_audio, size
