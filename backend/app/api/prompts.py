@@ -114,13 +114,13 @@ def _refused_message(e: "prompting.EnhanceRefused") -> str:
 def enhance(body: EnhanceIn) -> dict:
     try:
         out = prompting.enhance(body.text, body.kind, body.model or "")
+    except explicit_check.ExplicitContentError as e:  # a clean deployment: an explicit rewrite
+        raise HTTPException(422, f"{e} Your text is unchanged.") from None
     except UnsafePromptError as e:
         raise HTTPException(422, str(e)) from None
     except prompting.EnhanceRefused as e:
         log.info("prompt enhance refused (%s) by %s", e.reason, e.model)
         raise HTTPException(422, _refused_message(e)) from None
-    except explicit_check.ExplicitContentError as e:  # a clean deployment: an explicit rewrite
-        raise HTTPException(422, f"{e} Your text is unchanged.") from None
     except UnsafeScriptError as e:  # a script the script check refuses (what generating it would do)
         raise HTTPException(422, f"This script was refused: {e}") from None
     except httpx.HTTPStatusError as e:

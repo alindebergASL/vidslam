@@ -123,6 +123,15 @@ def _check_spec(spec: VariantSpec | VariantPatch) -> None:
         raise HTTPException(422, f"shot1_source must be one of {', '.join(hook_lab.SOURCES)}")
 
 
+def _check_shot1(*prompts: Optional[str]) -> None:
+    """A clean deployment: a new shot 1's prompt gets the explicit-content
+    check now (a 422), before anything is made."""
+    from ..services import explicit_check
+
+    if explicit_check.active():
+        explicit_check.check_prompts_or_422(*prompts)
+
+
 def _check_opening(db: Session, base: models.Render, hook: str, window: Optional[float]) -> None:
     """The minors check, on the opening alone, inside the script it joins
     and with the original voiceover heard after it from `window` on."""
@@ -343,6 +352,7 @@ def create_variants(project_id: int, body: VariantsIn, db: Session = Depends(get
             raise _err(e) from e
     for spec in body.variants:
         _check_opening(db, base, " ".join(spec.hook_text.split()), window)
+    _check_shot1(*(spec.shot1_prompt for spec in body.variants if spec.shot1_source == "new"))
     try:
         hook_lab.base_clips(db, base)  # its clips are still there to reuse
     except hook_lab.HookLabError as e:
@@ -412,6 +422,7 @@ def make(project_id: int, body: VariantIdsIn, db: Session = Depends(get_db)) -> 
         if v.status not in hook_lab.EDITABLE:
             what = "is already being made" if v.status in hook_lab.RUNNING else "is already made"
             raise HTTPException(409, f"Opening {v.label} {what}.")
+    _check_shot1(*(v.shot1_prompt for v in variants if v.shot1_source == "new"))
     priced = hook_lab.variant_plan(db, variants)
     bad = [r for r in priced["variants"] if not r["ok"]]
     if bad:
@@ -481,6 +492,10 @@ def patch_variant(variant_id: int, body: VariantPatch, db: Session = Depends(get
     _check_spec(body)
     base = _base(db, v.project_id, v.base_render_id)
     fields = body.model_fields_set
+    source = body.shot1_source if "shot1_source" in fields and body.shot1_source is not None else v.shot1_source
+    if source == "new":
+        _check_shot1(body.shot1_prompt.strip() if "shot1_prompt" in fields and body.shot1_prompt is not None
+                     else v.shot1_prompt)
     audio_changed = False
     text, window = v.hook_text, v.window_seconds
     new_text = "hook_text" in fields and body.hook_text is not None

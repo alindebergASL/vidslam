@@ -1288,6 +1288,7 @@ def precheck(db: Session, project: models.VideoProject, variant: models.HookVari
     shot (`needed`) that is lip-synced again, so a refused lip-sync never
     comes after other clips were paid for."""
     from .minor_check import check_generation
+    from .pipeline import lipsync_explicit
     from .prompting import effective_negative
     from .safety import check_prompt
 
@@ -1304,6 +1305,7 @@ def precheck(db: Session, project: models.VideoProject, variant: models.HookVari
         if asked["motion"].strip():
             check_prompt(asked["motion"])
         check_generation(" ".join(x for x in (asked["motion"], asked["text"]) if x.strip()), kind="lipsync")
+        lipsync_explicit(asked["motion"], asked["text"])
 
 
 def _fail(db: Session, variant: models.HookVariant, error: str) -> None:

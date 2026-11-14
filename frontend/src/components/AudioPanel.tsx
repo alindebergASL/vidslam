@@ -5,6 +5,7 @@ import { useToast } from "@/components/Toaster";
 import { VoiceSampleButton } from "@/components/VoiceSampleButton";
 import { api, Project, RenderPlan, Voice, VoiceoverFit, VoiceoverPreview } from "@/lib/api";
 import { AutoTextarea } from "@/components/AutoTextarea";
+import { useAdultFeatures } from "@/components/AdultModePanel";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
@@ -32,7 +33,11 @@ export function AudioPanel({
 }) {
   const [busy, setBusy] = useState<string | null>(null);
   const toast = useToast();
-  const [musicTab, setMusicTab] = useState<"generate" | "upload">("generate");
+  // A clean deployment (no adult features) takes no recordings of your own:
+  // what they say can't be checked there, so the upload buttons are hidden.
+  const ownAudio = useAdultFeatures() !== false;
+  const [musicTabPicked, setMusicTab] = useState<"generate" | "upload">("generate");
+  const musicTab = ownAudio ? musicTabPicked : "generate";
   const [musicPrompt, setMusicPrompt] = useState("");
   const voiceInput = useRef<HTMLInputElement>(null);
   const musicInput = useRef<HTMLInputElement>(null);
@@ -251,7 +256,7 @@ export function AudioPanel({
         <div>
           <div className="label">Voiceover source</div>
           <div className="flex flex-wrap gap-2 mb-2">
-            {(["tts", "upload", "silent"] as const).map((s) => (
+            {(ownAudio ? (["tts", "upload", "silent"] as const) : (["tts", "silent"] as const)).map((s) => (
               <button
                 key={s}
                 onClick={() => setSource(s)}
@@ -262,6 +267,11 @@ export function AudioPanel({
               </button>
             ))}
           </div>
+          {!ownAudio && project.voiceover_source === "upload" && project.voiceover_upload_path && (
+            <div className="text-xs mb-2 text-amber-300">
+              Uploading your own voiceover is off on this server; use a generated voice.
+            </div>
+          )}
           {project.voiceover_upload_path && (
             <div className="flex items-center gap-2">
               <audio
@@ -452,13 +462,15 @@ export function AudioPanel({
             >
               Generate from prompt
             </button>
-            <button
-              onClick={() => setMusicTab("upload")}
-              className={clsx("chip", musicTab === "upload" && "chip-active")}
-              disabled={busy === "music"}
-            >
-              Upload file
-            </button>
+            {ownAudio && (
+              <button
+                onClick={() => setMusicTab("upload")}
+                className={clsx("chip", musicTab === "upload" && "chip-active")}
+                disabled={busy === "music"}
+              >
+                Upload file
+              </button>
+            )}
           </div>
 
           {musicTab === "generate" ? (

@@ -56,8 +56,34 @@ Each channel (chat / image / video / tts) is mocked independently when its key i
 missing — partial configs work fine. `GET /api/providers/status` reflects what's live.
 
 Set `ADULT_FEATURES=false` for a clean deployment with no adult content: adult mode
-stays off, every content filter is on and uncensored models are hidden (see `.env.example`). Start
-it from an empty database and data directory, not a copy of a deployment that allowed adult
+stays off, every content filter is on and uncensored models are hidden (see `.env.example`).
+On a clean deployment:
+
+- no model of the adult text models' family can be the planner, whichever vendor publishes
+  it (the family name anywhere in the id, e.g. `tngtech/deepseek-r1t2-chimera`, plus known
+  derivatives under other names listed in `content_mode.FAMILY_DERIVATIVES`, e.g.
+  `perplexity/r1-1776`; a derivative not on that list isn't recognised); the Cast picture check
+  keeps its own model;
+- the planner is asked whether text is sexually explicit before it is voiced or shown (the
+  script, opening, end card, captions, Enhance rewrites) and before any prompt goes to a picture
+  or video model (Studio pictures and clips, Continue this clip, Remix and Retry, character
+  sheets, storyboard shots at plan, edit, render and re-roll time, ambient scenes, the hook
+  lab's new shot 1, Enhance's picture, clip and scene rewrites), with its avoid list (some
+  models get that inside the prompt text), and before a music or nature-sound prompt goes to
+  its model (project music, ambient music and sound beds). An ambient loop checks every
+  picture and clip prompt of every variation before its first paid call. A yes, or no answer,
+  is a plain 422 before anything is paid for; answers that clear a text are cached;
+- frames of an uploaded video are checked for nudity, and its sound is dropped;
+- your own voiceover and music uploads are refused and their upload buttons hidden: there is
+  no speech-to-text to check what a recording says (a music bed can carry speech as well as a
+  voiceover can), so use a generated voice and generated music. A voiceover uploaded before
+  the switch is refused by every render and recompose (Make video, Re-compose, Retry, re-rolls),
+  and so is a render's copy of one that a recompose would fall back to. Music uploaded before
+  the switch is **not** refused: an uploaded bed and a generated one are stored the same way,
+  so they can't be told apart, and an old uploaded bed is still mixed in. Starting from an
+  empty database (below) avoids this.
+
+Start it from an empty database and data directory, not a copy of a deployment that allowed adult
 content: what was made there (Studio results, renders, prompts) would still be shown. The app
 logs a warning at startup when the database has saved Adult content settings.
 

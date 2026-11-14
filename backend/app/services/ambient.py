@@ -479,6 +479,9 @@ def generate_sound_bed(db: Session, project: models.VideoProject, cfg: AmbientCo
     if not prompt:
         out.unlink(missing_ok=True)
         return None
+    from .pipeline import check_audio_prompt
+
+    check_audio_prompt(prompt)
     sound = get_sound()
     data = sound.generate(prompt=prompt, duration_seconds=30)
     out.write_bytes(data)
@@ -1301,8 +1304,9 @@ def generate_music_bed(db: Session, project: models.VideoProject, cfg: AmbientCo
     """One call when the bed fits the provider's cap; otherwise several
     tracks in the same mood, crossfaded into one long bed."""
     from ..providers import get_music
-    from .pipeline import _log_provider_call, generate_music_for_project
+    from .pipeline import _log_provider_call, check_audio_prompt, generate_music_for_project
 
+    check_audio_prompt(prompt)  # once for every part: the parts add only the joining words
     parts = music_parts(cfg)
     if len(parts) == 1:
         return generate_music_for_project(db, project.id, prompt=prompt, duration_seconds=parts[0])
@@ -1868,6 +1872,72 @@ def _segment_shots(db: Session, project: models.VideoProject, n: int) -> list[mo
     return out
 
 
+# What every segment after the first adds to the clip prompt.
+_CONTINUE = " Continue the exact same shot from the given first frame, same lighting."
+
+
+def clip_shots(project: models.VideoProject) -> list[models.VideoShot]:
+    """The loop shot and the variation shots, in variation order: the clip
+    prompts each variation is made from."""
+    loop = _loop_shot(project)
+    return [s for s in [loop, *_variant_shots(project)] if s is not None]
+
+
+def checked_prompts(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPlanOut,
+                    clip_prompts: Optional[list[str]] = None) -> list[tuple[str, str, str]]:
+    """(text, avoid list, kind) of every picture and clip prompt making this
+    loop can send: each variation's clip prompt (and the continuation of a
+    loop made of several segments), its anchor or drift still, and the
+    "same place" forms of a later variation's still. `clip_prompts`: the
+    variations' clip prompts as stored on their shots (a resume), else
+    made from `cfg`."""
+    k = variant_count(cfg)
+    clips = list(clip_prompts) if clip_prompts else [variant_prompt(cfg, i) for i in range(k)]
+    picture = has_picture(project, cfg)
+    out: list[tuple[str, str, str]] = []
+
+    def still(i: int, prompt: str, negative: str) -> None:
+        out.append((prompt, negative, "image"))
+        if i > 0:  # made from the first one: "same place, other light"
+            out.append((prompt + _SAME_PLACE, negative, "image"))
+            out.append((same_place_prompt(variant_config(cfg, i)), negative, "image"))
+
+    if cfg.source == "image_drift":
+        for i, prompt in enumerate(clips[:k]):
+            if not (i == 0 and picture):
+                still(i, prompt, _NEGATIVE)
+        return out
+    stills = plan.first_frame_still or plan.anchored or (picture and caps_first_frame(cfg))
+    for i, prompt in enumerate(clips[:k]):
+        out.append((prompt, _NEGATIVE, "video"))
+        if len(plan.segments) > 1:
+            out.append((prompt + _CONTINUE, _NEGATIVE, "video"))
+        if stills and not (i == 0 and picture) and not (i > 0 and cfg.variety == "takes"):
+            still(i, still_prompt(variant_config(cfg, i)), "")
+    return out
+
+
+def precheck(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPlanOut,
+             clip_prompts: Optional[list[str]] = None) -> None:
+    """A clean deployment: the checks every paid step of the loop will meet
+    (checked_prompts, and the music and sound prompts), before the first
+    one is paid for, so a refusal (or a check that can't run) never comes
+    after a still or clip was bought. Verdicts are cached, so the checks at
+    the providers are then hits. Nothing on a deployment with adult
+    features. Raises UnsafeScriptError."""
+    from . import explicit_check
+    from .minor_check import check_generation
+
+    if not explicit_check.active():
+        return
+    for text, negative, kind in dict.fromkeys(checked_prompts(project, cfg, plan, clip_prompts)):
+        if text.strip():
+            check_generation(text, negative, kind=kind)
+    for text in (resolve_music_prompt(cfg), resolve_sound_prompt(cfg)):
+        if text:
+            explicit_check.check_prompt(text)
+
+
 # Chain state: in flight, or kept (with "failed": True) when a clip failed so
 # the loop can be resumed from that clip. Cleared when the loop is done.
 _CHAIN_KEY = "_chain"
@@ -1923,9 +1993,7 @@ def _start_video_chain(
         anchor0_url = anchor_url
     segs = _segment_shots(db, project, len(plan.segments))
     for i, (seg, dur) in enumerate(zip(segs, plan.segments, strict=True)):
-        seg.prompt = shot.prompt + (
-            "" if i == 0 else " Continue the exact same shot from the given first frame, same lighting."
-        )
+        seg.prompt = shot.prompt + ("" if i == 0 else _CONTINUE)
         seg.negative_prompt = shot.negative_prompt
         seg.duration_seconds = float(dur)
         # Pinned to the model the loop was planned for (clip lengths, frame
@@ -2127,6 +2195,7 @@ def generate_loop(db: Session, project_id: int, *, regenerate_music: bool = True
         shot = _ensure_loop_shot(db, project, cfg)
         db.commit()
         plan = plan_loop(cfg)
+        precheck(project, cfg, plan)
         if cfg.source != "image_drift":
             _start_video_chain(db, project, shot, cfg, plan,
                                regenerate_music=regenerate_music, render_after=render_after)
@@ -2245,6 +2314,10 @@ def resume_loop(db: Session, project_id: int) -> None:
         sh.status, sh.error = "polling", ""
     db.commit()
     try:
+        cfg = _config_of(project)
+        k = variant_count(cfg)
+        precheck(project, cfg, LoopPlanOut.model_validate(chain["plan"]),
+                 [s.prompt or "" for s in clip_shots(project)][:k])
         segs = [db.get(models.VideoShot, i) for i in chain.get("segment_ids") or []]
         if not segs:
             # The take never started (its still or its first submit failed).

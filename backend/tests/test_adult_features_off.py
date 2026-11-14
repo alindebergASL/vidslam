@@ -13,7 +13,8 @@ from .test_content_mode import SOGNI_WF, _maya, _tick_now
 from .test_models_catalog import _mock_sources, _real
 from .test_runware import _CORE, _IMG, _fake_model, _ref
 
-ADULT_ONLY_SOGNI = ("sogni/seedream-5-0-pro-uncensored", "sogni/z-turbo", "sogni/moss-image")
+ADULT_ONLY_SOGNI = ("sogni/seedream-5-0-pro-uncensored", "sogni/seedream-5-5-uncensored", "sogni/z-turbo",
+                    "sogni/moss-image")
 ADULT_ONLY_VIDEO = ("sogni/seedance2-5-uncensored", "sogni/seedance2-mini-uncensored", "sogni/wan3.0-spicy-video")
 
 
@@ -55,7 +56,7 @@ def test_unset_behaves_as_today(auth_client, monkeypatch):
     r = auth_client.put(f"/api/settings/content/avatars/{avatar_id}", json={"adult_ok": True})
     assert r.status_code == 200 and r.json()["adult_ok_avatars"] == [avatar_id]
     images = {m.selector for m in sogni.image_models()}
-    assert {"seedream-5-0-pro-uncensored", "z-turbo"} <= images
+    assert {"seedream-5-0-pro-uncensored", "seedream-5-5-uncensored", "z-turbo"} <= images
     assert "seedance2-5-uncensored" in {m.selector for m in sogni.video_models()}
     assert "seedream-5-0-pro-uncensored" in {e.selector for e in sogni.edit_models()}
     assert not sogni.hidden("sogni/seedream-5-0-pro-uncensored")
@@ -198,6 +199,7 @@ def test_uncensored_sogni_models_are_hidden(auth_client, monkeypatch):
     assert not {s.split("/", 1)[1] for s in ADULT_ONLY_SOGNI} & images
     assert not {s.split("/", 1)[1] for s in ADULT_ONLY_VIDEO} & videos
     assert "seedream-5-0-pro-uncensored" not in edits and "dark-beast-krea2-identity-edit" not in edits
+    assert "seedream-5-5-uncensored" not in edits
     assert "flux-3-klein" in edits and "krea-2-turbo" in images  # the rest stay
     # A picked model never routes to an uncensored editor.
     for model in ("sogni/krea-2-turbo", "sogni/flux-3-klein"):
@@ -1067,10 +1069,11 @@ def test_clean_enhance_refuses_an_explicit_script_rewrite(auth_client, monkeypat
     assert "general audience" in r.json()["detail"] and "unchanged" in r.json()["detail"]
     r = auth_client.post("/api/prompts/enhance", json={"text": _PLAIN, "kind": "script"})
     assert r.status_code == 200
-    # Pictures are not this check's job (the provider filters are on).
+    # A picture or clip rewrite is checked too: it is sent to a picture or
+    # video model (tests/test_clean_mode_gaps.py has the rest).
     _calls().clear()
     assert auth_client.post("/api/prompts/enhance", json={"text": "a cat", "kind": "image"}).status_code == 200
-    assert _calls() == []
+    assert _calls()
 
 
 def test_clean_plan_refuses_an_explicit_original_script_and_planner_output(auth_client, monkeypatch):
