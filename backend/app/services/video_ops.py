@@ -11,14 +11,15 @@ options_json ({"at": "first" | "last" | seconds, "seconds": the time of the
 frame saved}) and a local model id: no provider is called and nothing is
 billed. A frame of a Studio clip makes no paid call at all, so the monthly
 budget cap doesn't apply to it (the rate limit does: it uses this
-machine's CPU); a frame of an uploaded video does pay for its safety
-check (below), so it is refused once the budget's hard stop is reached.
-ffmpeg is in the API image, so the API grabs the frame itself and the job
-is finished before it answers; without ffmpeg there, a clip's frame is
-queued for the worker instead (as the free upscale is). The frame is the
-one a paused player shows at that time (renderer.extract_frame_at), as an
-8-bit PNG (HDR tone-mapped), and every ffprobe/ffmpeg run for one frame
-shares one time limit (renderer.FRAME_TIMEOUT for a clip: past it the tool is
+machine's CPU); a frame of an uploaded video, of a clip with pictures of
+one, and "Upload a video" itself do pay for their safety check (below),
+so they are refused once the budget's hard stop is reached. ffmpeg is in
+the API image, so the API grabs the frame itself and the job is finished
+before it answers; without ffmpeg there, a clip's frame is queued for the
+worker instead (as the free upscale is). The frame is the one a paused
+player shows at that time (renderer.extract_frame_at), as an 8-bit PNG
+(HDR tone-mapped), and every ffprobe/ffmpeg run for one frame shares one
+time limit (renderer.FRAME_TIMEOUT for a clip: past it the tool is
 stopped, nothing is stored and the API answers 504; UPLOAD_STEP_TIMEOUT
 for an upload's prepared copy: "took too long", 422).
 
@@ -53,13 +54,19 @@ Which checks apply:
   with no card picture behind it, so no tick covers it: the owner's filter
   is forced on wherever it is used next (saved onto a ticked card, the new
   card picture is covered once the tick's picture check has looked at it,
-  like any picture added to the card).
+  like any picture added to the card). A scene's frame is a new picture.
 - A clip with pictures of an uploaded video used whole in a project (a
   shot's take, "Use in project"): frames across the stretch used, about
   one a second, get the same checks first (check_clip_used_whole). Every
   other place a Studio result goes (a scene's picture, a Cast picture,
-  "Animate this", remove background, upscale) takes pictures only, and a
-  picture of such a clip was checked as it was saved (checked_grab).
+  "Animate this", "Continue this clip", remove background, upscale) takes
+  pictures only, and a picture of such a clip was checked as it was saved
+  (checked_grab).
+- Joined clips, an uploaded video kept as a clip and a continuation keep
+  the Cast link the same way (pipeline.studio_cast_source, sections
+  below): a frame of joined clips counts as every Cast picture any of the
+  clips was made from; a continuation as the clip it continues; an
+  uploaded clip as a frame of an uploaded video does.
 """
 from __future__ import annotations
 
@@ -476,10 +483,16 @@ def _frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
 #
 # Checks: none new. Every source is a Studio clip that was made from a
 # prompt that passed the minors checks (and, on a clean deployment, with
-# the providers' content filters on); the joined clip only puts them one
-# after another. It is a new Studio clip like any other: it carries no
-# Cast exemption (pipeline.studio_cast_source gives (None, None) for it, so
-# anything made from it keeps the content filter), whatever its sources.
+# the providers' content filters on), or an uploaded video that was checked
+# (a frame saved from a join with one is checked again: checked_grab); the
+# joined clip only puts them one after another. Its pictures are its
+# clips' pictures, so it keeps their Cast link: a frame of it (saved, or
+# the last frame a continuation starts from) counts as every Cast picture
+# any of its clips was made from (pipeline.studio_cast_source follows each
+# clip back), so an unticked character's content filter is forced on
+# wherever the frame is used next, whichever clip the frame shows; a
+# ticked character's is skipped only when every card picture behind it is
+# one the tick's picture check covers.
 
 JOIN_OP = "join_clips"
 JOIN_MODEL = "local/join"
@@ -692,9 +705,15 @@ def run_join(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerat
 # (minor_check.check_pictures) and, on a clean deployment, the explicit
 # picture check (explicit_check.check_picture), as a frame of an uploaded
 # video does. Any frame failing, or a check that can't answer, refuses the
-# upload. It belongs to no Cast card: pipeline.studio_cast_source gives
-# (None, None) for it, so it, its frames and anything made from them keep
-# the content filter. The temporary files are removed on every path. Only
+# upload. It belongs to no Cast card and can't be saved onto one (only
+# pictures are): pipeline.studio_cast_source counts it as a frame of an
+# uploaded video, a picture of its owner when that is a Cast character with
+# no card picture behind it, so a frame of it, a continuation of it, or a
+# join with it forces that character's content filter wherever it is used
+# next, ticked or not (a frame saved onto a ticked card is covered once the
+# tick's picture check has looked at it, like any picture added to the
+# card); a scene's upload is a new picture. The temporary files are
+# removed on every path. Only
 # those frames were checked, so any frame saved from it later (or from a
 # join it is part of) is checked again as it is saved (checked_grab), and
 # the stretch of it used in a project shot is checked about once a second
@@ -1283,9 +1302,15 @@ def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
 # is full (one join per paid, rate-limited clip): a manual join waits.
 #
 # Checks: the frame is a frame of a Studio clip (no new check, as above,
-# unless the clip has pictures of an uploaded video: checked_grab);
-# the continuation and the join carry no Cast exemption
-# (pipeline.studio_cast_source gives (None, None) for each).
+# unless the clip has pictures of an uploaded video: checked_grab). The
+# frame keeps the clip's Cast link (pipeline.studio_cast_source), so the
+# continuation starts from that character's picture exactly as "Animate
+# this" on it would: an unticked character's content filter is forced on
+# (also for a continuation of a continuation, of a join, or of an uploaded
+# clip owned by a character), and a ticked character's is skipped only
+# when the card picture the original was made from is one the tick's
+# picture check covers. The continuation, and the join with the original,
+# keep that link for whatever is made from them next.
 
 CONTINUES = "continues_job_id"
 AUTO_JOIN = "auto_join"

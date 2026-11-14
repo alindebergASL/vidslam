@@ -226,8 +226,9 @@ const TOO_LARGE = `This video is larger than ${FRAME_VIDEO_MAX_MB} MB. Pick a sh
 
 /**
  * Upload a video from this device as a Studio clip, so it can be continued,
- * joined or have its frames saved like any clip. Free. A safety check looks
- * at frames across it first; it is refused if any shows someone under 18.
+ * joined or have its frames saved like any clip. A safety check looks at
+ * frames across it first (a vision call that costs a fraction of a cent);
+ * it is refused if any shows someone under 18.
  */
 export function UploadVideoDialog({
   avatars,
@@ -274,8 +275,8 @@ export function UploadVideoDialog({
     <Dialog title="Upload a video" onClose={onClose}>
       <p className="text-xs text-ink-300">
         Adds a video from this device to Studio as a clip, so you can continue it, join it with other clips or save
-        its frames. Free. A safety check looks at frames across the video first; videos that show anyone under 18
-        can&apos;t be added.
+        its frames. A safety check looks at frames across the video first (it costs a fraction of a cent), and
+        videos that show anyone under 18 can&apos;t be added.
       </p>
       <OwnerSelect id="upload-owner" label="Add it to" avatars={avatars} ingredients={ingredients} value={owner} onChange={setOwner} />
       <div>
@@ -314,7 +315,7 @@ export function UploadVideoDialog({
           disabled={!file || !owner || busy}
           onClick={upload}
         >
-          {busy ? "Uploading…" : "Upload · free"}
+          {busy ? "Uploading…" : "Upload"}
         </button>
       </div>
     </Dialog>

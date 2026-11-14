@@ -1025,7 +1025,7 @@ function Studio() {
             type="button"
             className="btn-ghost text-xs"
             onClick={() => setUploadingVideo(true)}
-            title="Add a video from this device as a clip you can continue or join (free)"
+            title="Add a video from this device as a clip you can continue or join (its safety check costs a fraction of a cent)"
           >
             Upload a video…
           </button>

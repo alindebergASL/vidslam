@@ -7,7 +7,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
@@ -270,22 +270,28 @@ def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob],
     character's. A copy is a cutout or upscale of the picture, or a saved
     frame ("extract_frame") of a clip animated from it or made with it as a
     reference, followed back through each step (a cutout of a frame of a
-    clip animated from an upscale of the picture still counts). When the
-    starting picture was deleted since, the picture is None (never covered
-    by a tick) and whose it was comes from the step: a cutout's owner
-    (copied from its source), what a clip recorded when the picture was
-    deleted (_deleted_picture), else the clip's owner when a character,
-    else UNKNOWN_CAST, so a frame of a clip whose picture is gone keeps
-    the filter whoever owns the clip. A frame of a
-    clip made from more than one Cast picture: with `marked` (the ticks
-    now, content_mode.adult_ok_avatars()), the first of them a tick doesn't
-    cover (so the filter stays on), else the first; without, the first
-    one's character with no picture, which keeps the filter whatever the
-    ticks say later. A frame of an uploaded video has no source: its
-    owner, with no picture. A frame of a clip made from a prompt alone is
-    a new picture, and so is a frame of joined clips or of a video
-    uploaded as a clip."""
-    found = list(dict.fromkeys(_cast_sources(db, job, set())))
+    clip animated from an upscale of the picture still counts). Clips made
+    from other clips are followed back too: a continuation ("Continue this
+    clip": a clip animated from a saved last frame) leads to the clip it
+    continues, however many continuations deep, and joined clips
+    ("join_clips") to every clip they join, so a frame of a join is a copy
+    of every Cast picture any of its clips was made from (whichever clip it
+    shows). A video uploaded as a clip ("upload_video") is like a frame of
+    an uploaded video: its owner, with no picture. When the starting
+    picture was deleted since, the picture is None (never covered by a
+    tick) and whose it was comes from the step: a cutout's owner (copied
+    from its source), what a clip recorded when the picture was deleted
+    (_deleted_picture), else the clip's owner when a character, else
+    UNKNOWN_CAST, so a frame of a clip whose picture is gone keeps the
+    filter whoever owns the clip (also a join whose clip can't be found).
+    A frame of a clip made from more than one Cast picture: with `marked`
+    (the ticks now, content_mode.adult_ok_avatars()), the first of them a
+    tick doesn't cover (so the filter stays on), else the first; without,
+    the first one's character with no picture, which keeps the filter
+    whatever the ticks say later. A frame of an uploaded video has no
+    source: its owner, with no picture. A frame of a clip made from a
+    prompt alone is a new picture."""
+    found = list(dict.fromkeys(_cast_sources(db, job)))
     if not found:
         return None, None
     if len(found) == 1:
@@ -297,6 +303,12 @@ def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob],
 
 def _owner_avatar(job: models.AssetGenerationJob) -> list[tuple[int, Optional[int]]]:
     return [(int(job.owner_id), None)] if job.owner_kind == "avatar" and job.owner_id is not None else []
+
+
+def _unknown(job: models.AssetGenerationJob) -> list[tuple[int, Optional[int]]]:
+    """A source of `job` that can't be found: its owner when a character,
+    else UNKNOWN_CAST (the filter stays on either way)."""
+    return _owner_avatar(job) or [(UNKNOWN_CAST, None)]
 
 
 # A Cast character no longer known (studio_cast_source): a clip's starting
@@ -347,63 +359,96 @@ def _deleted_picture(clip: models.AssetGenerationJob, asset_id: int) -> list[tup
         avatar_id = record[str(asset_id)]
         ok = isinstance(avatar_id, int) and not isinstance(avatar_id, bool)
         return [(avatar_id, None)] if ok else []
-    return _owner_avatar(clip) or [(UNKNOWN_CAST, None)]
+    return _unknown(clip)
 
 
-def _cast_sources(db: Session, job: Optional[models.AssetGenerationJob],
-                  seen: set[int]) -> list[tuple[int, Optional[int]]]:
+# One step back from a Studio result (_steps): Cast pictures found there
+# (a list of (character, card picture or None)), or a Studio job to follow
+# back next.
+_Step = Union[list[tuple[int, Optional[int]]], models.AssetGenerationJob]
+
+
+def _cast_sources(db: Session, job: Optional[models.AssetGenerationJob]) -> list[tuple[int, Optional[int]]]:
     """Every (character, card picture or None) a Studio result is a copy
-    of (studio_cast_source), in order."""
-    while job is not None and job.id not in seen:
-        seen.add(job.id)
-        if job.output_kind == "video_clip":
-            if job.operation in ("join_clips", "upload_video"):
-                # Joined clips, or a video uploaded as a clip: never a Cast picture.
-                return []
-            return _clip_cast_sources(db, job, seen)
-        if not job.operation:
-            return []  # made in Studio: a new picture
-        if job.source_asset_id:
-            asset = db.get(models.Asset, job.source_asset_id)
-            if asset is not None:
-                avatar_id = cast_avatar_of(asset)
-                return [(avatar_id, int(asset.id))] if avatar_id is not None else []
-        elif job.source_job_id:
-            src = db.get(models.AssetGenerationJob, job.source_job_id)
-            if src is not None:
-                job = src
-                continue
-        return _owner_avatar(job)
-    return []
-
-
-def _clip_cast_sources(db: Session, clip: models.AssetGenerationJob,
-                       seen: set[int]) -> list[tuple[int, Optional[int]]]:
-    """The Cast pictures a clip was made from (its frames are copies of
-    them): the picture it was animated from (followed back as
-    _cast_sources) and its character reference pictures. A picture deleted
-    since: _deleted_picture."""
+    of (studio_cast_source), in order. Followed back one step at a time
+    from a list of steps still to take (not by recursion: a clip continued
+    hundreds of times is followed to its start), each Studio job once (a
+    clip joined twice, or a loop, is looked at once)."""
     found: list[tuple[int, Optional[int]]] = []
+    seen: set[int] = set()
+    todo: list[Optional[_Step]] = [job]  # the next step is the last one
+    while todo:
+        step = todo.pop()
+        if isinstance(step, list):
+            found += step
+        elif step is not None and step.id not in seen:
+            seen.add(step.id)
+            todo += reversed(_steps(db, step))
+    return found
+
+
+def _steps(db: Session, job: models.AssetGenerationJob) -> list[_Step]:
+    """What one Studio result is a copy of, in order (_Step)."""
+    if job.output_kind == "video_clip":
+        return _clip_steps(db, job)
+    if not job.operation:
+        return []  # made in Studio: a new picture
+    if job.source_asset_id:
+        asset = db.get(models.Asset, job.source_asset_id)
+        if asset is not None:
+            avatar_id = cast_avatar_of(asset)
+            return [[(avatar_id, int(asset.id))]] if avatar_id is not None else []
+    elif job.source_job_id:
+        src = db.get(models.AssetGenerationJob, job.source_job_id)
+        if src is not None:
+            return [src]
+    # The source is gone (its owner was copied from it), or a frame of an
+    # uploaded video (no source): the owner, with no picture.
+    return [_owner_avatar(job)]
+
+
+def _clip_steps(db: Session, clip: models.AssetGenerationJob) -> list[_Step]:
+    """The Cast pictures a clip was made from (its frames are copies of
+    them). A generated clip: the picture it was animated from (a Studio
+    picture is followed back: a continuation's saved last frame leads to
+    the clip it continues) and its character reference pictures; a picture
+    deleted since: _deleted_picture. Joined clips: every clip they join (a
+    clip that can't be found: _unknown). A video uploaded as a clip: its
+    owner, with no picture. Any other clip made here: _unknown."""
+    from . import video_ops
+
+    Job = models.AssetGenerationJob
+    if clip.operation == video_ops.JOIN_OP:
+        ids, _transition, _crossfade = video_ops.join_options(clip)
+        steps: list[_Step] = []
+        for i in dict.fromkeys(ids):
+            src = db.get(Job, i)  # tombstones keep their sources
+            steps.append(src if src is not None else _unknown(clip))
+        return steps or [_unknown(clip)]
+    if clip.operation == video_ops.UPLOAD_OP:
+        return [_owner_avatar(clip)]
+    if clip.operation:
+        return [_unknown(clip)]
+    steps = []
     if clip.first_frame_job_id:
-        src = db.get(models.AssetGenerationJob, clip.first_frame_job_id)  # tombstones keep their sources
-        found += (_cast_sources(db, src, seen) if src is not None
-                  else _owner_avatar(clip) or [(UNKNOWN_CAST, None)])
+        src = db.get(Job, clip.first_frame_job_id)  # tombstones keep their sources
+        steps.append(src if src is not None else _unknown(clip))
     elif clip.first_frame_asset_id:
         asset = db.get(models.Asset, clip.first_frame_asset_id)
         if asset is None:
-            found += _deleted_picture(clip, clip.first_frame_asset_id)
+            steps.append(_deleted_picture(clip, clip.first_frame_asset_id))
         elif (avatar_id := cast_avatar_of(asset)) is not None:
-            found.append((avatar_id, int(asset.id)))
+            steps.append([(avatar_id, int(asset.id))])
     ids = _asset_ids(clip.reference_asset_ids_json)
     if ids:
         rows = {r.id: r for r in db.query(models.Asset).filter(models.Asset.id.in_(ids)).all()}
         for aid in dict.fromkeys(ids):
             row = rows.get(aid)
             if row is None:
-                found += _deleted_picture(clip, aid)
+                steps.append(_deleted_picture(clip, aid))
             elif (avatar_id := cast_avatar_of(row)) is not None:
-                found.append((avatar_id, int(row.id)))
-    return found
+                steps.append([(avatar_id, int(row.id))])
+    return steps
 
 
 # ---------- public entry points ----------

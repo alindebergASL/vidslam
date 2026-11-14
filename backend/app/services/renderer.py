@@ -1740,7 +1740,12 @@ def join_clips_with_audio(
     cmd += ["-filter_complex", graph, "-map", "[out]"]
     cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"] if audio else ["-an"]
     cmd += [*_X264, "-r", str(FPS), "-movflags", "+faststart", str(dst)]
-    rc, log = _run(cmd, timeout=join_timeout(sum(lengths)))
+    if should_stop is None:
+        rc, log = _run(cmd, timeout=join_timeout(sum(lengths)))
+    else:
+        rc, log = _run(cmd, timeout=join_timeout(sum(lengths)), should_stop=should_stop)
+    if rc == -2:
+        raise JoinStopped("the join was cancelled or deleted")
     if rc != 0 or not dst.exists():
         raise RuntimeError(f"ffmpeg clip join failed: {log[-2000:]}")
     return dst, _probe_duration(dst), audio

@@ -816,7 +816,9 @@ def _frame_from_clip(db: Session, job_id: int, at, response: Response) -> Studio
     Grabbed here and finished before answering (ffmpeg is in the API
     image), else queued for the worker (202). Free: no model, no spend, no
     budget cap. No new safety check, except for a clip with pictures of an
-    uploaded video (video_ops.checked_grab)."""
+    uploaded video (video_ops.checked_grab): that check is a vision call
+    costing a fraction of a cent, so it is refused past the budget's hard
+    stop, before anything is read."""
     from ..services import video_ops
 
     try:
@@ -825,6 +827,8 @@ def _frame_from_clip(db: Session, job_id: int, at, response: Response) -> Studio
         raise HTTPException(e.status, e.message) from e
     if not _owner_exists(db, src.owner_kind, src.owner_id):
         raise HTTPException(404, "owner not found")
+    if video_ops.has_upload(db, src):
+        budget_guard()
     if not video_ops.ffmpeg_here():
         job = video_ops.new_clip_job(db, src, at)
         _enqueue_jobs(db, [job])
@@ -1042,7 +1046,11 @@ def continue_clip(job_id: int, body: StudioContinueRequest, db: Session = Depend
     picture and the new clip starts from it, from `prompt` (paid like any
     clip). With `auto_join`, once the new clip is finished it is joined
     after this one as one more clip (see services/video_ops.py). Every
-    check a clip's prompt gets applies; nothing gets a Cast exemption."""
+    check a clip's prompt gets applies. The frame keeps the clip's Cast
+    link (pipeline.studio_cast_source), so the new clip starts from it as
+    "Animate this" on the clip's Cast picture would: an unticked
+    character's content filter is forced on, a ticked one's follows the
+    tick."""
     from ..providers import video_capabilities
     from ..services import video_ops
 
@@ -1106,13 +1114,15 @@ def upload_video(
     db: Session = Depends(get_db),
 ) -> StudioJobOut:
     """Keep a video from this device as a finished Studio clip owned by
-    `owner` (free), so it can be continued, joined or have its frames
-    saved. Frames across it go through the picture safety checks before
-    anything is stored, and it is refused when they can't run (see
-    services/video_ops.py)."""
+    `owner`, so it can be continued, joined or have its frames saved.
+    Frames across it go through the picture safety checks before anything
+    is stored (vision calls costing a fraction of a cent: refused past the
+    budget's hard stop, before anything is read), and it is refused when
+    they can't run (see services/video_ops.py)."""
     from ..config import get_settings
     from ..services import video_ops
 
+    budget_guard()
     if not _owner_exists(db, owner_kind, owner_id):
         raise HTTPException(404, "owner not found")
     if not video_ops.looks_like_video(file.content_type or "", file.filename or ""):
