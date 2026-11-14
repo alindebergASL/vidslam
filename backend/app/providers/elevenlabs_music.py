@@ -73,6 +73,9 @@ class ElevenLabsMusicProvider(MusicProvider):
             r.raise_for_status()
         from ..services import spend
 
-        spend.record_rate_card("elevenlabs", "music", self.model_id, s.cost_music_per_generation,
-                               note=f"{length_ms / 1000:.0f}s track")
+        delivered = length_ms / 1000
+        note = f"{delivered:.0f}s track"
+        if delivered < duration_seconds:  # clamped to the 5 min a call makes; the renderer loops it
+            note += f" ({duration_seconds:.0f}s asked)"
+        spend.record_rate_card("elevenlabs", "music", self.model_id, s.cost_music_per_generation, note=note)
         return r.content

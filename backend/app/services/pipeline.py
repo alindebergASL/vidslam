@@ -1977,10 +1977,24 @@ def generate_music_for_project(
     *,
     prompt: str,
     duration_seconds: Optional[float] = None,
-) -> Path:
+) -> dict:
     """Generate a music bed via the MusicProvider and save it as the project's
-    music_upload_path. Returns the saved file path. Overwrites any prior music."""
+    music_upload_path. Overwrites any prior music.
+
+    One call returns at most the active model's cap (ambient.music_cap_seconds,
+    5 min for ElevenLabs): a longer request is asked for at the cap, and the
+    renderer loops the track under the video. Returns {"path", "seconds",
+    "requested", "capped"}; spend is attributed to the project."""
+    from . import spend
+
+    with spend.scope(project_id=project_id):
+        return _generate_music_for_project(db, project_id, prompt=prompt, duration_seconds=duration_seconds)
+
+
+def _generate_music_for_project(db: Session, project_id: int, *, prompt: str,
+                                duration_seconds: Optional[float]) -> dict:
     from ..providers import get_music
+    from .ambient import music_cap_seconds
 
     project = db.get(models.VideoProject, project_id)
     if project is None:
@@ -1990,7 +2004,13 @@ def generate_music_for_project(
     check_audio_prompt(prompt.strip())
 
     music = get_music()
-    target = float(duration_seconds or project.target_duration_seconds or 25)
+    requested = float(duration_seconds or project.target_duration_seconds or 25)
+    cap = music_cap_seconds()
+    target = min(requested, cap)
+    capped = target < requested
+    if capped:
+        log.info("music for project %s: %.0fs asked, the model makes at most %.0fs; the track loops",
+                 project.id, requested, cap)
     try:
         data = music.generate(prompt=prompt.strip(), duration_seconds=target)
         ext = music.output_extension() or "mp3"
@@ -2000,7 +2020,7 @@ def generate_music_for_project(
             project_id=project.id,
             provider=type(music).__name__,
             endpoint="music.generate",
-            request_summary={"prompt_chars": len(prompt), "duration": target},
+            request_summary={"prompt_chars": len(prompt), "requested": requested, "duration": target},
             response_summary={"error": str(e)[:500]},
             status="error",
         )
@@ -2029,10 +2049,10 @@ def generate_music_for_project(
         project_id=project.id,
         provider=type(music).__name__,
         endpoint="music.generate",
-        request_summary={"prompt_chars": len(prompt), "duration": target},
-        response_summary={"bytes": len(data), "ext": ext},
+        request_summary={"prompt_chars": len(prompt), "requested": requested, "duration": target},
+        response_summary={"bytes": len(data), "ext": ext, "delivered": target, "capped": capped},
     )
-    return out_path
+    return {"path": out_path, "seconds": target, "requested": requested, "capped": capped}
 
 
 def render_project(db: Session, project_id: int, *, claim: Optional[str] = None,

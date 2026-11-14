@@ -470,7 +470,14 @@ def sound_path(project: models.VideoProject) -> Path:
 
 def generate_sound_bed(db: Session, project: models.VideoProject, cfg: AmbientConfig) -> Optional[Path]:
     """One 30 s looping clip; the renderer loops it (with a crossfaded seam)
-    under the music for the full length."""
+    under the music for the full length. Spend is attributed to the scene."""
+    from . import spend
+
+    with spend.scope(project_id=project.id):
+        return _generate_sound_bed(db, project, cfg)
+
+
+def _generate_sound_bed(db: Session, project: models.VideoProject, cfg: AmbientConfig) -> Optional[Path]:
     from ..providers.registry import get_sound
     from .pipeline import _log_provider_call
 
@@ -1099,8 +1106,16 @@ def picture_prompt(cfg: AmbientConfig) -> str:
 def generate_picture(db: Session, project: models.VideoProject, *,
                      discard_loop: bool = False) -> models.VideoProject:
     """Generate the scene's picture now (one image call), so it can be
-    previewed and regenerated before any video is made."""
+    previewed and regenerated before any video is made. Spend (the image
+    and any description rewrite) is attributed to the scene."""
+    from . import spend
+
     _check_discard(db, project, discard_loop)  # before the paid call
+    with spend.scope(project_id=project.id):
+        return _generate_picture(db, project, discard_loop=discard_loop)
+
+
+def _generate_picture(db: Session, project: models.VideoProject, *, discard_loop: bool) -> models.VideoProject:
     cfg = _with_current_rewrite(db, project, _config_of(project))
     # Same model choice as the loop path (still_model_chain), so the picture
     # previewed here is what the scene would have made anyway.
@@ -1302,14 +1317,22 @@ def music_parts(cfg: AmbientConfig, model: Optional[str] = None) -> list[float]:
 
 def generate_music_bed(db: Session, project: models.VideoProject, cfg: AmbientConfig, prompt: str) -> Path:
     """One call when the bed fits the provider's cap; otherwise several
-    tracks in the same mood, crossfaded into one long bed."""
+    tracks in the same mood, crossfaded into one long bed. Spend is
+    attributed to the scene."""
+    from . import spend
+
+    with spend.scope(project_id=project.id):
+        return _generate_music_bed(db, project, cfg, prompt)
+
+
+def _generate_music_bed(db: Session, project: models.VideoProject, cfg: AmbientConfig, prompt: str) -> Path:
     from ..providers import get_music
     from .pipeline import _log_provider_call, check_audio_prompt, generate_music_for_project
 
     check_audio_prompt(prompt)  # once for every part: the parts add only the joining words
     parts = music_parts(cfg)
     if len(parts) == 1:
-        return generate_music_for_project(db, project.id, prompt=prompt, duration_seconds=parts[0])
+        return generate_music_for_project(db, project.id, prompt=prompt, duration_seconds=parts[0])["path"]
     music = get_music()
     out_dir = storage.render_subdir(project.id)
     files: list[Path] = []
@@ -1706,8 +1729,11 @@ def list_scenes(db: Session) -> list[models.VideoProject]:
 
 
 def create_scene(db: Session, body: AmbientCreate) -> models.VideoProject:
-    cfg = ensure_photo_rewrite(body.config)
-    # Validate the prompt resolves before we persist anything.
+    from . import spend
+
+    cfg = body.config
+    # Validate the prompt resolves before we persist anything (the rewrite
+    # below changes its wording, never whether it resolves).
     resolve_scene_prompt(cfg)
     preset = _PRESET_BY_ID.get(cfg.scene_preset)
     title = body.title.strip() or (
@@ -1730,6 +1756,14 @@ def create_scene(db: Session, body: AmbientCreate) -> models.VideoProject:
     )
     db.add(project)
     db.flush()
+    if needs_photo_rewrite(cfg):
+        # The rewrite is a paid planner call: made once the scene has an id,
+        # so its spend is attributed to the scene. Committed first, so no
+        # write transaction is held open over the network call.
+        db.commit()
+        with spend.scope(project_id=project.id):
+            cfg = ensure_photo_rewrite(cfg)
+        project.ambient_config_json = cfg.model_dump()
     _ensure_loop_shot(db, project, cfg)
     db.commit()
     db.refresh(project)
@@ -1763,6 +1797,8 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate,
     """Save settings. A change that needs a new clip (see _clip_changed, or
     a new aspect) discards the clips that are made: without `discard_loop`
     it raises LoopDiscard instead and nothing is saved."""
+    from . import spend
+
     cfg: Optional[AmbientConfig] = None
     aspect_changed = body.aspect_ratio is not None and body.aspect_ratio != project.aspect_ratio
     if aspect_changed and _has_loop_work(project):
@@ -1785,7 +1821,9 @@ def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate,
                 or cfg.look != old.look):
             probe = cfg.model_copy(update={"picture_origin": old.picture_origin})
             if needs_photo_rewrite(probe):
-                cfg = cfg.model_copy(update={"photo": ensure_photo_rewrite(probe, allow=allow_rewrite).photo})
+                with spend.scope(project_id=project.id):
+                    rewritten = ensure_photo_rewrite(probe, allow=allow_rewrite)
+                cfg = cfg.model_copy(update={"photo": rewritten.photo})
                 db.expire_all()
     # A generation that started meanwhile (the API checked before the call)
     # owns the scene's state now.
