@@ -424,7 +424,10 @@ def test_a_live_webm_with_no_stated_length_is_measured_and_kept(auth_client, tmp
     assert r.json()["result_duration_seconds"] == pytest.approx(3.0, abs=0.25)
 
 
-def test_a_live_webm_too_long_is_refused_before_it_is_prepared(auth_client, tmp_path, monkeypatch):
+def test_a_live_webm_too_long_is_refused_once_prepared_never_measured_raw(auth_client, tmp_path, monkeypatch):
+    """A live WebM states no length: it goes straight to the capped
+    re-encode, and the prepared copy (cut a second past the most) is what
+    is measured and refused."""
     from app.services import video_ops
 
     aid = _avatar(auth_client)
@@ -432,11 +435,122 @@ def test_a_live_webm_too_long_is_refused_before_it_is_prepared(auth_client, tmp_
     webm = tmp_path / "recording.webm"
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=32x32:rate=10:duration=5",
                     "-c:v", "libvpx", "-f", "webm", "-live", "1", str(webm)], check=True)
-    prepared: list = []
-    monkeypatch.setattr(video_ops, "normalize_upload", lambda *a: prepared.append(a))
+    seen: list[float] = []
+    real_norm = video_ops.normalize_upload
+
+    def norm(src, dst, streams, **kw):
+        out = real_norm(src, dst, streams, **kw)
+        from app.services.renderer import _probe_clip
+
+        seen.append(_probe_clip(dst)[0])
+        return out
+
+    monkeypatch.setattr(video_ops, "normalize_upload", norm)
     r = _upload(auth_client, webm, aid, content_type="video/webm")
-    assert r.status_code == 422 and "long" in r.json()["detail"], r.text
-    assert prepared == []
+    assert r.status_code == 422 and "longer than" in r.json()["detail"], r.text
+    assert len(seen) == 1 and seen[0] <= 3.5  # never decoded past the cap
+    assert _uploads() == 0
+
+
+def _ebml(eid: int, data: bytes) -> bytes:
+    """One EBML element: its id, its size (8-byte vint) and its data."""
+    ident = eid.to_bytes((eid.bit_length() + 7) // 8, "big")
+    return ident + (0x01 << 56 | len(data)).to_bytes(8, "big") + data
+
+
+def _uint(eid: int, value: int) -> bytes:
+    return _ebml(eid, value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big"))
+
+
+def _many_tiny_packets_mkv(path: Path, blocks: int, tmp: Path) -> Path:
+    """A hand-built Matroska file (a live WebM: no stated length) of
+    `blocks` tiny VP8 blocks one millisecond apart: very many packets in
+    a small file, the shape that made walking the raw packets huge."""
+    ivf = tmp / "one.ivf"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=gray:size=16x16:rate=1:duration=1",
+                    "-c:v", "libvpx", "-f", "ivf", str(ivf)], check=True)
+    raw = ivf.read_bytes()
+    frame = raw[32 + 12:32 + 12 + int.from_bytes(raw[32:36], "little")]  # the first (key) frame
+    header = _ebml(0x1A45DFA3, _uint(0x4286, 1) + _uint(0x42F7, 1) + _uint(0x42F2, 4) + _uint(0x42F3, 8)
+                   + _ebml(0x4282, b"webm") + _uint(0x4287, 2) + _uint(0x4285, 2))
+    info = _ebml(0x1549A966, _uint(0x2AD7B1, 1_000_000))  # milliseconds; no Duration
+    tracks = _ebml(0x1654AE6B, _ebml(0xAE, _uint(0xD7, 1) + _uint(0x73C5, 1) + _uint(0x83, 1)
+                                     + _ebml(0x86, b"V_VP8") + _ebml(0xE0, _uint(0xB0, 16) + _uint(0xBA, 16))))
+    per_cluster = 30_000
+    with open(path, "wb") as f:
+        f.write(header + bytes.fromhex("18538067") + bytes.fromhex("01FFFFFFFFFFFFFF") + info + tracks)
+        for start in range(0, blocks, per_cluster):
+            n = min(per_cluster, blocks - start)
+            body = b"".join(_ebml(0xA3, b"\x81" + i.to_bytes(2, "big") + b"\x80" + frame) for i in range(n))
+            f.write(_ebml(0x1F43B675, _uint(0xE7, start) + body))
+    return path
+
+
+def test_many_tiny_packets_are_never_walked_on_the_raw_upload(auth_client, tmp_path, temp_root, monkeypatch):
+    """A file of very many tiny blocks that states no length: no per-packet
+    ffprobe runs over the raw upload (nor is any such output parsed); it
+    goes to the capped, limited re-encode and the prepared copy decides."""
+    import time
+
+    from app.services import renderer, video_ops
+
+    aid = _avatar(auth_client)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SECONDS", 20.0)
+    mkv = _many_tiny_packets_mkv(tmp_path / "bomb.webm", 200_000, tmp_path)
+    assert mkv.stat().st_size < 50 * 1024 * 1024
+    assert video_ops._probe_upload(mkv, "matroska")["seconds"] == 0.0  # really no stated length
+    runs: list[list[str]] = []
+    real = renderer._run
+
+    def spy(cmd, timeout=None, should_stop=None):
+        runs.append(cmd)
+        return real(cmd, timeout=timeout, should_stop=should_stop)
+
+    monkeypatch.setattr(renderer, "_run", spy)
+    begun = time.monotonic()
+    r = _upload(auth_client, mkv, aid, content_type="video/webm")
+    took = time.monotonic() - begun
+    assert r.status_code == 422 and "longer than" in r.json()["detail"], r.text
+    raw = [c for c in runs if any("upload.mkv" in part for part in c)]
+    entries = [c[i + 1] for c in raw for i, part in enumerate(c[:-1]) if part == "-show_entries"]
+    assert raw and entries and not [e for e in entries if "packet" in e or "frame=" in e], entries
+    assert took < video_ops.UPLOAD_DEADLINE
+    assert _uploads() == 0 and _left(temp_root) == []
+
+
+def test_an_anamorphic_upload_is_stored_with_square_pixels_at_its_shown_shape(auth_client, tmp_path):
+    """720x576 with a 64:45 sample aspect ratio (PAL 16:9) is shown at
+    1024x576: stored so (square pixels), never squashed to 5:4, and its
+    aspect is 16:9."""
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    src = tmp_path / "pal.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=720x576:rate=10:duration=2",
+                    "-vf", "setsar=64/45", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(src)], check=True)
+    streams = video_ops._probe_upload(src, "mov")
+    assert streams["size"] == (720, 576) and streams["display"] == (1024, 576)
+    assert video_ops.aspect_for(streams["display"]) == "16:9"
+    r = _upload(auth_client, src, aid)
+    assert r.status_code == 201, r.text
+    job = r.json()
+    w, h = job["result_width"], job["result_height"]
+    assert w / h == pytest.approx(16 / 9, rel=0.02), (w, h)
+    assert job["aspect_ratio"] == "16:9"
+    out = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
+                          "-show_entries", "stream=width,height,sample_aspect_ratio", job["result_path"]],
+                         capture_output=True, text=True, check=True)
+    st = json.loads(out.stdout)["streams"][0]
+    assert (st["width"], st["height"]) == (w, h) and st.get("sample_aspect_ratio", "1:1") in ("1:1", "0:1")
+
+
+def test_a_shown_size_past_4k_is_refused_before_decoding():
+    from app.services import video_ops
+
+    ok = {"video": "h264", "size": (2048, 2048), "display": (2048, 2048)}
+    assert video_ops.upload_refusal(ok) is None
+    wide = {**ok, "display": (8192, 2048)}  # a sample aspect ratio of 4:1
+    assert "8192x2048" in video_ops.upload_refusal(wide)
 
 
 def _without_ftyp(src: Path, dst: Path) -> Path:

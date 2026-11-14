@@ -393,13 +393,13 @@ def test_saved_upload_gets_a_sniffed_extension_never_the_uploaders(auth_client, 
     assert video_ops.sniffed_extension(junk) == ""
 
     seen: list[str] = []
-    real_grab = video_ops.grab
+    real_probe = video_ops._probe_upload
 
-    def spy(video, at):
+    def spy(video, demuxer):
         seen.append(video.name)
-        return real_grab(video, at)
+        return real_probe(video, demuxer)
 
-    monkeypatch.setattr(video_ops, "grab", spy)
+    monkeypatch.setattr(video_ops, "_probe_upload", spy)
     aid = _avatar(auth_client)
     # A real MP4 named with another (odd) extension: stored as .mp4, and still read.
     odd = tmp_path / "holiday.PHP"
@@ -411,3 +411,46 @@ def test_saved_upload_gets_a_sniffed_extension_never_the_uploaders(auth_client, 
     mov.write_bytes(webm.read_bytes())
     assert _upload(auth_client, mov, aid, content_type="video/quicktime").status_code == 201
     assert seen == ["upload.mp4", "upload.mkv"]
+
+
+@pytest.mark.parametrize("at", ["first", "last", "1.5"])
+def test_a_live_webm_with_no_stated_length_gives_its_frames(auth_client, tmp_path, at):
+    """A browser recording (MediaRecorder: live WebM) states no length; its
+    frames are grabbed from the prepared copy, as "Upload a video" keeps it."""
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    webm = tmp_path / "recording.webm"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=3",
+                    "-c:v", "libvpx", "-f", "webm", "-live", "1", str(webm)], check=True)
+    assert video_ops._probe_upload(webm, "matroska")["seconds"] == 0.0  # really no stated length
+    r = _upload(auth_client, webm, aid, at=at, content_type="video/webm")
+    assert r.status_code == 201, r.text
+    job = r.json()
+    used = job["options"]["seconds"]
+    assert {"first": used == 0.0, "last": 2.5 <= used <= 3.0, "1.5": used == pytest.approx(1.5, abs=0.11)}[at], used
+    assert _open(job["result_path"]).size == (64, 48)
+
+
+def test_frame_from_a_video_goes_the_same_safe_way_as_upload_a_video(auth_client, tmp_path, monkeypatch):
+    """Refused on its headers before decoding (a picture past 4K), and too
+    long a video is refused once prepared (capped), as Upload a video."""
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    calls: list = []
+    real = video_ops.prepare_upload
+
+    def spy(raw, out, step):
+        calls.append(raw)
+        return real(raw, out, step)
+
+    monkeypatch.setattr(video_ops, "prepare_upload", spy)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SIDE", 64)
+    r = _upload(auth_client, _video(tmp_path, size=(96, 64)), aid)
+    assert r.status_code == 422 and "96x64" in r.json()["detail"], r.text
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SIDE", 4096)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SECONDS", 1.0)
+    r = _upload(auth_client, _video(tmp_path, seconds=4.0, name="long.mp4"), aid, at="last")
+    assert r.status_code == 422 and "long" in r.json()["detail"], r.text
+    assert len(calls) == 2 and _frame_jobs() == 0

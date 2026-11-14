@@ -378,23 +378,46 @@ def check_uploaded_frames(frames: list[tuple[Path, bytes]], label: str, *, video
 def frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
                       at: At, limit: int) -> models.AssetGenerationJob:
     """Grab a frame from an uploaded video, check it, and store it as a
-    finished Studio picture owned by `owner`. The video itself is deleted."""
+    finished Studio picture owned by `owner`. The video itself is deleted.
+    The upload is read the one safe way (prepare_upload: refused before
+    decoding when it should be, then a capped, limited re-encode), and the
+    frame grabbed from that prepared copy, so a browser's live WebM (no
+    stated length) works and the same limits apply as for "Upload a
+    video" (429 while too many are being prepared)."""
     if not ffmpeg_here():
         raise OpError(503, NO_FFMPEG)
+    if not _upload_slots.acquire(blocking=False):
+        raise OpError(429, UPLOAD_BUSY)
+    try:
+        # No database connection is held while ffmpeg and the checks run.
+        db.commit()
+        return _frame_from_upload(db, owner_kind=owner_kind, owner_id=owner_id, file=file, filename=filename,
+                                  at=at, limit=limit)
+    finally:
+        _upload_slots.release()
+
+
+def _frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
+                       at: At, limit: int) -> models.AssetGenerationJob:
     name = Path(filename or "video").name[:60] or "video"
     with tempfile.TemporaryDirectory(prefix="upload-") as tmp:
         raw = Path(tmp) / "upload"
         save_upload(file, raw, limit)
-        # The client's own suffix is never used for the file on disk.
-        video = raw.rename(raw.with_name("upload" + sniffed_extension(raw)))
+        step = _upload_clock()
+        prepared = Path(tmp) / "prepared.mp4"
+        prepare_upload(raw, prepared, step)
         try:
-            data, used = grab(video, at)
+            data, used = grab(prepared, at, timeout=step(UPLOAD_STEP_TIMEOUT))
+        except TimeoutError:
+            raise OpError(422, UPLOAD_TOO_SLOW) from None
         except RuntimeError:
             raise OpError(422, NOT_A_VIDEO) from None
         label = label_for(name, used)
         frame = Path(tmp) / "frame.png"
         frame.write_bytes(data)
         check_uploaded_frame(frame, data, label)
+    if not _owner_exists(db, owner_kind, owner_id):
+        raise OpError(404, "owner not found")  # deleted while the video was prepared
     job = models.AssetGenerationJob(
         owner_kind=owner_kind, owner_id=owner_id, output_kind="image", prompt=label, negative_prompt="",
         reference_asset_ids_json=[], provider=PROVIDER, provider_model=LOCAL_MODEL, label=label,
@@ -667,7 +690,7 @@ UPLOAD_DEMUXERS = {".mp4": "mov", ".mkv": "matroska", ".avi": "avi"}
 UPLOAD_PROBE_TIMEOUT = 60.0
 UPLOAD_ENCODE_TIMEOUT = 360.0
 # Once prepared, each probe or frame grab of the copy (each ffmpeg run) has
-# this long, and all the ffmpeg work of one upload (raw probe, measuring,
+# this long, and all the ffmpeg work of one upload (raw probe,
 # re-encode, the copy's probe and grabs) must end within UPLOAD_DEADLINE of
 # its start, leaving the picture checks room inside the proxy's 600 s.
 UPLOAD_STEP_TIMEOUT = 20.0
@@ -728,7 +751,9 @@ def _probe_upload(path: Path, demuxer: str) -> dict:
     by UPLOAD_PROBE_TIMEOUT): {"video": codec, "pix_fmt", "audio": codec or
     "", "size": (w, h) or None, "fps": frames a second (0.0 unknown),
     "seconds": its stated length (0.0: it states none, as a browser's live
-    WebM recording doesn't)}; {} when it has no readable picture. Read from
+    WebM recording doesn't), "display": (w, h) as it is shown, its pixels
+    made square (its sample aspect ratio applied: a 720x576 PAL 16:9 picture
+    shows as 1024x576) or None}; {} when it has no readable picture. Read from
     the container's headers only: nothing is decoded (an upload is refused
     on what is read here, upload_refusal, before any decoding). The stated
     length, size and rate come from the file, which the uploader controls:
@@ -738,7 +763,8 @@ def _probe_upload(path: Path, demuxer: str) -> dict:
     from .renderer import _run, stream_size
 
     rc, log = _run(["ffprobe", "-v", "quiet", "-nofind_stream_info", "-print_format", "json", "-show_entries",
-                    "stream=codec_type,codec_name,pix_fmt,width,height,duration,avg_frame_rate,r_frame_rate:"
+                    "stream=codec_type,codec_name,pix_fmt,width,height,sample_aspect_ratio,duration,avg_frame_rate,"
+                    "r_frame_rate:"
                     "stream_side_data=rotation:stream_tags=rotate:format=duration", *_raw_input(path, demuxer)],
                    timeout=UPLOAD_PROBE_TIMEOUT)
     if rc == -1:
@@ -755,6 +781,7 @@ def _probe_upload(path: Path, demuxer: str) -> dict:
         if st.get("codec_type") == "video" and "video" not in out:
             out["video"], out["pix_fmt"] = st.get("codec_name") or "", st.get("pix_fmt") or ""
             out["size"] = stream_size(st)
+            out["display"] = display_size(st)
             out["fps"] = _rate(st.get("avg_frame_rate")) or _rate(st.get("r_frame_rate"))
             try:
                 seconds = float(st.get("duration") or 0.0)
@@ -773,53 +800,46 @@ def _probe_upload(path: Path, demuxer: str) -> dict:
     return out
 
 
-def _measure_upload(path: Path, demuxer: str) -> float:
-    """How long the raw upload plays, from its picture's packets (read, not
-    decoded; bounded by UPLOAD_PROBE_TIMEOUT), for a file that states no
-    length. Only the first UPLOAD_MAX_SECONDS and a little more are read:
-    a longer one measures past the most. 0.0 when it has no packets.
-    TimeoutError past the limit."""
-    from .renderer import _run
+def _sar(value: object) -> float:
+    """An ffprobe sample aspect ratio ("64:45", "1:1", "0:1", "N/A") as a
+    number; 1.0 when unknown or nonsense (square pixels)."""
+    num, _, den = str(value or "").partition(":")
+    try:
+        sar = float(num) / float(den)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 1.0
+    return sar if math.isfinite(sar) and sar > 0 else 1.0
 
-    rc, log = _run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-read_intervals",
-                    f"%+{UPLOAD_MAX_SECONDS + 2:.0f}", "-show_entries", "packet=pts_time,duration_time",
-                    "-of", "csv=p=0", *_raw_input(path, demuxer)], timeout=UPLOAD_PROBE_TIMEOUT)
-    if rc == -1:
-        raise TimeoutError(log)
-    if rc != 0:
-        return 0.0
-    first = end = None
-    for line in log.splitlines():
-        parts = line.split(",")
-        try:
-            pts = float(parts[0])
-        except (ValueError, IndexError):
-            continue
-        try:
-            dur = float(parts[1]) if len(parts) > 1 else 0.0
-        except ValueError:
-            dur = 0.0
-        if not math.isfinite(pts):
-            continue
-        first = pts if first is None else min(first, pts)
-        stop = pts + (dur if math.isfinite(dur) and dur > 0 else 0.0)
-        end = stop if end is None else max(end, stop)
-    if first is None or end is None:
-        return 0.0
-    return max(0.0, end - first)
+
+def display_size(st: dict) -> Optional[tuple[int, int]]:
+    """(width, height) of one ffprobe video stream entry as it is shown:
+    its pixels made square (width times its sample aspect ratio, to an even
+    number, as normalize_upload's first scale does), then rotation applied
+    (as renderer.stream_size); None when its size isn't stated."""
+    from .renderer import stream_size
+
+    try:
+        w, h = int(st["width"]), int(st["height"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    shown = max(2, int(w * _sar(st.get("sample_aspect_ratio")) / 2) * 2)
+    return stream_size({**st, "width": shown, "height": h})
 
 
 def upload_refusal(streams: dict) -> Optional[str]:
     """Why an upload (what `_probe_upload` read, nothing decoded yet) is
     refused before it is decoded, or None: a picture larger than 4K
-    (UPLOAD_MAX_SIDE a side, UPLOAD_MAX_PIXELS in all) or of a size not
+    (UPLOAD_MAX_SIDE a side, UPLOAD_MAX_PIXELS in all) as it is stored or
+    as it is shown (its pixels made square: "display"), or of a size not
     stated, or a picture that isn't one of UPLOAD_CODECS."""
-    size = streams.get("size")
-    if not size or size[0] <= 0 or size[1] <= 0:
-        return NOT_A_VIDEO
-    w, h = size
-    if w > UPLOAD_MAX_SIDE or h > UPLOAD_MAX_SIDE or w * h > UPLOAD_MAX_PIXELS:
-        return f"That video's picture is {w}x{h}; the largest read here is 4K (3840x2160 or 4096x2304)"
+    for size in (streams.get("size"), streams.get("display", streams.get("size"))):
+        if not size or size[0] <= 0 or size[1] <= 0:
+            return NOT_A_VIDEO
+        w, h = size
+        if w > UPLOAD_MAX_SIDE or h > UPLOAD_MAX_SIDE or w * h > UPLOAD_MAX_PIXELS:
+            return f"That video's picture is {w}x{h}; the largest read here is 4K (3840x2160 or 4096x2304)"
     codec = str(streams.get("video") or "")
     if codec not in UPLOAD_CODECS:
         return (f"That file's picture ({codec or 'unknown format'}) isn't a video format read here; "
@@ -833,10 +853,13 @@ def normalize_upload(src: Path, dst: Path, streams: dict, *, timeout: float = UP
     fast start), never longer than UPLOAD_MAX_SECONDS and a second, however
     long it claims to be. Always re-encoded, never copied as it is (the
     stream may change size midway, or pack many frames into a moment,
-    whatever its first picture and average rate say): every frame is
-    scaled into the size of its first picture fitted to 1080p (even sides,
-    shape kept, padded if a later picture's shape differs), at a steady
-    rate of at most UPLOAD_MAX_FPS. Returns True (it was re-encoded).
+    whatever its first picture and average rate say): every frame's
+    pixels are first made square (its own sample aspect ratio applied, so
+    an anamorphic 720x576 16:9 picture becomes 1024x576, never stored
+    squashed), then it is scaled into the size its first picture is shown
+    at ("display") fitted to 1080p (even sides, shape kept, padded if a
+    later picture's shape differs), at a steady rate of at most
+    UPLOAD_MAX_FPS. Returns True (it was re-encoded).
     RuntimeError when ffmpeg can't; TimeoutError when it takes longer than
     `timeout` (UPLOAD_ENCODE_TIMEOUT at most)."""
     from fractions import Fraction
@@ -847,13 +870,16 @@ def normalize_upload(src: Path, dst: Path, streams: dict, *, timeout: float = UP
     demuxer = UPLOAD_DEMUXERS[sniffed_extension(src)]
     cap = ["-t", f"{UPLOAD_MAX_SECONDS + 1:.0f}"]
     maps = ["-map", "0:v:0"] + (["-map", "0:a:0"] if streams.get("audio") else [])
-    size = streams.get("size")
+    size = streams.get("display") or streams.get("size")
     if not size:
         raise RuntimeError("the picture's size isn't known")
     w, h = join_size(size)
     stated = float(streams.get("fps") or 0.0)
     rate = Fraction(stated).limit_denominator(1001) if 0 < stated <= UPLOAD_MAX_FPS else Fraction(UPLOAD_MAX_FPS)
+    # The square-pixel width is kept within UPLOAD_MAX_SIDE (a stream may
+    # change its sample aspect ratio midway), so no frame grows past 4K.
     vf = ["-vf", f"fps={rate.numerator}/{rate.denominator},"
+                 f"scale=w='min(trunc(iw*sar/2)*2,{UPLOAD_MAX_SIDE})':h=ih,setsar=1,"
                  f"scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
                  f"pad={w}:{h}:-1:-1,setsar=1"]
     audio = ["-c:a", "aac", "-b:a", "160k"] if streams.get("audio") else []
@@ -936,68 +962,86 @@ def video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
         _upload_slots.release()
 
 
-def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
-                       limit: int) -> models.AssetGenerationJob:
+def _upload_clock():
+    """A step(limit) for one upload, its clock started now (the file is
+    in): the time limit for the next ffmpeg run, `limit` or what is left of
+    UPLOAD_DEADLINE when less; OpError "took too long" when nothing is."""
     import time
 
-    from . import events, storage
-
-    started = 0.0  # set once the file is in
+    started = time.monotonic()
 
     def step(limit: float) -> float:
-        """The time limit for the next ffmpeg run: `limit`, or what is left
-        of UPLOAD_DEADLINE when less; "took too long" when nothing is."""
         left = UPLOAD_DEADLINE - (time.monotonic() - started)
         if left < 1.0:
             raise OpError(422, UPLOAD_TOO_SLOW)
         return min(limit, left)
 
+    return step
+
+
+def prepare_upload(raw: Path, out: Path, step) -> tuple[float, bool, tuple[int, int]]:
+    """The one safe way an uploaded video (`raw`, saved as it came) is read:
+    its container sniffed (only UPLOAD_DEMUXERS are read), its headers
+    probed and refused before anything is decoded (upload_refusal, or a
+    stated length past the most), then re-encoded to `out`
+    (normalize_upload: capped a second past UPLOAD_MAX_SECONDS, time and
+    thread limited) and the prepared copy measured, refused when longer
+    than the most. A file that states no length (a browser's live WebM
+    recording) goes straight to the capped re-encode: the raw file's
+    packets are never walked here. `raw` is removed once prepared. Returns
+    the copy's (length, has sound, size). OpError for anything refused or
+    unreadable, or past the time limits (`step`, _upload_clock)."""
+    # The client's own suffix is never used for the file on disk; only the
+    # containers sniffed here are read at all.
+    ext = sniffed_extension(raw)
+    if ext not in UPLOAD_DEMUXERS:
+        raise OpError(422, NOT_A_VIDEO)
+    video = raw.rename(raw.with_name("upload" + ext))
+    try:
+        streams = _probe_upload(video, UPLOAD_DEMUXERS[ext])
+    except TimeoutError:
+        raise OpError(422, UPLOAD_TOO_SLOW) from None
+    if not streams:
+        raise OpError(422, NOT_A_VIDEO)
+    # Refused on what its headers say, before anything is decoded.
+    refusal = upload_refusal(streams)
+    if refusal:
+        raise OpError(422, refusal)
+    if streams["seconds"] > UPLOAD_MAX_SECONDS:
+        raise _too_long(streams["seconds"])
+    try:
+        normalize_upload(video, out, streams, timeout=step(UPLOAD_ENCODE_TIMEOUT))
+    except TimeoutError:
+        raise OpError(422, UPLOAD_TOO_SLOW) from None
+    except RuntimeError:
+        raise OpError(422, NOT_A_VIDEO) from None
+    video.unlink(missing_ok=True)
+    # The length that counts is the prepared copy's (the file's own claim,
+    # or its lack of one, may be anything; the copy is cut a second past
+    # the most, so a longer one is refused here).
+    try:
+        length, has_audio, size = _probe_prepared(out, step(UPLOAD_STEP_TIMEOUT))
+    except TimeoutError:
+        raise OpError(422, UPLOAD_TOO_SLOW) from None
+    if length <= 0 or not size:
+        raise OpError(422, NOT_A_VIDEO)
+    if length > UPLOAD_MAX_SECONDS + 0.5:
+        raise OpError(422, f"That video is longer than {int(UPLOAD_MAX_SECONDS // 60)} minutes; "
+                           f"the most is {int(UPLOAD_MAX_SECONDS // 60)} minutes")
+    return length, has_audio, size
+
+
+def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
+                       limit: int) -> models.AssetGenerationJob:
+    from . import events, storage
+
     name = Path(filename or "video").name[:60] or "video"
     with tempfile.TemporaryDirectory(prefix="upload-video-") as tmp:
         raw = Path(tmp) / "upload"
         save_upload(file, raw, limit)
-        started = time.monotonic()  # the time limits count from here (the file is in)
-        # The client's own suffix is never used for the file on disk; only
-        # the containers sniffed here are read at all.
-        ext = sniffed_extension(raw)
-        if ext not in UPLOAD_DEMUXERS:
-            raise OpError(422, NOT_A_VIDEO)
-        video = raw.rename(raw.with_name("upload" + ext))
-        try:
-            streams = _probe_upload(video, UPLOAD_DEMUXERS[ext])
-            # Refused on what its headers say, before anything is decoded.
-            refusal = upload_refusal(streams) if streams else None
-            if refusal:
-                raise OpError(422, refusal)
-            if streams and streams["seconds"] <= 0:
-                # No stated length (a browser's live WebM recording):
-                # measured from its packets instead.
-                streams["seconds"] = _measure_upload(video, UPLOAD_DEMUXERS[ext])
-        except TimeoutError:
-            raise OpError(422, UPLOAD_TOO_SLOW) from None
-        if not streams or streams["seconds"] <= 0:
-            raise OpError(422, NOT_A_VIDEO)
-        if streams["seconds"] > UPLOAD_MAX_SECONDS:
-            raise _too_long(streams["seconds"])
+        step = _upload_clock()  # the time limits count from here (the file is in)
         out = Path(tmp) / "clip.mp4"
-        try:
-            reencoded = normalize_upload(video, out, streams, timeout=step(UPLOAD_ENCODE_TIMEOUT))
-        except TimeoutError:
-            raise OpError(422, UPLOAD_TOO_SLOW) from None
-        except RuntimeError:
-            raise OpError(422, NOT_A_VIDEO) from None
-        video.unlink(missing_ok=True)
-        # The length that counts is the prepared copy's (the file's own
-        # claim may be anything; the copy is cut a second past the most).
-        try:
-            length, has_audio, size = _probe_prepared(out, step(UPLOAD_STEP_TIMEOUT))
-        except TimeoutError:
-            raise OpError(422, UPLOAD_TOO_SLOW) from None
-        if length <= 0 or not size:
-            raise OpError(422, NOT_A_VIDEO)
-        if length > UPLOAD_MAX_SECONDS + 0.5:
-            raise OpError(422, f"That video is longer than {int(UPLOAD_MAX_SECONDS // 60)} minutes; "
-                               f"the most is {int(UPLOAD_MAX_SECONDS // 60)} minutes")
+        length, has_audio, size = prepare_upload(raw, out, step)
         frames: list[tuple[Path, bytes]] = []
         for i, t in enumerate(upload_frame_times(length)):
             try:
@@ -1017,7 +1061,7 @@ def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
         owner_kind=owner_kind, owner_id=owner_id, output_kind="video_clip", duration_seconds=round(length, 3),
         aspect_ratio=aspect_for(size), prompt="", negative_prompt="", reference_asset_ids_json=[],
         provider=PROVIDER, provider_model=UPLOAD_MODEL, label=UPLOAD_LABEL, operation=UPLOAD_OP,
-        options_json={"upload": name, "has_audio": has_audio, "reencoded": reencoded},
+        options_json={"upload": name, "has_audio": has_audio, "reencoded": True},
         result_path=str(path), result_width=size[0], result_height=size[1],
         result_duration_seconds=round(length, 3), status="completed",
     )
