@@ -667,9 +667,12 @@ def take_from_studio(project_id: int, shot_id: int, body: TakeFromStudioIn,
     current. Free; Re-compose puts it in the video. A clip with pictures of
     an uploaded video (or a join with one) has the stretch used checked
     first, about a frame a second (video_ops.check_clip_used_whole): 422
-    refused, 503 the check couldn't run."""
-    from ..services import inspector
+    refused, 503 the check couldn't run; that check is a vision call
+    costing a fraction of a cent, so it is refused (402) past the budget's
+    hard stop, before anything is read."""
+    from ..services import inspector, video_ops
     from ..services.pipeline import STUDIO_DELETED, _active_job_for
+    from ..services.spend import budget_guard
 
     shot = _shot_of(db, project_id, shot_id)
     job = db.get(models.AssetGenerationJob, body.studio_job_id)
@@ -684,6 +687,8 @@ def take_from_studio(project_id: int, shot_id: int, body: TakeFromStudioIn,
     if _active_job_for(db, shot.id) is not None:
         raise HTTPException(409, "A new clip for this shot is still being made. Wait until it is back, "
                                  "then use the Studio clip.")
+    if video_ops.has_upload(db, job):
+        budget_guard()
     try:
         take, warning, seconds = takes_svc.import_studio_clip(db, shot, job)
     except takes_svc.StudioImportError as e:

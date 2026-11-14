@@ -3,6 +3,13 @@ import { useEffect, useRef, useState } from "react";
 import { Dialog } from "@/components/Dialog";
 import { api, Avatar, errorText, FRAME_VIDEO_MAX_MB, FrameAt, Ingredient, StudioJob } from "@/lib/api";
 
+/** A player's time to send for "Save this frame": to the microsecond,
+ *  rounded down, so it never crosses into the next frame (the server saves
+ *  the frame showing at that time: the last one that starts at or before it). */
+export function frameSeconds(t: number): number {
+  return Math.max(0, Math.floor(t * 1e6 + 1e-6) / 1e6);
+}
+
 /** "0:03.2" for 3.2 seconds. */
 export function clockText(t: number): string {
   const s = Math.max(0, Math.round(t * 10) / 10);
@@ -13,7 +20,8 @@ export function clockText(t: number): string {
 /**
  * Save a frame of a video from this device as a Studio picture. The video
  * is only previewed here; the server grabs the frame, the picture safety
- * check looks at it, and only the frame is kept.
+ * check looks at it (a vision call that costs a fraction of a cent), and
+ * only the frame is kept.
  */
 export function FrameFromVideoDialog({
   avatars,
@@ -79,8 +87,8 @@ export function FrameFromVideoDialog({
     <Dialog title="Save a frame from a video" onClose={onClose}>
       <p className="text-xs text-ink-300">
         Pick a video from this device and the moment you want. Only that frame is saved, as a new picture; the video
-        isn&apos;t kept. Free. A safety check looks at the frame first, and frames that show anyone under 18 can&apos;t
-        be saved.
+        isn&apos;t kept. A safety check looks at the frame first (it costs a fraction of a cent), and frames that show
+        anyone under 18 can&apos;t be saved.
       </p>
       <OwnerSelect id="frame-owner" label="Save it for" avatars={avatars} ingredients={ingredients} value={owner} onChange={setOwner} />
       <div>
@@ -158,7 +166,7 @@ export function FrameFromVideoDialog({
           disabled={!file || !owner || busy || !playable}
           onClick={() => {
             videoRef.current?.pause();
-            save(videoRef.current ? videoRef.current.currentTime : time);
+            save(frameSeconds(videoRef.current ? videoRef.current.currentTime : time));
           }}
         >
           {busy ? "Saving…" : `Save this frame${playable ? ` (${clockText(time)})` : ""}`}
@@ -218,8 +226,9 @@ const TOO_LARGE = `This video is larger than ${FRAME_VIDEO_MAX_MB} MB. Pick a sh
 
 /**
  * Upload a video from this device as a Studio clip, so it can be continued,
- * joined or have its frames saved like any clip. Free. A safety check looks
- * at frames across it first; it is refused if any shows someone under 18.
+ * joined or have its frames saved like any clip. A safety check looks at
+ * frames across it first (a vision call that costs a fraction of a cent);
+ * it is refused if any shows someone under 18.
  */
 export function UploadVideoDialog({
   avatars,
@@ -266,8 +275,8 @@ export function UploadVideoDialog({
     <Dialog title="Upload a video" onClose={onClose}>
       <p className="text-xs text-ink-300">
         Adds a video from this device to Studio as a clip, so you can continue it, join it with other clips or save
-        its frames. Free. A safety check looks at frames across the video first; videos that show anyone under 18
-        can&apos;t be added.
+        its frames. A safety check looks at frames across the video first (it costs a fraction of a cent), and
+        videos that show anyone under 18 can&apos;t be added.
       </p>
       <OwnerSelect id="upload-owner" label="Add it to" avatars={avatars} ingredients={ingredients} value={owner} onChange={setOwner} />
       <div>
@@ -306,7 +315,7 @@ export function UploadVideoDialog({
           disabled={!file || !owner || busy}
           onClick={upload}
         >
-          {busy ? "Uploading…" : "Upload · free"}
+          {busy ? "Uploading…" : "Upload"}
         </button>
       </div>
     </Dialog>

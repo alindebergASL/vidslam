@@ -100,12 +100,15 @@ def test_upload_is_checked_then_kept_as_a_finished_free_clip(auth_client, tmp_pa
     assert _codecs(job["result_path"]) == {"video": ("h264", "yuv420p"), "audio": ("aac", None)}
     assert auth_client.get(f"/api/studio/jobs/{job['id']}/preview").headers["content-type"] == "video/mp4"
     assert _left(temp_root) == []
-    # Nothing to make again; never a Cast picture.
+    # Nothing to make again; never a Cast exemption: like a frame of an
+    # uploaded video, a picture of its owner (a character) with no card
+    # picture behind it, so no tick covers it.
     r = auth_client.post(f"/api/studio/jobs/{job['id']}/retry")
     assert r.status_code == 409 and "upload it again" in r.json()["detail"]
     with SessionLocal() as db:
         row = db.get(models.AssetGenerationJob, job["id"])
-        assert pipeline.studio_cast_source(db, row) == (None, None)
+        assert pipeline.studio_cast_source(db, row) == (aid, None)
+        assert pipeline.avatar_adult_ok(aid, None, {aid: frozenset(range(1, 50))}) is False
 
 
 def test_uploaded_clip_can_be_continued_joined_and_framed(auth_client, tmp_path):
@@ -243,7 +246,8 @@ def test_patched_checkers_see_every_frame_and_any_refusal_refuses(auth_client, t
     r = _upload(auth_client, _video(tmp_path / "a.mp4", seconds=35.0, size=(32, 32)), aid)
     assert r.status_code == 422, r.text
     assert seen["frames"] == [f"frame{i}.png" for i in range(5)]  # 35 s: 5 frames
-    assert explicit == seen["frames"][:4]
+    # Asked about several at a time: at least the four up to the refusal.
+    assert len(explicit) >= 4 and set(explicit) <= set(seen["frames"])
     assert _uploads() == 0 and _left(temp_root) == []
 
     # A check answering for only some frames is never a yes.

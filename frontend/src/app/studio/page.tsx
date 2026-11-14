@@ -1033,7 +1033,7 @@ function Studio() {
             type="button"
             className="btn-ghost text-xs"
             onClick={() => setUploadingVideo(true)}
-            title="Add a video from this device as a clip you can continue or join (free)"
+            title="Add a video from this device as a clip you can continue or join (its safety check costs a fraction of a cent)"
           >
             Upload a video…
           </button>
@@ -1041,7 +1041,7 @@ function Studio() {
             type="button"
             className="btn-ghost text-xs"
             onClick={() => setFraming(true)}
-            title="Save a frame of a video from this device as a picture (free)"
+            title="Save a frame of a video from this device as a picture (its safety check costs a fraction of a cent)"
           >
             Frame from a video…
           </button>

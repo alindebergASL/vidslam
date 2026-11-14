@@ -204,6 +204,11 @@ def delete_asset(asset_id: int, db: Session = Depends(get_db)) -> None:
         refs = list(shot.reference_asset_ids_json or [])
         if asset_id in refs:
             shot.reference_asset_ids_json = [x for x in refs if x != asset_id]
+    # Clips made from it remember whose picture it was (their saved frames
+    # keep that character's content filter).
+    from ..services.pipeline import remember_deleted_pictures
+
+    remember_deleted_pictures(db, [a])
     # Flush the FK clears before the row goes so the UPDATE runs first.
     db.flush()
     db.delete(a)

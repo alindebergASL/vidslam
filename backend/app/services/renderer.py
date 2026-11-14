@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -64,13 +67,8 @@ def _run(cmd: list[str], timeout: Optional[float] = None,
     asked about once a second while the command runs; when it says yes the
     command is killed and the answer is (-2, "stopped")."""
     if should_stop is None:
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return -1, f"timed out after {timeout:.0f}s"
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
-    import time
-
+        rc, out, err = _run_parts(cmd, timeout)
+        return rc, out + err
     deadline = None if timeout is None else time.monotonic() + timeout
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
         while True:
@@ -88,6 +86,19 @@ def _run(cmd: list[str], timeout: Optional[float] = None,
                 proc.kill()
                 proc.communicate()
                 return (-2, "stopped") if stop else (-1, f"timed out after {timeout:.0f}s")
+
+
+def _run_parts(cmd: list[str], timeout: Optional[float] = None) -> tuple[int, str, str]:
+    """(exit code, stdout, stderr) of a tool, as _run (past `timeout`:
+    (-1, "", "timed out ...")). Output that is parsed (ffprobe's JSON) is
+    read from stdout alone: the error lines a damaged or cut-off file logs
+    ("partial file", "non-existing PPS") go to stderr and would make it
+    unreadable."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return -1, "", f"timed out after {timeout:.0f}s"
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
 def _dims_for_aspect(aspect: str, resolution: str = "1080p") -> tuple[int, int]:
@@ -377,96 +388,317 @@ def _mux_audio_captions_overlays(
     return log
 
 
-# How far before a clip's end "the last frame" is taken: a seek to the very
-# end finds no frame to decode.
-LAST_FRAME_MARGIN = 0.05
+# ---------- one frame of a video, as a picture (services/video_ops.py) ----------
+#
+# The frame saved for a time t is the one a paused player shows at t: the
+# last frame whose timestamp is at or before t (a player shows each frame
+# until the next one starts), never the next one. ffmpeg's own -ss gives
+# the first frame at or after t, so the frame is found in two steps:
+#   1. ffprobe decodes the frames around t (from the keyframe before
+#      t - FRAME_LOOKBACK) and lists their exact timestamps; the last one at
+#      or before t is the frame (the first frame when t comes before it).
+#   2. ffmpeg decodes up to that exact timestamp and keeps only that frame,
+#      as an 8-bit PNG (HDR tone-mapped first).
+# A seek that lands in the wrong place (a file without an index, MPEG-TS)
+# is noticed (no frame at or before t, or not the exact frame) and that
+# step is decoded from the start instead. When ffprobe can't list the
+# frames at all (a damaged or cut-off file), ffmpeg decodes from the start
+# up to t (to the end for the last frame) and the last frame it gets to is
+# the one; only a file ffmpeg can't decode at all is refused. ffprobe's
+# listings are read from its stdout alone (its error lines go to stderr).
+# Times count from the start of the file. The frame paths read videos
+# inside an API request, so all the ffprobe/ffmpeg runs for one frame share
+# one time limit (FRAME_TIMEOUT, or the caller's): past it the tool is
+# killed and FFmpegTimeout is raised.
+
+FRAME_TIMEOUT = 60.0
+# Step 1 decodes from this far before t (a lower frame rate or a longer gap
+# between frames than this falls back to decoding from the start), and
+# FRAME_LOOKAHEAD past it, or at least 16 frames' worth: frames are stored
+# out of order (B-frames), so a frame at or before t can be stored after
+# one past it.
+FRAME_LOOKBACK = 1.0
+FRAME_LOOKAHEAD = 1.0
+# How close step 2's frame must be to the timestamp step 1 found (frames
+# are always further apart than this).
+FRAME_MATCH = 0.0005
+# PQ (HDR10, Dolby Vision's base layer) and HLG (phones): tone-mapped to
+# standard range, so the picture isn't washed out.
+HDR_TRANSFERS = ("smpte2084", "arib-std-b67")
+TONEMAP = ("zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+           "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=pc")
 
 
-def _probe_video_duration(path: Path, timeout: Optional[float] = None) -> float:
-    """Length of the first video stream; the file's length when the stream
-    doesn't say. Audio can outlast the picture, so the file's length alone
-    can point past the final frame. TimeoutError past `timeout`."""
-    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
-                    "-show_entries", "stream=duration:stream_tags=DURATION", str(path)], timeout=timeout)
-    if rc == -1:
-        raise TimeoutError(log)
-    if rc == 0:
+class FFmpegTimeout(TimeoutError, RuntimeError):
+    """ffprobe/ffmpeg ran past its time limit and was stopped. A
+    TimeoutError (what a caller that sets a time limit catches) and a
+    RuntimeError (a caller that only knows "couldn't read it" still
+    refuses, never a crash)."""
+
+
+class _Deadline:
+    """The time left for every tool run of one frame grab."""
+
+    def __init__(self, seconds: float) -> None:
+        self.end = time.monotonic() + seconds
+
+    def left(self) -> float:
+        left = self.end - time.monotonic()
+        if left <= 0:
+            raise FFmpegTimeout("reading the video took too long")
+        return left
+
+    def run(self, cmd: list[str]) -> tuple[int, str]:
+        """_run within the time left; FFmpegTimeout when it runs out."""
+        rc, log = _run(cmd, timeout=self.left())
+        if rc == -1:
+            raise FFmpegTimeout(f"{Path(cmd[0]).name}: {log}")
+        return rc, log
+
+    def run_parts(self, cmd: list[str]) -> tuple[int, str, str]:
+        """_run_parts within the time left; FFmpegTimeout when it runs out."""
+        rc, out, err = _run_parts(cmd, timeout=self.left())
+        if rc == -1:
+            raise FFmpegTimeout(f"{Path(cmd[0]).name}: {err}")
+        return rc, out, err
+
+
+@dataclass
+class _VideoInfo:
+    # The video stream's length (the file's when it doesn't say); 0 = unknown.
+    duration: float
+    # Where 0 s is, in the file's own timestamps (its start, never below 0).
+    start: Fraction
+    # What ffmpeg's -ss counts from (the file's start, may be below 0).
+    file_start: Fraction
+    # Timestamp of the end of the picture, when the length is known.
+    end: Optional[Fraction]
+    fps: float  # 0 = unknown
+    pix_fmt: str
+    transfer: str
+
+
+def _fraction(value: object) -> Optional[Fraction]:
+    """"1/15360", "0.040000", 2 → a Fraction; None for "N/A", "0/0" and the like."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return Fraction(str(value).strip())
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _probe_video(path: Path, deadline: Optional[_Deadline] = None) -> Optional[_VideoInfo]:
+    """What a frame grab needs to know about `path`'s first video stream;
+    None when ffprobe can't read it or it has no video."""
+    cmd = ["ffprobe", "-v", "error", "-print_format", "json", "-select_streams", "v:0",
+           "-show_entries", "stream=duration,start_time,avg_frame_rate,r_frame_rate,pix_fmt,"
+           "color_transfer:stream_tags=DURATION:format=start_time,duration", str(path)]
+    rc, out, _err = deadline.run_parts(cmd) if deadline else _run_parts(cmd)
+    if rc != 0:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    streams = data.get("streams") or []
+    if not streams:
+        return None
+    stream, fmt = streams[0], data.get("format") or {}
+    duration = 0.0
+    # Audio can outlast the picture, so the file's length alone can point
+    # past the final frame: the stream's own length first.
+    raw = _fraction(stream.get("duration"))
+    if raw is not None and raw > 0:
+        duration = float(raw)
+    tag = (stream.get("tags") or {}).get("DURATION")  # Matroska keeps it here
+    if not duration and isinstance(tag, str):
         try:
-            stream = (json.loads(log).get("streams") or [{}])[0]
+            h, m, sec = tag.split(":")
+            duration = max(int(h) * 3600 + int(m) * 60 + float(sec), 0.0)
         except ValueError:
-            stream = {}
-        raw = stream.get("duration")
-        if raw not in (None, "N/A"):
-            try:
-                if float(raw) > 0:
-                    return float(raw)
-            except ValueError:
-                pass
-        tag = (stream.get("tags") or {}).get("DURATION")  # Matroska keeps it here
-        if tag:
-            try:
-                h, m, sec = tag.split(":")
-                value = int(h) * 3600 + int(m) * 60 + float(sec)
-                if value > 0:
-                    return value
-            except ValueError:
-                pass
-    return _probe_duration(path)
+            pass
+    raw = _fraction(fmt.get("duration"))
+    if not duration and raw is not None and raw > 0:
+        duration = float(raw)
+    file_start = _fraction(fmt.get("start_time")) or Fraction(0)
+    start = max(file_start, Fraction(0))
+    stream_start = _fraction(stream.get("start_time"))
+    end = None
+    if duration > 0:
+        end = (stream_start if stream_start is not None else start) + Fraction(duration)
+    rate = _fraction(stream.get("avg_frame_rate")) or _fraction(stream.get("r_frame_rate"))
+    return _VideoInfo(duration=duration, start=start, file_start=file_start, end=end,
+                      fps=float(rate) if rate and rate > 0 else 0.0,
+                      pix_fmt=str(stream.get("pix_fmt") or ""), transfer=str(stream.get("color_transfer") or ""))
+
+
+def _frame_times(src: Path, deadline: _Deadline, start: Optional[Fraction],
+                 end: Optional[Fraction]) -> list[Fraction]:
+    """Timestamps (in the file's own time) of the video frames decoded
+    from the keyframe before `start` (None: from the beginning) to about
+    `end` (None: to the end). Empty when none could be decoded there."""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+           "stream=time_base:frame=best_effort_timestamp", "-of", "json"]
+    if start is not None or end is not None:
+        # Always with an end: an open "START%" can list nothing at all.
+        cmd += ["-read_intervals", ("" if start is None else f"{math.floor(float(start) * 1e6) / 1e6:.6f}")
+                + ("%+1000000" if end is None else f"%{math.ceil(float(end) * 1e6) / 1e6:.6f}")]
+    # The frames listed before an error (a cut-off file) still count.
+    _rc, out, _err = deadline.run_parts(cmd + [str(src)])
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return []
+    tb = _fraction(((data.get("streams") or [{}])[0]).get("time_base"))
+    if not tb:
+        return []
+    out = []
+    for frame in data.get("frames") or []:
+        ts = frame.get("best_effort_timestamp")
+        if isinstance(ts, int) and not isinstance(ts, bool):
+            out.append(ts * tb)
+    return out
+
+
+def _has_alpha(pix_fmt: str) -> bool:
+    return pix_fmt.startswith(("yuva", "gbrap", "ya", "rgba", "bgra", "argb", "abgr"))
+
+
+def _write_frame(src: Path, dst: Path, info: _VideoInfo, at: Fraction, deadline: _Deadline) -> bool:
+    """Write the frame with timestamp `at` (as _frame_times lists it) to
+    `dst` as an 8-bit PNG (RGBA when the video has transparency). False
+    when it couldn't be written."""
+    out_fmt = "rgba" if _has_alpha(info.pix_fmt) else "rgb24"
+    pick = f"select=between(t\\,{float(at) - FRAME_MATCH:.6f}\\,{float(at) + FRAME_MATCH:.6f})"
+    chains = [f"{pick},{TONEMAP},format={out_fmt}"] if info.transfer in HDR_TRANSFERS else []
+    chains.append(f"{pick},format={out_fmt}")  # also when the tone-mapping filters are missing
+    # -ss counts from the file's start; seek a little before the frame
+    # (a keyframe before it), else decode from the beginning.
+    seek = float(at - info.file_start) - 0.5
+    seeks = ([seek] if seek > 0 else []) + [None]
+    for chain in chains:
+        for ss in seeks:
+            dst.unlink(missing_ok=True)
+            cmd = ["ffmpeg", "-nostdin", "-y", "-v", "error", "-copyts"]
+            if ss is not None:
+                cmd += ["-ss", f"{ss:.6f}", "-t", "1.5"]
+            else:
+                cmd += ["-t", f"{max(float(at - info.file_start), 0.0) + 1.0:.6f}"]
+            rc, _log = deadline.run(cmd + ["-i", str(src), "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", chain,
+                                           "-frames:v", "1", "-update", "1", str(dst)])
+            if rc == 0 and dst.exists() and dst.stat().st_size > 0:
+                return True
+            if rc != 0:
+                break  # ffmpeg itself failed (e.g. no zscale): the next way of converting
+    dst.unlink(missing_ok=True)
+    return False
+
+
+def _target(info: _VideoInfo, t: float) -> Fraction:
+    """`t` seconds in, in the file's own time: to the microsecond, rounded
+    down (never past the frame on screen)."""
+    return info.start + Fraction(math.floor(t * 1_000_000 + 1e-6), 1_000_000)
+
+
+_SHOWINFO_TB = re.compile(r"config in time_base:\s*(\d+)/(\d+)")
+_SHOWINFO_PTS = re.compile(r"\bn:\s*\d+\s+pts:\s*(-?\d+)")
+
+
+def _last_decoded(src: Path, info: _VideoInfo, until: Optional[Fraction], deadline: _Deadline) -> Optional[Fraction]:
+    """Timestamp (in the file's own time, as _frame_times) of the last
+    video frame ffmpeg itself decodes, from the start, at or before
+    `until` (None: to the end). The last resort when ffprobe couldn't list
+    the frames (a damaged or cut-off file: an interrupted recording or
+    copy stops before its stated length, and ffmpeg still decodes it up to
+    the cut). Decoded to ffmpeg's null output, so no picture is made per
+    frame; _write_frame then writes the one found. None when no frame came
+    out."""
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-copyts"]
+    vf = "showinfo"
+    if until is not None:
+        cmd += ["-t", f"{max(float(until - info.file_start), 0.0) + 1.0:.6f}"]
+        vf = f"select=lte(t\\,{float(until):.6f}),showinfo"
+    _rc, _out, err = deadline.run_parts(cmd + ["-i", str(src), "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf,
+                                               "-f", "null", "-"])
+    tb: Optional[Fraction] = None
+    last: Optional[Fraction] = None
+    for line in err.splitlines():
+        if m := _SHOWINFO_TB.search(line):
+            tb = Fraction(int(m[1]), int(m[2])) if int(m[2]) else None
+        elif tb and (m := _SHOWINFO_PTS.search(line)):
+            ts = int(m[1]) * tb
+            last = ts if last is None else max(last, ts)
+    return last
+
+
+def _find_frame(src: Path, info: _VideoInfo, t: float, deadline: _Deadline) -> Optional[Fraction]:
+    """Timestamp of the frame shown at `t` seconds (math.inf: the last
+    frame): the last one at or before it, the first one when `t` is before
+    it. None when no frame could be found."""
+    if not math.isfinite(t):
+        tries = ([info.end - Fraction(FRAME_LOOKBACK)] if info.end is not None else []) + [None]
+        for start in tries:
+            times = _frame_times(src, deadline, start if start is not None and start > info.start else None, None)
+            if times:
+                return max(times)
+        return None
+    target = _target(info, t)
+    if info.end is not None:
+        target = min(target, info.end)
+    ahead = max(FRAME_LOOKAHEAD, 16 / info.fps) if info.fps else 2 * FRAME_LOOKAHEAD
+    end = target + Fraction(ahead)
+    start = target - Fraction(FRAME_LOOKBACK)
+    for begin in ([start] if start > info.start else []) + [None]:
+        times = _frame_times(src, deadline, begin, end)
+        if not times:
+            continue
+        before = [x for x in times if x <= target]
+        if before:
+            return max(before)
+        if begin is None:
+            return min(times)  # before the first frame: the first frame
+    return None
 
 
 def extract_frame_at(src: Path, dst: Path, t: float, *, timeout: Optional[float] = None) -> float:
-    """Write the frame `t` seconds into the video `src` to `dst` (a PNG, at
-    the video's own size, rotation applied). `t` is kept within
-    [0, video length - LAST_FRAME_MARGIN]. Returns the time used. Raises
-    RuntimeError when the file isn't a video ffmpeg can read; with
-    `timeout`, TimeoutError when any one ffmpeg/ffprobe run takes longer."""
-    duration = _probe_video_duration(src, timeout=timeout)
-    if duration <= 0:
+    """Write the frame of the video `src` that a paused player shows `t`
+    seconds in (math.inf, or past the end: the last frame) to `dst`, an
+    8-bit PNG at the video's own size, rotation applied, HDR tone-mapped.
+    Returns that frame's time. Raises RuntimeError when the file isn't a
+    video ffmpeg can decode, FFmpegTimeout (a TimeoutError and a
+    RuntimeError) past `timeout` seconds for all its ffprobe/ffmpeg runs
+    together (FRAME_TIMEOUT when not given)."""
+    deadline = _Deadline(FRAME_TIMEOUT if timeout is None else timeout)
+    info = _probe_video(src, deadline)
+    if info is None:
         raise RuntimeError("couldn't read that video")
-    t = min(max(float(t), 0.0), max(duration - LAST_FRAME_MARGIN, 0.0))
-    # Some files stop a little before their stated length: step back a
-    # little, then decode up to `t` and keep the last frame that came out.
+    t = max(float(t), 0.0) if not math.isnan(t) else 0.0
+    at = _find_frame(src, info, t, deadline)
+    if at is not None and _write_frame(src, dst, info, at, deadline):
+        return max(round(float(at - info.start), 3), 0.0)
+    # ffprobe couldn't list the frames there: ffmpeg decodes from the start
+    # up to the time (to the end for the last frame, or for a time past
+    # where a cut-off file stops) and the last frame that came out is it.
+    found = _last_decoded(src, info, _target(info, t) if math.isfinite(t) else None, deadline)
+    if found is not None and found != at and _write_frame(src, dst, info, found, deadline):
+        return max(round(float(found - info.start), 3), 0.0)
+    # No frame at or before the time (it comes before the first one) or no
+    # timestamps to go by: ffmpeg's own seek (the frame at or after the
+    # time), as close to the end as it gets for the last frame.
+    fmt = "rgba" if _has_alpha(info.pix_fmt) else "rgb24"
     log = ""
-    for at in [t] + [x for x in (t - 0.25,) if x >= 0.0]:
-        dst.unlink(missing_ok=True)
-        rc, log = _run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.3f}", "-i", str(src),
-                        "-frames:v", "1", "-an", str(dst)], timeout=timeout)
-        if rc == -1:
-            raise TimeoutError(log)
-        if rc == 0 and dst.exists() and dst.stat().st_size > 0:
-            return round(at, 3)
+    if math.isfinite(t) or info.duration > 0:
+        near = min(t, info.duration - 0.05) if info.duration > 0 else t
+        for ss in dict.fromkeys(x for x in (max(near, 0.0), near - 0.25) if x >= 0.0):
+            dst.unlink(missing_ok=True)
+            rc, log = deadline.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", f"{ss:.3f}", "-i", str(src),
+                                    "-map", "0:v:0", "-an", "-vf", f"format={fmt}", "-frames:v", "1", "-update", "1",
+                                    str(dst)])
+            if rc == 0 and dst.exists() and dst.stat().st_size > 0:
+                return round(ss, 3)
     dst.unlink(missing_ok=True)
-    rc, log = _run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-t", f"{t + LAST_FRAME_MARGIN:.3f}",
-                    "-an", "-update", "1", str(dst)], timeout=timeout)
-    if rc == -1:
-        raise TimeoutError(log)
-    if rc == 0 and dst.exists() and dst.stat().st_size > 0:
-        last = _probe_last_frame_time(src, t + LAST_FRAME_MARGIN, timeout=timeout)
-        return round(last if last is not None else t, 3)
     raise RuntimeError(f"ffmpeg frame grab failed: {log[-2000:]}")
-
-
-def _probe_last_frame_time(src: Path, until: float, timeout: Optional[float] = None) -> Optional[float]:
-    """Time of the last video frame at or before `until`, or None.
-    TimeoutError past `timeout`."""
-    rc, log = _run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-read_intervals", f"%{until:.3f}",
-                    "-show_entries", "frame=pts_time,best_effort_timestamp_time", "-of", "csv=p=0", str(src)],
-                   timeout=timeout)
-    if rc == -1:
-        raise TimeoutError(log)
-    if rc != 0:
-        return None
-    best = None
-    for line in log.splitlines():
-        for part in line.split(","):
-            try:
-                v = float(part)
-            except ValueError:
-                continue
-            if v <= until and (best is None or v > best):
-                best = v
-            break
-    return best
 
 
 def _make_thumbnail(src: Path, dst: Path) -> str:
@@ -1512,7 +1744,10 @@ def join_clips_with_audio(
     cmd += ["-filter_complex", graph, "-map", "[out]"]
     cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"] if audio else ["-an"]
     cmd += [*_X264, "-r", str(FPS), "-movflags", "+faststart", str(dst)]
-    rc, log = _run(cmd, timeout=join_timeout(sum(lengths)), should_stop=should_stop)
+    if should_stop is None:
+        rc, log = _run(cmd, timeout=join_timeout(sum(lengths)))
+    else:
+        rc, log = _run(cmd, timeout=join_timeout(sum(lengths)), should_stop=should_stop)
     if rc == -2:
         dst.unlink(missing_ok=True)
         raise JoinStopped("the join was cancelled or deleted")

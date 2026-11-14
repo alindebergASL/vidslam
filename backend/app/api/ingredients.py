@@ -58,5 +58,10 @@ def delete_ingredient(ingredient_id: int, db: Session = Depends(get_db)) -> None
         models.ProjectCastMember.member_kind == "ingredient",
         models.ProjectCastMember.ingredient_id == ingredient_id,
     ).delete(synchronize_session=False)
+    # Its pictures go with it: clips made from them remember they were no
+    # Cast pictures.
+    from ..services.pipeline import remember_deleted_pictures
+
+    remember_deleted_pictures(db, list(i.assets))
     db.delete(i)
     db.commit()
