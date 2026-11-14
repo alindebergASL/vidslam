@@ -5,6 +5,7 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
@@ -203,6 +204,36 @@ def render_plan(project_id: int, db: Session = Depends(get_db)) -> dict:
     return _render_plan(db, project)
 
 
+def _check_own_voiceover(project: models.VideoProject, db: Optional[Session] = None, *,
+                         recompose: bool = False) -> None:
+    """A clean deployment: an uploaded voiceover (one saved before the
+    switch) can't be checked, so a render that would use it is refused.
+    With `recompose` (a Retry or a re-roll that recomposes), also the audio
+    the recompose would reuse when it is an upload or a render's copy of one
+    (a source switched to tts can fall back to it). recompose_project
+    refuses it too, whichever way it is reached."""
+    if content_mode.own_audio_allowed():
+        return
+    if (project.voiceover_source == "upload" and project.voiceover_upload_path
+            and Path(project.voiceover_upload_path).exists()):
+        raise HTTPException(422, content_mode.VOICEOVER_UPLOAD_OFF)
+    if recompose and db is not None:
+        from ..services.pipeline import recompose_plays_own_voice
+
+        if recompose_plays_own_voice(db, project):
+            raise HTTPException(422, content_mode.VOICEOVER_UPLOAD_OFF)
+
+
+def _check_shot_prompts(shots) -> None:  # noqa: ANN001 — VideoShot rows
+    """A clean deployment: every clip prompt a render or re-roll will send
+    gets the explicit-content check now (a 422), not in the worker after
+    the voiceover is paid for. Cached, so the worker's checks are hits."""
+    from ..services import explicit_check
+
+    if explicit_check.active():
+        explicit_check.check_prompts_or_422(*(s.prompt for s in shots if s.shot_type != "end_card"))
+
+
 @router.post("/projects/{project_id}/generate-video", status_code=202, dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def generate_video(
     project_id: int,
@@ -215,6 +246,8 @@ def generate_video(
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
     provider_gate.require_project(db, project)  # even with force: a switched-off provider is refused
+    _check_own_voiceover(project)
+    _check_shot_prompts(project.shots)
     if not force:
         result = run_preflight(db, project)
         if not result["ok"]:
@@ -239,6 +272,7 @@ def recompose_video(project_id: int, db: Session = Depends(get_db)) -> dict:
     # of this project (a hook-lab variant too) is running, so two composes
     # never run at once.
     _refuse_while_composing(db, project)
+    _check_own_voiceover(project, db, recompose=True)
     job_id = _enqueue_claimed(db, project, "generating", "Already making this video",
                               recompose_project_job, project_id)
     return {"project_id": project_id, "job_id": job_id, "status": "enqueued"}
@@ -374,6 +408,8 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
                .order_by(models.Render.id.desc()).first())
     if (project.status or "draft") not in _IDLE or (running is not None and running[0] not in _DONE_RENDER):
         raise HTTPException(409, "Already making this video")
+    # Either way (resume or recompose), before anything is reset or queued.
+    _check_own_voiceover(project, db, recompose=True)
 
     # Reset any failed shots so the pipeline's idempotent check doesn't skip them.
     for s in body_shots:
@@ -485,6 +521,8 @@ def regenerate_shots_bulk(
     _refuse_while_hook_lab(db, project_id)
     _refuse_stale_voice_reroll(db, project, [s for s in project.shots if s.id in set(targets)])
     provider_gate.require_project(db, project, shot_ids=set(targets))
+    _check_shot_prompts([s for s in project.shots if s.id in set(targets)])
+    _check_own_voiceover(project, db, recompose=True)  # the re-rolls end in a recompose
     job_id = enqueue(regenerate_shots_bulk_job, project_id, targets)
     return {
         "project_id": project_id,
@@ -545,6 +583,9 @@ def regenerate_shot(
     _refuse_while_hook_lab(db, project_id)
     _refuse_stale_voice_reroll(db, shot.project, [shot], recompose=recompose)
     provider_gate.require_model("video", shot.model_override or None, db)
+    _check_shot_prompts([shot])
+    if recompose:
+        _check_own_voiceover(shot.project, db, recompose=True)
     job_id = enqueue(regenerate_shot_job, project_id, shot_id, recompose)
     return {
         "shot_id": shot_id,

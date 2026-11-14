@@ -13,7 +13,7 @@ from ..config import get_settings
 from ..db import get_db
 from ..schemas import ProjectOut
 from ..schemas.api import VoiceoverFitOut, VoiceoverPreviewOut
-from ..services import pipeline, storage
+from ..services import content_mode, pipeline, storage
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from .auth import require_auth
@@ -70,6 +70,8 @@ async def upload_voiceover(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    if not content_mode.own_audio_allowed():
+        raise HTTPException(422, content_mode.VOICEOVER_UPLOAD_OFF)
     refuse_while_busy(db, project, "The voiceover")
     path = _save_audio(file, project_id=project_id, kind="voiceover")
     project.voiceover_upload_path = str(path)
@@ -145,6 +147,8 @@ async def upload_music(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    if not content_mode.own_audio_allowed():
+        raise HTTPException(422, content_mode.MUSIC_UPLOAD_OFF)
     path = _save_audio(file, project_id=project_id, kind="music")
     project.music_upload_path = str(path)
     db.commit()

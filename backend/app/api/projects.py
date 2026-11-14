@@ -208,6 +208,11 @@ def update_project(
         raise HTTPException(404, "project not found")
     _refuse_clip_changes_while_busy(db, p, body)
     _check_shown_words(p, body)
+    if body.voiceover_source == "upload" != p.voiceover_source:
+        from ..services import content_mode
+
+        if not content_mode.own_audio_allowed():
+            raise HTTPException(422, content_mode.VOICEOVER_UPLOAD_OFF)
     _adopt_old_voiceover(db, p)
     for k, v in body.model_dump(exclude_none=True).items():
         if k != "voice_id":

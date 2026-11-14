@@ -51,6 +51,15 @@ def _explicit(text: str) -> None:
     explicit_check.check(text or "")
 
 
+def _explicit_prompt(prompt: str) -> None:
+    """A clean deployment: a prompt sent to a lip-sync model (its motion)
+    gets the explicit-content check (services/explicit_check.py)."""
+    from ..services import explicit_check
+
+    if (prompt or "").strip() and explicit_check.active():
+        explicit_check.check_prompt(prompt)
+
+
 class GuardedImageProvider(_Guarded):
     def generate(self, *, model: str, prompt: str, references, negative_prompt: str = "",
                  settings: dict | None = None, **kw) -> bytes:
@@ -78,6 +87,9 @@ class GuardedAvatarProvider(_Guarded):
             check_prompt(motion_prompt)
         check_generation(" ".join(x for x in (motion_prompt or "", script or "") if x.strip()),
                          kind="lipsync")
+        # A clean deployment: the motion and the script, each judged once
+        # (the script as the voiceover's words are).
+        _explicit_prompt(motion_prompt)
         _explicit(script)
         return self.inner.submit_avatar(script=script, motion_prompt=motion_prompt, **kw)
 

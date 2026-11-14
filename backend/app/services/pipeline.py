@@ -1010,6 +1010,19 @@ def _talking_head_script(project: models.VideoProject, shot: models.VideoShot, p
         or plan.cleaned_voice_script or shot.prompt
 
 
+def lipsync_explicit(motion: str, script: str) -> None:
+    """A clean deployment: the explicit-content checks a lip-sync call meets
+    (GuardedAvatarProvider.submit_avatar), the motion and the script each
+    on its own, so the checks at the provider are cache hits."""
+    from . import explicit_check
+
+    if not explicit_check.active():
+        return
+    if (motion or "").strip():
+        explicit_check.check_prompt(motion)
+    explicit_check.check(script or "")
+
+
 def precheck_render(db: Session, project: models.VideoProject, plan: StoryboardPlan) -> None:
     """The safety checks every paid step of a render will meet, run before
     anything is paid for (the voiceover first of all): each body shot's clip
@@ -1047,6 +1060,7 @@ def precheck_render(db: Session, project: models.VideoProject, plan: StoryboardP
                     check_prompt(motion)
                 script = _talking_head_script(project, shot, plan)
                 once(" ".join(x for x in (motion, script) if x.strip()), "", "lipsync")
+                lipsync_explicit(motion, script)
     if (project.voiceover_source or "tts").lower() == "tts":
         once(plan.cleaned_voice_script or "", "", "script")
 
@@ -1071,8 +1085,13 @@ def generate_audio(
     """
     source = (project.voiceover_source or "tts").lower()
     if source == "upload":
+        from . import content_mode
+
         path = Path(project.voiceover_upload_path or "")
         if path.exists():
+            if not content_mode.own_audio_allowed():
+                # A clean deployment: one uploaded before can't be checked either.
+                raise VoiceoverFailed(content_mode.VOICEOVER_UPLOAD_OFF)
             return path
         log.warning(
             "voiceover_source=upload but file missing for project %s; falling back to TTS",
@@ -1746,6 +1765,18 @@ def _check_cancel(db: Session, render: models.Render) -> None:
         probe.close()
 
 
+def check_audio_prompt(prompt: str) -> None:
+    """A clean deployment: a music or sound prompt gets the explicit-content
+    check before the provider is paid (a music model may sing what the
+    prompt asks for, and the bed is mixed into the video). Raises
+    explicit_check.ExplicitPromptError (a ValueError). Nothing with adult
+    features."""
+    from . import explicit_check
+
+    if explicit_check.active() and (prompt or "").strip():
+        explicit_check.check_prompt(prompt.strip())
+
+
 def generate_music_for_project(
     db: Session,
     project_id: int,
@@ -1762,6 +1793,7 @@ def generate_music_for_project(
         raise ValueError(f"project {project_id} not found")
     if not prompt or not prompt.strip():
         raise ValueError("music prompt is empty")
+    check_audio_prompt(prompt.strip())
 
     music = get_music()
     target = float(duration_seconds or project.target_duration_seconds or 25)
@@ -2521,6 +2553,26 @@ def _recompose_voiceover(db: Session, project: models.VideoProject) -> tuple[Opt
     return Path(current), voice_fp
 
 
+def is_own_voice(project: models.VideoProject, audio: Optional[Path]) -> bool:
+    """`audio` is an uploaded voiceover: the upload file itself
+    (voiceover.<ext>), or a render's own copy of one (keep_voice).
+    Synthesized voiceovers are voice_<...>.m4a, never these names."""
+    if audio is None:
+        return False
+    audio = Path(audio)
+    upload = project.voiceover_upload_path
+    return (is_voice_copy(audio) or audio.name.startswith("voiceover.")
+            or bool(upload and audio == Path(upload)))
+
+
+def recompose_plays_own_voice(db: Session, project: models.VideoProject) -> bool:
+    """A recompose would put an uploaded voiceover under the clips: the
+    source is the upload, or a source switched to tts falls back to the
+    audio of a render that played one."""
+    audio, _ = _recompose_voiceover(db, project)
+    return audio is not None and audio.exists() and is_own_voice(project, audio)
+
+
 def _spoken_texts(db: Session, project: models.VideoProject, audio: Optional[Path],
                   audio_fp: str) -> Optional[dict]:
     """{script, hook_text} to record for a recompose whose voiceover is not
@@ -2570,6 +2622,16 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
         raise
 
     audio, audio_fp = _recompose_voiceover(db, project)
+    from . import content_mode
+
+    if audio is not None and is_own_voice(project, audio) and not content_mode.own_audio_allowed():
+        # A clean deployment: an uploaded voiceover (one from before the
+        # switch, or a render's copy of it) can't be checked, so it is
+        # never put under a video, whichever way the recompose came.
+        if project.status == "generating":
+            project.status = "failed"
+            db.commit()
+        raise VoiceoverFailed(content_mode.VOICEOVER_UPLOAD_OFF)
 
     render = models.Render(
         project_id=project.id,

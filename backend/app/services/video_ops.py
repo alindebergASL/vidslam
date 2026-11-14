@@ -1017,7 +1017,11 @@ def normalize_upload(src: Path, dst: Path, streams: dict, *, timeout: float = UP
     demuxer = UPLOAD_DEMUXERS[sniffed_extension(src)]
     seconds = UPLOAD_MAX_SECONDS if until is None else min(max(float(until), 0.0), UPLOAD_MAX_SECONDS)
     cap = ["-t", f"{seconds + 1:g}"]
-    keep_audio = audio_kept(streams.get("audio"))
+    from . import content_mode
+
+    # A clean deployment can't check what an upload's sound says (no
+    # speech-to-text), so it is dropped, as an uploaded voiceover is refused.
+    keep_audio = audio_kept(streams.get("audio")) and content_mode.own_audio_allowed()
     maps = ["-map", "0:v:0"] + (["-map", "0:a:0"] if keep_audio else [])
     size = streams.get("display") or streams.get("size")
     if not size:

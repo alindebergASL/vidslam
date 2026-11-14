@@ -110,6 +110,13 @@ class MockChatProvider(ChatProvider):
             raise EXPLICIT_REPLY
         if EXPLICIT_REPLY is not None:
             return dict(EXPLICIT_REPLY)
+        if text.startswith("Avoid: "):
+            # An avoid list: terms that only name what to keep out are fine;
+            # a longer phrase asking for sexual content is not.
+            terms = [t.strip() for t in text[len("Avoid: "):].split(",")]
+            if any(len(t.split()) > 3 and is_hard_sexual(t) for t in terms):
+                return {"explicit": True, "reason": "The avoid list asks for sexual content."}
+            return {"explicit": False, "reason": "Only names what to keep out."}
         if is_hard_sexual(text):
             return {"explicit": True, "reason": "A sexual word."}
         return {"explicit": False, "reason": "Nothing sexual."}
