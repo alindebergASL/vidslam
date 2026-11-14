@@ -363,18 +363,27 @@ def test_a_seam_preview_that_takes_too_long_is_an_error_not_a_crash(tmp_path, mo
 
 
 def test_a_jump_the_render_blends_says_so(monkeypatch):
-    """The reading is of the raw clip; when the finished video dissolves
-    across the join, the text says so and the level is a warning."""
+    """The reading is of the raw clip; when the finished video's blend covers
+    the join, the text says so and the level is a warning. A jump the blend
+    doesn't cover keeps its level (and says so); the raw level is kept."""
     from types import SimpleNamespace
 
     from app.services import ambient, loop_health
 
-    monkeypatch.setattr(ambient, "render_seam_blend_seconds", lambda p: 2.0)
+    def treat(blend, covers):
+        return lambda p: {"blend_seconds": blend, "verdict": "slight_jump", "ratio": 4.0,
+                          "basis": "measured", "covers": covers}
+
+    monkeypatch.setattr(ambient, "seam_treatment", treat(2.0, True))
     entry = {"seam": {"verdict": "visible_jump", "level": "bad", "text": "There's a visible jump at the join",
                       "difference": 0.3, "typical": 0.01, "ratio": 30.0}, "clip_seconds": 10}
     view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), entry)
     assert view["seam"]["level"] == "warn" and view["seam"]["blend_seconds"] == 2.0
+    assert view["seam"]["raw_level"] == "bad" and view["seam"]["treatment"]["covers"] is True
     assert "blends it over 2 s" in view["seam"]["text"]
-    monkeypatch.setattr(ambient, "render_seam_blend_seconds", lambda p: 0.0)
+    monkeypatch.setattr(ambient, "seam_treatment", treat(2.0, False))
+    view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), entry)
+    assert view["seam"]["level"] == "bad" and "won't hide it" in view["seam"]["text"]
+    monkeypatch.setattr(ambient, "seam_treatment", treat(0.0, True))
     view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), entry)
     assert view["seam"]["level"] == "bad" and "visible jump" in view["seam"]["text"]

@@ -466,13 +466,33 @@ def picture_file(scene_id: int, db: Session = Depends(get_db)) -> FileResponse:
 
 @router.post("/{scene_id}/render", status_code=202,
              dependencies=[Depends(rate_limit("generation"))])
-def render_scene(scene_id: int, db: Session = Depends(get_db)) -> dict:
+def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends(get_db)) -> dict:
+    """Queue the full-length render. A loop whose join jumps visibly (the
+    blend won't hide it) answers 409 {code: "seam_jump"} unless
+    `accept_seam` or the scene's seam_mode is "blend"."""
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is already generating")
     shot = svc._loop_shot(project)
     if shot is None or not shot.clip_path or not Path(shot.clip_path).exists():
         raise HTTPException(409, "generate the loop clip first")
+    treatment = svc.seam_treatment(project)
+    if treatment["basis"] == "plan":
+        # No current reading: measure now (local, a few seconds).
+        from ..services import loop_health
+
+        loop_health.measure_scene(db, project)
+        db.refresh(project)
+        treatment = svc.seam_treatment(project)
+    if not accept_seam and svc.seam_needs_a_look(project, treatment):
+        every = svc.plan_loop(svc._config_of(project)).unit_seconds
+        raise HTTPException(409, {
+            "code": "seam_jump",
+            "message": "The loop jumps at the join, and the blend won't hide it.",
+            "ratio": treatment["ratio"],
+            "blend_seconds": treatment["blend_seconds"],
+            "repeat_every_seconds": every,
+        })
     # Claim before queueing (a conditional UPDATE): a double-click or a
     # second tab can't queue a second render, and the page keeps polling
     # while the job waits for a worker.

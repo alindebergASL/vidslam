@@ -274,9 +274,9 @@ def _stored(project: models.VideoProject) -> dict:
     return dict((project.ambient_config_json or {}).get(STATE_KEY) or {})
 
 
-def current(project: models.VideoProject, shot: Optional[models.VideoShot]) -> Optional[dict]:
-    """The reading of the shot's clip as it is now, or None (never measured,
-    no clip, or the clip changed since)."""
+def current_entry(project: models.VideoProject, shot: Optional[models.VideoShot]) -> Optional[dict]:
+    """The stored reading of the shot's clip as it is now (raw, as measured),
+    or None (never measured, no clip, or the clip changed since)."""
     if shot is None or not shot.clip_path or shot.status != "completed":
         return None
     entry = _stored(project).get(str(shot.id))
@@ -284,27 +284,43 @@ def current(project: models.VideoProject, shot: Optional[models.VideoShot]) -> O
         return None
     if entry.get("clip_mtime_ns") != _clip_stamp(shot.clip_path):
         return None
-    return out(project, shot, entry)
+    return entry
+
+
+def current(project: models.VideoProject, shot: Optional[models.VideoShot]) -> Optional[dict]:
+    """The reading of the shot's clip as it is now, or None (never measured,
+    no clip, or the clip changed since)."""
+    entry = current_entry(project, shot)
+    return None if entry is None else out(project, shot, entry)
 
 
 def out(project: models.VideoProject, shot: models.VideoShot, entry: dict) -> dict:
     view = {k: v for k, v in entry.items() if k not in ("clip_path", "clip_mtime_ns")}
     view["shot_id"] = shot.id
     # The reading is of the raw clip; the finished video dissolves across the
-    # join, which hides most of a small jump. Say so rather than alarm.
+    # join, which hides a small jump. Say so, and soften the level only when
+    # the blend covers it (a visible jump stays "bad": the render asks first).
     seam = dict(view.get("seam") or {})
+    seam["raw_level"] = seam.get("level")
     try:
-        from .ambient import render_seam_blend_seconds
+        from .ambient import seam_treatment
 
-        blend = render_seam_blend_seconds(project)
+        treatment = seam_treatment(project)
     except Exception:  # noqa: BLE001 — a note, never a failure
-        blend = 0.0
+        treatment = None
+    blend = float(treatment["blend_seconds"]) if treatment else 0.0
+    covers = bool(treatment["covers"]) if treatment else False
+    seam["treatment"] = treatment
     seam["blend_seconds"] = round(blend, 2)
     if blend > 0 and seam.get("verdict") in ("slight_jump", "visible_jump"):
         jump = "a slight jump" if seam["verdict"] == "slight_jump" else "a visible jump"
-        seam["text"] = f"The raw clip has {jump} at the join; the finished video blends it over {blend:g} s"
-        if seam.get("level") == "bad":
-            seam["level"] = "warn"
+        if covers:
+            seam["text"] = f"The raw clip has {jump} at the join; the finished video blends it over {blend:g} s"
+            if seam.get("level") == "bad":
+                seam["level"] = "warn"
+        else:
+            seam["text"] = (f"The raw clip has {jump} at the join; a {blend:g} s blend won't hide it, "
+                            "so the loop will jump")
     view["seam"] = seam
     view["seam_preview_url"] = f"/api/ambient/{project.id}/seam-preview?shot_id={shot.id}"
     view["join_at_seconds"] = round(min(SEAM_PREVIEW_SECONDS, float(entry.get("clip_seconds") or 0) / 2.0), 2)

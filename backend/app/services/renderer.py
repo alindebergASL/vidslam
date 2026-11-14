@@ -743,6 +743,12 @@ def _make_thumbnail(src: Path, dst: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Crossfade where a music bed joins itself (the bed's own loop point, and
+# where parts of a long bed are joined): long and gentle, so the join is a
+# swell rather than a cut. Capped at a third of the bed for short beds.
+MUSIC_JOIN_CROSSFADE = 6.0
+
+
 @dataclass
 class AmbientRenderInputs:
     project_id: int
@@ -754,6 +760,8 @@ class AmbientRenderInputs:
     slow_factor: float = 1.0
     fade_seconds: float = 4.0
     music_path: Optional[Path] = None
+    # The music bed's own loop point (not tied to the video seam's blend).
+    music_crossfade: float = MUSIC_JOIN_CROSSFADE
     music_volume: float = 0.7
     # Nature-sound bed (rain, waves…), looped and mixed with the music.
     sound_path: Optional[Path] = None
@@ -1472,7 +1480,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     if inputs.music_path is not None and inputs.music_path.exists():
         music_unit = out / "ambient_music_unit.wav"
         mlog, _ = _make_seamless_audio_unit(
-            inputs.music_path, music_unit, crossfade=max(1.0, inputs.crossfade_seconds),
+            inputs.music_path, music_unit, crossfade=inputs.music_crossfade,
             loops=_probe_duration(inputs.music_path) < total,
         )
         logs.append(mlog)

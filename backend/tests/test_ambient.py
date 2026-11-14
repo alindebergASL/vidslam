@@ -87,9 +87,10 @@ def test_estimate_is_independent_of_total_duration(auth_client):
     tiling = [ln for ln in one_hour["lines"] if ln["unit"] == "repeat"]
     assert tiling and tiling[0]["cost"] == 0.0
     # Mock model caps clips at 10s with first+last frame support:
-    # 3 × 10s chained (−2 × 0.5s joins) = 29s, closed loop → 0.5s seam
-    # → 28.5s unit → ceil(3600/28.5) = 127 repeats.
-    assert tiling[0]["qty"] == 127
+    # 3 × 10s chained (−2 × 0.5s joins) = 29s; until the clip is measured
+    # the seam blend is the scene's 2s (closure is never assumed)
+    # → 27s unit → ceil(3600/27) = 134 repeats.
+    assert tiling[0]["qty"] == 134
     plan = one_hour["plan"]
     assert plan["segments"] == [10, 10, 10]
     assert plan["strategy"] == "chain" and plan["closed"] and plan["anchored"]
@@ -223,7 +224,7 @@ def test_update_scene_prompt_invalidates_clip_but_fade_does_not(auth_client):
     assert r.status_code == 200, r.text
     assert r.json()["loop_status"] == "completed"
     assert r.json()["total_seconds"] == 40
-    # 5s closed loop → 4.5s unit → ceil(40/4.5) = 9.
+    # 5s loop measured seamless → 0.5s blend → 4.5s unit → ceil(40/4.5) = 9.
     assert r.json()["repeats"] == 9
 
     # Scene change → clip must be regenerated (the made loop is discarded: say so).
@@ -424,12 +425,17 @@ def test_chained_30s_loop_pins_first_and_last_frames(auth_client, monkeypatch):
     segs = [s for s in p["shots"] if s["shot_type"] == "ambient_segment"]
     assert len(segs) == 3 and all(s["status"] == "completed" for s in segs)
     assert p["ambient_config_json"]["_generated"]["closed"] is True
+    # Pinning the last frame doesn't make the join seamless (the mock's
+    # segments differ in colour): the join is measured, and a render asks.
+    assert p["ambient_config_json"]["_generated"]["seam_verdict"] == "visible_jump"
+    r = auth_client.post(f"/api/ambient/{scene['id']}/render")
+    assert r.status_code == 409 and r.json()["detail"]["code"] == "seam_jump"
 
-    assert auth_client.post(f"/api/ambient/{scene['id']}/render").status_code == 202
+    assert auth_client.post(f"/api/ambient/{scene['id']}/render?accept_seam=true").status_code == 202
     scene = auth_client.get(f"/api/ambient/{scene['id']}").json()
     log = scene["latest_render"]["render_log"]
     assert scene["latest_render"]["status"] == "completed", log[:400]
-    assert "clips=3" in log and "seam=closed" in log
+    assert "clips=3" in log and "seam=visible_jump blend=2s" in log
     assert 119.0 <= _duration(Path(scene["latest_render"]["final_video_path"])) <= 121.0
 
     # Regenerating with fewer segments leaves no stale segment shots.
