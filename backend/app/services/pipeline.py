@@ -1071,8 +1071,13 @@ def generate_audio(
     """
     source = (project.voiceover_source or "tts").lower()
     if source == "upload":
+        from . import content_mode
+
         path = Path(project.voiceover_upload_path or "")
         if path.exists():
+            if not content_mode.own_audio_allowed():
+                # A clean deployment: one uploaded before can't be checked either.
+                raise VoiceoverFailed(content_mode.VOICEOVER_UPLOAD_OFF)
             return path
         log.warning(
             "voiceover_source=upload but file missing for project %s; falling back to TTS",

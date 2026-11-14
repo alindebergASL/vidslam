@@ -1067,10 +1067,11 @@ def test_clean_enhance_refuses_an_explicit_script_rewrite(auth_client, monkeypat
     assert "general audience" in r.json()["detail"] and "unchanged" in r.json()["detail"]
     r = auth_client.post("/api/prompts/enhance", json={"text": _PLAIN, "kind": "script"})
     assert r.status_code == 200
-    # Pictures are not this check's job (the provider filters are on).
+    # A picture or clip rewrite is checked too: it is sent to a picture or
+    # video model (tests/test_clean_mode_gaps.py has the rest).
     _calls().clear()
     assert auth_client.post("/api/prompts/enhance", json={"text": "a cat", "kind": "image"}).status_code == 200
-    assert _calls() == []
+    assert _calls()
 
 
 def test_clean_plan_refuses_an_explicit_original_script_and_planner_output(auth_client, monkeypatch):

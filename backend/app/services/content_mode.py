@@ -21,7 +21,11 @@ looked at skip them, however they were made).
 
 ADULT_FEATURES=false (a clean deployment): adult mode is locked off, ticks
 are ignored (and no picture check is queued for them), every filter is on
-and the API refuses to turn any of it on.
+and the API refuses to turn any of it on. No model of the adult text
+models' family writes text there, whoever publishes it
+(in_adult_text_family); scripts, captions and every picture or video prompt
+get the explicit-content check (services/explicit_check.py); and the
+owner's own recordings aren't taken (own_audio_allowed).
 """
 from __future__ import annotations
 
@@ -66,6 +70,19 @@ def features() -> bool:
     """False on a clean deployment (ADULT_FEATURES=false): no adult content
     at all, whatever ADULT_MODE or the saved switch say."""
     return bool(get_settings().adult_features)
+
+
+# A clean deployment has no speech-to-text to check what an uploaded
+# recording says, so the owner's own voiceover and music aren't taken there
+# (a music bed can carry speech as well as a voiceover can): the API refuses
+# them with these messages, and the pages hide the upload buttons.
+VOICEOVER_UPLOAD_OFF = "Uploading your own voiceover is off on this server; use a generated voice."
+MUSIC_UPLOAD_OFF = "Uploading your own music is off on this server; generate a music bed instead."
+
+
+def own_audio_allowed() -> bool:
+    """Whether the owner's own recordings (voiceover, music) may be used."""
+    return features()
 
 
 # Words a model's id, name or description uses when it is made for adult
@@ -114,12 +131,23 @@ def adult_text_families() -> frozenset[str]:
     return frozenset(f for f in (_family(m) for m in ids if m and str(m).strip()) if f)
 
 
+def adult_text_family_names() -> frozenset[str]:
+    """The family names of the adult text models ("deepseek"), without the
+    vendor: a derivative published under another vendor's prefix
+    ("tngtech/deepseek-r1t2-chimera") is of the same family. Names shorter
+    than three letters are left out (they would match almost any id)."""
+    names = (f.partition("/")[2] for f in adult_text_families())
+    return frozenset(n for n in names if len(n) >= 3)
+
+
 def in_adult_text_family(model_id: Optional[str]) -> bool:
-    """Another model of the adult text models' family (any version or size).
-    On a clean deployment none of them may write text: it is the same
-    family that wrote adult prompts where other planners refused."""
-    fam = _family(model_id)
-    return bool(fam) and fam in adult_text_families()
+    """Another model of the adult text models' family (any version, size,
+    vendor or fine-tune): the family's name anywhere in the id, without
+    case or a ":variant" suffix. On a clean deployment none of them may
+    write text: it is the same family that wrote adult prompts where other
+    planners refused."""
+    base = _base_id(str(model_id or "")).lstrip("~")
+    return bool(base) and any(name in base for name in adult_text_family_names())
 
 
 def adult_text_ids() -> frozenset[str]:

@@ -13,7 +13,11 @@ It fails closed: when the check can't run (no key, the planner switched
 off, an error or an unreadable reply), or the model won't judge the text,
 the text is refused too. In mock mode a word list answers (mock_chat).
 
-With ADULT_FEATURES unset (true) nothing here runs: check() returns at once.
+Every prompt sent to a picture or video model gets the same question
+(check_prompt, below).
+
+With ADULT_FEATURES unset (true) nothing here runs: check() returns at once,
+and the callers of check_prompt don't call it.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ import hashlib
 import logging
 
 from . import content_mode, minor_check
-from .safety import UnsafeScriptError
+from .safety import UnsafePromptError, UnsafeScriptError
 
 log = logging.getLogger("avs.explicit_check")
 
@@ -144,6 +148,57 @@ def plan_texts(plan: dict) -> list[str]:
     return [text(plan.get("cleaned_voice_script")), text(plan.get("hook")), text(plan.get("end_card_text")),
             "\n".join(text(c.get("text")) for c in chunks if isinstance(c, dict)),
             "\n".join(text(s.get("caption_text")) for s in shots if isinstance(s, dict))]
+
+
+# ---------- a picture or video prompt (clean deployment) ----------
+#
+# Every prompt sent to a picture or video model (Studio, Continue this clip,
+# Remix and Retry, character sheets, storyboard shots, ambient scenes, the
+# hook lab's shot 1, an Enhance rewrite) goes through
+# minor_check.check_generation, which calls check_prompt on a clean
+# deployment: at the provider (providers/registry.py's guarded providers)
+# and in the early API checks, so a refusal is a 422 before anything is
+# paid for. Same question, cache and failing closed as the script check.
+
+PROMPT_REFUSED = ("This prompt was refused: this app is for a general audience, and the content check found it "
+                  "sexually explicit. Reword it without sexual content.")
+PROMPT_UNAVAILABLE = ("The content check couldn't run, so this prompt is paused until it's available (check the "
+                      "planner model in Settings → Models).")
+PROMPT_DECLINED = ("This prompt was refused: the content check model declined to judge it, which counts as a "
+                   "no. A different planner model (Settings → Models) may answer.")
+_PROMPT_MESSAGES = {REFUSED: PROMPT_REFUSED, UNAVAILABLE: PROMPT_UNAVAILABLE, DECLINED: PROMPT_DECLINED}
+
+
+class ExplicitPromptError(ExplicitContentError, UnsafePromptError):
+    """A picture or video prompt refused on a clean deployment."""
+
+
+def check_prompt(prompt: str | None) -> None:
+    """On a clean deployment, raise ExplicitPromptError when `prompt` (for
+    a picture or video model) is sexually explicit, or when the check can't
+    say it isn't. Otherwise nothing."""
+    if not active():
+        return
+    try:
+        check(prompt)
+    except ExplicitContentError as e:
+        raise ExplicitPromptError(_PROMPT_MESSAGES.get(str(e), str(e))) from None
+
+
+def check_prompts_or_422(*prompts: str | None) -> None:
+    """check_prompt() for API endpoints, on each distinct prompt: a refusal
+    is a 422 with its message, before anything is queued or paid for.
+    Nothing at all on a deployment with adult features."""
+    if not active():
+        return
+    from fastapi import HTTPException
+
+    try:
+        for prompt in dict.fromkeys(p or "" for p in prompts):
+            if prompt.strip():
+                check_prompt(prompt)
+    except ExplicitContentError as e:
+        raise HTTPException(422, str(e)) from None
 
 
 def check_or_422(*texts: str | None) -> None:

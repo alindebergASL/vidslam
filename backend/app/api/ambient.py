@@ -191,6 +191,19 @@ def _check_scene(config) -> None:
         check_or_422(text, kind="image")
 
 
+def _check_scene_prompts(project: models.VideoProject) -> None:
+    """A clean deployment: the scene's text and the picture prompt made
+    from it (with its look and light) get the explicit-content check now
+    (a 422), before any picture or clip is paid for. Cached, so the checks
+    at the provider are hits."""
+    from ..services import explicit_check
+
+    if not explicit_check.active():
+        return
+    cfg = svc._config_of(project)
+    explicit_check.check_prompts_or_422(cfg.scene_prompt, svc.picture_prompt(cfg))
+
+
 @router.post("", response_model=AmbientOut, status_code=201,
              dependencies=[Depends(rate_limit("generation"))])
 def create_scene(body: AmbientCreate, db: Session = Depends(get_db)) -> AmbientOut:
@@ -256,6 +269,7 @@ def generate_loop(
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is already generating")
+    _check_scene_prompts(project)
     job_id = _enqueue_generation(db, project, regenerate_music)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
 
@@ -273,6 +287,7 @@ def resume_loop(scene_id: int, db: Session = Depends(get_db)) -> dict:
     if info is None:
         raise HTTPException(409, "this scene has no failed loop to resume; generate the loop instead")
     chain = (project.ambient_config_json or {}).get(svc._CHAIN_KEY) or {}
+    _check_scene_prompts(project)
     job_id = _enqueue_generation(db, project, job=svc.resume_loop_job,
                                  makes_music=bool(chain.get("regenerate_music", True)))
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued", "clip": info.clip, "take": info.take}
@@ -357,12 +372,17 @@ def generate_picture(scene_id: int, discard_loop: bool = False, db: Session = De
     project = _get_scene(db, scene_id)
     _picture_busy(project)
     provider_gate.require_still(svc._config_of(project))  # the scene's chosen model, not a silent swap
+    _check_scene_prompts(project)
+    from ..services.explicit_check import ExplicitContentError
+
     try:
         svc.generate_picture(db, project, discard_loop=discard_loop)
     except svc.LoopDiscard as e:
         raise HTTPException(409, str(e)) from e
     except svc.PictureError as e:
         raise HTTPException(422, str(e)) from e
+    except ExplicitContentError as e:  # a clean deployment only: e.g. a rewrite made just now
+        raise HTTPException(422, str(e)) from None
     return svc.to_out(db, project)
 
 
