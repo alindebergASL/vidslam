@@ -1026,7 +1026,7 @@ def test_a_re_encode_that_crashes_is_reported_as_unreadable(auth_client, tmp_pat
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video)], check=True)
     r = _upload(auth_client, video, aid)
-    assert r.status_code == 422 and r.json()["detail"] == video_ops.NOT_A_VIDEO, r.text
+    assert r.status_code == 422 and r.json()["detail"] == video_ops.UPLOAD_NOT_PREPARED, r.text
     assert _uploads() == 0 and _clip_files() == [] and _left(temp_root) == []
 
 

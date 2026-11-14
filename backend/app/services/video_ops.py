@@ -83,7 +83,10 @@ VIDEO_CHECK_UNAVAILABLE = ("The safety check couldn't look at this video, so it 
                            "(OpenRouter must be on and have a key in Settings → API keys).")
 VIDEO_CHECK_DECLINED = ("This video was refused: the safety check model declined to judge it, which counts as "
                         "a no.")
-NOT_A_VIDEO = "That file isn't a video this app can read (MP4, MOV or WebM)."
+NOT_A_VIDEO = "That file isn't a video this app can read (MP4, MOV, WebM, MKV or AVI)."
+# A file that reads as a video but couldn't be prepared (its decoding
+# failed or was cut off): not called "not a video".
+UPLOAD_NOT_PREPARED = "That video couldn't be prepared here; try exporting it again as an MP4."
 NO_FFMPEG = "This server can't read videos right now (ffmpeg is missing)."
 
 
@@ -782,7 +785,8 @@ def _raw_input(path: Path, demuxer: str, *, decode: bool = False) -> list[str]:
 # failed (with the address-space cap in force, that is the cap reached). A
 # run killed or crashed by a signal is not taken as out of memory: the
 # upload is reported as unreadable, like any other failed run.
-_MEMORY_WORDS = ("cannot allocate memory", "malloc of size", "resource temporarily unavailable")
+_MEMORY_WORDS = ("cannot allocate memory", "malloc of size", "resource temporarily unavailable",
+                 "failed to map segment")
 
 
 def _memory_limit() -> int:
@@ -975,7 +979,8 @@ def upload_refusal(streams: dict) -> Optional[str]:
         return f"That video's picture is {w}x{h}; the largest read here is 4K (3840x2160 or 4096x2304)"
     dw, dh = display
     if dw * dh > UPLOAD_MAX_DISPLAY_PIXELS:
-        return f"That video's picture is shown at {dw}x{dh}; the largest read here is 4K (3840x2160 or 4096x2304)"
+        return (f"That video's pixels have an unusual shape (it would be shown at {dw}x{dh}); "
+                "export it again with square pixels")
     codec = str(streams.get("video") or "")
     if codec not in UPLOAD_CODECS:
         return (f"That file's picture ({codec or 'unknown format'}) isn't a video format read here; "
@@ -1173,7 +1178,7 @@ def prepare_upload(raw: Path, out: Path, step, *,
     except TimeoutError:
         raise OpError(422, UPLOAD_TOO_SLOW) from None
     except RuntimeError:
-        raise OpError(422, NOT_A_VIDEO) from None
+        raise OpError(422, UPLOAD_NOT_PREPARED) from None
     video.unlink(missing_ok=True)
     # The length that counts is the prepared copy's (the file's own claim,
     # or its lack of one, may be anything; the copy is cut a second past

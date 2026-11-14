@@ -85,7 +85,7 @@ export function FrameFromVideoDialog({
       <OwnerSelect id="frame-owner" label="Save it for" avatars={avatars} ingredients={ingredients} value={owner} onChange={setOwner} />
       <div>
         <label className="label" htmlFor="frame-file">
-          Video (MP4, MOV or WebM, up to {FRAME_VIDEO_MAX_MB} MB)
+          Video (MP4, MOV, WebM, MKV or AVI, up to {FRAME_VIDEO_MAX_MB} MB)
         </label>
         <input
           id="frame-file"
@@ -272,7 +272,7 @@ export function UploadVideoDialog({
       <OwnerSelect id="upload-owner" label="Add it to" avatars={avatars} ingredients={ingredients} value={owner} onChange={setOwner} />
       <div>
         <label className="label" htmlFor="upload-file">
-          Video (MP4, MOV or WebM, up to {FRAME_VIDEO_MAX_MB} MB)
+          Video (MP4, MOV, WebM, MKV or AVI, up to {FRAME_VIDEO_MAX_MB} MB)
         </label>
         <input
           id="upload-file"
