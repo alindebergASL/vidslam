@@ -44,9 +44,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import resource
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -723,13 +723,15 @@ UPLOAD_CODECS = frozenset({"h264", "hevc", "vp8", "vp9", "av1", "mpeg4", "mpeg2v
                            "theora"})
 UPLOAD_THREADS = 2
 # Every ffmpeg/ffprobe run over the raw upload also runs with at most this
-# much address space (RLIMIT_AS, set in the child before it starts: an
-# ordinary 4K or 1080p upload needs about 1 GB of it, most of that the
-# libraries), and ffmpeg itself refuses any single allocation larger than
-# UPLOAD_MAX_ALLOC (-max_alloc): a small file whose tables claim millions
-# of samples can't make it take gigabytes. A run that runs out is refused
-# (UPLOAD_TOO_MUCH_MEMORY).
-UPLOAD_MEMORY_LIMIT = 1536 * 1024 * 1024
+# much address space (RLIMIT_AS, set by prlimit before the command starts,
+# or in the child when prlimit isn't installed), with glibc kept to
+# MALLOC_ARENA_MAX malloc arenas (each thread's own arena reserves address
+# space it never uses), and ffmpeg itself refuses any single allocation
+# larger than UPLOAD_MAX_ALLOC (-max_alloc): a small file whose tables
+# claim millions of samples can't make it take gigabytes. A run that says
+# an allocation failed is refused (UPLOAD_TOO_MUCH_MEMORY).
+UPLOAD_MEMORY_LIMIT = 2 * 1024 * 1024 * 1024
+MALLOC_ARENA_MAX = 2
 UPLOAD_MAX_ALLOC = 512 * 1024 * 1024
 UPLOAD_TOO_MUCH_MEMORY = "That video needs too much memory to read"
 # What is kept of a raw run's output: its error log's last RAW_LOG_TAIL
@@ -740,9 +742,15 @@ RAW_OUTPUT_MAX = 1024 * 1024
 # The re-encode's bit rate is capped (a picture of pure noise can't make it
 # huge), and its output may be at most UPLOAD_MAX_OUTPUT_BYTES: one that
 # reaches it is refused (UPLOAD_TOO_LARGE).
-UPLOAD_MAXRATE, UPLOAD_BUFSIZE = "12M", "24M"
-UPLOAD_MAX_OUTPUT_BYTES = 200 * 1000 * 1000
-UPLOAD_TOO_LARGE = "That video is too large once prepared; upload a shorter or simpler one"
+UPLOAD_MAXRATE, UPLOAD_BUFSIZE = "8M", "16M"
+UPLOAD_AUDIO_RATE = "160k"
+# The most a capped re-encode can come to: 8 Mb/s of picture for the
+# longest copy (UPLOAD_MAX_SECONDS and a second) is 601 MB, about 15 MB for
+# the sound (160 kb/s for as long is 12 MB, plus container overhead), and
+# 10% to spare (the rate cap is kept on average, not frame by frame):
+# about 680 MB.
+UPLOAD_MAX_OUTPUT_BYTES = int((8_000_000 * (UPLOAD_MAX_SECONDS + 1) / 8 + 15_000_000) * 1.1)
+UPLOAD_TOO_LARGE = "That video is too large to prepare here; upload a shorter one"
 # Sound in one of these codecs (or any PCM) is kept (re-encoded to AAC);
 # any other sound is dropped, not refused: the clip is kept without it.
 UPLOAD_AUDIO_CODECS = frozenset({"aac", "mp3", "opus", "vorbis", "flac", "ac3", "eac3", "alac"})
@@ -770,11 +778,11 @@ def _raw_input(path: Path, demuxer: str, *, decode: bool = False) -> list[str]:
     return ["-max_alloc", str(UPLOAD_MAX_ALLOC), "-threads", str(UPLOAD_THREADS), *limit, *_input(path, demuxer)]
 
 
-# How a run that ran out of memory shows: killed or crashed (a failed
-# allocation inside a library), or saying so in its log.
-_MEMORY_SIGNALS = frozenset({signal.SIGKILL, signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS})
-_MEMORY_WORDS = ("cannot allocate memory", "out of memory", "malloc of size", "bad_alloc",
-                 "failed to map segment")
+# How a run that ran out of memory shows: only a log saying an allocation
+# failed (with the address-space cap in force, that is the cap reached). A
+# run killed or crashed by a signal is not taken as out of memory: the
+# upload is reported as unreadable, like any other failed run.
+_MEMORY_WORDS = ("cannot allocate memory", "malloc of size", "resource temporarily unavailable")
 
 
 def _memory_limit() -> int:
@@ -784,27 +792,36 @@ def _memory_limit() -> int:
 
 
 def _ran_out_of_memory(rc: int, log: str) -> bool:
-    if rc < 0 and -rc in _MEMORY_SIGNALS:
-        return True
     text = log.lower()
     return rc != 0 and any(word in text for word in _MEMORY_WORDS)
+
+
+def _capped(cmd: list[str], limit: int) -> tuple[list[str], object]:
+    """`cmd` with its address space capped at `limit`: run through prlimit
+    when it is installed (no Python runs in the child between fork and
+    exec), else (command, a preexec_fn that sets the limit)."""
+    if shutil.which("prlimit"):
+        return ["prlimit", f"--as={limit}:{limit}", "--", *cmd], None
+
+    def cap() -> None:  # in the child, before the command starts: nothing that locks
+        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+    return cmd, cap
 
 
 def _run_raw(cmd: list[str], timeout: float) -> tuple[int, str, str]:
     """Run one ffmpeg/ffprobe command over a raw upload: (exit code, what it
     printed (at most RAW_OUTPUT_MAX bytes), the last RAW_LOG_TAIL bytes of
     its error log). Its address space is capped at UPLOAD_MEMORY_LIMIT
-    (RLIMIT_AS, set in the child); its output and log go to temporary
-    files, so however much it prints, only that much is kept. Past
-    `timeout` it is killed: (-1, "", "timed out ..."). OpError 422
-    (UPLOAD_TOO_MUCH_MEMORY) when it ran out of memory."""
-    limit = _memory_limit()
-
-    def cap() -> None:  # in the child, before the command starts: nothing that locks
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-
+    (RLIMIT_AS: _capped) and glibc keeps at most MALLOC_ARENA_MAX arenas;
+    its output and log go to temporary files, so however much it prints,
+    only that much is kept. Past `timeout` it is killed: (-1, "",
+    "timed out ..."). OpError 422 (UPLOAD_TOO_MUCH_MEMORY) when its log
+    says an allocation failed."""
+    run, cap = _capped(cmd, _memory_limit())
+    env = {**os.environ, "MALLOC_ARENA_MAX": str(MALLOC_ARENA_MAX)}
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=err, preexec_fn=cap)
+        proc = subprocess.Popen(run, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=env, preexec_fn=cap)
         try:
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -905,7 +922,8 @@ def display_size(st: dict) -> Optional[tuple[int, int]]:
     above 1, taller when below, to even numbers, as square_pixels_vf), then
     rotation applied (as renderer.stream_size); None when its size isn't
     stated. Not fitted within any limit: upload_refusal refuses one past
-    4K before anything is decoded."""
+    UPLOAD_MAX_DISPLAY_PIXELS before anything is decoded, and the
+    square-pixel step fits the rest within 4K."""
     from .renderer import stream_size
 
     try:
@@ -935,18 +953,29 @@ def square_pixels_vf() -> str:
     return f"scale=w='max(2,trunc(({sw})*{k}/2)*2)':h='max(2,trunc(({sh})*{k}/2)*2)',setsar=1"
 
 
+# The size an upload's picture may be shown at (its pixels made square) is
+# bounded only against absurd sample aspect ratios: at most this many times
+# UPLOAD_MAX_PIXELS. The square-pixel step fits whatever it makes within 4K
+# (square_pixels_vf), so a stored 4K picture that is shown wider is read.
+UPLOAD_MAX_DISPLAY_PIXELS = 4 * UPLOAD_MAX_PIXELS
+
+
 def upload_refusal(streams: dict) -> Optional[str]:
     """Why an upload (what `_probe_upload` read, nothing decoded yet) is
-    refused before it is decoded, or None: a picture larger than 4K
-    (UPLOAD_MAX_SIDE a side, UPLOAD_MAX_PIXELS in all) as it is stored or
-    as it is shown (its pixels made square: "display"), or of a size not
-    stated, or a picture that isn't one of UPLOAD_CODECS."""
-    for size in (streams.get("size"), streams.get("display", streams.get("size"))):
-        if not size or size[0] <= 0 or size[1] <= 0:
+    refused before it is decoded, or None: a picture stored larger than 4K
+    (UPLOAD_MAX_SIDE a side, UPLOAD_MAX_PIXELS in all: what is decoded), one
+    shown (its pixels made square: "display") over UPLOAD_MAX_DISPLAY_PIXELS,
+    or of a size not stated, or a picture that isn't one of UPLOAD_CODECS."""
+    size, display = streams.get("size"), streams.get("display", streams.get("size"))
+    for s in (size, display):
+        if not s or s[0] <= 0 or s[1] <= 0:
             return NOT_A_VIDEO
-        w, h = size
-        if w > UPLOAD_MAX_SIDE or h > UPLOAD_MAX_SIDE or w * h > UPLOAD_MAX_PIXELS:
-            return f"That video's picture is {w}x{h}; the largest read here is 4K (3840x2160 or 4096x2304)"
+    w, h = size
+    if w > UPLOAD_MAX_SIDE or h > UPLOAD_MAX_SIDE or w * h > UPLOAD_MAX_PIXELS:
+        return f"That video's picture is {w}x{h}; the largest read here is 4K (3840x2160 or 4096x2304)"
+    dw, dh = display
+    if dw * dh > UPLOAD_MAX_DISPLAY_PIXELS:
+        return f"That video's picture is shown at {dw}x{dh}; the largest read here is 4K (3840x2160 or 4096x2304)"
     codec = str(streams.get("video") or "")
     if codec not in UPLOAD_CODECS:
         return (f"That file's picture ({codec or 'unknown format'}) isn't a video format read here; "
@@ -996,7 +1025,7 @@ def normalize_upload(src: Path, dst: Path, streams: dict, *, timeout: float = UP
     vf = ["-vf", f"fps={rate.numerator}/{rate.denominator},{square_pixels_vf()},"
                  f"scale={w}:{h}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
                  f"pad={w}:{h}:-1:-1,setsar=1"]
-    audio = ["-c:a", "aac", "-b:a", "160k"] if keep_audio else ["-an"]
+    audio = ["-c:a", "aac", "-b:a", UPLOAD_AUDIO_RATE] if keep_audio else ["-an"]
     rc, _printed, log = _run_raw(
         ["ffmpeg", "-y", "-v", "error", *_raw_input(src, demuxer, decode=True), *cap, *maps,
          "-filter_threads", str(UPLOAD_THREADS), *vf, "-fpsmax", str(UPLOAD_MAX_FPS),

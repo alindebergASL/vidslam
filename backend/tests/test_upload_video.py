@@ -559,13 +559,26 @@ def test_an_anamorphic_upload_is_stored_with_square_pixels_at_its_shown_shape(au
     assert (st["width"], st["height"]) == (w, h) and st.get("sample_aspect_ratio", "1:1") in ("1:1", "0:1")
 
 
-def test_a_shown_size_past_4k_is_refused_before_decoding():
+def test_the_stored_size_is_what_is_refused_and_the_shown_size_only_when_absurd():
+    """The picture is refused on the size it is stored (and decoded) at; the
+    size it is shown at (its pixels made square) only past 4x 4K's pixels,
+    against absurd sample aspect ratios: the square-pixel step fits the rest
+    within 4K."""
     from app.services import video_ops
 
+    assert video_ops.UPLOAD_MAX_DISPLAY_PIXELS == 4 * video_ops.UPLOAD_MAX_PIXELS
     ok = {"video": "h264", "size": (2048, 2048), "display": (2048, 2048)}
     assert video_ops.upload_refusal(ok) is None
-    wide = {**ok, "display": (8192, 2048)}  # a sample aspect ratio of 4:1
-    assert "8192x2048" in video_ops.upload_refusal(wide)
+    # Stored within 4K, shown wider than 4K: read (and fitted).
+    assert video_ops.upload_refusal({**ok, "display": (8192, 2048)}) is None  # a ratio of 4:1
+    uhd = {"video": "hevc", "size": (3840, 2160), "display": (5120, 2160)}  # 4:3 pixels
+    assert video_ops.upload_refusal(uhd) is None
+    # Shown at an absurd size: refused before decoding.
+    absurd = {**ok, "display": (2048 * 100, 2048)}
+    assert "204800x2048" in video_ops.upload_refusal(absurd)
+    # Stored past 4K: refused, whatever it is shown at.
+    big = {"video": "h264", "size": (4096, 4096), "display": (4096, 2048)}
+    assert "4096x4096" in video_ops.upload_refusal(big)
 
 
 def _without_ftyp(src: Path, dst: Path) -> Path:
@@ -959,16 +972,62 @@ def test_raw_runs_have_their_memory_capped_and_running_out_is_a_plain_refusal(tm
     from app.services import video_ops
     from app.services.image_ops import OpError
 
-    assert video_ops.UPLOAD_MEMORY_LIMIT == 1536 * 1024 * 1024
-    rc, printed, _log = video_ops._run_raw(
-        [sys.executable, "-c", "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])"], timeout=30)
-    assert rc == 0 and int(printed) == video_ops.UPLOAD_MEMORY_LIMIT
-    # Killed (as the kernel does when memory runs out), or saying it ran out.
-    for code in ("import os, signal; os.kill(os.getpid(), signal.SIGKILL)",
-                 "import sys; sys.stderr.write('[h264] Cannot allocate memory'); sys.exit(1)"):
+    assert video_ops.UPLOAD_MEMORY_LIMIT == 2 * 1024 * 1024 * 1024
+    show = ("import os, resource; print(resource.getrlimit(resource.RLIMIT_AS)[0], "
+            "os.environ.get('MALLOC_ARENA_MAX'))")
+    rc, printed, _log = video_ops._run_raw([sys.executable, "-c", show], timeout=30)
+    assert rc == 0 and printed.split() == [str(video_ops.UPLOAD_MEMORY_LIMIT), "2"]
+    # Only a log saying an allocation failed counts as running out.
+    for said in ("[h264] Cannot allocate memory", "[mov] malloc of size 123456789 failed",
+                 "Error: Resource temporarily unavailable"):
+        code = f"import sys; sys.stderr.write({said!r}); sys.exit(1)"
         with pytest.raises(OpError) as e:
             video_ops._run_raw([sys.executable, "-c", code], timeout=30)
         assert (e.value.status, e.value.message) == (422, "That video needs too much memory to read")
+    # Killed or crashed by a signal: an ordinary failed run (the upload is
+    # then reported as unreadable), not "too much memory".
+    for sig in ("SIGKILL", "SIGSEGV", "SIGABRT"):
+        code = f"import os, signal; os.kill(os.getpid(), signal.{sig})"
+        rc, _printed, _log = video_ops._run_raw([sys.executable, "-c", code], timeout=30)
+        assert rc < 0, (sig, rc)
+
+
+def test_the_memory_cap_is_set_by_prlimit_when_installed_else_in_the_child(monkeypatch):
+    import shutil
+    import sys
+
+    from app.services import video_ops
+
+    limit = video_ops.UPLOAD_MEMORY_LIMIT
+    cmd, cap = video_ops._capped(["ffmpeg", "-i", "x"], limit)
+    if shutil.which("prlimit"):
+        assert cmd == ["prlimit", f"--as={limit}:{limit}", "--", "ffmpeg", "-i", "x"] and cap is None
+    monkeypatch.setattr(video_ops.shutil, "which", lambda name: None)
+    cmd, cap = video_ops._capped(["ffmpeg", "-i", "x"], limit)
+    assert cmd == ["ffmpeg", "-i", "x"] and callable(cap)
+    show = "import resource; print(resource.getrlimit(resource.RLIMIT_AS)[0])"
+    rc, printed, _log = video_ops._run_raw([sys.executable, "-c", show], timeout=30)
+    assert rc == 0 and int(printed) == limit
+
+
+def test_a_re_encode_that_crashes_is_reported_as_unreadable(auth_client, tmp_path, temp_root, monkeypatch):
+    from app.services import video_ops
+
+    real = video_ops._capped
+
+    def crash_encode(cmd, limit):
+        if cmd[0] == "ffmpeg":
+            cmd = ["sh", "-c", "kill -SEGV $$"]
+        return real(cmd, limit)
+
+    monkeypatch.setattr(video_ops, "_capped", crash_encode)
+    aid = _avatar(auth_client)
+    video = tmp_path / "small.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video)], check=True)
+    r = _upload(auth_client, video, aid)
+    assert r.status_code == 422 and r.json()["detail"] == video_ops.NOT_A_VIDEO, r.text
+    assert _uploads() == 0 and _clip_files() == [] and _left(temp_root) == []
 
 
 def test_raw_runs_keep_only_the_tail_of_a_huge_log(tmp_path):
@@ -1068,15 +1127,27 @@ def test_the_re_encode_is_rate_capped_and_an_output_reaching_its_size_limit_is_r
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
                     "nullsrc=size=320x240:rate=10:duration=3,geq=random(1)*255:128:128", "-c:v", "libx264",
                     "-crf", "0", "-pix_fmt", "yuv420p", str(noise)], check=True)
+    limit = video_ops.UPLOAD_MAX_OUTPUT_BYTES
     monkeypatch.setattr(video_ops, "UPLOAD_MAX_OUTPUT_BYTES", 200_000)
     r = _upload(auth_client, noise, aid)
     assert r.status_code == 422 and "too large" in r.json()["detail"], r.text
     encode = [c for c in runs if c[0] == "ffmpeg"][-1]
-    assert (encode[encode.index("-maxrate") + 1], encode[encode.index("-bufsize") + 1]) == ("12M", "24M")
+    assert (encode[encode.index("-maxrate") + 1], encode[encode.index("-bufsize") + 1]) == ("8M", "16M")
     assert encode[encode.index("-fs") + 1] == "200000"
     assert _uploads() == 0 and _clip_files() == [] and _left(temp_root) == []
-    monkeypatch.setattr(video_ops, "UPLOAD_MAX_OUTPUT_BYTES", 200 * 1000 * 1000)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_OUTPUT_BYTES", limit)
     r = _upload(auth_client, noise, aid)
     assert r.status_code == 201, r.text
     encode = [c for c in runs if c[0] == "ffmpeg"][-1]
-    assert encode[encode.index("-fs") + 1] == "200000000"
+    assert encode[encode.index("-fs") + 1] == "677600000"
+
+
+def test_the_output_size_limit_follows_the_rate_cap_and_the_longest_copy():
+    """8 Mb/s for UPLOAD_MAX_SECONDS and a second, about 15 MB of sound, and
+    10% to spare: about 680 MB."""
+    from app.services import video_ops
+
+    assert video_ops.UPLOAD_MAXRATE == "8M" and video_ops.UPLOAD_MAX_SECONDS == 600
+    expected = (8_000_000 * 601 / 8 + 15_000_000) * 1.1
+    assert video_ops.UPLOAD_MAX_OUTPUT_BYTES == int(expected) == 677_600_000
+    assert video_ops.UPLOAD_TOO_LARGE == "That video is too large to prepare here; upload a shorter one"
