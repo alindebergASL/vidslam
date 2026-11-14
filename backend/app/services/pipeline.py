@@ -283,7 +283,8 @@ def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob],
     one's character with no picture, which keeps the filter whatever the
     ticks say later. A frame of an uploaded video has no source: its
     owner, with no picture. A frame of a clip made from a prompt alone is
-    a new picture."""
+    a new picture, and so is a frame of joined clips or of a video
+    uploaded as a clip."""
     found = list(dict.fromkeys(_cast_sources(db, job, set())))
     if not found:
         return None, None
@@ -356,6 +357,9 @@ def _cast_sources(db: Session, job: Optional[models.AssetGenerationJob],
     while job is not None and job.id not in seen:
         seen.add(job.id)
         if job.output_kind == "video_clip":
+            if job.operation in ("join_clips", "upload_video"):
+                # Joined clips, or a video uploaded as a clip: never a Cast picture.
+                return []
             return _clip_cast_sources(db, job, seen)
         if not job.operation:
             return []  # made in Studio: a new picture
@@ -2831,9 +2835,10 @@ def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models
     Studio result or a Cast picture), or save a frame of a Studio clip. No
     prompt, so no safety check: the operation makes nothing new, it only
     cuts out, enlarges or copies a frame of a clip made from a checked
-    prompt; the result stays the picture it was made from wherever it is
-    used next (studio_cast_source). A frame of an uploaded video is
-    checked before it is stored, in the API: services/video_ops.py."""
+    prompt, or joins such clips; the result stays the picture it was made
+    from wherever it is used next (studio_cast_source). A frame of an
+    uploaded video is checked before it is stored, in the API, and so is a
+    frame of a clip with pictures of one: video_ops.checked_grab."""
     from ..providers import get_image_op
     from . import image_ops, video_ops
     from . import model_registry as reg
@@ -2843,6 +2848,12 @@ def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models
         # itself (no ffmpeg there), or run again: grabbed here, free.
         data, seconds = video_ops.grab_for_job(db, job)
         return video_ops.finish(db, job, data, seconds)
+    if job.operation == video_ops.JOIN_OP:
+        # Finished Studio clips played back to back, joined here: free.
+        return video_ops.run_join(db, job)
+    if job.operation == video_ops.UPLOAD_OP:
+        # Finished when it was uploaded; there is nothing to run again.
+        raise ValueError("An uploaded video can't be made again; upload it again")
     kind = image_ops.kind_for(job.operation)
     model = job.provider_model or reg.active_model(kind)
     provider = get_image_op(kind, model)
@@ -3203,6 +3214,10 @@ def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
             Path(path).unlink(missing_ok=True)
             return
         db.refresh(job)
+        # "Continue this clip" with "Join with the original": the join is
+        # added in this same transaction, so only the completion that won
+        # the claim above makes it, exactly once (video_ops.plan_auto_join).
+        join = _plan_auto_join(db, job)
         events.studio_event(db, job, "completed")
         db.commit()
     except Exception:
@@ -3212,6 +3227,27 @@ def on_studio_clip_ready(db: Session, vjob: models.VideoJob) -> None:
         Path(path).unlink(missing_ok=True)
         raise
     Path(vjob.result_path).unlink(missing_ok=True)  # only once the clip is saved
+    if join is not None:
+        from . import video_ops
+
+        video_ops.queue_join(db, join)
+
+
+def _plan_auto_join(db: Session, job: models.AssetGenerationJob) -> Optional[models.AssetGenerationJob]:
+    """video_ops.plan_auto_join, but a fault in it never costs the paid clip:
+    it runs in a savepoint, so a failed insert (a constraint, a lost
+    serialization) rolls back only the join, and it is noted on the clip
+    instead (the clip still completes in the caller's transaction)."""
+    from . import video_ops
+
+    try:
+        with db.begin_nested():
+            return video_ops.plan_auto_join(db, job)
+    except Exception:  # noqa: BLE001
+        log.exception("studio job %s: couldn't plan the join with the original", job.id)
+        opts = {k: v for k, v in (job.options_json or {}).items() if k != video_ops.JOIN_JOB}
+        job.options_json = {**opts, video_ops.JOIN_NOTE: "Not joined: something went wrong"}
+        return None
 
 
 def on_studio_clip_failed(db: Session, vjob: models.VideoJob) -> None:

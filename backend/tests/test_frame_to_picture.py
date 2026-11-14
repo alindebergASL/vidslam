@@ -394,13 +394,13 @@ def test_saved_upload_gets_a_sniffed_extension_never_the_uploaders(auth_client, 
     assert video_ops.sniffed_extension(junk) == ""
 
     seen: list[str] = []
-    real_grab = video_ops.grab
+    real_probe = video_ops._probe_upload
 
-    def spy(video, at):
+    def spy(video, demuxer):
         seen.append(video.name)
-        return real_grab(video, at)
+        return real_probe(video, demuxer)
 
-    monkeypatch.setattr(video_ops, "grab", spy)
+    monkeypatch.setattr(video_ops, "_probe_upload", spy)
     aid = _avatar(auth_client)
     # A real MP4 named with another (odd) extension: stored as .mp4, and still read.
     odd = tmp_path / "holiday.PHP"
@@ -412,6 +412,95 @@ def test_saved_upload_gets_a_sniffed_extension_never_the_uploaders(auth_client, 
     mov.write_bytes(webm.read_bytes())
     assert _upload(auth_client, mov, aid, content_type="video/quicktime").status_code == 201
     assert seen == ["upload.mp4", "upload.mkv"]
+
+
+@pytest.mark.parametrize("at", ["first", "last", "1.5"])
+def test_a_live_webm_with_no_stated_length_gives_its_frames(auth_client, tmp_path, at):
+    """A browser recording (MediaRecorder: live WebM) states no length; its
+    frames are grabbed from the prepared copy, as "Upload a video" keeps it."""
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    webm = tmp_path / "recording.webm"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=3",
+                    "-c:v", "libvpx", "-f", "webm", "-live", "1", str(webm)], check=True)
+    assert video_ops._probe_upload(webm, "matroska")["seconds"] == 0.0  # really no stated length
+    r = _upload(auth_client, webm, aid, at=at, content_type="video/webm")
+    assert r.status_code == 201, r.text
+    job = r.json()
+    used = job["options"]["seconds"]
+    assert {"first": used == 0.0, "last": 2.5 <= used <= 3.0, "1.5": used == pytest.approx(1.5, abs=0.11)}[at], used
+    assert _open(job["result_path"]).size == (64, 48)
+
+
+def test_frame_from_a_video_goes_the_same_safe_way_as_upload_a_video(auth_client, tmp_path, monkeypatch):
+    """Refused on its headers before decoding (a picture past 4K), and too
+    long a video is refused once prepared (capped), as Upload a video."""
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    calls: list = []
+    real = video_ops.prepare_upload
+
+    def spy(raw, out, step, **kw):
+        calls.append(raw)
+        return real(raw, out, step, **kw)
+
+    monkeypatch.setattr(video_ops, "prepare_upload", spy)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SIDE", 64)
+    r = _upload(auth_client, _video(tmp_path, size=(96, 64)), aid)
+    assert r.status_code == 422 and "96x64" in r.json()["detail"], r.text
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SIDE", 4096)
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SECONDS", 1.0)
+    r = _upload(auth_client, _video(tmp_path, seconds=4.0, name="long.mp4"), aid, at="last")
+    assert r.status_code == 422 and "long" in r.json()["detail"], r.text
+    assert len(calls) == 2 and _frame_jobs() == 0
+
+
+def test_a_frame_near_the_start_prepares_only_up_to_it(auth_client, tmp_path, monkeypatch):
+    """"first" or a time t re-encodes only up to t and a second (never the
+    whole upload); "last" prepares the capped whole. The 10-minute rule
+    applies only to a time past it."""
+    import time
+
+    from app.services import video_ops
+
+    aid = _avatar(auth_client)
+    long = tmp_path / "long.mp4"
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=5:duration=120",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(long)], check=True)
+    caps: list[str] = []
+    real_raw = video_ops._run_raw
+
+    def spy(cmd, timeout):
+        if cmd[0] == "ffmpeg":
+            caps.append(cmd[cmd.index("-t") + 1])
+        return real_raw(cmd, timeout)
+
+    monkeypatch.setattr(video_ops, "_run_raw", spy)
+    begun = time.monotonic()
+    r = _upload(auth_client, long, aid, at="first")
+    assert r.status_code == 201, r.text
+    assert caps == ["1"] and r.json()["options"]["seconds"] == 0.0
+    assert time.monotonic() - begun < 30
+    r = _upload(auth_client, long, aid, at="30")
+    assert r.status_code == 201, r.text
+    assert caps[-1] == "31" and r.json()["options"]["seconds"] == pytest.approx(30.0, abs=0.25)
+    r = _upload(auth_client, long, aid, at="last")
+    assert r.status_code == 201, r.text
+    assert caps[-1] == "601" and r.json()["options"]["seconds"] >= 119.0
+    # Past the most: only a time past it (or "last") is refused for length.
+    monkeypatch.setattr(video_ops, "UPLOAD_MAX_SECONDS", 60.0)
+    caps.clear()
+    r = _upload(auth_client, long, aid, at="first")
+    assert r.status_code == 201, r.text
+    r = _upload(auth_client, long, aid, at="45")
+    assert r.status_code == 201, r.text
+    assert caps == ["1", "46"]
+    for at in ("90", "last"):
+        r = _upload(auth_client, long, aid, at=at)
+        assert r.status_code == 422 and "minutes" in r.json()["detail"], (at, r.text)
+    assert caps == ["1", "46"]  # neither was prepared
 
 
 # ---------- the frame a paused player shows ----------
@@ -550,25 +639,43 @@ def test_a_tool_past_its_time_limit_is_stopped(tmp_path):
     from app.services import renderer
 
     t0 = time.monotonic()
-    with pytest.raises(renderer.FFmpegTimeout):
-        renderer._run(["sleep", "10"], timeout=0.3)
+    assert renderer._run(["sleep", "10"], timeout=0.3)[0] == -1  # killed, answered (as the joins expect)
+    assert renderer._run_parts(["sleep", "10"], timeout=0.3)[0] == -1
     assert time.monotonic() - t0 < 5
     video = _video(tmp_path)
     with pytest.raises(renderer.FFmpegTimeout):
         renderer.extract_frame_at(video, tmp_path / "f.png", 1.0, timeout=0)
+    # A run of a frame grab that is stopped is a timeout too, never "not a
+    # video"; callers that catch either TimeoutError or RuntimeError see it.
+    real = renderer._run
+
+    def stuck(cmd, timeout=None, should_stop=None):
+        return (-1, "timed out") if "-frames:v" in cmd else real(cmd, timeout=timeout, should_stop=should_stop)
+
+    renderer._run = stuck
+    try:
+        with pytest.raises(renderer.FFmpegTimeout) as caught:
+            renderer.extract_frame_at(video, tmp_path / "f.png", 1.0)
+    finally:
+        renderer._run = real
+    assert isinstance(caught.value, TimeoutError) and isinstance(caught.value, RuntimeError)
 
 
-def test_a_frame_that_takes_too_long_to_read_is_a_504_and_nothing_is_stored(auth_client, tmp_path, monkeypatch):
+def test_a_frame_that_takes_too_long_to_read_is_refused_and_nothing_is_stored(auth_client, tmp_path, monkeypatch):
+    """A clip's frame past its time limit: 504. An uploaded video's frame,
+    grabbed from its prepared copy within the upload's own limits: "took
+    too long", 422, as Upload a video."""
     from app.providers import mock_chat
-    from app.services import renderer
+    from app.services import renderer, video_ops
 
     aid = _avatar(auth_client)
     clip = _clip(auth_client, aid)
     monkeypatch.setattr(renderer, "FRAME_TIMEOUT", 0.0)
-    r = _upload(auth_client, _video(tmp_path), aid)
-    assert r.status_code == 504 and "took too long" in r.json()["detail"]
     r = auth_client.post(f"/api/studio/jobs/{clip['id']}/frame-to-picture", json={"at": "last"})
     assert r.status_code == 504 and "took too long" in r.json()["detail"]
+    monkeypatch.setattr(video_ops, "UPLOAD_STEP_TIMEOUT", 0.0)
+    r = _upload(auth_client, _video(tmp_path), aid)
+    assert r.status_code == 422 and "took too long" in r.json()["detail"], r.text
     assert _frame_jobs() == 0 and mock_chat.PICTURE_CALLS == []
 
 
@@ -638,7 +745,10 @@ def _check_frame(png: Path, seconds: float) -> int:
 def test_a_cut_off_or_damaged_video_gives_the_frames_it_has(auth_client, tmp_path, kind):
     """ffprobe's error lines are never read as part of its listing: a file
     that logs errors is still read, and the last frame of a cut-off file
-    (also for a time past where it stops) is the last one ffmpeg decodes."""
+    (also for a time past where it stops) is the last one ffmpeg decodes.
+    Uploaded, a cut-off MP4 or WebM gives the same frames (from its
+    prepared copy); an MPEG-TS isn't a container uploads are read in
+    (video_ops.UPLOAD_DEMUXERS), so only the frame grab itself reads it."""
     from app.services import renderer
 
     path, content_type = _cut_videos(tmp_path)[kind]
@@ -648,6 +758,14 @@ def test_a_cut_off_or_damaged_video_gives_the_frames_it_has(auth_client, tmp_pat
     aid = _avatar(auth_client)
     seconds, offsets = {}, set()
     for at in ("first", "1.05", "last", "4.9"):
+        if kind == "ts":
+            r = _upload(auth_client, path, aid, at=at, content_type=content_type)
+            assert r.status_code == 422 and "isn't a video" in r.json()["detail"], r.text
+            png = tmp_path / f"f{at}.png"
+            t = {"first": 0.0, "last": math.inf}.get(at, float(at) if at[0].isdigit() else 0.0)
+            seconds[at] = renderer.extract_frame_at(path, png, t)
+            offsets.add(_check_frame(png, seconds[at]))
+            continue
         r = _upload(auth_client, path, aid, at=at, content_type=content_type)
         assert r.status_code == 201, (at, r.text)
         seconds[at] = r.json()["options"]["seconds"]

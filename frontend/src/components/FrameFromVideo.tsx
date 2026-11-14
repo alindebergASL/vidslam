@@ -90,35 +90,10 @@ export function FrameFromVideoDialog({
         isn&apos;t kept. A safety check looks at the frame first (it costs a fraction of a cent), and frames that show
         anyone under 18 can&apos;t be saved.
       </p>
-      <div>
-        <label className="label" htmlFor="frame-owner">
-          Save it for
-        </label>
-        <select id="frame-owner" className="input" value={owner} onChange={(e) => setOwner(e.target.value)}>
-          {avatars.length > 0 && (
-            <optgroup label="Characters">
-              {avatars.map((a) => (
-                <option key={`a${a.id}`} value={`avatar:${a.id}`}>
-                  {a.name}
-                </option>
-              ))}
-            </optgroup>
-          )}
-          {ingredients.length > 0 && (
-            <optgroup label="Scenes and objects">
-              {ingredients.map((i) => (
-                <option key={`i${i.id}`} value={`ingredient:${i.id}`}>
-                  {i.name}
-                </option>
-              ))}
-            </optgroup>
-          )}
-        </select>
-        {!owner && <p className="text-[11px] text-ink-400 mt-1">Add a character or scene in Cast first.</p>}
-      </div>
+      <OwnerSelect id="frame-owner" label="Save it for" avatars={avatars} ingredients={ingredients} value={owner} onChange={setOwner} />
       <div>
         <label className="label" htmlFor="frame-file">
-          Video (MP4, MOV or WebM, up to {FRAME_VIDEO_MAX_MB} MB)
+          Video (MP4, MOV, WebM, MKV or AVI, up to {FRAME_VIDEO_MAX_MB} MB)
         </label>
         <input
           id="frame-file"
@@ -195,6 +170,151 @@ export function FrameFromVideoDialog({
           }}
         >
           {busy ? "Saving…" : `Save this frame${playable ? ` (${clockText(time)})` : ""}`}
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+
+/** The character or scene a picture or clip from this device goes to. */
+function OwnerSelect({
+  id,
+  label,
+  avatars,
+  ingredients,
+  value,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  avatars: Avatar[];
+  ingredients: Ingredient[];
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <div>
+      <label className="label" htmlFor={id}>
+        {label}
+      </label>
+      <select id={id} className="input" value={value} onChange={(e) => onChange(e.target.value)}>
+        {avatars.length > 0 && (
+          <optgroup label="Characters">
+            {avatars.map((a) => (
+              <option key={`a${a.id}`} value={`avatar:${a.id}`}>
+                {a.name}
+              </option>
+            ))}
+          </optgroup>
+        )}
+        {ingredients.length > 0 && (
+          <optgroup label="Scenes and objects">
+            {ingredients.map((i) => (
+              <option key={`i${i.id}`} value={`ingredient:${i.id}`}>
+                {i.name}
+              </option>
+            ))}
+          </optgroup>
+        )}
+      </select>
+      {!value && <p className="text-[11px] text-ink-400 mt-1">Add a character or scene in Cast first.</p>}
+    </div>
+  );
+}
+
+const TOO_LARGE = `This video is larger than ${FRAME_VIDEO_MAX_MB} MB. Pick a shorter or smaller one.`;
+
+/**
+ * Upload a video from this device as a Studio clip, so it can be continued,
+ * joined or have its frames saved like any clip. Free. A safety check looks
+ * at frames across it first; it is refused if any shows someone under 18.
+ */
+export function UploadVideoDialog({
+  avatars,
+  ingredients,
+  defaultOwner,
+  onClose,
+  onSaved,
+}: {
+  avatars: Avatar[];
+  ingredients: Ingredient[];
+  /** "avatar:3" or "ingredient:5"; "" = the first character. */
+  defaultOwner?: string;
+  onClose: () => void;
+  onSaved: (job: StudioJob) => void;
+}) {
+  const first = avatars[0] ? `avatar:${avatars[0].id}` : ingredients[0] ? `ingredient:${ingredients[0].id}` : "";
+  const [owner, setOwner] = useState(defaultOwner || first);
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!owner && first) setOwner(first);
+  }, [first, owner]);
+
+  const upload = async () => {
+    if (!file || !owner) return;
+    if (file.size > FRAME_VIDEO_MAX_MB * 1024 * 1024) {
+      setError(TOO_LARGE);
+      return;
+    }
+    const [kind, id] = owner.split(":");
+    setBusy(true);
+    setError(null);
+    try {
+      onSaved(await api.uploadVideo(file, { kind: kind as "avatar" | "ingredient", id: Number(id) }));
+    } catch (e) {
+      setError(errorText(e, "Couldn't upload the video"));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Dialog title="Upload a video" onClose={onClose}>
+      <p className="text-xs text-ink-300">
+        Adds a video from this device to Studio as a clip, so you can continue it, join it with other clips or save
+        its frames. Free. A safety check looks at frames across the video first; videos that show anyone under 18
+        can&apos;t be added.
+      </p>
+      <OwnerSelect id="upload-owner" label="Add it to" avatars={avatars} ingredients={ingredients} value={owner} onChange={setOwner} />
+      <div>
+        <label className="label" htmlFor="upload-file">
+          Video (MP4, MOV, WebM, MKV or AVI, up to {FRAME_VIDEO_MAX_MB} MB)
+        </label>
+        <input
+          id="upload-file"
+          type="file"
+          accept="video/mp4,video/quicktime,video/webm,video/*"
+          className="block w-full text-sm text-ink-300 file:mr-3 file:chip file:text-xs"
+          onChange={(e) => {
+            const f = e.target.files?.[0] || null;
+            setFile(f);
+            setError(f && f.size > FRAME_VIDEO_MAX_MB * 1024 * 1024 ? TOO_LARGE : null);
+          }}
+        />
+      </div>
+      {busy && (
+        <p className="text-[11px] text-ink-400" role="status">
+          Uploading and checking… a long video can take a minute.
+        </p>
+      )}
+      {error && (
+        <p className="text-sm text-red-300" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2 justify-end">
+        <button type="button" className="btn-ghost text-sm" onClick={onClose}>
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="btn-primary text-sm disabled:opacity-50"
+          disabled={!file || !owner || busy}
+          onClick={upload}
+        >
+          {busy ? "Uploading…" : "Upload · free"}
         </button>
       </div>
     </Dialog>

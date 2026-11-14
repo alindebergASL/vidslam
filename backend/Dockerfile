@@ -4,9 +4,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+# util-linux: prlimit, which caps the memory of each ffmpeg/ffprobe run over
+# an upload (video_ops._run_raw); named so it stays installed.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       ffmpeg fonts-dejavu-core curl \
+       ffmpeg fonts-dejavu-core curl util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

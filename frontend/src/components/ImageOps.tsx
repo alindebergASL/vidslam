@@ -117,9 +117,10 @@ export const OP_TITLES: Record<ImageOp, string> = {
 /** The source an operation job ran on, as a short chip text ("from #12", "from Cast #34",
  *  "from clip #9", "from a video"). */
 export function sourceChipText(
-  job: Pick<StudioJob, "source_job_id" | "source_asset_id"> & Partial<Pick<StudioJob, "operation">>
+  job: Pick<StudioJob, "source_job_id" | "source_asset_id"> & Partial<Pick<StudioJob, "operation" | "options">>
 ): string | null {
   if (job.operation === "extract_frame") return job.source_job_id ? `from clip #${job.source_job_id}` : "from a video";
+  if (job.options?.continues_job_id) return `continues #${job.options.continues_job_id}`;
   if (job.source_job_id) return `from #${job.source_job_id}`;
   if (job.source_asset_id) return `from Cast #${job.source_asset_id}`;
   return null;
