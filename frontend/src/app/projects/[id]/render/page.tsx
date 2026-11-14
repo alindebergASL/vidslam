@@ -81,11 +81,15 @@ function Inner() {
     (r) => r.id !== render?.id && r.status === "completed"
   );
   const comparing = render && compareRender && render.status === "completed";
+  // An Ambient scene keeps this page for its share links and versions, but
+  // its editor is the Ambient page: no storyboard "Edit shots" or duplicate.
+  const ambient = project.mode === "ambient_loop";
+  const editHref = ambient ? `/ambient/${projectId}` : `/projects/${projectId}`;
 
   return (
     <div className={`p-4 sm:p-8 ${comparing ? "max-w-6xl" : "max-w-3xl"}`}>
       <Link
-        href={`/projects/${projectId}`}
+        href={editHref}
         className="text-xs text-ink-300 hover:text-ink-100"
       >
         ← {project.title || "Project"}
@@ -285,22 +289,26 @@ function Inner() {
                 All openings
               </Link>
             )}
-            <Link href={`/projects/${projectId}`} className="btn-ghost">
-              Edit shots
-            </Link>
-            <button
-              className="btn-ghost"
-              onClick={async () => {
-                try {
-                  const dup = await api.duplicateProject(project);
-                  window.location.href = `/projects/${dup.id}`;
-                } catch (e: any) {
-                  toast.error(e.message || "Duplicate failed");
-                }
-              }}
-            >
-              Duplicate project
-            </button>
+            {!ambient && (
+              <>
+                <Link href={`/projects/${projectId}`} className="btn-ghost">
+                  Edit shots
+                </Link>
+                <button
+                  className="btn-ghost"
+                  onClick={async () => {
+                    try {
+                      const dup = await api.duplicateProject(project);
+                      window.location.href = `/projects/${dup.id}`;
+                    } catch (e: any) {
+                      toast.error(e.message || "Duplicate failed");
+                    }
+                  }}
+                >
+                  Duplicate project
+                </button>
+              </>
+            )}
           </div>
           <div className="mt-6">
             <PublishPanel key={render.id} projectId={projectId} renderId={render.id} />

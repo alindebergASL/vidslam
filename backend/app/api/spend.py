@@ -44,6 +44,8 @@ class SpendEntryOut(BaseModel):
     is_estimate: bool
     source: str
     note: str
+    # The project's mode ("ambient_loop" links to the Ambient page), or None.
+    project_mode: Optional[str] = None
 
 
 def _month(month: Optional[str]) -> Optional[str]:
@@ -66,7 +68,14 @@ def entries(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    return spend.entries(db, month=_month(month), project_id=project_id, kind=kind, limit=limit, offset=offset)
+    rows = spend.entries(db, month=_month(month), project_id=project_id, kind=kind, limit=limit, offset=offset)
+    modes = spend.project_modes(db, {e.project_id for e in rows if e.project_id})
+    out = []
+    for e in rows:
+        item = SpendEntryOut.model_validate(e)
+        item.project_mode = modes.get(e.project_id) if e.project_id else None
+        out.append(item)
+    return out
 
 
 @router.get("/budget")

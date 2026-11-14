@@ -420,7 +420,7 @@ def summary(db: Session, month: Optional[str] = None) -> dict:
                    .group_by(E.project_id).order_by(func.sum(E.cost_usd).desc()).limit(10).all()):
         p = db.get(models.VideoProject, pid)
         projects.append({"project_id": pid, "title": p.title if p else f"#{pid} (deleted)",
-                         "cost_usd": round(float(c), 4)})
+                         "project_mode": p.mode if p else None, "cost_usd": round(float(c), 4)})
     b = get_budget(db)
     return {
         "month": month,
@@ -438,6 +438,15 @@ def summary(db: Session, month: Optional[str] = None) -> dict:
         "top_projects": projects,
         "daily": daily,
     }
+
+
+def project_modes(db: Session, project_ids: set[int]) -> dict[int, str]:
+    """{project id: mode} for the spend rows' links (Ambient scenes open
+    the Ambient page, not the storyboard editor)."""
+    if not project_ids:
+        return {}
+    return {pid: mode or "" for pid, mode in db.query(models.VideoProject.id, models.VideoProject.mode)
+            .filter(models.VideoProject.id.in_(project_ids))}
 
 
 def entries(db: Session, *, month: Optional[str] = None, project_id: Optional[int] = None,

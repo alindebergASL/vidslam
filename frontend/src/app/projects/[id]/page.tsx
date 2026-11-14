@@ -114,6 +114,12 @@ function Inner() {
     const seq = kickSeq.current;
     try {
       const p = await api.getProject(projectId);
+      if (p.mode === "ambient_loop") {
+        // An Ambient scene has its own page; the storyboard tools here
+        // (re-roll, recompose, shot edits) don't apply to it.
+        router.replace(`/ambient/${projectId}`);
+        return;
+      }
       setProject(p);
       const st = await api.projectStatus(projectId);
       setRender(st.latest_render);

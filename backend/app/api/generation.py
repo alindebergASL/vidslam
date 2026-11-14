@@ -30,6 +30,7 @@ from ..workers.jobs import (
 )
 from ..workers.queue import enqueue
 from .auth import require_auth
+from .projects import refuse_ambient as _refuse_ambient
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
@@ -147,6 +148,7 @@ def generate_plan(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    _refuse_ambient(project)
     try:
         validate_script(project.original_script or "")
         # Everything the planner reads: in adult mode a permissive model plans.
@@ -243,6 +245,7 @@ def generate_video(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    _refuse_ambient(project)
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
     provider_gate.require_project(db, project)  # even with force: a switched-off provider is refused
@@ -266,6 +269,7 @@ def recompose_video(project_id: int, db: Session = Depends(get_db)) -> dict:
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    _refuse_ambient(project)
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
     # Claimed like Generate: 409 while a render, a re-roll or another compose
@@ -327,7 +331,8 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
         # yet: still queued, or it stopped before it could. Give the claim
         # back, so the editor stops waiting and Generate works again; the
         # queued job sees the claim is gone and does nothing.
-        released = _release_waiting_claim(db, project)
+        released = _release_waiting_claim(db, project) or (
+            _claim_looks_stranded(db, project) and _release_waiting_claim(db, project, stranded=True))
         if released:
             return {"render_id": latest.id if latest is not None else None, "status": "cancelled",
                     "action": "released", "clips_in_flight": video_jobs.pending_for(db, project_id=project_id)}
@@ -350,8 +355,30 @@ def cancel_render(project_id: int, db: Session = Depends(get_db)) -> dict:
             "clips_in_flight": in_flight}
 
 
-def _release_waiting_claim(db: Session, project: models.VideoProject) -> bool:
-    """generating / planning with no render running → cancelled (atomic)."""
+def _claim_looks_stranded(db: Session, project: models.VideoProject) -> bool:
+    """generating / planning whose claim a job already took (token
+    consumed) but nothing is left to finish it: the latest render is done
+    (checked by the caller), no clip is still being made and the project's
+    queue entry is gone. E.g. a recompose that raised before it made a
+    render. Cancel then gives the project back instead of doing nothing.
+    Only for an RQ entry: an inline or background run ("", "inline:...",
+    "background:...") always reads as gone, even while its job is still
+    running, so those are left to the sweeper's time limit."""
+    qid = (project.queue_job_id or "").strip()
+    if project.status not in ("generating", "planning") or project.claim_token or not qid or ":" in qid:
+        return False
+    from ..services import video_jobs
+    from ..workers import queue as _queue
+
+    if video_jobs.pending_for(db, project_id=project.id) != 0:
+        return False
+    return _queue.queue_entry_state(project.queue_job_id or "") == "gone"
+
+
+def _release_waiting_claim(db: Session, project: models.VideoProject, *, stranded: bool = False) -> bool:
+    """generating / planning with no render running → cancelled (atomic).
+    `stranded`: the claim was consumed but nothing is left to finish it
+    (_claim_looks_stranded), so an empty token is released too."""
     was = project.status
     if was not in ("generating", "planning"):
         return False
@@ -361,9 +388,10 @@ def _release_waiting_claim(db: Session, project: models.VideoProject) -> bool:
     # Only while no worker has taken the claim over (its token is still
     # set): after that the job owns it and cancel goes through its render.
     # Never a hook-lab claim (the project's finished video stays as it is).
+    token = (models.VideoProject.claim_token == "") if stranded else (models.VideoProject.claim_token != "")
     done = (db.query(models.VideoProject)
             .filter(models.VideoProject.id == project.id, models.VideoProject.status == was,
-                    models.VideoProject.claim_token != "",
+                    token,
                     ~models.VideoProject.claim_token.startswith(HOOK_CLAIM))
             .update({"status": "cancelled", "claim_token": "", "updated_at": datetime.utcnow()},
                     synchronize_session=False))
@@ -397,6 +425,7 @@ def retry_render(project_id: int, db: Session = Depends(get_db)) -> dict:
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    _refuse_ambient(project)
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
 
@@ -514,6 +543,7 @@ def regenerate_shots_bulk(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    _refuse_ambient(project)
     valid = {s.id for s in project.shots if s.shot_type != "end_card"}
     targets = [sid for sid in body.shot_ids if sid in valid]
     if not targets:
@@ -580,6 +610,9 @@ def regenerate_shot(
     shot = db.get(models.VideoShot, shot_id)
     if shot is None or shot.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
+    # Also "Regenerate clip only" (recompose=false): an Ambient loop clip is
+    # made from the scene picture on the Ambient page, never re-rolled here.
+    _refuse_ambient(shot.project)
     _refuse_while_hook_lab(db, project_id)
     _refuse_stale_voice_reroll(db, shot.project, [shot], recompose=recompose)
     provider_gate.require_model("video", shot.model_override or None, db)
@@ -679,7 +712,7 @@ def recent_renders(limit: int = 12, db: Session = Depends(get_db)) -> list[dict]
     """Most-recent completed renders across all projects, for the dashboard gallery."""
     limit = max(1, min(limit, 48))
     rows = (
-        db.query(models.Render, models.VideoProject.title)
+        db.query(models.Render, models.VideoProject.title, models.VideoProject.mode)
         .join(models.VideoProject, models.Render.project_id == models.VideoProject.id)
         .filter(models.Render.status == "completed", models.Render.final_video_path != "")
         .order_by(models.Render.created_at.desc())
@@ -687,13 +720,14 @@ def recent_renders(limit: int = 12, db: Session = Depends(get_db)) -> list[dict]
         .all()
     )
     out: list[dict] = []
-    for r, title in rows:
+    for r, title, mode in rows:
         if not (r.final_video_path and Path(r.final_video_path).exists()):
             continue
         out.append({
             "render_id": r.id,
             "project_id": r.project_id,
             "project_title": title or "Untitled",
+            "project_mode": mode or "",
             "share_token": r.share_token,
             "created_at": r.created_at.isoformat(),
         })

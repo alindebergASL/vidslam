@@ -33,6 +33,9 @@ function humanize(id: string): string {
 }
 
 export const modeLabel = (mode: string) => MODES[mode] ?? humanize(mode);
+/** A project's page: Ambient scenes have their own, everything else the storyboard editor. */
+export const projectHref = (id: number, mode?: string | null) =>
+  mode === "ambient_loop" ? `/ambient/${id}` : `/projects/${id}`;
 export const shotTypeLabel = (t: string) => SHOT_TYPES[t] ?? humanize(t);
 export const statusLabel = (s: string) => STATUSES[s] ?? (s || "").replace(/_/g, " ");
 

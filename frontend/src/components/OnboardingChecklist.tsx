@@ -2,6 +2,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
+import { projectHref } from "@/lib/labels";
 
 type Step = {
   id: string;
@@ -70,7 +71,7 @@ export function OnboardingChecklist() {
           id: "render",
           label: "Render your first video",
           cta: projects.length > 0 ? "Open project" : "Create a project first",
-          href: projects.length > 0 ? `/projects/${projects[0].id}` : "/projects/new",
+          href: projects.length > 0 ? projectHref(projects[0].id, projects[0].mode) : "/projects/new",
           done: completedRender,
         },
       ]);
