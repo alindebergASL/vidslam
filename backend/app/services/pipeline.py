@@ -2843,6 +2843,19 @@ def _options_with_ran_on(options: Optional[dict], ran_on: Optional[dict]) -> dic
     return out
 
 
+def studio_clip_audio(job: models.AssetGenerationJob) -> bool:
+    """Whether a Studio clip asks its video model for sound: yes unless
+    it was turned off (options "audio": false). A clip made before the
+    choice existed counts as yes."""
+    audio = (job.options_json or {}).get("audio")
+    return audio if isinstance(audio, bool) else True
+
+
+def options_with_audio(options: Optional[dict], audio: bool) -> dict:
+    """A job's options with "audio" set; the rest stays as it is."""
+    return {**dict(options or {}), "audio": bool(audio)}
+
+
 def _finish_studio_image(db: Session, job: models.AssetGenerationJob, data: bytes, *,
                          sized: bool = False, ran_on: Optional[dict] = None) -> models.AssetGenerationJob:
     """Store a finished picture for a Studio job and complete it. Deleted
@@ -2977,7 +2990,10 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
                 return job  # cancelled or deleted before anything was sent
 
             negative = effective_negative("video", job.negative_prompt or "")
-            settings_extra: dict = {}
+            # Sound unless turned off: a Studio clip is used as it is (a
+            # storyboard shot's sound is laid in by the renderer instead).
+            audio = studio_clip_audio(job)
+            settings_extra: dict = {"generate_audio": audio}
             if job.aspect_ratio:  # unset: the model's own default, as before
                 settings_extra["aspect_ratio"] = job.aspect_ratio
             strategy = "input_references"
@@ -2999,8 +3015,9 @@ def run_studio_job(db: Session, job_id: int) -> models.AssetGenerationJob:
             if _studio_job_deleted(db, job.id):
                 db.rollback()
                 return job
+            # "audio" prices the clip with or without sound where that differs.
             vj = video_jobs.submit(db, purpose="studio", ref_id=job.id, project_id=None, start=start,
-                                   webhooks=uses_webhooks(model))
+                                   context={"audio": audio}, webhooks=uses_webhooks(model))
             job.provider_job_id = vj.provider_job_id
             db.refresh(job)
             return job

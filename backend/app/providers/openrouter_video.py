@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Optional
 
 import httpx
 
@@ -31,6 +32,13 @@ _models_cache: tuple[float, list[dict]] | None = None
 def _reset_models_cache() -> None:
     global _models_cache
     _models_cache = None
+
+
+def audio_support(row: Optional[dict]) -> Optional[bool]:
+    """Whether a model can make sound, from its /videos/models row
+    (`generate_audio`); None when the row doesn't say."""
+    value = (row or {}).get("generate_audio")
+    return value if isinstance(value, bool) else None
 
 
 class OpenRouterVideoProvider(VideoProvider):
@@ -101,29 +109,44 @@ class OpenRouterVideoProvider(VideoProvider):
             )
         return out
 
-    def capabilities(self, model: str) -> VideoCapabilities:
+    def _model_row(self, model: str) -> Optional[dict]:
+        """`model`'s /videos/models row; None when it isn't listed or the list
+        can't be read. A failed read isn't cached, so a submit reads the list
+        once (here) and takes both its capabilities and its sound flag from
+        the one row, rather than waiting out the fetch timeout twice."""
+        try:
+            rows = self._video_models()
+        except Exception as e:  # noqa: BLE001 — never block a render on discovery
+            log.warning("video model discovery failed: %s", e)
+            return None
+        model = model or self.model
+        return next((m for m in rows if m.get("id") == model or m.get("canonical_slug") == model), None)
+
+    @staticmethod
+    def _capabilities_from(row: Optional[dict]) -> VideoCapabilities:
         fallback = VideoCapabilities(
             durations=sorted({5, max(5, get_settings().ambient_default_max_clip_seconds)}),
             first_frame=True,
             last_frame=False,
             known=False,
         )
-        try:
-            rows = self._video_models()
-        except Exception as e:  # noqa: BLE001 — never block a render on discovery
-            log.warning("video model discovery failed: %s", e)
+        if row is None:
             return fallback
-        model = model or self.model
-        for m in rows:
-            if m.get("id") == model or m.get("canonical_slug") == model:
-                durations = expand_durations(m.get("supported_durations")) or fallback.durations
-                frames = m.get("supported_frame_images") or []
-                return VideoCapabilities(
-                    durations=durations,
-                    first_frame="first_frame" in frames,
-                    last_frame="last_frame" in frames,
-                )
-        return fallback
+        durations = expand_durations(row.get("supported_durations")) or fallback.durations
+        frames = row.get("supported_frame_images") or []
+        return VideoCapabilities(
+            durations=durations,
+            first_frame="first_frame" in frames,
+            last_frame="last_frame" in frames,
+        )
+
+    def capabilities(self, model: str) -> VideoCapabilities:
+        return self._capabilities_from(self._model_row(model))
+
+    def makes_audio(self, model: str) -> Optional[bool]:
+        """Whether `model` can make sound, per OpenRouter's model list; None
+        when the list can't be read or doesn't say."""
+        return audio_support(self._model_row(model))
 
     # ---- generation ----
 
@@ -144,7 +167,8 @@ class OpenRouterVideoProvider(VideoProvider):
         check_prompt(prompt)  # minors: refused here too, not only by the vendor
         if negative_prompt:
             check_prompt(negative_prompt)  # sent too, as "Avoid: …"
-        caps = self.capabilities(model)
+        row = self._model_row(model)  # one read of the list for caps and sound
+        caps = self._capabilities_from(row)
         # Providers 400 on any duration outside supported_durations; snap
         # up to the nearest accepted length (or the model's max).
         body: dict = {
@@ -174,15 +198,25 @@ class OpenRouterVideoProvider(VideoProvider):
                 ]
         if settings:
             body.update({k: v for k, v in settings.items() if v not in (None, "")})
-        if model in _ALWAYS_AUDIO:
-            body.pop("generate_audio", None)
+        if "generate_audio" in body:
+            body["generate_audio"] = want = bool(body["generate_audio"])
+            # Sound on is asked only of a model the list says can make it
+            # (others make what they make by default, which for one that
+            # can is sound); off goes to every model that may make sound.
+            # Never to one that can't, nor to one found to always make it.
+            can = audio_support(row)
+            if can is False or model in _ALWAYS_AUDIO or (want and can is not True):
+                body.pop("generate_audio")
         with httpx.Client(timeout=120.0) as client:
             r = client.post(f"{self._base}/videos", headers=self._headers(), json=body)
-            if r.status_code == 400 and body.get("generate_audio") is False and "generate_audio" in r.text:
+            if r.status_code == 400 and "generate_audio" in body and "generate_audio" in r.text:
                 # Some models (Gemini Omni) always make audio and reject
-                # generate_audio=false. The clip's audio is never used (the
-                # renderer lays in voice/music/sound), so send it without.
-                _ALWAYS_AUDIO.add(model)
+                # generate_audio=false: a storyboard clip's audio is never
+                # used (the renderer lays in voice/music/sound), and a
+                # Studio clip gets the model's sound. A model refusing the
+                # field altogether makes what it makes by default.
+                if body["generate_audio"] is False:
+                    _ALWAYS_AUDIO.add(model)
                 body.pop("generate_audio")
                 r = client.post(f"{self._base}/videos", headers=self._headers(), json=body)
             if r.status_code >= 400:

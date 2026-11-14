@@ -586,6 +586,8 @@ export type StudioJob = {
   /** What the reference pictures are for when Sogni picks an editor:
    *  "identity" = one is a Cast character's picture; null = no references. */
   ref_intent?: PictureIntent | null;
+  /** A clip: whether sound was asked for; null = a picture, or a clip made before the choice existed. */
+  audio?: boolean | null;
 };
 
 /** What reference pictures are for when Sogni picks an editor. */
@@ -629,6 +631,9 @@ export type ContinueInfo = {
   /** The model used when none is picked; "" = none can start from a picture. */
   model: string;
   duration_seconds: number;
+  /** Whether the new clip asks for sound unless the Sound switch says: as the
+   *  clip it continues (a joined clip's last clip; an uploaded video's own sound). */
+  audio: boolean;
 };
 
 export type ContinueBody = {
@@ -638,6 +643,8 @@ export type ContinueBody = {
   duration_seconds?: number;
   /** Join the new clip after the original once it is finished (on by default). */
   auto_join?: boolean;
+  /** Ask the model for its own sound; left out = as the clip it continues (ContinueInfo.audio). */
+  audio?: boolean;
 };
 
 /** Which frame of a video to save as a picture: "first", "last" or a time in seconds. */
@@ -703,6 +710,8 @@ export type StudioRetryBody = {
   prompt?: string | null;
   negative_prompt?: string | null;
   aspect_ratio?: "9:16" | "16:9" | "1:1" | null;
+  /** A clip's sound; null/left out = as the source clip. */
+  audio?: boolean | null;
 };
 
 export type CharacterSheetView = { id: string; label: string; aspect_ratio: string };
@@ -734,6 +743,8 @@ export type StudioGenerateBody = {
   /** Clips only, at most one: start from a finished Studio picture or a Cast picture. */
   first_frame_job_id?: number | null;
   first_frame_asset_id?: number | null;
+  /** Clips only: ask the model for its own sound (default true; models that can't make sound ignore it). */
+  audio?: boolean;
 };
 
 /** A Studio clip filed as a shot's take (POST …/takes/from-studio). */
@@ -753,6 +764,10 @@ export type VideoModelOption = {
   first_frame?: boolean;
   /** Rough price in plain words ("about $0.30 per 5 s"); "" = unknown. */
   price_text?: string;
+  /** The model makes its own sound when asked (Studio's Sound switch). */
+  supports_audio?: boolean;
+  /** Its rough price with sound (only when supports_audio). */
+  audio_price_text?: string;
 };
 
 export type PromptDefaults = { image: string; video: string };

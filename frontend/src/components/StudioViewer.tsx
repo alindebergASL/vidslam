@@ -288,8 +288,14 @@ export function StudioViewer({
           `${job.options?.has_audio === false ? ", no sound" : ""}) · free`
       );
     } else if (job.operation === "upload_video") {
-      details.push(`Uploaded video${job.options?.upload ? ` (${job.options.upload})` : ""} · free`);
+      // An uploaded video keeps its own sound (the Sound switch isn't for it).
+      details.push(
+        `Uploaded video${job.options?.upload ? ` (${job.options.upload})` : ""}` +
+          `${job.options?.has_audio === false ? " · no sound" : ""} · free`
+      );
     } else if (job.provider_model) details.push(job.provider_model);
+    // Sound was turned off for this generated clip.
+    if (isVideo && !job.operation && job.audio === false) details.push("no sound");
     // Reference pictures sent a Sogni model to one of Sogni's editors.
     const ranOn = ranOnText(job);
     if (ranOn) details.push(ranOn);

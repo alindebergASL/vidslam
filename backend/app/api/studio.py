@@ -38,7 +38,12 @@ from ..schemas.api import (
 )
 from ..services import provider_gate
 from ..services.model_registry import LOCAL_PREFIX
-from ..services.pipeline import STUDIO_DELETED, save_studio_result_as_asset
+from ..services.pipeline import (
+    STUDIO_DELETED,
+    options_with_audio,
+    save_studio_result_as_asset,
+    studio_clip_audio,
+)
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from ..services.storage import drop_reference_copy
@@ -157,7 +162,10 @@ def _create_jobs(db: Session, body: StudioRequest, output_kind: str, count: int,
             provider_model=body.model or "",
             first_frame_job_id=body.first_frame_job_id,
             first_frame_asset_id=body.first_frame_asset_id,
-            options_json=dict(options) if options else None,
+            # A clip keeps its sound choice (Retry and Try another model reuse
+            # it), beside `options` (a continuation's intent).
+            options_json=(options_with_audio(options, body.audio) if output_kind == "video_clip"
+                          else dict(options) if options else None),
             status="pending",
         )
         for _ in range(count)
@@ -546,7 +554,7 @@ def bulk_favorite(body: StudioBulkFavorite, db: Session = Depends(get_db)) -> St
 def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest] = Body(None),
               db: Session = Depends(get_db)) -> StudioJobOut:
     """Run a job again as a new job (failed or completed alike), with any
-    of model, prompt, avoid text and aspect changed."""
+    of model, prompt, avoid text, aspect and (a clip's) sound changed."""
     src = _live_job(db, job_id)
     if src is None:
         raise HTTPException(404, "job not found")
@@ -603,9 +611,12 @@ def retry_job(job_id: int, response: Response, body: Optional[StudioRetryRequest
         provider_model=model,
         first_frame_job_id=src.first_frame_job_id,
         first_frame_asset_id=src.first_frame_asset_id,
-        # A continuation run again stays one (and joins with its original
-        # once finished, when it was asked to).
-        options_json=video_ops.continuation_of(src),
+        # A clip asks for sound as the one it remakes did, unless the body
+        # says. A continuation run again stays one (and joins with its
+        # original once finished, when it was asked to).
+        options_json=(options_with_audio(video_ops.continuation_of(src),
+                                         studio_clip_audio(src) if body.audio is None else body.audio)
+                      if src.output_kind == "video_clip" else None),
         status="pending",
     )
     _check_safety(job.prompt, job.negative_prompt, job.output_kind)
@@ -1035,6 +1046,7 @@ def continue_info(job_id: int, db: Session = Depends(get_db)) -> StudioContinueI
         aspect_ratio=video_ops.continue_aspect(src),
         model=_continue_model(db, src),
         duration_seconds=float(origin.duration_seconds or 5.0) if origin is not None else 5.0,
+        audio=video_ops.continue_audio(db, src),
     )
 
 
@@ -1045,12 +1057,13 @@ def continue_clip(job_id: int, body: StudioContinueRequest, db: Session = Depend
     joined, continued or uploaded): its last frame is saved as a Studio
     picture and the new clip starts from it, from `prompt` (paid like any
     clip). With `auto_join`, once the new clip is finished it is joined
-    after this one as one more clip (see services/video_ops.py). Every
-    check a clip's prompt gets applies. The frame keeps the clip's Cast
-    link (pipeline.studio_cast_source), so the new clip starts from it as
-    "Animate this" on the clip's Cast picture would: an unticked
-    character's content filter is forced on, a ticked one's follows the
-    tick."""
+    after this one as one more clip (see services/video_ops.py). It asks
+    for sound as the clip it continues does unless `audio` says (priced
+    that way). Every check a clip's prompt gets applies. The frame keeps
+    the clip's Cast link (pipeline.studio_cast_source), so the new clip
+    starts from it as "Animate this" on the clip's Cast picture would: an
+    unticked character's content filter is forced on, a ticked one's
+    follows the tick."""
     from ..providers import video_capabilities
     from ..services import video_ops
 
@@ -1074,6 +1087,7 @@ def continue_clip(job_id: int, body: StudioContinueRequest, db: Session = Depend
             owner_kind=src.owner_kind, owner_id=src.owner_id, output_kind="video_clip", prompt=body.prompt,
             negative_prompt=body.negative_prompt, model=model, duration_seconds=body.duration_seconds,
             aspect_ratio=video_ops.continue_aspect(src) or None, first_frame_job_id=frame.id,
+            audio=video_ops.continue_audio(db, src) if body.audio is None else body.audio,
         )
         return _create_jobs(db, request, "video_clip", 1,
                             options=video_ops.continue_options(src.id, body.auto_join))

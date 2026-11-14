@@ -484,6 +484,9 @@ class StudioRequest(BaseModel):
     # Cast picture (at most one). 422 when the video model can't.
     first_frame_job_id: Optional[int] = None
     first_frame_asset_id: Optional[int] = None
+    # Clips only: ask the video model for its own sound. Only models that
+    # can make sound use it (others make a silent clip either way).
+    audio: bool = True
 
 
 class StudioSaveRequest(BaseModel):
@@ -562,6 +565,9 @@ class StudioJobOut(BaseModel):
     # "identity" when one is a Cast character's picture (not its logo),
     # else "guide"; null for a picture without references.
     ref_intent: Optional[Literal["identity", "guide"]] = None
+    # A clip: whether sound was asked for (options["audio"]); null for a
+    # picture, or a clip made before the choice existed.
+    audio: Optional[bool] = None
 
     @field_validator("options", mode="before")
     @classmethod
@@ -574,6 +580,8 @@ class StudioJobOut(BaseModel):
         if isinstance(ran, dict):
             self.ran_on_name = self.ran_on_name or str(ran.get("name") or "") or None
             self.ran_on_editor = self.ran_on_editor or str(ran.get("model") or "") or None
+        if self.audio is None and isinstance(self.options.get("audio"), bool):
+            self.audio = self.options["audio"]
         return self
 
     @field_validator("operation", mode="before")
@@ -682,24 +690,30 @@ class StudioContinueRequest(BaseModel):
     next; the aspect is the clip's own. `model`: one that can start from a
     picture (null = the clip's own model when it can, else the default
     video model). `auto_join`: once the new clip is finished, join the two
-    into one more clip (a cut)."""
+    into one more clip (a cut). `audio`: ask the model for its own sound
+    (null = as the clip it continues: StudioContinueInfo.audio)."""
     prompt: str = Field(..., min_length=1)
     negative_prompt: str = ""
     model: Optional[str] = None
     duration_seconds: float = Field(5.0, ge=1.0, le=60.0)
     auto_join: bool = True
+    audio: Optional[bool] = None
 
 
 class StudioContinueInfo(BaseModel):
     """GET /api/studio/jobs/{id}/continue: what "Continue this clip" starts
     from: the prompt to prefill (a joined clip's last clip's; "" for an
-    uploaded video), the aspect it keeps, and the model it would use when
-    none is picked ("" = none can start from a picture)."""
+    uploaded video), the aspect it keeps, the model it would use when
+    none is picked ("" = none can start from a picture), and whether it
+    asks for sound when the request doesn't say (`audio`: as the clip it
+    continues: a generated clip's choice, a joined clip's last clip's, an
+    uploaded video's own sound)."""
     prompt: str = ""
     negative_prompt: str = ""
     aspect_ratio: str = ""
     model: str = ""
     duration_seconds: float = 5.0
+    audio: bool = True
 
 
 class ImageOpEstimateOut(BaseModel):
@@ -738,6 +752,7 @@ class StudioRetryRequest(BaseModel):
     prompt: Optional[str] = Field(None, min_length=1)
     negative_prompt: Optional[str] = None
     aspect_ratio: Optional[Literal["9:16", "16:9", "1:1"]] = None
+    audio: Optional[bool] = None  # a clip's sound choice (left out: the source's)
 
 
 # Character-sheet views: id → (label, aspect, what the picture shows).

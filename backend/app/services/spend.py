@@ -166,11 +166,13 @@ def record_video_job(db: Session, job: models.VideoJob) -> None:
     ctx = job.context_json or {}
     s = get_settings()
     if job.provider == "runware" and kind == "video":
-        # Runware's own price for the model (from its schema), not the generic rate.
+        # Runware's own price for the model (from its schema), not the
+        # generic rate; with sound where a Studio clip asked for it.
         from ..providers import runware
 
         record(provider="runware", kind=kind, model=job.model,
-               cost=runware.video_cost_usd(job.model, float(ctx.get("duration") or 5.0)),
+               cost=runware.video_cost_usd(job.model, float(ctx.get("duration") or 5.0),
+                                           audio=bool(ctx.get("audio"))),
                is_estimate=True, source="rate_card", project_id=job.project_id,
                render_id=job.render_id, ref=ref, generation_id=job.provider_job_id,
                note="provider reported no cost", db=db)

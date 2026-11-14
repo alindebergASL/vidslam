@@ -1697,10 +1697,13 @@ def join_clips_with_audio(
     transition: str = "cut",
     crossfade: float = 0.5,
     should_stop: Optional[Callable[[], bool]] = None,
+    silent: Optional[list[bool]] = None,
 ) -> tuple[Path, float, bool]:
     """Play `clips` back to back as one clip (Studio's "Join clips").
     `should_stop`: asked about once a second while FFmpeg runs; yes kills it
-    (JoinStopped).
+    (JoinStopped). `silent`: per clip, whether to leave its own sound out
+    (a Studio clip made with sound off): it gets silence, as a clip without
+    any does.
 
     The picture is the first clip's size; the others are fitted into it
     (scaled and padded, or cropped when their shape is nearly the same:
@@ -1715,7 +1718,8 @@ def join_clips_with_audio(
         raise ValueError("join needs at least two clips")
     probed = [_probe_clip(p) for p in clips]
     lengths = [length for length, _, _ in probed]
-    has_audio = [audio for _, audio, _ in probed]
+    quiet = (list(silent or []) + [False] * len(clips))[:len(clips)]
+    has_audio = [audio and not mute for (_, audio, _), mute in zip(probed, quiet, strict=True)]
     video_starts = [start for _, _, start in probed]
     if any(length <= 0 for length in lengths):
         raise RuntimeError("a clip to join can't be read")
@@ -1745,6 +1749,7 @@ def join_clips_with_audio(
     else:
         rc, log = _run(cmd, timeout=join_timeout(sum(lengths)), should_stop=should_stop)
     if rc == -2:
+        dst.unlink(missing_ok=True)
         raise JoinStopped("the join was cancelled or deleted")
     if rc != 0 or not dst.exists():
         raise RuntimeError(f"ffmpeg clip join failed: {log[-2000:]}")

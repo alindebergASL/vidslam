@@ -670,6 +670,17 @@ def join_options(job: models.AssetGenerationJob) -> tuple[list[int], str, float]
     return ids, transition, min(max(cf, 0.0), JOIN_MAX_CROSSFADE)
 
 
+def sound_off(job: models.AssetGenerationJob) -> bool:
+    """Whether a clip to join plays silent: a generated Studio clip made
+    with sound turned off (options "audio": false), even when its model
+    made some anyway. Every other clip keeps its own sound: one made with
+    sound on (or before the choice existed), joined clips (already joined
+    that way) and an uploaded video."""
+    from .pipeline import studio_clip_audio
+
+    return not job.operation and not studio_clip_audio(job)
+
+
 def run_join(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerationJob:
     """The worker's side: join the job's clips and complete it with the new
     clip (its real size and length, a "completed" event). ValueError when a
@@ -701,7 +712,7 @@ def run_join(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerat
         try:
             _, seconds, has_audio = join_clips_with_audio(
                 [Path(s.result_path) for s in sources], out, transition=transition, crossfade=crossfade,
-                should_stop=stopped)
+                should_stop=stopped, silent=[sound_off(s) for s in sources])
         except JoinStopped:
             db.refresh(job)
             return job
@@ -1462,6 +1473,25 @@ def continue_origin(db: Session, job: Optional[models.AssetGenerationJob], *,
         ids, _, _ = join_options(job)
         return continue_origin(db, db.get(models.AssetGenerationJob, ids[-1]) if ids else None, depth=depth + 1)
     return None if job.operation else job
+
+
+def continue_audio(db: Session, job: Optional[models.AssetGenerationJob], *, depth: int = 0) -> bool:
+    """Whether a continuation of `job` asks its model for sound when the
+    request doesn't say: as the clip it carries on from does. A generated
+    clip's own choice (pipeline.studio_clip_audio); for joined clips, the
+    last clip's (followed back); for an uploaded video, whether it has
+    sound. Yes when none of that is known (Studio's default)."""
+    from .pipeline import studio_clip_audio
+
+    if job is None or depth > 8 or job.output_kind != "video_clip":
+        return True
+    if job.operation == JOIN_OP:
+        ids, _, _ = join_options(job)
+        return continue_audio(db, db.get(models.AssetGenerationJob, ids[-1]) if ids else None, depth=depth + 1)
+    if job.operation == UPLOAD_OP:
+        has = (job.options_json or {}).get("has_audio")
+        return has if isinstance(has, bool) else True
+    return True if job.operation else studio_clip_audio(job)
 
 
 def continue_prompt(db: Session, job: Optional[models.AssetGenerationJob]) -> str:
