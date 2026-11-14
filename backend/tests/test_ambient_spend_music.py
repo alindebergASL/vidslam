@@ -54,7 +54,7 @@ def billed(monkeypatch):
     def music(self, *, prompt, duration_seconds, settings=None):
         music_calls.append(duration_seconds)
         spend.record_rate_card("elevenlabs", "music", "m", 0.5)
-        # The real mock makes audio as long as asked: keep the 5 min ones quick
+        # The real mock makes audio as long as asked: keep the 10 min ones quick
         # (30 s still outlasts the crossfade a long bed joins its parts with).
         return real_music(self, prompt=prompt, duration_seconds=min(duration_seconds, 30), settings=settings)
 
@@ -132,6 +132,23 @@ def test_the_description_rewrite_on_create_is_charged_to_the_new_scene(auth_clie
     assert len(rows) == 1 and rows[0].project_id == scene["id"]
 
 
+def test_a_create_that_fails_after_the_rewrite_leaves_no_scene_behind(auth_client, billed, monkeypatch):
+    """The scene is committed before the rewrite: a failure after it must not
+    leave a half-made scene (with no loop shot) in the list."""
+    from app.services import ambient
+
+    def boom(*a, **k):
+        raise ValueError("shot could not be shaped")
+
+    before = {s["id"] for s in auth_client.get("/api/ambient").json()}
+    monkeypatch.setattr(ambient, "_ensure_loop_shot", boom)
+    r = auth_client.post("/api/ambient", json={"config": {
+        **SHORT, "scene_preset": "custom", "scene_prompt": "an infinity pool over the ocean, 8k"},
+        "generate": False})
+    assert r.status_code == 422
+    assert {s["id"] for s in auth_client.get("/api/ambient").json()} == before
+
+
 def test_storyboard_music_is_charged_to_the_project(auth_client, billed):
     pid = _project(auth_client)
     r = auth_client.post(f"/api/projects/{pid}/music/generate", json={"prompt": "warm pad", "duration_seconds": 6})
@@ -161,15 +178,15 @@ def test_a_one_hour_request_asks_for_the_cap_and_logs_both(auth_client, billed):
     db = SessionLocal()
     try:
         out = pipeline.generate_music_for_project(db, pid, prompt="warm pad", duration_seconds=3600)
-        assert billed == [300.0]
-        assert out["seconds"] == 300.0 and out["requested"] == 3600.0 and out["capped"] is True
+        assert billed == [600.0]
+        assert out["seconds"] == 600.0 and out["requested"] == 3600.0 and out["capped"] is True
         assert out["path"].exists()
         log = (db.query(models.ProviderLog)
                .filter(models.ProviderLog.project_id == pid, models.ProviderLog.endpoint == "music.generate")
                .order_by(models.ProviderLog.id.desc()).first())
         assert log.request_summary_json["requested"] == 3600.0
-        assert log.request_summary_json["duration"] == 300.0
-        assert log.response_summary_json["delivered"] == 300.0 and log.response_summary_json["capped"] is True
+        assert log.request_summary_json["duration"] == 600.0
+        assert log.response_summary_json["delivered"] == 600.0 and log.response_summary_json["capped"] is True
     finally:
         db.close()
 
@@ -191,7 +208,7 @@ def test_storyboard_endpoint_caps_a_long_request(auth_client, billed):
     pid = _project(auth_client)
     r = auth_client.post(f"/api/projects/{pid}/music/generate", json={"prompt": "warm pad", "duration_seconds": 3600})
     assert r.status_code == 200, r.text
-    assert billed == [300.0]
+    assert billed == [600.0]
 
 
 def test_elevenlabs_spend_note_says_what_was_delivered(monkeypatch):
@@ -210,8 +227,8 @@ def test_elevenlabs_spend_note_says_what_was_delivered(monkeypatch):
         ElevenLabsMusicProvider(api_key="k").generate(prompt="p", duration_seconds=3600)
         import json
 
-        assert json.loads(route.calls[0].request.content)["music_length_ms"] == 300_000
-    assert notes == ["300s track (3600s asked)"]
+        assert json.loads(route.calls[0].request.content)["music_length_ms"] == 600_000
+    assert notes == ["600s track (3600s asked)"]
 
 
 # ---------- the bed endpoints wait while generating ----------

@@ -1982,7 +1982,7 @@ def generate_music_for_project(
     music_upload_path. Overwrites any prior music.
 
     One call returns at most the active model's cap (ambient.music_cap_seconds,
-    5 min for ElevenLabs): a longer request is asked for at the cap, and the
+    10 min for ElevenLabs): a longer request is asked for at the cap, and the
     renderer loops the track under the video. Returns {"path", "seconds",
     "requested", "capped"}; spend is attributed to the project."""
     from . import spend

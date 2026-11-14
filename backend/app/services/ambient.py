@@ -1301,7 +1301,7 @@ def music_cap_seconds(model: Optional[str] = None) -> float:
         return 30.0
     if m.startswith("google/lyria"):
         return 180.0  # "a couple of minutes", prompt-steered
-    return 300.0  # ElevenLabs Music: 3 s – 5 min per call (and the mock)
+    return 600.0  # ElevenLabs Music: 3 s – 10 min per call (and the mock)
 
 
 def music_parts(cfg: AmbientConfig, model: Optional[str] = None) -> list[float]:
@@ -1761,11 +1761,24 @@ def create_scene(db: Session, body: AmbientCreate) -> models.VideoProject:
         # so its spend is attributed to the scene. Committed first, so no
         # write transaction is held open over the network call.
         db.commit()
-        with spend.scope(project_id=project.id):
-            cfg = ensure_photo_rewrite(cfg)
-        project.ambient_config_json = cfg.model_dump()
-    _ensure_loop_shot(db, project, cfg)
-    db.commit()
+        try:
+            with spend.scope(project_id=project.id):
+                cfg = ensure_photo_rewrite(cfg)
+            project.ambient_config_json = cfg.model_dump()
+            _ensure_loop_shot(db, project, cfg)
+            db.commit()
+        except Exception:
+            # The scene is saved already: don't leave a half-made one behind
+            # (without the early commit, a failure here saved nothing).
+            db.rollback()
+            orphan = db.get(models.VideoProject, project.id)
+            if orphan is not None:
+                db.delete(orphan)
+                db.commit()
+            raise
+    else:
+        _ensure_loop_shot(db, project, cfg)
+        db.commit()
     db.refresh(project)
     return project
 

@@ -135,7 +135,7 @@ def test_elevenlabs_music_adapter_parses_response(monkeypatch, tmp_path):
     # music_v1 (the API default) is deprecated → always pin the model.
     assert body == {"prompt": "warm pad", "music_length_ms": 8000,
                     "model_id": "music_v2_5", "force_instrumental": True}
-    # Length clamps to the documented 3 s – 5 min window.
+    # Length clamps to 3 s – 10 min (a 600000 ms request returns 600 s).
     ElevenLabsMusicProvider(model_id="music_v2").generate(prompt="x", duration_seconds=3600)
     body2 = _json.loads(route.calls[1].request.content)
-    assert body2["music_length_ms"] == 300000 and body2["model_id"] == "music_v2"
+    assert body2["music_length_ms"] == 600000 and body2["model_id"] == "music_v2"
