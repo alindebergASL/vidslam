@@ -2,7 +2,7 @@
 import { useEffect, useId, useState } from "react";
 import { Dialog } from "@/components/Dialog";
 import { AutoTextarea } from "@/components/AutoTextarea";
-import { modelPrice, usd } from "@/components/ImageOps";
+import { modelPrice, usd, withKnownPrice } from "@/components/ImageOps";
 import { api, ContinueInfo, errorText, StudioJob, VideoModelOption } from "@/lib/api";
 
 /** A clip's length: its measured length, else the length asked for. */
@@ -18,12 +18,21 @@ export function clipPriceText(model: VideoModelOption | undefined, seconds: numb
   return total === 0 ? "Free" : `About ${usd(total)}`;
 }
 
+/** The video models priced with sound when `sound` is on (for the ones that make sound). */
+export function soundPriced(models: VideoModelOption[], sound: boolean): VideoModelOption[] {
+  if (!sound) return models;
+  return models.map((m) =>
+    m.supports_audio && m.audio_price_text ? withKnownPrice({ ...m, price_text: m.audio_price_text }) : m
+  );
+}
+
 /**
  * Continue this clip: a new clip that starts from this clip's last frame
  * (saved as a picture too), from what happens next. Paid like any clip;
  * the price shows before it runs. With "Join with the original when done"
  * (on by default) the two are joined into one more clip once the new one
- * is finished.
+ * is finished. It asks for sound as the clip it continues does (the Sound
+ * switch, for a model that makes sound, changes that; priced with it).
  */
 export function ContinueClipDialog({
   job,
@@ -48,6 +57,8 @@ export function ContinueClipDialog({
   const [model, setModel] = useState("");
   const [seconds, setSeconds] = useState<number>(durations[0] ?? 5);
   const [autoJoin, setAutoJoin] = useState(true);
+  // Sound as the clip it continues has it, until the switch says otherwise.
+  const [sound, setSound] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -61,6 +72,7 @@ export function ContinueClipDialog({
         setPrompt(i.prompt);
         setAvoid(i.negative_prompt);
         setModel(i.model);
+        setSound(i.audio !== false);
         const want = i.duration_seconds || 5;
         setSeconds(durations.reduce((a, b) => (Math.abs(b - want) < Math.abs(a - want) ? b : a), durations[0] ?? 5));
       })
@@ -75,7 +87,10 @@ export function ContinueClipDialog({
     if (info && models.length > 0 && !models.some((m) => m.id === model)) setModel(models[0].id);
   }, [info, models.length]);
 
-  const picked = models.find((m) => m.id === model);
+  // Priced with sound while it's on; the switch only for a model that makes sound.
+  const offered = soundPriced(models, sound);
+  const picked = offered.find((m) => m.id === model);
+  const canSound = Boolean(models.find((m) => m.id === model)?.supports_audio);
   const price = clipPriceText(picked, seconds);
   const noModel = info !== null && models.length === 0;
   const total = lengthOf(job) + seconds;
@@ -94,6 +109,8 @@ export function ContinueClipDialog({
         model: model || undefined,
         duration_seconds: seconds,
         auto_join: autoJoin,
+        // No switch shown (a model without sound): as the clip it continues.
+        ...(canSound ? { audio: sound } : {}),
       });
       onStarted(created);
     } catch (e) {
@@ -184,7 +201,7 @@ export function ContinueClipDialog({
             onChange={(e) => setModel(e.target.value)}
             disabled={models.length === 0}
           >
-            {models.map((m) => (
+            {offered.map((m) => (
               <option key={m.id} value={m.id}>
                 {m.name}
                 {m.price_text ? ` · ${m.price_text}` : ""}
@@ -196,6 +213,27 @@ export function ContinueClipDialog({
           )}
         </div>
       </div>
+      {canSound && (
+        <label className="flex items-start gap-2 text-sm cursor-pointer">
+          <input
+            type="checkbox"
+            role="switch"
+            aria-checked={sound}
+            className="mt-1 h-4 w-4 accent-current"
+            checked={sound}
+            onChange={(e) => setSound(e.target.checked)}
+          />
+          <span>
+            Sound
+            <span className="block text-[11px] text-ink-400">
+              {sound
+                ? "The model makes the new clip's own sound. Turn off for a silent clip."
+                : "A silent clip. Turn on to have the model make its own sound."}
+              {info && info.audio !== sound ? ` (Clip #${job.id} is ${info.audio ? "with" : "without"} sound.)` : ""}
+            </span>
+          </span>
+        </label>
+      )}
       <label className="flex items-start gap-2 text-sm cursor-pointer">
         <input
           type="checkbox"
@@ -219,7 +257,11 @@ export function ContinueClipDialog({
       )}
       <div className="flex flex-wrap items-center gap-2 justify-end">
         <span className="text-xs text-ink-300 mr-auto" aria-live="polite">
-          {price ? `${price} for the new clip` : picked ? "Price unknown" : ""}
+          {price
+            ? `${price} for the new clip${canSound ? (sound ? ", with sound" : ", no sound") : ""}`
+            : picked
+            ? "Price unknown"
+            : ""}
         </span>
         <button type="button" className="btn-ghost text-sm" onClick={onClose}>
           Cancel

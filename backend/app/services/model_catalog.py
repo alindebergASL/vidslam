@@ -264,7 +264,8 @@ def _sogni_entries() -> list[dict]:
             "id": f"{sogni.PREFIX}{v.selector}", "kind": "video", "name": sogni.display_name(v),
             "provider": "sogni", "description": v.note, "notes": " · ".join(bits),
             "durations": caps.durations, "max_seconds": caps.max_seconds, "frame_images": frames,
-            "resolutions": [], "aspect_ratios": [], "generate_audio": None,
+            # Makes its own sound when asked (generateAudio), at the same price.
+            "resolutions": [], "aspect_ratios": [], "generate_audio": v.audio_toggle,
             "pricing_skus": {}, "price_per_second": round(v.spark_per_second * sogni.SPARK_USD, 4),
             "uncensored": v.uncensored, "usable": usable,
         })

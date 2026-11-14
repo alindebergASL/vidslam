@@ -24,7 +24,7 @@ import {
 import { TileMenu, TileMenuItem } from "@/components/TileMenu";
 import { UseInProjectDialog } from "@/components/UseInProjectDialog";
 import { FrameFromVideoDialog, UploadVideoDialog } from "@/components/FrameFromVideo";
-import { ContinueClipDialog, clipPriceText } from "@/components/ContinueClipDialog";
+import { ContinueClipDialog, clipPriceText, soundPriced } from "@/components/ContinueClipDialog";
 import { JoinClipsDialog } from "@/components/JoinClipsDialog";
 import {
   BulkSaveDialog,
@@ -79,6 +79,8 @@ type PromptLoad = {
   model: string;
   aspect_ratio: StudioAspect;
   duration_seconds?: number;
+  /** A clip's sound; left out = keep the bar's choice. */
+  audio?: boolean;
 };
 
 function asAspect(v: string | undefined | null): StudioAspect {
@@ -378,6 +380,7 @@ function Studio() {
       model: job.provider_model || "",
       aspect_ratio: asAspect(job.aspect_ratio),
       duration_seconds: job.output_kind === "video_clip" ? job.duration_seconds : undefined,
+      audio: job.output_kind === "video_clip" ? job.audio !== false : undefined,
     });
   };
 
@@ -551,9 +554,12 @@ function Studio() {
   const [uploadingVideo, setUploadingVideo] = useState(false);
   // "Continue this clip": the finished clip the dialog continues.
   const [continuing, setContinuing] = useState<StudioJob | null>(null);
-  // Rough price of continuing a clip with its own model, for its menu ("" = unknown).
+  // Rough price of continuing a clip with its own model, for its menu ("" = unknown):
+  // with sound when the clip has it on (a continuation asks for sound as its clip does).
   const continuePrice = (job: StudioJob): string => {
-    const own = job.operation ? undefined : videoModels.find((m) => m.first_frame && m.id === job.provider_model);
+    const own = job.operation
+      ? undefined
+      : soundPriced(videoModels, job.audio !== false).find((m) => m.first_frame && m.id === job.provider_model);
     return clipPriceText(own, snapClipSeconds(job.duration_seconds || 5)).replace(/^About /, "about ");
   };
   const continueStarted = (j: StudioJob) => {
@@ -575,9 +581,11 @@ function Studio() {
       ? opModels[job.operation].map((m) => withKnownPrice({ id: m.id, name: m.name, price_text: m.free ? "free" : m.price_text }))
       : job.output_kind === "image"
       ? imageModels
-      : job.first_frame_job_id || job.first_frame_asset_id
-      ? videoModels.filter((m) => m.first_frame)
-      : videoModels;
+      : // A clip runs again with its own sound choice, priced that way.
+        soundPriced(
+          job.first_frame_job_id || job.first_frame_asset_id ? videoModels.filter((m) => m.first_frame) : videoModels,
+          job.audio !== false
+        );
   const retryPrice = (job: StudioJob): string => {
     if (job.operation === "extract_frame" || job.operation === "join_clips" || job.operation === "upload_video")
       return "free";
@@ -652,7 +660,7 @@ function Studio() {
         label:
           j.prompt.slice(0, 60) ||
           (j.operation === "upload_video" ? j.options?.upload || "Uploaded video" : `${j.output_kind} job`),
-        sub: `${j.output_kind} · ${j.owner_kind} #${j.owner_id}`,
+        sub: `${j.output_kind}${j.audio === false ? " · no sound" : ""} · ${j.owner_kind} #${j.owner_id}`,
         status: j.status,
         jobId: j.id,
         job: j,
@@ -1850,6 +1858,8 @@ function PromptBar({
   const [moreOpen, setMoreOpen] = useState(false);
   const [aspect, setAspect] = useState<StudioAspect>("");
   const [variations, setVariations] = useState(1);
+  // Clips: ask the model for its own sound (shown for models that make sound).
+  const [sound, setSound] = useState(true);
   const [sheetOpen, setSheetOpen] = useState(false);
   const promptRef = useRef<HTMLTextAreaElement>(null);
   const barRef = useRef<HTMLDivElement>(null);
@@ -1882,9 +1892,13 @@ function PromptBar({
 
   // A clip that starts from a picture: only models that can.
   const startsFromPicture = outputKind === "video_clip" && firstFrame !== null;
-  const frameModels = useMemo(() => videoModels.filter((m) => m.first_frame), [videoModels]);
+  // Clips are priced with sound while it's on.
+  const clipModels = useMemo(() => soundPriced(videoModels, sound), [videoModels, sound]);
+  const frameModels = useMemo(() => clipModels.filter((m) => m.first_frame), [clipModels]);
   const currentModels: ModelOption[] =
-    outputKind === "image" ? imageModels : startsFromPicture ? frameModels : videoModels;
+    outputKind === "image" ? imageModels : startsFromPicture ? frameModels : clipModels;
+  // The Sound switch: only for a clip model that makes its own sound.
+  const canSound = outputKind === "video_clip" && Boolean(videoModels.find((m) => m.id === model)?.supports_audio);
   // With reference pictures a Sogni picture model runs on one of Sogni's editors.
   const refIntent = outputKind === "image" ? pictureIntent(selectedAssets) : null;
   const refCount = refIntent ? selectedAssets.length : 0;
@@ -1916,7 +1930,7 @@ function PromptBar({
   const priceTitle = pickedPrice
     ? `${pickedEditor ? `${pickedEditor.name} (Sogni)` : pickedModel?.name}: ${pickedPrice}${
         outputKind === "image" && variations > 1 ? ` × ${variations}` : ""
-      }${unsent}`
+      }${canSound ? (sound ? ", with sound" : ", no sound") : ""}${unsent}`
     : undefined;
 
   // Fill the bar from Remix or a preset.
@@ -1926,6 +1940,7 @@ function PromptBar({
     if (p.negative_prompt) setMoreOpen(true);
     setAspect(p.aspect_ratio);
     if (p.duration_seconds) setClipSeconds(snapClipSeconds(p.duration_seconds));
+    if (p.audio !== undefined) setSound(p.audio);
     if (p.outputKind !== outputKind) {
       wantModel.current = p.model;
       setOutputKind(p.outputKind);
@@ -2028,7 +2043,10 @@ function PromptBar({
         aspect_ratio: aspect || null,
         ...(avoid.trim() ? { negative_prompt: avoid.trim() } : {}),
         ...(model ? { model } : {}),
-        ...(outputKind === "video_clip" ? { duration_seconds: clipSeconds, ...frame } : { variations }),
+        // A model that makes no sound gets the default, so Try another model can add it.
+        ...(outputKind === "video_clip"
+          ? { duration_seconds: clipSeconds, ...frame, audio: !canSound || sound }
+          : { variations }),
       };
       const job =
         outputKind === "image"
@@ -2203,6 +2221,21 @@ function PromptBar({
             >
               <ModelOptions models={currentModels} intent={refIntent} count={refCount} />
             </select>
+          )}
+          {canSound && (
+            <button
+              type="button"
+              onClick={() => setSound((v) => !v)}
+              className="chip text-xs"
+              aria-pressed={sound}
+              title={
+                sound
+                  ? "The model makes the clip's own sound. Click for a silent clip."
+                  : "A silent clip. Click to have the model make its own sound."
+              }
+            >
+              {sound ? "Sound on" : "Sound off"}
+            </button>
           )}
           <select
             value={aspect}

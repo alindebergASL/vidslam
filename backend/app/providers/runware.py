@@ -505,29 +505,34 @@ def video_resolution() -> str:
     return r if r in _RES_LONG else "1080p"
 
 
-def video_rate_usd(model: str, resolution: Optional[str] = None) -> float:
-    """Price per second of silent output at `resolution` (estimate)."""
+def _with_audio(rate: dict) -> bool:
+    label = str(rate.get("label") or "").lower()
+    return "with audio" in label or "· audio" in label
+
+
+def video_rate_usd(model: str, resolution: Optional[str] = None, *, audio: bool = False) -> float:
+    """Price per second of output at `resolution` (estimate): silent, or
+    with sound (`audio`) where the model prices that apart (Veo)."""
     rates = _rates(schema(model, fetch=False), "durationSecond")
     if not rates:
         return get_settings().cost_video_per_second
     res = (resolution or video_resolution()).lower()
 
-    def silent(r: dict) -> bool:
-        label = str(r.get("label") or "").lower()
-        return "with audio" not in label and "· audio" not in label
+    def fits(r: dict) -> bool:
+        return _with_audio(r) == bool(audio)
 
-    for pick in (lambda r: res in str(r.get("label") or "").lower() and silent(r),
+    for pick in (lambda r: res in str(r.get("label") or "").lower() and fits(r),
                  lambda r: res in str(r.get("label") or "").lower(),
                  lambda r: not r.get("label")):
         hit = [r for r in rates if pick(r)]
         if hit:
             return float(min(h["amount"] for h in hit))
-    quiet = [r for r in rates if silent(r)] or rates
-    return float(max(r["amount"] for r in quiet))  # no label for this resolution: err high
+    same = [r for r in rates if fits(r)] or rates
+    return float(max(r["amount"] for r in same))  # no label for this resolution: err high
 
 
-def video_cost_usd(model: str, seconds: float) -> float:
-    return round(video_rate_usd(model) * max(1.0, float(seconds or 0)), 4)
+def video_cost_usd(model: str, seconds: float, *, audio: bool = False) -> float:
+    return round(video_rate_usd(model, audio=audio) * max(1.0, float(seconds or 0)), 4)
 
 
 # ---------- request building ----------
@@ -591,6 +596,17 @@ _QUIET = (
     (("settings", "enhancePrompt"), False), (("settings", "promptExtend"), False),
     (("settings", "promptExpansion"), False), (("providerSettings", "alibaba", "promptExtend"), False),
 )
+# The fields that ask a video model for its own sound (the first four above).
+_AUDIO_PATHS = tuple(path for path, _ in _QUIET[:4])
+
+
+def makes_audio(model: str) -> bool:
+    """Whether a video model makes its own sound on request: its schema has
+    a sound field (settings.audio, providerSettings.google.generateAudio…)
+    that takes true."""
+    sch = schema(model, fetch=False)
+    props = _props(sch) if sch else {}
+    return any(_allowed(_sub(props, *path), True) for path in _AUDIO_PATHS)
 # Vendor safety knobs at their most permissive (the vendor still moderates).
 # Set only in adult mode, and only where the model's published schema has
 # the field and allows the value (_put): a model that doesn't document one
@@ -966,7 +982,7 @@ def build_video_task(model: str, prompt: str, references: list[ImageRef], *, neg
         if loop:
             _put(base, props, ("providerSettings", "bytedance", "cameraFixed"), True)
         if settings.get("generate_audio"):
-            for path, _ in _QUIET[:4]:
+            for path in _AUDIO_PATHS:
                 _put(base, props, path, True)
     want = caps.snap(duration_seconds)
     durations = sorted(caps.durations or [want], key=lambda d: (d < want, abs(d - want)))
@@ -1291,7 +1307,8 @@ def _over_with_in_flight(db) -> Optional[str]:  # noqa: ANN001
     for model, ctx in db.query(models.VideoJob.model, models.VideoJob.context_json).filter(
             models.VideoJob.provider == "runware", models.VideoJob.status.in_(ACTIVE)):
         try:
-            pending += video_cost_usd(model, float((ctx or {}).get("duration") or 5.0))
+            pending += video_cost_usd(model, float((ctx or {}).get("duration") or 5.0),
+                                      audio=bool((ctx or {}).get("audio")))
         except Exception:  # noqa: BLE001 — an unknown model: count nothing
             continue
     if pending <= 0:
@@ -1359,15 +1376,22 @@ def catalog_entries(usable: bool) -> list[dict]:
             if caps and caps.last_frame:
                 frames.append("last_frame")
             rate = video_rate_usd(model) if sch else None
+            sound = makes_audio(model) if sch else None
+            # With sound, where the model prices it apart (Studio clips ask for it).
+            sound_rate = video_rate_usd(model, audio=True) if sound else None
             bits = [tag]
             if caps:
                 bits.append(f"{min(caps.durations)}–{max(caps.durations)} s")
             if rate:
                 bits.append(f"~${rate:.3f}/s at {video_resolution()}")
+            if rate and sound_rate and sound_rate != rate:
+                bits.append(f"~${sound_rate:.3f}/s with sound")
             e.update({"notes": " · ".join(bits), "durations": caps.durations if caps else [],
                       "max_seconds": caps.max_seconds if caps else None, "frame_images": frames,
-                      "resolutions": [], "aspect_ratios": [], "generate_audio": None,
+                      "resolutions": [], "aspect_ratios": [], "generate_audio": sound,
                       "pricing_skus": {}, "price_per_second": rate})
+            if sound_rate and sound_rate != rate:
+                e["audio_price_per_second"] = sound_rate
         out.append(e)
     return out
 

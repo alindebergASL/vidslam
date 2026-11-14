@@ -79,7 +79,8 @@ def test_switch_off_means_no_join(auth_client):
     original = _clip(auth_client, aid)
     cont = _job(auth_client, _continue(auth_client, original["id"], auto_join=False).json()["id"])
     assert cont["status"] == "completed"
-    assert cont["options"] == {"continues_job_id": original["id"], "auto_join": False}
+    # It asks for sound as the clip it continues does (#49: on by default).
+    assert cont["options"] == {"continues_job_id": original["id"], "auto_join": False, "audio": True}
     assert _rows(operation="join_clips") == []
 
 

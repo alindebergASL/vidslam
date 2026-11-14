@@ -135,14 +135,39 @@ def _merged(kind: str, provider_list) -> list[dict]:
 @router.get("/openrouter/video-models")
 def video_models(db: Session = Depends(get_db)) -> list[dict]:
     """Each entry also says whether the model can start from a picture
-    (`first_frame`), for Studio's "Animate this"."""
+    (`first_frame`), for Studio's "Animate this", and whether it can make
+    its own sound (`supports_audio`, with `audio_price_text`: its price
+    with sound), for Studio's Sound switch."""
     entries = _trained_lora_entries(db, "video") + _merged("video", lambda: get_video().list_models())
     from ..services import model_catalog
 
-    frames = {e.get("id"): e.get("frame_images") or []
-              for e in (model_catalog.get_snapshot() or {}).get("entries") or []
-              if e.get("kind") == "video" and "frame_images" in e}
-    return [{**e, "first_frame": _first_frame(e["id"], frames)} for e in entries]
+    catalog = {e.get("id"): e for e in (model_catalog.get_snapshot() or {}).get("entries") or []
+               if e.get("kind") == "video"}
+    frames = {i: e.get("frame_images") or [] for i, e in catalog.items() if "frame_images" in e}
+    out = []
+    for e in entries:
+        row = {**e, "first_frame": _first_frame(e["id"], frames), "supports_audio": _supports_audio(
+            e["id"], catalog.get(e["id"]))}
+        if row["supports_audio"]:
+            row["audio_price_text"] = price_text(catalog.get(e["id"]), "video", audio=True) or e.get("price_text", "")
+        out.append(row)
+    return out
+
+
+def _supports_audio(model_id: str, entry: dict | None) -> bool:
+    """Whether a video model makes its own sound when asked: a Sogni model
+    that takes generateAudio, a Runware model with a sound field, any other
+    one whose catalog entry says generate_audio (trained adapters: no)."""
+    from ..providers import runware, sogni
+
+    if model_id.startswith("custom:"):
+        return False
+    if sogni.is_sogni(model_id):
+        spec = sogni.video_model(model_id)
+        return bool(spec and spec.audio_toggle)
+    if runware.is_runware(model_id):
+        return runware.makes_audio(model_id)
+    return (entry or {}).get("generate_audio") is True
 
 
 def _first_frame(model_id: str, catalog_frames: dict) -> bool:

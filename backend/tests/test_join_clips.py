@@ -514,11 +514,11 @@ def test_joined_clip_is_at_most_1080p_and_ffmpeg_is_time_limited(tmp_path, monke
     seen = {}
     real = renderer._run
 
-    def run(cmd, timeout=None):
+    def run(cmd, timeout=None, should_stop=None):
         if cmd[0] == "ffmpeg":
             seen["timeout"] = timeout
             return -1, "timed out after 120s"
-        return real(cmd, timeout)
+        return real(cmd, timeout, should_stop)
 
     monkeypatch.setattr(renderer, "_run", run)
     with pytest.raises(RuntimeError, match="timed out"):
@@ -703,7 +703,7 @@ def test_cancelling_a_running_join_stops_its_ffmpeg_and_keeps_it_cancelled(auth_
     b = _clip_job(_video(tmp_path / "b.mp4", seconds=1.5), aid)
     seen = {}
 
-    def fake_join(clips, dst, *, transition="cut", crossfade=0.5, should_stop=None):
+    def fake_join(clips, dst, *, transition="cut", crossfade=0.5, should_stop=None, silent=None):
         with SessionLocal() as db:  # the user cancels while FFmpeg runs
             db.query(models.AssetGenerationJob).filter(
                 models.AssetGenerationJob.operation == video_ops.JOIN_OP).update(
@@ -718,3 +718,28 @@ def test_cancelling_a_running_join_stops_its_ffmpeg_and_keeps_it_cancelled(auth_
     assert seen["stop"] is True
     job = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
     assert job["status"] == "failed" and job["error"] == "Cancelled"
+
+
+def test_the_joins_ffmpeg_is_asked_whether_to_stop(tmp_path, monkeypatch):
+    """join_clips_with_audio hands should_stop to the FFmpeg run, and a run
+    it stopped is JoinStopped (not a failed join)."""
+    from app.services import renderer
+
+    a = _video(tmp_path / "a.mp4", seconds=1.5)
+    seen = {}
+    real = renderer._run
+
+    def run(cmd, timeout=None, should_stop=None):
+        if cmd[0] == "ffmpeg":
+            seen["should_stop"] = should_stop
+            return -2, "stopped"
+        return real(cmd, timeout, should_stop)
+
+    monkeypatch.setattr(renderer, "_run", run)
+
+    def stop() -> bool:
+        return True
+
+    with pytest.raises(renderer.JoinStopped):
+        renderer.join_clips_with_audio([a, a], tmp_path / "s.mp4", should_stop=stop)
+    assert seen["should_stop"] is stop

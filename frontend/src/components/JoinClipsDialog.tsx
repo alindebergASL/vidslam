@@ -114,7 +114,8 @@ export function JoinClipsDialog({
   return (
     <Dialog title="Join clips" onClose={onClose}>
       <p className="text-xs text-ink-300">
-        Plays the clips one after another as a new clip. The first clip sets the size; each clip keeps its sound.
+        Plays the clips one after another as a new clip. The first clip sets the size; each clip keeps its sound (a
+        clip made with sound off stays silent).
         {skipped > 0 && ` ${skipped === 1 ? "1 selected item isn't" : `${skipped} selected items aren't`} a finished clip, so it's left out.`}
         {dropped > 0 && ` Only the first ${JOIN_MAX_CLIPS} clips are used.`}
       </p>
@@ -139,6 +140,7 @@ export function JoinClipsDialog({
               </div>
               <div className="text-ink-400">
                 #{row.job.id} · {clockText(clipSeconds(row.job))}
+                {row.job.audio === false || row.job.options?.has_audio === false ? " · no sound" : ""}
               </div>
             </div>
             <div className="flex shrink-0 gap-1">
