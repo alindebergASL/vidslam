@@ -11,10 +11,13 @@ const DONE = ["completed", "failed", "cancelled", "expired"];
 
 export function RenderHistory({
   projectId,
+  aspect,
   linkFor,
 }: {
   projectId: number;
-  /** Where a version's tile links (default: the render page). */
+  /** The video's shape, for the tiles ("9:16" when not given). */
+  aspect?: string;
+  /** Where a render's tile leads (default: the project's render page). */
   linkFor?: (renderId: number) => string;
 }) {
   const [renders, setRenders] = useState<Render[]>([]);
@@ -88,7 +91,15 @@ export function RenderHistory({
                 href={linkFor ? linkFor(r.id) : `/projects/${projectId}/render?id=${r.id}`}
                 className="block"
               >
-                <div className="aspect-9/16 max-h-44 bg-ink-800 relative">
+                <div
+                  className={
+                    aspect === "16:9"
+                      ? "aspect-video bg-ink-800 relative"
+                      : aspect === "1:1"
+                      ? "aspect-square max-h-44 bg-ink-800 relative"
+                      : "aspect-9/16 max-h-44 bg-ink-800 relative"
+                  }
+                >
                   {completed ? (
                     <img
                       src={api.renderThumb(r.id)}

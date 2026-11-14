@@ -25,6 +25,7 @@ import {
   rewriteApplies,
   type ModelOption,
   OverlayControls,
+  ownPictureVideo,
   MUSIC_LENGTHS,
   PlanSummary,
   previewSrc,
@@ -98,6 +99,7 @@ function Inner() {
         if (
           prev &&
           (prev.loop_shot?.clip_path !== s.loop_shot?.clip_path ||
+            prev.clip_version !== s.clip_version ||
             prev.music_ready !== s.music_ready ||
             prev.latest_render?.id !== s.latest_render?.id ||
             prev.status !== s.status)
@@ -221,6 +223,18 @@ function Inner() {
   const plan = scene.plan;
   const resume = !inFlight ? scene.resume ?? null : null;
   const loopCost = aboutUsd(scene.generate_cost);
+  // The scene's own picture stands in for the preset art wherever no video is shown yet.
+  const pictureSrc = scene.picture_ready ? api.ambientPictureUrl(id, scene.picture_version || scene.updated_at) : null;
+  const placeholderSrc = pictureSrc ?? previewSrc(preset);
+  const priceTag = (n: number | undefined) => (n && n >= 0.005 ? ` · ~$${n.toFixed(2)}` : n === 0 ? " · free" : "");
+  // How long the full render takes: a timer re-encodes the whole video; 4K
+  // upscales the loop first; otherwise the loops are stream-copied.
+  const renderPace =
+    scene.config.timer !== "none"
+      ? "The timer is drawn on every frame, so the whole video is re-encoded once: expect several minutes per hour of video."
+      : scene.config.output_resolution === "4k"
+      ? "The loop is upscaled to 4K once, then copied end to end: a minute or two, even for three hours."
+      : "Stream-copy assembly — this is seconds, not minutes, even for three hours.";
   // The picture is there and no video has been made from it: the step where
   // the creator checks it before paying for the loop.
   const checkPicture =
@@ -274,9 +288,16 @@ function Inner() {
               )}
               {sceneStatusLabel(scene)}
             </span>
-            <span className="chip text-xs py-0.5">
-              {preset?.emoji} {preset?.label ?? scene.config.scene_preset}
-            </span>
+            {pictureSrc ? (
+              <span className="chip text-xs py-0.5 inline-flex items-center gap-1.5">
+                <img src={pictureSrc} alt="" className="w-5 h-3.5 rounded-xs object-cover" />
+                Your picture
+              </span>
+            ) : (
+              <span className="chip text-xs py-0.5">
+                {preset?.emoji} {preset?.label ?? scene.config.scene_preset}
+              </span>
+            )}
             <span className="chip text-xs py-0.5">{fmtDuration(scene.total_seconds)}</span>
             <span className="chip text-xs py-0.5">{scene.aspect_ratio}</span>
             <span className="chip text-xs py-0.5">
@@ -309,6 +330,26 @@ function Inner() {
           </button>
         </div>
       </header>
+
+      {scene.stuck && (
+        <div
+          role="alert"
+          className="mb-6 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200 flex flex-wrap items-center justify-between gap-3"
+        >
+          <span>
+            This scene looks stuck: it says it is generating, but nothing is making it. Reset it to edit and generate
+            again; nothing that is already made is lost.
+          </span>
+          <button
+            type="button"
+            className="btn-ghost text-sm"
+            disabled={busy !== null}
+            onClick={() => run("reset", () => api.cancelRender(id), "Scene reset")}
+          >
+            {busy === "reset" ? "Resetting…" : "Reset"}
+          </button>
+        </div>
+      )}
 
       {/* Step strip */}
       <ol className="grid grid-cols-3 gap-2 mb-6" aria-label="Progress">
@@ -379,9 +420,7 @@ function Inner() {
                   <div className="h-1.5 rounded-full bg-ink-800 overflow-hidden mt-4">
                     <div className="h-full w-1/2 grad animate-shimmer" style={{ backgroundSize: "200% 100%" }} />
                   </div>
-                  <p className="text-xs text-ink-400 mt-3">
-                    Stream-copy assembly — this is seconds, not minutes, even for three hours.
-                  </p>
+                  <p className="text-xs text-ink-400 mt-3">{renderPace}</p>
                 </div>
               ) : (
                 <div className="p-6 text-sm">
@@ -451,8 +490,8 @@ function Inner() {
             {loopReady && scene.loop_shot ? (
               <div className="bg-black">
                 <video
-                  key={`c-${scene.loop_shot.id}-${cacheBust}`}
-                  src={api.shotClip(id, scene.loop_shot.id)}
+                  key={`c-${scene.loop_shot.id}-${scene.clip_version ?? ""}-${cacheBust}`}
+                  src={api.shotClip(id, scene.loop_shot.id, scene.clip_version || String(cacheBust))}
                   autoPlay
                   loop
                   muted
@@ -465,7 +504,7 @@ function Inner() {
               </div>
             ) : loopGenerating ? (
               <div className="relative">
-                <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={previewSrc(preset)} className="aspect-video" />
+                <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={placeholderSrc} still={!!pictureSrc} className="aspect-video" />
                 <div className="absolute inset-x-0 bottom-0 p-4 bg-linear-to-t from-ink-950/90 to-transparent text-sm">
                   <span className="inline-flex items-center gap-2">
                     <span className="w-2 h-2 rounded-full grad animate-pulse" />
@@ -479,7 +518,7 @@ function Inner() {
               </div>
             ) : (
               <div className="relative">
-                <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={previewSrc(preset)} className="aspect-video" />
+                <SceneArt palette={preset?.palette} emoji={preset?.emoji} image={placeholderSrc} still={!!pictureSrc} className="aspect-video" />
                 <div className="absolute inset-x-0 bottom-0 p-4 bg-linear-to-t from-ink-950/90 to-transparent text-sm">
                   {resume ? (
                     <div className="space-y-2">
@@ -597,6 +636,7 @@ function Inner() {
                   }
                 >
                   {busy === "music" ? "Generating…" : scene.music_ready ? "Regenerate music" : "Generate music"}
+                  {busy !== "music" && <span className="text-ink-400">{priceTag(scene.music_cost)}</span>}
                 </button>
               )}
             </div>
@@ -634,6 +674,7 @@ function Inner() {
                   onClick={() => run("sound", () => api.regenerateAmbientSound(id), "Nature sound regenerated")}
                 >
                   {busy === "sound" ? "Generating…" : scene.sound_ready ? "Regenerate sound" : "Generate sound"}
+                  {busy !== "sound" && <span className="text-ink-400">{priceTag(scene.sound_cost)}</span>}
                 </button>
               </div>
               {scene.sound_ready && (
@@ -704,7 +745,7 @@ function Inner() {
             </div>
           )}
 
-          <RenderHistory projectId={id} />
+          <RenderHistory projectId={id} aspect={scene.aspect_ratio} linkFor={(rid) => `/ambient/${id}?render=${rid}`} />
         </div>
 
         {seamAsk && seamAsk.code === "seam_unmeasured" && (
@@ -906,6 +947,9 @@ function TitleEditor({ title, onSave }: { title: string; onSave: (t: string) => 
   );
 }
 
+/** services.ambient.INDOOR_PRESETS: their light is from the fire or candles. */
+const INDOOR_PRESETS = ["fireplace", "candles"];
+
 const rewriteKey = (rw: PhotoRewrite | null) => (rw ? JSON.stringify([rw.scene, rw.light, rw.camera]) : null);
 
 /** The rewrite the saved scene will use after this save, as a comparable key
@@ -961,12 +1005,19 @@ function SettingsPanel({
   const set = <K extends keyof AmbientConfig>(k: K, v: AmbientConfig[K]) =>
     setCfg((c) => ({ ...c, [k]: v }));
   const dirty = JSON.stringify(cfg) !== JSON.stringify(scene.config) || aspect !== scene.aspect_ratio;
+  // A video scene made from the scene's own picture, before and after this save.
+  const ownPicture = ownPictureVideo(cfg);
+  const ownBoth = ownPicture && ownPictureVideo(scene.config);
+  // Indoor presets put the time of day and weather "outside" in the prompt.
+  const indoor = (pid: string) => INDOOR_PRESETS.includes(pid);
+  const indoorChanged =
+    indoor(cfg.scene_preset) !== indoor(scene.config.scene_preset) &&
+    (cfg.time_of_day !== "any" || cfg.weather !== "any");
   // Changes that force a new loop clip (mirrors services.ambient.update_scene).
   const invalidates =
     // The clip was made for the old shape.
     aspect !== scene.aspect_ratio ||
     cfg.scene_prompt !== scene.config.scene_prompt ||
-    cfg.scene_preset !== scene.config.scene_preset ||
     // The rewrite changes the prompt only when one applies before or after.
     rewriteKey(activeRewrite(scene.config)) !== nextRewriteKey(cfg, scene.config) ||
     cfg.source !== scene.config.source ||
@@ -976,8 +1027,12 @@ function SettingsPanel({
     cfg.chain_segments !== scene.config.chain_segments ||
     cfg.variety !== scene.config.variety ||
     (cfg.variety !== "none" && cfg.variations !== scene.config.variations) ||
-    cfg.look !== scene.config.look ||
-    cfg.look_strength !== scene.config.look_strength ||
+    // Preset and look don't reach a clip made from the scene's own picture
+    // (services.ambient._clip_changed); an indoor preset's "outside" light can.
+    (!ownBoth && cfg.scene_preset !== scene.config.scene_preset) ||
+    (ownBoth && cfg.scene_preset !== scene.config.scene_preset && indoorChanged) ||
+    (!ownBoth && cfg.look !== scene.config.look) ||
+    (!ownBoth && cfg.look_strength !== scene.config.look_strength) ||
     cfg.time_of_day !== scene.config.time_of_day ||
     cfg.weather !== scene.config.weather;
   const preset = presetFor(presets?.scenes ?? null, cfg.scene_preset);
@@ -997,7 +1052,7 @@ function SettingsPanel({
         )}
       </div>
 
-      <LookControls cfg={cfg} set={set} presets={presets} idPrefix="set-look" />
+      <LookControls cfg={cfg} set={set} presets={presets} idPrefix="set-look" hideLook={ownPicture} />
 
       <VarietyControls cfg={cfg} set={set} labels={scene.plan.variant_labels} />
 
@@ -1025,6 +1080,20 @@ function SettingsPanel({
         />
         {cfg.music_mood !== "none" && (
           <>
+            <label className="label mt-3" htmlFor="set-music-prompt">
+              Music prompt <span className="text-ink-400 normal-case tracking-normal">(optional)</span>
+            </label>
+            <AutoTextarea
+              id="set-music-prompt"
+              className="input text-xs"
+              maxLength={1000}
+              value={cfg.music_prompt}
+              placeholder={presets?.music_moods.find((m) => m.id === cfg.music_mood)?.prompt || ""}
+              onChange={(e) => set("music_prompt", e.target.value)}
+            />
+            {cfg.music_prompt !== scene.config.music_prompt && (
+              <p className="text-[11px] text-ink-400 mt-1">Save, then Regenerate music to apply.</p>
+            )}
             <label className="label mt-3" htmlFor="set-volume">
               Volume · {Math.round(cfg.music_volume * 100)}%
             </label>
@@ -1042,12 +1111,13 @@ function SettingsPanel({
         )}
       </div>
 
-      <SoundControls cfg={cfg} set={set} presets={presets} idPrefix="set-sound" />
+      <SoundControls cfg={cfg} set={set} presets={presets} idPrefix="set-sound">
+        {(cfg.sound !== scene.config.sound || cfg.sound_prompt !== scene.config.sound_prompt) && cfg.sound !== "none" && (
+          <p className="text-[11px] text-ink-400 mt-1">Save, then Generate sound to apply.</p>
+        )}
+      </SoundControls>
 
       <OverlayControls cfg={cfg} set={set} idPrefix="set-overlay" />
-      {cfg.sound !== scene.config.sound && (
-        <p className="text-[11px] text-ink-400 -mt-2">Save, then Generate sound to apply.</p>
-      )}
 
       <div className="grid grid-cols-2 gap-3">
         <div>
@@ -1093,6 +1163,20 @@ function SettingsPanel({
             className="w-full accent-iris"
           />
         </div>
+        {cfg.source === "video" && (
+          <div className="col-span-2">
+            <div className="label">Stillness</div>
+            <ChipRow
+              label="Stillness"
+              options={[1, 1.5, 2]}
+              value={cfg.slow_factor}
+              onChange={(v) => set("slow_factor", v)}
+              render={(v) => (v === 1 ? "Natural" : v === 1.5 ? "Slower" : "Barely moves")}
+              className="text-xs"
+            />
+            <p className="text-[11px] text-ink-400 mt-1">Applied when rendering: free, and the loop is kept.</p>
+          </div>
+        )}
       </div>
 
       {cfg.music_mood !== "none" && (
@@ -1137,6 +1221,7 @@ function SettingsPanel({
               className="text-xs"
             />
           </div>
+          {!ownPicture && (
           <div>
             <div className="label">Preset</div>
             <select
@@ -1152,6 +1237,7 @@ function SettingsPanel({
               ))}
             </select>
           </div>
+          )}
           <div>
             <label className="label" htmlFor="set-prompt">
               Scene description
@@ -1179,6 +1265,7 @@ function SettingsPanel({
             imageModels={imageModels}
             videoModels={videoModels}
             idPrefix="set-models"
+            hideStill={ownPicture}
           />
           <div>
             <div className="label">Loop clip</div>
@@ -1217,19 +1304,6 @@ function SettingsPanel({
                 value={cfg.chain_segments ? "chain" : "single"}
                 onChange={(v) => set("chain_segments", v === "chain")}
                 render={(v) => (v === "chain" ? "Chain clips" : "One clip")}
-                className="text-xs"
-              />
-            </div>
-          )}
-          {cfg.source === "video" && (
-            <div>
-              <div className="label">Stillness</div>
-              <ChipRow
-                label="Stillness"
-                options={[1, 1.5, 2]}
-                value={cfg.slow_factor}
-                onChange={(v) => set("slow_factor", v)}
-                render={(v) => (v === 1 ? "Natural" : v === 1.5 ? "Slower" : "Barely moves")}
                 className="text-xs"
               />
             </div>

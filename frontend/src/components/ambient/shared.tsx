@@ -422,17 +422,23 @@ export function LookControls({
   set,
   presets,
   idPrefix = "look",
+  hideLook = false,
 }: {
   cfg: AmbientConfig;
   set: CfgSetter;
   presets: AmbientPresets | null;
   idPrefix?: string;
+  /** The scene's own picture sets the look (ownPictureVideo): show light and weather only. */
+  hideLook?: boolean;
 }) {
   const looks = presets?.looks?.length ? presets.looks : FALLBACK_LOOKS;
   const times = presets?.times_of_day ?? [];
   const weathers = presets?.weathers ?? [];
   return (
     <div className="space-y-3">
+      {hideLook ? (
+        <p className="text-xs text-ink-400">Your picture sets the look. Time of day and weather still guide the motion.</p>
+      ) : (
       <div>
         <div className="label">Look</div>
         <ChipRow
@@ -466,6 +472,7 @@ export function LookControls({
           </>
         )}
       </div>
+      )}
       {times.length > 0 && cfg.variety === "day_night" ? (
         <div>
           <div className="label">Time of day</div>
@@ -700,11 +707,14 @@ export function SoundControls({
   set,
   presets,
   idPrefix = "sound",
+  children,
 }: {
   cfg: AmbientConfig;
   set: CfgSetter;
   presets: AmbientPresets | null;
   idPrefix?: string;
+  /** Shown under the sound settings (e.g. a "save, then generate" hint). */
+  children?: ReactNode;
 }) {
   const sounds = presets?.sounds ?? [];
   const options = ["none", "auto", ...sounds.map((s) => s.id)];
@@ -739,8 +749,23 @@ export function SoundControls({
           <p className="text-[11px] text-ink-400 mt-1">
             Mixed under the music, or on its own with music set to &ldquo;No music&rdquo;.
           </p>
+          <label className="label mt-3" htmlFor={`${idPrefix}-prompt`}>
+            Sound prompt <span className="text-ink-400 normal-case tracking-normal">(optional)</span>
+          </label>
+          <textarea
+            id={`${idPrefix}-prompt`}
+            className="input min-h-[60px] text-xs"
+            maxLength={500}
+            value={cfg.sound_prompt}
+            placeholder={
+              sounds.find((s) => s.id === cfg.sound)?.prompt ||
+              (cfg.sound === "auto" ? "Matches the scene and weather, e.g. gentle rain on leaves" : "")
+            }
+            onChange={(e) => set("sound_prompt", e.target.value)}
+          />
         </>
       )}
+      {children}
     </div>
   );
 }
@@ -790,6 +815,13 @@ export function textFingerprint(text: string): string {
 }
 
 const OWN_PICTURE = ["upload", "studio", "asset"];
+
+/** A video scene built from a picture the user brought, with no stills of
+ *  its own to make (services.ambient.own_picture_video): its preset, look and
+ *  Picture model don't reach the clip. */
+export function ownPictureVideo(cfg: AmbientConfig): boolean {
+  return cfg.source === "video" && OWN_PICTURE.includes(cfg.picture_origin) && cfg.variety !== "day_night";
+}
 
 /** Whether a photo rewrite is made for this config (services.ambient.ensure_photo_rewrite). */
 export function rewriteApplies(cfg: AmbientConfig): boolean {
@@ -859,9 +891,15 @@ export function PhotoRewriteControl({
 /** A catalog model, as the model dropdowns list it. */
 export type ModelOption = { id: string; name: string };
 
-function choiceLabel(c: ModelChoice): string {
+/** "~$0.13 per picture", "free"; "" when the rate card doesn't say. */
+function priceTag(c: ModelChoice | undefined, unit: string): string {
+  if (!c || c.est_cost == null) return "";
+  return c.est_cost < 0.0005 ? "free" : `~$${c.est_cost.toFixed(c.est_cost < 0.1 ? 3 : 2)} ${unit}`;
+}
+
+function choiceLabel(c: ModelChoice, unit: string): string {
   const tags = [c.recommended && "recommended", c.experimental && "experimental"].filter(Boolean).join(", ");
-  return tags ? `${c.label} (${tags})` : c.label;
+  return [tags ? `${c.label} (${tags})` : c.label, priceTag(c, unit)].filter(Boolean).join(" · ");
 }
 
 function others(list: ModelOption[], curated: ModelChoice[]): ModelOption[] {
@@ -877,6 +915,7 @@ export function ModelControls({
   imageModels,
   videoModels,
   idPrefix = "models",
+  hideStill = false,
 }: {
   cfg: AmbientConfig;
   set: CfgSetter;
@@ -884,6 +923,8 @@ export function ModelControls({
   imageModels: ModelOption[];
   videoModels: ModelOption[];
   idPrefix?: string;
+  /** The scene makes no pictures (ownPictureVideo): leave the Picture model out. */
+  hideStill?: boolean;
 }) {
   const stills = presets?.still_models ?? [];
   const videos = presets?.video_models ?? [];
@@ -921,6 +962,7 @@ export function ModelControls({
 
   return (
     <div className="grid md:grid-cols-2 gap-4">
+      {!hideStill && (
       <div>
         <label className="label" htmlFor={`${idPrefix}-still`}>
           Picture model
@@ -936,13 +978,14 @@ export function ModelControls({
         >
           <option value="">
             Recommended{defaultStill ? ` · ${defaultStill.label}` : ""}
+            {priceTag(defaultStill, "per picture") ? ` · ${priceTag(defaultStill, "per picture")}` : ""}
             {presets?.default_still_off ? " (provider off)" : ""}
           </option>
           {stills.length > 0 && (
             <optgroup label="Suggested">
               {stills.map((c) => (
                 <option key={c.id} value={c.id}>
-                  {choiceLabel(c)}
+                  {choiceLabel(c, "per picture")}
                 </option>
               ))}
             </optgroup>
@@ -960,6 +1003,7 @@ export function ModelControls({
         </select>
         {stillHelp && <p className="text-xs text-ink-400 mt-1">{stillHelp}</p>}
       </div>
+      )}
       {!drift && (
         <div>
           <label className="label" htmlFor={`${idPrefix}-video`}>
@@ -973,13 +1017,14 @@ export function ModelControls({
           >
             <option value="">
               Default{defaultVideo ? ` · ${defaultVideo.label}` : presets?.default_video_model ? ` · ${presets.default_video_model}` : ""}
+              {priceTag(defaultVideo, "per second") ? ` · ${priceTag(defaultVideo, "per second")}` : ""}
               {presets?.default_video_off ? " (provider off)" : ""}
             </option>
             {videos.length > 0 && (
               <optgroup label="Suggested">
                 {videos.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {choiceLabel(c)}
+                    {choiceLabel(c, "per second")}
                   </option>
                 ))}
               </optgroup>

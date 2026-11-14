@@ -85,7 +85,7 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args,
     claimed = (
         db.query(models.VideoProject)
         .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
-        .update({"status": "generating", "claim_token": token}, synchronize_session=False)
+        .update({"status": "generating", "claim_token": token, "queue_job_id": ""}, synchronize_session=False)
     )
     db.commit()
     if not claimed:
@@ -116,6 +116,15 @@ def _record_queue_entry(db: Session, scene_id: int, job_id) -> None:  # noqa: AN
     db.query(models.VideoProject).filter(
         models.VideoProject.id == scene_id, models.VideoProject.status == "generating",
     ).update({"queue_job_id": str(job_id or "")[:80]}, synchronize_session=False)
+    db.commit()
+
+
+def _record_batch_queue_entry(db: Session, scene_ids: list[int], job_id) -> None:  # noqa: ANN001
+    """A batch's scenes wait as drafts for one job that generates them in
+    turn: each keeps that job's queue entry, so a scene the job is making
+    isn't read as stuck (or swept) while the job is still running."""
+    db.query(models.VideoProject).filter(models.VideoProject.id.in_(scene_ids)).update(
+        {"queue_job_id": str(job_id or "")[:80]}, synchronize_session=False)
     db.commit()
 
 
@@ -176,6 +185,7 @@ def batch_create(body: AmbientBatchRequest, db: Session = Depends(get_db)) -> di
         created.append(project.id)
         total += svc.estimate_ambient_cost(cfg)["total"]
     job_id = enqueue(ambient_batch_job, created, body.render)
+    _record_batch_queue_entry(db, created, job_id)
     db.expire_all()
     return {
         "scene_ids": created,
@@ -533,7 +543,7 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
     claimed = (
         db.query(models.VideoProject)
         .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
-        .update({"status": "generating", "claim_token": token}, synchronize_session=False)
+        .update({"status": "generating", "claim_token": token, "queue_job_id": ""}, synchronize_session=False)
     )
     db.commit()
     if not claimed:

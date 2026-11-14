@@ -18,6 +18,7 @@ import {
   PhotoRewriteControl,
   type ModelOption,
   OverlayControls,
+  ownPictureVideo,
   PlanSummary,
   seamBlendHint,
   SceneArt,
@@ -106,13 +107,22 @@ function Inner() {
   const [picture, setPicture] = useState<{ file?: File; picked?: PickedImage; url: string } | null>(null);
   const [picking, setPicking] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  // A picture you bring is the scene: the preset no longer applies, its name
+  // is a fair default title, and nothing is bought until you say so.
+  const choosePicture = (next: { file?: File; picked?: PickedImage; url: string }, name: string) => {
+    setPicture(next);
+    setCfg((c) => ({ ...c, scene_preset: "custom" }));
+    const base = name.replace(/\.[a-z0-9]{2,5}$/i, "").replace(/[_-]+/g, " ").trim().slice(0, 120);
+    if (base) setTitle((t) => (t.trim() ? t : base));
+    setAfter("save");
+  };
 
   // Studio → "Ambient scene" lands here with ?studio_job=<id>.
   useEffect(() => {
     const id = Number(new URLSearchParams(window.location.search).get("studio_job"));
     if (Number.isFinite(id) && id > 0) {
-      setPicture({ picked: { kind: "studio", id, url: api.studioPreview(id), label: "From Studio" },
-                   url: api.studioPreview(id) });
+      choosePicture({ picked: { kind: "studio", id, url: api.studioPreview(id), label: "From Studio" },
+                      url: api.studioPreview(id) }, "");
     }
   }, []);
   useEffect(() => () => {
@@ -216,6 +226,9 @@ function Inner() {
   };
 
   const effectivePrompt = cfg.scene_prompt || preset?.prompt || "";
+  const pictureOrigin = picture ? (picture.file ? "upload" : picture.picked!.kind) : "";
+  // Preset, look and Picture model don't reach a video made from your own picture.
+  const ownPicture = ownPictureVideo({ ...cfg, picture_origin: pictureOrigin });
   // With a picture, the picture is the scene: no description needed.
   const canSubmit =
     !submitting &&
@@ -346,7 +359,14 @@ function Inner() {
                 </button>
               )}
             </div>
-            {!presets ? (
+            {ownPicture ? (
+              <p className="text-xs text-ink-400">
+                Your picture is the scene, so no preset is needed.{" "}
+                <button type="button" className="text-iris-soft hover:underline" onClick={() => setPicture(null)}>
+                  Remove the picture to pick a preset instead
+                </button>
+              </p>
+            ) : !presets ? (
               <div className="grid grid-cols-2 sm:grid-cols-5 gap-3" aria-hidden>
                 {Array.from({ length: 10 }).map((_, i) => (
                   <div key={i} className="aspect-4/3 skeleton" />
@@ -464,7 +484,7 @@ function Inner() {
                 const f = e.target.files?.[0];
                 e.target.value = "";
                 // Most browsers cannot decode HEIC/HEIF, so skip the object URL and show a placeholder tile.
-                if (f) setPicture({ file: f, url: isHeicFile(f) ? "" : URL.createObjectURL(f) });
+                if (f) choosePicture({ file: f, url: isHeicFile(f) ? "" : URL.createObjectURL(f) }, f.name);
               }}
             />
             {picking && (
@@ -472,7 +492,7 @@ function Inner() {
                 onClose={() => setPicking(false)}
                 onPick={(p) => {
                   setPicking(false);
-                  setPicture({ picked: p, url: p.url });
+                  choosePicture({ picked: p, url: p.url }, p.label);
                 }}
               />
             )}
@@ -499,7 +519,7 @@ function Inner() {
           {/* 2. Look & light */}
           <section className="card p-5">
             <StepHeading n={2} title="Look & light" hint="Realistic or artsy, any time of day, and the models that make it." />
-            <LookControls cfg={cfg} set={set} presets={presets} idPrefix="new-look" />
+            <LookControls cfg={cfg} set={set} presets={presets} idPrefix="new-look" hideLook={ownPicture} />
             <div className="mt-5 pt-4 border-t border-ink-800">
               <ModelControls
                 cfg={{ ...cfg, picture_origin: picture ? (picture.file ? "upload" : picture.picked!.kind) : "" }}
@@ -508,6 +528,7 @@ function Inner() {
                 imageModels={imageModels}
                 videoModels={videoModels}
                 idPrefix="new-models"
+                hideStill={ownPicture}
               />
             </div>
           </section>
@@ -756,8 +777,9 @@ function Inner() {
           <div className="card overflow-hidden">
             <SceneArt
               palette={preset?.palette}
-              emoji={preset?.emoji}
-              image={previewSrc(preset)}
+              emoji={picture ? undefined : preset?.emoji}
+              image={picture?.url || previewSrc(preset)}
+              still={!!picture}
               className={clsx(aspect === "9:16" ? "aspect-9/16 max-h-72" : aspect === "1:1" ? "aspect-square" : "aspect-video")}
             >
               <div className="absolute bottom-2 right-2 rounded-md bg-ink-950/70 backdrop-blur-sm px-2 py-0.5 text-xs font-medium text-ink-100">
@@ -773,7 +795,9 @@ function Inner() {
                   id="amb-title"
                   className="input"
                   value={title}
-                  placeholder={preset ? `${preset.label} — ${fmtDuration(cfg.total_seconds)}` : "Untitled scene"}
+                  placeholder={
+                    preset && preset.id !== "custom" ? `${preset.label} — ${fmtDuration(cfg.total_seconds)}` : "Untitled scene"
+                  }
                   onChange={(e) => setTitle(e.target.value)}
                 />
               </div>

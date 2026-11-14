@@ -1,0 +1,183 @@
+"""Ambient Stage 1, quick UI fixes: settings that don't reach a clip made
+from the scene's own picture keep the loop, the loop clip has a version for
+cache-busting, a scene left "generating" with nothing making it is flagged
+stuck, and the scene carries the prices of its paid buttons."""
+from __future__ import annotations
+
+import time
+from datetime import datetime, timedelta
+
+from .conftest import make_png_bytes
+from .test_ambient import SHORT
+
+
+def _scene(client, **cfg) -> int:
+    r = client.post("/api/ambient", json={"aspect_ratio": "16:9", "config": {**SHORT, **cfg}, "generate": False})
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def _own_picture_loop(client, **cfg) -> dict:
+    """A video scene with an uploaded picture and its loop made."""
+    sid = _scene(client, **cfg)
+    r = client.post(f"/api/ambient/{sid}/picture",
+                    files={"file": ("pic.png", make_png_bytes((1920, 1080), (30, 160, 60)), "image/png")})
+    assert r.status_code == 200, r.text
+    client.post(f"/api/ambient/{sid}/generate-loop")
+    scene = client.get(f"/api/ambient/{sid}").json()
+    assert scene["loop_status"] == "completed", scene
+    return scene
+
+
+def _patch(client, scene: dict, **changes):
+    return client.patch(f"/api/ambient/{scene['id']}", json={"config": {**scene["config"], **changes}})
+
+
+def test_look_and_preset_keep_a_loop_made_from_your_picture(auth_client):
+    scene = _own_picture_loop(auth_client)
+    r = _patch(auth_client, scene, look="watercolor", look_strength=0.9, scene_preset="ocean")
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["loop_status"] == "completed" and out["config"]["look"] == "watercolor"
+
+    # Time of day and weather reach the prompt (light_phrase): a new clip.
+    r = _patch(auth_client, out, time_of_day="night")
+    assert r.status_code == 409, r.text
+    assert auth_client.get(f"/api/ambient/{scene['id']}").json()["loop_status"] == "completed"
+
+
+def test_look_still_counts_without_your_own_picture(auth_client):
+    sid = _scene(auth_client)
+    auth_client.post(f"/api/ambient/{sid}/generate-loop")
+    scene = auth_client.get(f"/api/ambient/{sid}").json()
+    assert scene["loop_status"] == "completed"
+    assert _patch(auth_client, scene, look="watercolor").status_code == 409
+    assert _patch(auth_client, scene, scene_preset="ocean").status_code == 409
+
+
+def test_clip_changed_rules():
+    from app.schemas.ambient import AmbientConfig
+    from app.services import ambient
+
+    own = AmbientConfig(**SHORT, picture_origin="upload")
+    assert not ambient._clip_changed(own, own.model_copy(update={"look": "anime", "look_strength": 0.1}))
+    assert not ambient._clip_changed(own, own.model_copy(update={"scene_preset": "ocean"}))
+    assert ambient._clip_changed(own, own.model_copy(update={"weather": "rain"}))
+    # Indoors, the time of day is "outside": switching to an indoor preset changes the prompt.
+    lit = own.model_copy(update={"time_of_day": "night"})
+    assert ambient._clip_changed(lit, lit.model_copy(update={"scene_preset": "fireplace"}))
+    # A generated picture, Day to night and Still + drift still use them.
+    gen = own.model_copy(update={"picture_origin": "generated"})
+    assert ambient._clip_changed(gen, gen.model_copy(update={"look": "anime"}))
+    dn = own.model_copy(update={"variety": "day_night"})
+    assert ambient._clip_changed(dn, dn.model_copy(update={"look": "anime"}))
+    drift = own.model_copy(update={"source": "image_drift"})
+    assert ambient._clip_changed(drift, drift.model_copy(update={"scene_preset": "ocean"}))
+
+
+def test_clip_version_changes_after_a_second_generate(auth_client):
+    sid = _scene(auth_client, music_mood="none")
+    assert auth_client.get(f"/api/ambient/{sid}").json()["clip_version"] == ""
+    auth_client.post(f"/api/ambient/{sid}/generate-loop")
+    v1 = auth_client.get(f"/api/ambient/{sid}").json()["clip_version"]
+    time.sleep(0.02)
+    auth_client.post(f"/api/ambient/{sid}/generate-loop")
+    v2 = auth_client.get(f"/api/ambient/{sid}").json()["clip_version"]
+    assert v1 and v2 and v1 != v2
+
+
+def _set(sid: int, **values) -> None:
+    from app import models
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    p = db.get(models.VideoProject, sid)
+    for k, v in values.items():
+        setattr(p, k, v)
+    db.commit()
+    # updated_at has onupdate: put it back where the test wants it.
+    if "updated_at" in values:
+        db.query(models.VideoProject).filter(models.VideoProject.id == sid).update(
+            {"updated_at": values["updated_at"]}, synchronize_session=False)
+        db.commit()
+    db.close()
+
+
+def test_stuck_flag(auth_client, monkeypatch):
+    from app import models
+    from app.db import SessionLocal
+    from app.workers import queue
+
+    state = {"v": "gone"}
+    monkeypatch.setattr(queue, "queue_entry_state", lambda job_id: state["v"])
+    sid = _scene(auth_client)
+    get = lambda: auth_client.get(f"/api/ambient/{sid}").json()["stuck"]  # noqa: E731
+    long_ago = datetime.utcnow() - timedelta(hours=1)
+
+    assert get() is False  # a draft is never stuck
+    _set(sid, status="generating", queue_job_id="rq-123", updated_at=long_ago)
+    assert get() is True
+    # In the list too.
+    row = next(s for s in auth_client.get("/api/ambient").json() if s["id"] == sid)
+    assert row["stuck"] is True
+
+    state["v"] = "alive"  # still waiting in a busy queue
+    assert get() is False
+    state["v"] = "unknown"  # Redis didn't answer: don't guess
+    assert get() is False
+    state["v"] = "gone"
+
+    _set(sid, updated_at=datetime.utcnow())  # just claimed: give it a moment
+    assert get() is False
+    _set(sid, updated_at=long_ago)
+
+    db = SessionLocal()
+    job = models.VideoJob(purpose="ambient_segment", ref_id=0, project_id=sid, provider="mock", model="mock",
+                          provider_job_id="x", status="submitted")
+    db.add(job)
+    db.commit()
+    assert get() is False  # a clip is still being made
+    job.status = "completed"
+    db.commit()
+    db.query(models.VideoJob).filter(models.VideoJob.id == job.id).update(
+        {"updated_at": long_ago}, synchronize_session=False)
+    db.commit()
+    assert get() is True
+
+    render = models.Render(project_id=sid, status="rendering")
+    db.add(render)
+    db.commit()
+    assert get() is False  # a live render
+    render.status = "failed"
+    db.commit()
+    db.close()
+    assert get() is True
+
+
+def test_generation_records_its_queue_entry(auth_client, monkeypatch):
+    from app import models
+    from app.api import ambient as api_ambient
+    from app.db import SessionLocal
+
+    monkeypatch.setattr(api_ambient, "enqueue", lambda *a, **k: "rq-job-42")
+    sid = _scene(auth_client)
+    r = auth_client.post(f"/api/ambient/{sid}/generate-loop")
+    assert r.status_code == 202, r.text
+    db = SessionLocal()
+    assert db.get(models.VideoProject, sid).queue_job_id == "rq-job-42"
+    db.close()
+
+
+def test_cost_fields(auth_client):
+    from app.config import get_settings
+
+    s = get_settings()
+    sid = _scene(auth_client, sound="rain")
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    for k in ("music_cost", "sound_cost", "picture_cost"):
+        assert k in out and out[k] >= 0
+    assert out["music_cost"] >= s.cost_music_per_generation
+    assert out["sound_cost"] == round(s.cost_sound_per_generation, 4)
+
+    quiet = auth_client.get(f"/api/ambient/{_scene(auth_client, music_mood='none')}").json()
+    assert quiet["music_cost"] == 0 and quiet["sound_cost"] == 0
