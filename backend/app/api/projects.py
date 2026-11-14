@@ -659,7 +659,10 @@ def take_from_studio(project_id: int, shot_id: int, body: TakeFromStudioIn,
                      db: Session = Depends(get_db)) -> TakeFromStudioOut:
     """Use a finished Studio clip as this shot's clip: copied into the
     project as a new take (trimmed to the shot when longer) and made
-    current. Free; Re-compose puts it in the video."""
+    current. Free; Re-compose puts it in the video. A clip with pictures of
+    an uploaded video (or a join with one) has the stretch used checked
+    first, about a frame a second (video_ops.check_clip_used_whole): 422
+    refused, 503 the check couldn't run."""
     from ..services import inspector
     from ..services.pipeline import STUDIO_DELETED, _active_job_for
 

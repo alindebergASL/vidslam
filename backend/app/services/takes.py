@@ -250,7 +250,7 @@ def import_studio_clip(db: Session, shot: models.VideoShot,
     import shutil
     import uuid
 
-    from . import fingerprints, storage
+    from . import fingerprints, storage, video_ops
     from .renderer import _probe_duration, _probe_size, trim_clip
 
     project = shot.project
@@ -261,6 +261,12 @@ def import_studio_clip(db: Session, shot: models.VideoShot,
         raise StudioImportError(422, "This clip can't be read, so it can't be used in a project.")
     aspect = nearest_aspect(*size)
     planned = float(shot.duration_seconds or 5.0)
+    # A clip with pictures of an uploaded video (or a join with one) has
+    # the whole stretch used checked first (video_ops.check_clip_used_whole).
+    try:
+        video_ops.check_clip_used_whole(db, job, min(length, planned))
+    except video_ops.OpError as e:
+        raise StudioImportError(e.status, e.message) from None
     dest = storage.render_subdir(project.id) / f"shot_{shot.shot_order:02d}_{shot.id}_studio{job.id}_{uuid.uuid4().hex[:8]}.mp4"
     warnings: list[str] = []
     if length > planned + 0.05:

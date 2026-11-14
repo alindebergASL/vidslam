@@ -314,6 +314,183 @@ def test_video_model_list_says_which_models_make_sound(auth_client):
     assert model_catalog.find("video", "sogni/wan3.0-video")["generate_audio"] is True
 
 
+# ---------- joined, continued and uploaded clips (#51, #52) ----------
+
+
+def _studio_clip(path, owner_id: int, *, options=None, operation: str = "") -> int:
+    """A finished Studio clip row pointing at a real file: generated
+    (operation ""), joined or uploaded."""
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        job = models.AssetGenerationJob(
+            owner_kind="avatar", owner_id=owner_id, output_kind="video_clip",
+            prompt="" if operation else "a clip", negative_prompt="", reference_asset_ids_json=[],
+            provider="local" if operation else "mock", provider_model="local/x" if operation else "mock/video",
+            operation=operation, options_json=options, status="completed", result_path=str(path),
+            result_duration_seconds=1.5, duration_seconds=1.5)
+        db.add(job)
+        db.commit()
+        return job.id
+
+
+def test_join_leaves_out_the_sound_of_a_clip_made_with_sound_off(tmp_path):
+    from app.services.renderer import join_clips_with_audio
+
+    from .test_join_clips import _mean_volume, _streams, _video
+
+    loud = _video(tmp_path / "loud.mp4", seconds=1.5, audio=True)
+    quiet = _video(tmp_path / "quiet.mp4", seconds=1.5)
+    out, seconds, has_audio = join_clips_with_audio([loud, loud, quiet, loud], tmp_path / "o.mp4",
+                                                    silent=[False, True, False, False])
+    assert has_audio is True and seconds == pytest.approx(6.0, abs=0.1)
+    streams = _streams(out)
+    assert streams["audio"] == pytest.approx(streams["video"], abs=0.1)
+    # Its tone, then silence (sound turned off), silence (no sound), the tone.
+    assert _mean_volume(out, 0.2, 1.1) > -40
+    assert _mean_volume(out, 1.7, 1.1) < -80
+    assert _mean_volume(out, 3.2, 1.1) < -80
+    assert _mean_volume(out, 4.7, 1.1) > -40
+    # Every clip's sound left out: no sound track at all.
+    out, _, has_audio = join_clips_with_audio([loud, loud], tmp_path / "n.mp4", silent=[True, True])
+    assert has_audio is False and "audio" not in _streams(out)
+
+
+def test_which_clips_play_silent_in_a_join():
+    from types import SimpleNamespace as NS
+
+    from app.services.video_ops import sound_off
+
+    assert sound_off(NS(operation="", options_json={"audio": False})) is True
+    assert sound_off(NS(operation="", options_json={"audio": True})) is False
+    assert sound_off(NS(operation="", options_json=None)) is False  # made before the choice: its sound
+    # Joined clips (already joined that way) and uploads keep their own sound.
+    assert sound_off(NS(operation="join_clips", options_json={"has_audio": True, "audio": False})) is False
+    assert sound_off(NS(operation="upload_video", options_json={"has_audio": True})) is False
+
+
+def test_joining_studio_clips_keeps_each_ones_sound(auth_client, tmp_path):
+    from pathlib import Path
+
+    from .test_join_clips import _mean_volume, _streams, _video
+
+    aid = _avatar(auth_client)
+    loud = _video(tmp_path / "loud.mp4", seconds=1.5, audio=True)
+    quiet = _video(tmp_path / "quiet.mp4", seconds=1.5)
+    on = _studio_clip(loud, aid, options={"audio": True})
+    off = _studio_clip(loud, aid, options={"audio": False})  # its model made sound anyway
+    none = _studio_clip(quiet, aid, options={"audio": True})  # its model made none
+    upload = _studio_clip(loud, aid, operation="upload_video", options={"upload": "a.mp4", "has_audio": True})
+    r = auth_client.post("/api/studio/join-clips", json={"job_ids": [on, off, none, upload]})
+    assert r.status_code == 202, r.text
+    job = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+    assert job["status"] == "completed", job
+    # A join asks no model for sound: no Sound choice on it.
+    assert job["options"]["has_audio"] is True and job["audio"] is None
+    out = Path(job["result_path"])
+    streams = _streams(out)
+    assert streams["audio"] == pytest.approx(streams["video"], abs=0.1)
+    assert _mean_volume(out, 0.2, 1.1) > -40  # sound on
+    assert _mean_volume(out, 1.7, 1.1) < -80  # sound off: silent
+    assert _mean_volume(out, 3.2, 1.1) < -80  # no sound: padded with silence
+    assert _mean_volume(out, 4.7, 1.1) > -40  # the upload's own sound
+    # Only clips with sound off: the joined clip has no sound track.
+    r = auth_client.post("/api/studio/join-clips", json={"job_ids": [off, off]})
+    job = auth_client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+    assert job["status"] == "completed" and job["options"]["has_audio"] is False
+    assert "audio" not in _streams(Path(job["result_path"]))
+
+
+def _continued(client, jid: int, **extra) -> dict:
+    r = client.post(f"/api/studio/jobs/{jid}/continue",
+                    json={"prompt": "she turns and walks away", "auto_join": False, **extra})
+    assert r.status_code == 202, r.text
+    return client.get(f"/api/studio/jobs/{r.json()['id']}").json()
+
+
+def test_a_continuation_asks_for_sound_like_the_clip_it_continues(auth_client, monkeypatch):
+    from app.providers import mock_video
+
+    calls = []
+    real = mock_video.MockVideoProvider.submit
+    monkeypatch.setattr(mock_video.MockVideoProvider, "submit", lambda self, **kw: calls.append(kw) or real(self, **kw))
+    aid = _avatar(auth_client)
+    body = {"owner_kind": "avatar", "owner_id": aid, "prompt": "a walk on the beach"}
+    silent = auth_client.post("/api/studio/generate-clip", json={**body, "audio": False}).json()["id"]
+    loud = auth_client.post("/api/studio/generate-clip", json=body).json()["id"]
+    assert auth_client.get(f"/api/studio/jobs/{silent}/continue").json()["audio"] is False
+    assert auth_client.get(f"/api/studio/jobs/{loud}/continue").json()["audio"] is True
+    calls.clear()
+    made = [_continued(auth_client, silent), _continued(auth_client, loud),
+            _continued(auth_client, silent, audio=True), _continued(auth_client, loud, audio=False)]
+    assert [j["audio"] for j in made] == [False, True, True, False]
+    assert [c["settings"]["generate_audio"] for c in calls] == [False, True, True, False]
+    first = made[0]
+    assert first["options"] == {"continues_job_id": silent, "auto_join": False, "audio": False}
+    # Retry and Try another model keep it a continuation, with its sound choice.
+    again = auth_client.post(f"/api/studio/jobs/{first['id']}/retry", json={}).json()
+    assert again["options"] == {"continues_job_id": silent, "auto_join": False, "audio": False}
+    louder = auth_client.post(f"/api/studio/jobs/{first['id']}/retry", json={"audio": True}).json()
+    assert louder["options"] == {"continues_job_id": silent, "auto_join": False, "audio": True}
+
+
+def test_continuing_joined_clips_or_an_upload_follows_their_sound(auth_client, tmp_path):
+    from .test_join_clips import _video
+
+    aid = _avatar(auth_client)
+    loud = _video(tmp_path / "loud.mp4", audio=True)
+    quiet = _video(tmp_path / "quiet.mp4")
+    on = _studio_clip(loud, aid, options={"audio": True})
+    off = _studio_clip(loud, aid, options={"audio": False})
+    up_loud = _studio_clip(loud, aid, operation="upload_video", options={"upload": "a.mp4", "has_audio": True})
+    up_quiet = _studio_clip(quiet, aid, operation="upload_video", options={"upload": "b.mp4", "has_audio": False})
+
+    def joined(*ids):
+        return _studio_clip(loud, aid, operation="join_clips",
+                            options={"job_ids": list(ids), "transition": "cut", "crossfade": 0.0, "has_audio": True})
+
+    def audio(jid):
+        r = auth_client.get(f"/api/studio/jobs/{jid}/continue")
+        assert r.status_code == 200, r.text
+        return r.json()["audio"]
+
+    # Joined clips: as their last clip (followed back through a join).
+    assert audio(joined(on, off)) is False and audio(joined(off, on)) is True
+    assert audio(joined(on, joined(on, off))) is False
+    # An uploaded video: its own sound; it has no Sound choice of its own.
+    assert audio(up_loud) is True and audio(up_quiet) is False
+    assert audio(joined(on, up_quiet)) is False
+    assert auth_client.get(f"/api/studio/jobs/{up_quiet}").json()["audio"] is None
+
+
+def test_a_continuation_is_priced_with_its_sound(auth_client):
+    """The continuation's video job carries its sound choice, so on a model
+    that prices sound apart (Runware Veo 3.1 Lite) it is priced with it."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import spend
+
+    aid = _avatar(auth_client)
+    body = {"owner_kind": "avatar", "owner_id": aid, "prompt": "a walk on the beach"}
+    silent = auth_client.post("/api/studio/generate-clip", json={**body, "audio": False}).json()["id"]
+    loud = auth_client.post("/api/studio/generate-clip", json=body).json()["id"]
+    a, b = _continued(auth_client, silent)["id"], _continued(auth_client, loud)["id"]
+    costs = []
+    with SessionLocal() as db:
+        ctx = {j.ref_id: dict(j.context_json or {}) for j in db.query(models.VideoJob).filter_by(purpose="studio")}
+        assert (ctx[a]["audio"], ctx[b]["audio"]) == (False, True)
+        for jid in (a, b):
+            vj = models.VideoJob(purpose="studio", ref_id=jid, provider="runware",
+                                 model="runware/google:veo@3.1-lite", context_json={**ctx[jid], "duration": 8},
+                                 status="completed")
+            db.add(vj)
+            db.commit()
+            spend.record_video_job(db, vj)
+            costs.append(round(db.query(models.SpendEntry).filter_by(ref=f"video_job:{vj.id}").one().cost_usd, 4))
+    assert costs == [0.4, 0.64]
+
+
 # ---------- everything else stays silent ----------
 
 

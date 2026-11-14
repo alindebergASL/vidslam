@@ -550,14 +550,35 @@ export type StudioJob = {
   /** Ids in reference_asset_ids whose picture was deleted since. */
   missing_reference_ids?: number[];
   /** "" = made from a prompt; else the picture operation that made it
-   *  ("extract_frame": a frame saved from a clip or an uploaded video). */
-  operation?: "" | ImageOp | "extract_frame";
+   *  ("extract_frame": a frame saved from a clip or an uploaded video;
+   *  "join_clips": finished clips played back to back, see options.job_ids;
+   *  "upload_video": a video uploaded from this device, kept as a clip). */
+  operation?: "" | ImageOp | "extract_frame" | "join_clips" | "upload_video";
   /** The Studio picture (or, for a saved frame, the clip) an operation ran on ("from #12"). */
   source_job_id?: number | null;
   /** The Cast/ingredient picture an operation ran on. */
   source_asset_id?: number | null;
-  /** Operation options: {} for removal, {factor: 2|4} for upscale. */
-  options?: { factor?: number } & Record<string, unknown>;
+  /** Operation options: {} for removal, {factor: 2|4} for upscale; for joined
+   *  clips the clip ids in order, the transition and whether it has sound. */
+  options?: {
+    factor?: number;
+    job_ids?: number[];
+    transition?: JoinTransition;
+    crossfade?: number;
+    has_audio?: boolean;
+    /** "Continue this clip": the clip this one carries on from, and whether
+     *  it is joined after it once finished. */
+    continues_job_id?: number;
+    auto_join?: boolean;
+    /** The join with the original once made, or why there is none
+     *  ("Not joined: the original was deleted"). */
+    join_job_id?: number;
+    join_note?: string;
+    /** On that join: the continuation it was made for. */
+    auto_join_for?: number;
+    /** An uploaded video: its file name. */
+    upload?: string;
+  } & Record<string, unknown>;
   /** A Sogni picture made from reference pictures runs on one of Sogni's
    *  editors: the one that really ran (name and id); null = the picked model ran. */
   ran_on_name?: string | null;
@@ -592,6 +613,39 @@ export type SogniEditor = {
 export type WithPictures = { identity: SogniEditor | null; guide: SogniEditor | null };
 
 export type ImageOp = "remove_background" | "upscale";
+
+/** How each joined clip leads into the next: a straight cut or a short dissolve. */
+export type JoinTransition = "cut" | "dissolve";
+
+/** Join clips: how many clips may be joined at once. */
+export const JOIN_MIN_CLIPS = 2;
+export const JOIN_MAX_CLIPS = 12;
+
+/** GET /api/studio/jobs/{id}/continue: what "Continue this clip" starts from. */
+export type ContinueInfo = {
+  /** The prompt to prefill (a joined clip's last clip's; "" for an uploaded video). */
+  prompt: string;
+  negative_prompt: string;
+  /** The aspect the new clip keeps ("" = the owner's default). */
+  aspect_ratio: string;
+  /** The model used when none is picked; "" = none can start from a picture. */
+  model: string;
+  duration_seconds: number;
+  /** Whether the new clip asks for sound unless the Sound switch says: as the
+   *  clip it continues (a joined clip's last clip; an uploaded video's own sound). */
+  audio: boolean;
+};
+
+export type ContinueBody = {
+  prompt: string;
+  negative_prompt?: string;
+  model?: string;
+  duration_seconds?: number;
+  /** Join the new clip after the original once it is finished (on by default). */
+  auto_join?: boolean;
+  /** Ask the model for its own sound; left out = as the clip it continues (ContinueInfo.audio). */
+  audio?: boolean;
+};
 
 /** Which frame of a video to save as a picture: "first", "last" or a time in seconds. */
 export type FrameAt = "first" | "last" | number;
@@ -1570,6 +1624,37 @@ export type Activity = {
  *  server's MAX_UPLOAD_BYTES default (backend/app/config.py, 50 MB). */
 export const FRAME_VIDEO_MAX_MB = 50;
 
+/** POST a video from this device with its owner (and any other fields) as a
+ *  form; answers the new Studio job. */
+async function postVideo(
+  path: string,
+  file: File,
+  owner: { kind: "avatar" | "ingredient"; id: number },
+  fields: Record<string, string>,
+  fallback: string,
+): Promise<StudioJob> {
+  const fd = new FormData();
+  fd.append("file", file);
+  fd.append("owner_kind", owner.kind);
+  fd.append("owner_id", String(owner.id));
+  for (const [k, v] of Object.entries(fields)) fd.append(k, v);
+  const r = await fetch(`${API_BASE}${path}`, { method: "POST", credentials: "include", body: fd });
+  if (!r.ok) {
+    const text = await r.text();
+    // A proxy in front of the API may refuse a large upload with its own
+    // HTML page: never show that, say what went wrong instead.
+    let detail = r.status === 413 ? `This video is larger than ${FRAME_VIDEO_MAX_MB} MB.` : fallback;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed?.detail) detail = typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail);
+    } catch {
+      /* not JSON: keep the plain message */
+    }
+    throw new ApiError(`${r.status}: ${detail}`, r.status, detail, r.headers);
+  }
+  return (await r.json()) as StudioJob;
+}
+
 export const api = {
   base: API_BASE,
 
@@ -2374,33 +2459,32 @@ export const api = {
   /** A new Studio picture: a frame of a finished Studio clip (free; usually finished at once). */
   frameToPicture: (jobId: number, at: FrameAt) =>
     req<StudioJob>(`/api/studio/jobs/${jobId}/frame-to-picture`, { method: "POST", body: JSON.stringify({ at }) }),
+  /** A new Studio clip: finished Studio clips played back to back in this order
+   *  (free; queued, so it is usually still being made when this answers). */
+  joinClips: (jobIds: number[], transition: JoinTransition, crossfade?: number) =>
+    req<StudioJob>("/api/studio/join-clips", {
+      method: "POST",
+      body: JSON.stringify({ job_ids: jobIds, transition, ...(crossfade !== undefined ? { crossfade } : {}) }),
+    }),
+  /** What "Continue this clip" would start from (nothing is made). */
+  continueInfo: (jobId: number) => req<ContinueInfo>(`/api/studio/jobs/${jobId}/continue`),
+  /** A new (paid) clip starting from this clip's last frame (saved as a picture too). */
+  continueClip: (jobId: number, body: ContinueBody) =>
+    req<StudioJob>(`/api/studio/jobs/${jobId}/continue`, { method: "POST", body: JSON.stringify(body) }),
+  /** A new finished Studio clip: a video from this device (the picture safety
+   *  check looks at frames across it first). */
+  uploadVideo: (file: File, owner: { kind: "avatar" | "ingredient"; id: number }) =>
+    postVideo("/api/studio/upload-video", file, owner, {}, "Couldn't upload the video. Please try again."),
   /** A new Studio picture: a frame of a video from this device (the video isn't kept;
    *  the picture safety check looks at the frame first). */
-  frameFromVideo: async (file: File, owner: { kind: "avatar" | "ingredient"; id: number }, at: FrameAt) => {
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("owner_kind", owner.kind);
-    fd.append("owner_id", String(owner.id));
-    fd.append("at", typeof at === "number" ? at.toFixed(2) : at);
-    const r = await fetch(`${API_BASE}/api/studio/frame-from-video`, { method: "POST", credentials: "include", body: fd });
-    if (!r.ok) {
-      const text = await r.text();
-      // A proxy in front of the API may refuse a large upload with its own
-      // HTML page: never show that, say what went wrong instead.
-      let detail =
-        r.status === 413
-          ? `This video is larger than ${FRAME_VIDEO_MAX_MB} MB.`
-          : "Couldn't save the frame. Please try again.";
-      try {
-        const parsed = JSON.parse(text);
-        if (parsed?.detail) detail = typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail);
-      } catch {
-        /* not JSON: keep the plain message */
-      }
-      throw new ApiError(`${r.status}: ${detail}`, r.status, detail, r.headers);
-    }
-    return (await r.json()) as StudioJob;
-  },
+  frameFromVideo: (file: File, owner: { kind: "avatar" | "ingredient"; id: number }, at: FrameAt) =>
+    postVideo(
+      "/api/studio/frame-from-video",
+      file,
+      owner,
+      { at: typeof at === "number" ? at.toFixed(2) : at },
+      "Couldn't save the frame. Please try again.",
+    ),
   /** What an operation would cost and make (nothing is queued or billed). */
   imageOpEstimate: (op: ImageOp, opts: { model?: string; factor?: number; source?: ImageOpSource } = {}) => {
     const q = new URLSearchParams({ op });

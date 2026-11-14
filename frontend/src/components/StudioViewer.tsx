@@ -9,6 +9,11 @@ import { useToast } from "@/components/Toaster";
 import { sourceChipText } from "@/components/ImageOps";
 import { clockText } from "@/components/FrameFromVideo";
 
+/** Operations made here without a model and without one original picture
+ *  (a saved frame, joined clips, an uploaded video): no Compare, no "Try
+ *  another model". */
+const NO_ORIGINAL: string[] = ["extract_frame", "join_clips", "upload_video"];
+
 /** One thing the viewer can show: a Studio result or a cast picture. */
 export type ViewerItem = {
   key: string;
@@ -54,6 +59,10 @@ export type ViewerActions = {
   onOpenSource?: (job: StudioJob) => void;
   /** Finished clips: save a frame ("first", "last" or the playhead's time) as a new picture. */
   onSaveFrame?: (job: StudioJob, at: FrameAt) => void;
+  /** Finished clips: open "Continue this clip". */
+  onContinue?: (job: StudioJob) => void;
+  /** "about $0.30" for continuing a clip with its own model; "" = unknown. */
+  continuePrice?: (job: StudioJob) => string;
 };
 
 /** Transparent pictures (cutouts) get a checkerboard behind them. */
@@ -243,10 +252,12 @@ export function StudioViewer({
   const act = "chip text-xs py-1.5";
   const checker = mayBeTransparent(item);
   const fromText = job ? sourceChipText(job) : null;
-  // A saved frame's source is a clip (or a video that wasn't kept): there is
-  // no picture to compare it with.
+  // A saved frame's source is a clip (or a video that wasn't kept), and
+  // joined clips have several: there is no one picture to compare with.
   const sourceOf =
-    job?.operation && job.operation !== "extract_frame" && finished && actions.sourceUrl ? actions.sourceUrl(job) : null;
+    job?.operation && !NO_ORIGINAL.includes(job.operation) && finished && actions.sourceUrl
+      ? actions.sourceUrl(job)
+      : null;
   const originalUrl = sourceOf && sourceOf !== brokenOriginal ? sourceOf : null;
   const showCompare = compare && Boolean(originalUrl) && Boolean(item.imageUrl);
   const isPicture = !isVideo && Boolean(item.imageUrl) && (item.kind === "asset" || finished);
@@ -270,9 +281,21 @@ export function StudioViewer({
     } else {
       details.push("Image");
     }
-    if (job.provider_model) details.push(job.provider_model);
-    // Sound was turned off for this clip.
-    if (isVideo && job.audio === false) details.push("no sound");
+    if (job.operation === "join_clips") {
+      const n = job.options?.job_ids?.length ?? 0;
+      details.push(
+        `Joined ${n ? `${n} clips` : "clips"} (${job.options?.transition === "dissolve" ? "dissolve" : "cut"}` +
+          `${job.options?.has_audio === false ? ", no sound" : ""}) · free`
+      );
+    } else if (job.operation === "upload_video") {
+      // An uploaded video keeps its own sound (the Sound switch isn't for it).
+      details.push(
+        `Uploaded video${job.options?.upload ? ` (${job.options.upload})` : ""}` +
+          `${job.options?.has_audio === false ? " · no sound" : ""} · free`
+      );
+    } else if (job.provider_model) details.push(job.provider_model);
+    // Sound was turned off for this generated clip.
+    if (isVideo && !job.operation && job.audio === false) details.push("no sound");
     // Reference pictures sent a Sogni model to one of Sogni's editors.
     const ranOn = ranOnText(job);
     if (ranOn) details.push(ranOn);
@@ -285,6 +308,7 @@ export function StudioViewer({
       details.push(isVideo ? "Model default" : job.owner_kind === "avatar" ? "9:16 (default)" : "16:9 (default)");
     }
     if (cost) details.push(cost);
+    if (job.options?.join_note) details.push(job.options.join_note);
     if (job.status === "saved") details.push("saved to the cast");
     else if (!finished) details.push(studioStatusLabel(job));
     const made = when(job.created_at);
@@ -444,12 +468,12 @@ export function StudioViewer({
             </span>
           ))}
           {job && fromText && (
-            actions.onOpenSource && (job.source_job_id || job.source_asset_id) ? (
+            actions.onOpenSource && (job.source_job_id || job.source_asset_id || job.options?.continues_job_id) ? (
               <button
                 type="button"
                 onClick={() => actions.onOpenSource!(job)}
                 className="underline underline-offset-2 hover:text-ink-100"
-                title="Show the picture this was made from"
+                title={job.options?.continues_job_id ? "Show the clip this one continues" : "Show the picture this was made from"}
               >
                 {fromText}
               </button>
@@ -563,7 +587,7 @@ export function StudioViewer({
               </button>
             </>
           )}
-          {job && finished && job.operation !== "extract_frame" && (
+          {job && finished && !NO_ORIGINAL.includes(job.operation || "") && (
             <button onClick={closeThen(() => actions.onTryModel(job))} className={act}>
               Try another model…
             </button>
@@ -572,6 +596,15 @@ export function StudioViewer({
             <a href={`/ambient/new?studio_job=${job.id}`} className={act}>
               Ambient scene →
             </a>
+          )}
+          {job && finished && isVideo && actions.onContinue && (
+            <button
+              onClick={closeThen(() => actions.onContinue!(job))}
+              className={act}
+              title="Make a new clip that starts from this clip's last frame; the price shows before it runs"
+            >
+              Continue this clip… · {actions.continuePrice?.(job) || "paid"}
+            </button>
           )}
           {job && finished && isVideo && (
             <button
