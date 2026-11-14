@@ -140,14 +140,26 @@ def adult_text_family_names() -> frozenset[str]:
     return frozenset(n for n in names if len(n) >= 3)
 
 
+# Known derivatives of a family whose ids don't carry its name (post-trained
+# DeepSeek-R1 models). The name match below can't see them; any other such
+# model has to be added here.
+FAMILY_DERIVATIVES: dict[str, frozenset[str]] = {
+    "deepseek": frozenset({"perplexity/r1-1776", "microsoft/mai-ds-r1"}),
+}
+
+
 def in_adult_text_family(model_id: Optional[str]) -> bool:
     """Another model of the adult text models' family (any version, size,
     vendor or fine-tune): the family's name anywhere in the id, without
-    case or a ":variant" suffix. On a clean deployment none of them may
-    write text: it is the same family that wrote adult prompts where other
-    planners refused."""
+    case or a ":variant" suffix, or one of its known derivatives under
+    another name (FAMILY_DERIVATIVES). On a clean deployment none of them
+    may write text: it is the same family that wrote adult prompts where
+    other planners refused."""
     base = _base_id(str(model_id or "")).lstrip("~")
-    return bool(base) and any(name in base for name in adult_text_family_names())
+    if not base:
+        return False
+    names = adult_text_family_names()
+    return any(name in base or base in FAMILY_DERIVATIVES.get(name, ()) for name in names)
 
 
 def adult_text_ids() -> frozenset[str]:

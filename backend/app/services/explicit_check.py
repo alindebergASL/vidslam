@@ -13,8 +13,8 @@ It fails closed: when the check can't run (no key, the planner switched
 off, an error or an unreadable reply), or the model won't judge the text,
 the text is refused too. In mock mode a word list answers (mock_chat).
 
-Every prompt sent to a picture or video model gets the same question
-(check_prompt, below).
+Every prompt sent to a picture, video, music or sound model gets the same
+question (check_prompt, below).
 
 With ADULT_FEATURES unset (true) nothing here runs: check() returns at once,
 and the callers of check_prompt don't call it.
@@ -30,7 +30,7 @@ from .safety import UnsafePromptError, UnsafeScriptError
 log = logging.getLogger("avs.explicit_check")
 
 # Bump to invalidate every cached verdict when the question changes.
-POLICY_VERSION = "explicit-1"
+POLICY_VERSION = "explicit-2"
 # What the model reads at a time (openrouter_chat.classify_explicit cuts at
 # minor_check.JUDGE_WINDOW); longer text is read in overlapping parts.
 PART = 5600
@@ -159,6 +159,10 @@ def plan_texts(plan: dict) -> list[str]:
 # deployment: at the provider (providers/registry.py's guarded providers)
 # and in the early API checks, so a refusal is a 422 before anything is
 # paid for. Same question, cache and failing closed as the script check.
+# The avoid list is judged too, read as one (check_avoid); a lip-sync's
+# motion is judged on its own (registry.GuardedAvatarProvider); a music or
+# sound prompt goes through pipeline.check_audio_prompt; an ambient loop
+# checks all its prompts before its first paid call (ambient.precheck).
 
 PROMPT_REFUSED = ("This prompt was refused: this app is for a general audience, and the content check found it "
                   "sexually explicit. Reword it without sexual content.")
@@ -183,6 +187,20 @@ def check_prompt(prompt: str | None) -> None:
         check(prompt)
     except ExplicitContentError as e:
         raise ExplicitPromptError(_PROMPT_MESSAGES.get(str(e), str(e))) from None
+
+
+AVOID_PREFIX = "Avoid: "
+
+
+def check_avoid(negative: str | None) -> None:
+    """On a clean deployment, the avoid list (negative prompt) of a picture
+    or video prompt gets the same question, read as an avoid list: some
+    adapters send it inside the prompt text ("<prompt>\nAvoid: <list>",
+    OpenRouter), so text there that asks for explicit content would reach
+    the model. Judged on its own, so the default lists are asked once."""
+    negative = (negative or "").strip()
+    if negative and active():
+        check_prompt(AVOID_PREFIX + negative)
 
 
 def check_prompts_or_422(*prompts: str | None) -> None:

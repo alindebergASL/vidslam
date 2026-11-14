@@ -402,10 +402,11 @@ def test_clean_refuses_own_voiceover_and_music(auth_client, monkeypatch, spied):
     assert r.status_code == 422 and r.json()["detail"] == content_mode.VOICEOVER_UPLOAD_OFF
     p = auth_client.get(f"/api/projects/{pid}").json()
     assert p["voiceover_upload_path"] == "" and p["music_upload_path"] == "" and p["voiceover_source"] == "tts"
-    # Generated music is still made.
+    assert spied == []  # nothing to transcribe or ask: refused outright
+    # Generated music is still made (its prompt checked).
     r = auth_client.post(f"/api/projects/{pid}/music/generate", json={"prompt": "soft piano", "duration_seconds": 5})
     assert r.status_code == 200 and r.json()["music_upload_path"]
-    assert spied == []  # nothing to transcribe or ask: refused outright
+    assert "check_prompt" in spied
 
 
 def test_clean_refuses_a_voiceover_uploaded_before_the_switch(auth_client, monkeypatch):

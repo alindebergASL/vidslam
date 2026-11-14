@@ -30,6 +30,7 @@ from ..schemas.ambient import (
 )
 from ..services import ambient as svc
 from ..services import provider_gate, storage
+from ..services.explicit_check import ExplicitContentError
 from ..services.ratelimit import rate_limit
 from ..services.spend import budget_guard
 from ..workers.jobs import (
@@ -191,17 +192,31 @@ def _check_scene(config) -> None:
         check_or_422(text, kind="image")
 
 
-def _check_scene_prompts(project: models.VideoProject) -> None:
+def _check_scene_prompts(project: models.VideoProject, *, loop: bool = False,
+                         clip_prompts: Optional[list[str]] = None) -> None:
     """A clean deployment: the scene's text and the picture prompt made
     from it (with its look and light) get the explicit-content check now
-    (a 422), before any picture or clip is paid for. Cached, so the checks
-    at the provider are hits."""
+    (a 422), before any picture or clip is paid for. For a loop (`loop`),
+    every prompt making it can send too (svc.precheck: each variation's
+    clip and still prompts, the music and sound prompts), so the worker's
+    own precheck and the provider checks are cache hits."""
     from ..services import explicit_check
+    from ..services.safety import UnsafeScriptError
 
     if not explicit_check.active():
         return
     cfg = svc._config_of(project)
     explicit_check.check_prompts_or_422(cfg.scene_prompt, svc.picture_prompt(cfg))
+    if not loop:
+        return
+    try:
+        plan = svc.plan_loop(cfg)
+    except ValueError:
+        return  # the worker says what is wrong with the scene
+    try:
+        svc.precheck(project, cfg, plan, clip_prompts)
+    except UnsafeScriptError as e:
+        raise HTTPException(422, str(e)) from None
 
 
 @router.post("", response_model=AmbientOut, status_code=201,
@@ -269,7 +284,7 @@ def generate_loop(
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is already generating")
-    _check_scene_prompts(project)
+    _check_scene_prompts(project, loop=True)
     job_id = _enqueue_generation(db, project, regenerate_music)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
 
@@ -287,7 +302,8 @@ def resume_loop(scene_id: int, db: Session = Depends(get_db)) -> dict:
     if info is None:
         raise HTTPException(409, "this scene has no failed loop to resume; generate the loop instead")
     chain = (project.ambient_config_json or {}).get(svc._CHAIN_KEY) or {}
-    _check_scene_prompts(project)
+    _check_scene_prompts(project, loop=True,
+                         clip_prompts=[s.prompt or "" for s in svc.clip_shots(project)])
     job_id = _enqueue_generation(db, project, job=svc.resume_loop_job,
                                  makes_music=bool(chain.get("regenerate_music", True)))
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued", "clip": info.clip, "take": info.take}
@@ -302,7 +318,10 @@ def regenerate_music(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut
     prompt = svc.resolve_music_prompt(cfg)
     if not prompt:
         raise HTTPException(409, "music mood is 'none'")
-    svc.generate_music_bed(db, project, cfg, prompt)
+    try:
+        svc.generate_music_bed(db, project, cfg, prompt)
+    except ExplicitContentError as e:  # a clean deployment: before the provider is paid
+        raise HTTPException(422, str(e)) from None
     db.refresh(project)
     return svc.to_out(db, project)
 
@@ -314,7 +333,10 @@ def regenerate_sound(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut
     cfg = svc._config_of(project)
     if not svc.resolve_sound_prompt(cfg):
         raise HTTPException(409, "nature sound is off for this scene")
-    svc.generate_sound_bed(db, project, cfg)
+    try:
+        svc.generate_sound_bed(db, project, cfg)
+    except ExplicitContentError as e:  # a clean deployment: before the provider is paid
+        raise HTTPException(422, str(e)) from None
     db.refresh(project)
     return svc.to_out(db, project)
 
@@ -373,8 +395,6 @@ def generate_picture(scene_id: int, discard_loop: bool = False, db: Session = De
     _picture_busy(project)
     provider_gate.require_still(svc._config_of(project))  # the scene's chosen model, not a silent swap
     _check_scene_prompts(project)
-    from ..services.explicit_check import ExplicitContentError
-
     try:
         svc.generate_picture(db, project, discard_loop=discard_loop)
     except svc.LoopDiscard as e:

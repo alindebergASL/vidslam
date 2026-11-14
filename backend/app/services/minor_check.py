@@ -447,7 +447,10 @@ def _fails_closed(prompt: str, negative: str, kind: str) -> bool:
 
 # Kinds whose prompt goes to a picture or video model: on a clean deployment
 # they also get the explicit-content check (services/explicit_check.py).
-VISUAL_KINDS = ("image", "video", "lipsync")
+# A lip-sync's text is motion + script, each already judged on its own
+# (the motion with check_prompt, the script with check), so judging the two
+# joined would only ask again.
+VISUAL_KINDS = ("image", "video")
 
 
 def check_generation(prompt: str, negative: str = "", *, kind: str) -> None:
@@ -455,17 +458,20 @@ def check_generation(prompt: str, negative: str = "", *, kind: str) -> None:
     minor in a sexual context, or when it's sexual and the check can't run.
     `kind`: "image" | "video" | "lipsync" | "script".
 
-    On a clean deployment (ADULT_FEATURES=false) a picture, clip or
-    lip-sync prompt is also refused when it is sexually explicit
-    (explicit_check.check_prompt; the avoid list isn't judged: it names
-    what to keep out). Every provider call and every early API check of
-    such a prompt comes through here, so this is the one place it runs."""
+    On a clean deployment (ADULT_FEATURES=false) a picture or clip prompt
+    is also refused when it is sexually explicit (explicit_check.check_prompt),
+    and so is its avoid list when it asks for explicit content
+    (explicit_check.check_avoid: OpenRouter sends it inside the prompt
+    text). Every provider call and every early API check of such a prompt
+    comes through here, so this is the one place it runs. A lip-sync's
+    motion and script are judged separately (GuardedAvatarProvider)."""
     _check_minors(prompt, negative, kind=kind)
     if kind in VISUAL_KINDS:
         from . import explicit_check
 
         if explicit_check.active():
             explicit_check.check_prompt(prompt or "")
+            explicit_check.check_avoid(negative)
 
 
 def _check_minors(prompt: str, negative: str = "", *, kind: str) -> None:
