@@ -542,7 +542,13 @@ class StudioJobOut(BaseModel):
     # e.g. {"factor": 2} or {"at": "last", "seconds": 4.95}. A clip can be
     # "join_clips": finished Studio clips played back to back (no single
     # source; options {"job_ids": [...], "transition", "crossfade",
-    # "has_audio"}).
+    # "has_audio"}), or "upload_video": a video uploaded from the owner's
+    # device (provider "local", no model; options {"upload": its name,
+    # "has_audio", "reencoded"}). A clip made by "Continue this clip" is a
+    # generation (operation "") whose options hold {"continues_job_id",
+    # "auto_join"} and, once it finished, "join_job_id" (the join with the
+    # original) or "join_note" (why there is none); that join's options
+    # hold "auto_join_for" (the continuation's id).
     operation: str = ""
     source_job_id: Optional[int] = None
     source_asset_id: Optional[int] = None
@@ -668,6 +674,32 @@ class StudioJoinRequest(BaseModel):
     job_ids: list[int] = Field(..., max_length=100)
     transition: Literal["cut", "dissolve"] = "cut"
     crossfade: Optional[float] = Field(None, ge=0, le=1.5)
+
+
+class StudioContinueRequest(BaseModel):
+    """Body for POST /api/studio/jobs/{id}/continue: a new clip that starts
+    from this finished clip's last frame. The prompt says what happens
+    next; the aspect is the clip's own. `model`: one that can start from a
+    picture (null = the clip's own model when it can, else the default
+    video model). `auto_join`: once the new clip is finished, join the two
+    into one more clip (a cut)."""
+    prompt: str = Field(..., min_length=1)
+    negative_prompt: str = ""
+    model: Optional[str] = None
+    duration_seconds: float = Field(5.0, ge=1.0, le=60.0)
+    auto_join: bool = True
+
+
+class StudioContinueInfo(BaseModel):
+    """GET /api/studio/jobs/{id}/continue: what "Continue this clip" starts
+    from: the prompt to prefill (a joined clip's last clip's; "" for an
+    uploaded video), the aspect it keeps, and the model it would use when
+    none is picked ("" = none can start from a picture)."""
+    prompt: str = ""
+    negative_prompt: str = ""
+    aspect_ratio: str = ""
+    model: str = ""
+    duration_seconds: float = 5.0
 
 
 class ImageOpEstimateOut(BaseModel):

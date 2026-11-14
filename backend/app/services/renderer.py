@@ -119,8 +119,17 @@ def _probe_size(path: Path) -> Optional[tuple[int, int]]:
         return None
     try:
         st = json.loads(log)["streams"][0]
-        w, h = int(st["width"]), int(st["height"])
     except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return stream_size(st)
+
+
+def stream_size(st: dict) -> Optional[tuple[int, int]]:
+    """(width, height) of one ffprobe video stream entry (width, height and
+    its rotation side data or tag), rotation applied, or None."""
+    try:
+        w, h = int(st["width"]), int(st["height"])
+    except (KeyError, TypeError, ValueError):
         return None
     rotation = 0.0
     try:
@@ -373,12 +382,14 @@ def _mux_audio_captions_overlays(
 LAST_FRAME_MARGIN = 0.05
 
 
-def _probe_video_duration(path: Path) -> float:
+def _probe_video_duration(path: Path, timeout: Optional[float] = None) -> float:
     """Length of the first video stream; the file's length when the stream
     doesn't say. Audio can outlast the picture, so the file's length alone
-    can point past the final frame."""
+    can point past the final frame. TimeoutError past `timeout`."""
     rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
-                    "-show_entries", "stream=duration:stream_tags=DURATION", str(path)])
+                    "-show_entries", "stream=duration:stream_tags=DURATION", str(path)], timeout=timeout)
+    if rc == -1:
+        raise TimeoutError(log)
     if rc == 0:
         try:
             stream = (json.loads(log).get("streams") or [{}])[0]
@@ -403,12 +414,13 @@ def _probe_video_duration(path: Path) -> float:
     return _probe_duration(path)
 
 
-def extract_frame_at(src: Path, dst: Path, t: float) -> float:
+def extract_frame_at(src: Path, dst: Path, t: float, *, timeout: Optional[float] = None) -> float:
     """Write the frame `t` seconds into the video `src` to `dst` (a PNG, at
     the video's own size, rotation applied). `t` is kept within
     [0, video length - LAST_FRAME_MARGIN]. Returns the time used. Raises
-    RuntimeError when the file isn't a video ffmpeg can read."""
-    duration = _probe_video_duration(src)
+    RuntimeError when the file isn't a video ffmpeg can read; with
+    `timeout`, TimeoutError when any one ffmpeg/ffprobe run takes longer."""
+    duration = _probe_video_duration(src, timeout=timeout)
     if duration <= 0:
         raise RuntimeError("couldn't read that video")
     t = min(max(float(t), 0.0), max(duration - LAST_FRAME_MARGIN, 0.0))
@@ -418,22 +430,30 @@ def extract_frame_at(src: Path, dst: Path, t: float) -> float:
     for at in [t] + [x for x in (t - 0.25,) if x >= 0.0]:
         dst.unlink(missing_ok=True)
         rc, log = _run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.3f}", "-i", str(src),
-                        "-frames:v", "1", "-an", str(dst)])
+                        "-frames:v", "1", "-an", str(dst)], timeout=timeout)
+        if rc == -1:
+            raise TimeoutError(log)
         if rc == 0 and dst.exists() and dst.stat().st_size > 0:
             return round(at, 3)
     dst.unlink(missing_ok=True)
     rc, log = _run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-t", f"{t + LAST_FRAME_MARGIN:.3f}",
-                    "-an", "-update", "1", str(dst)])
+                    "-an", "-update", "1", str(dst)], timeout=timeout)
+    if rc == -1:
+        raise TimeoutError(log)
     if rc == 0 and dst.exists() and dst.stat().st_size > 0:
-        last = _probe_last_frame_time(src, t + LAST_FRAME_MARGIN)
+        last = _probe_last_frame_time(src, t + LAST_FRAME_MARGIN, timeout=timeout)
         return round(last if last is not None else t, 3)
     raise RuntimeError(f"ffmpeg frame grab failed: {log[-2000:]}")
 
 
-def _probe_last_frame_time(src: Path, until: float) -> Optional[float]:
-    """Time of the last video frame at or before `until`, or None."""
+def _probe_last_frame_time(src: Path, until: float, timeout: Optional[float] = None) -> Optional[float]:
+    """Time of the last video frame at or before `until`, or None.
+    TimeoutError past `timeout`."""
     rc, log = _run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-read_intervals", f"%{until:.3f}",
-                    "-show_entries", "frame=pts_time,best_effort_timestamp_time", "-of", "csv=p=0", str(src)])
+                    "-show_entries", "frame=pts_time,best_effort_timestamp_time", "-of", "csv=p=0", str(src)],
+                   timeout=timeout)
+    if rc == -1:
+        raise TimeoutError(log)
     if rc != 0:
         return None
     best = None

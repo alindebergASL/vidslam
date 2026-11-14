@@ -6,6 +6,14 @@ import clsx from "clsx";
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+/** The box's focusable elements that can take focus now: one inside a closed
+ *  <details> (or otherwise not rendered) can't, and would leave focus behind. */
+function focusables(box: HTMLElement): HTMLElement[] {
+  return Array.from(box.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((el) =>
+    typeof el.checkVisibility === "function" ? el.checkVisibility() : el.getClientRects().length > 0
+  );
+}
+
 /**
  * A modal dialog: backdrop click and Escape close it, Tab stays inside, and
  * focus goes back to whatever opened it. Same look as AssignDialog. Rendered
@@ -31,7 +39,7 @@ export function Dialog({
     const opener = document.activeElement as HTMLElement | null;
     const box = boxRef.current;
     // Focus the first field (or button) after the close button.
-    const items = box ? Array.from(box.querySelectorAll<HTMLElement>(FOCUSABLE)) : [];
+    const items = box ? focusables(box) : [];
     (items[1] || items[0])?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
@@ -40,7 +48,7 @@ export function Dialog({
         return;
       }
       if (e.key !== "Tab" || !box) return;
-      const list = Array.from(box.querySelectorAll<HTMLElement>(FOCUSABLE));
+      const list = focusables(box);
       if (list.length === 0) return;
       const first = list[0];
       const last = list[list.length - 1];
