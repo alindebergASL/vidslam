@@ -246,7 +246,8 @@ def test_patched_checkers_see_every_frame_and_any_refusal_refuses(auth_client, t
     r = _upload(auth_client, _video(tmp_path / "a.mp4", seconds=35.0, size=(32, 32)), aid)
     assert r.status_code == 422, r.text
     assert seen["frames"] == [f"frame{i}.png" for i in range(5)]  # 35 s: 5 frames
-    assert explicit == seen["frames"][:4]
+    # Asked about several at a time: at least the four up to the refusal.
+    assert len(explicit) >= 4 and set(explicit) <= set(seen["frames"])
     assert _uploads() == 0 and _left(temp_root) == []
 
     # A check answering for only some frames is never a yes.

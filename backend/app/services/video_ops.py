@@ -70,6 +70,7 @@ Which checks apply:
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import math
 import os
@@ -78,6 +79,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -369,6 +371,10 @@ def save_upload(file: BinaryIO, dst: Path, limit: int) -> None:
         raise OpError(422, "That file is empty")
 
 
+# Frames of an upload asked about at once by the explicit check.
+EXPLICIT_AT_ONCE = 4
+
+
 def check_uploaded_frame(path: Path, data: bytes, label: str) -> None:
     """The checks a frame from an uploaded video must pass before it is
     stored (see the module notes). OpError (422 refused, 503 the check
@@ -403,10 +409,36 @@ def check_uploaded_frames(frames: list[tuple[Path, bytes]], label: str, *, video
     if any(i not in seen["checked"] for i in range(len(frames))):
         # Not judged (e.g. a frame couldn't be read): never a yes.
         raise OpError(503, unavailable)
-    for (path, _data), digest in zip(frames, digests, strict=True):
+    # The explicit check (a clean deployment's), EXPLICIT_AT_ONCE frames at
+    # a time as the minors check does: one after another, a clean upload's
+    # many frames could outlast the proxy. Once one fails, frames not yet
+    # started aren't asked about; the first failure in frame order answers.
+    failed = threading.Event()
+
+    def one(item: tuple[Path, str]) -> Optional[Exception]:
+        if failed.is_set():
+            return None
         try:
-            explicit_check.check_picture(str(path), digest)
+            explicit_check.check_picture(str(item[0]), item[1])
         except explicit_check.ExplicitContentError as e:
+            failed.set()
+            return e
+        return None
+
+    items = [(path, digest) for (path, _data), digest in zip(frames, digests, strict=True)]
+    if len(items) == 1:
+        errors = [one(items[0])]
+    else:
+        import contextvars
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Each check runs in a copy of this context (its spend attribution,
+        # a provider kept on for work already under way), as it would here.
+        ctx = contextvars.copy_context()
+        with ThreadPoolExecutor(max_workers=EXPLICIT_AT_ONCE) as pool:
+            errors = list(pool.map(lambda item: ctx.copy().run(one, item), items))
+    for e in errors:
+        if e is not None:
             status = 503 if str(e) == explicit_check.PICTURE_UNAVAILABLE else 422
             raise OpError(status, str(e)) from None
 
@@ -422,7 +454,9 @@ def frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
     video" (429 while too many are being prepared). For "first" or a time
     t only the start of the video, up to t and a second, is prepared (and
     only a time past UPLOAD_MAX_SECONDS is refused for length); "last"
-    prepares the whole of it, capped, as Upload a video does."""
+    prepares the whole of it, capped, as Upload a video does. Not kept
+    when it can't be answered in time (UPLOAD_ANSWER_BY: 504)."""
+    started = time.monotonic()
     if not ffmpeg_here():
         raise OpError(503, NO_FFMPEG)
     if not _upload_slots.acquire(blocking=False):
@@ -431,13 +465,13 @@ def frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
         # No database connection is held while ffmpeg and the checks run.
         db.commit()
         return _frame_from_upload(db, owner_kind=owner_kind, owner_id=owner_id, file=file, filename=filename,
-                                  at=at, limit=limit)
+                                  at=at, limit=limit, started=started)
     finally:
         _upload_slots.release()
 
 
 def _frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
-                       at: At, limit: int) -> models.AssetGenerationJob:
+                       at: At, limit: int, started: float) -> models.AssetGenerationJob:
     name = Path(filename or "video").name[:60] or "video"
     with tempfile.TemporaryDirectory(prefix="upload-") as tmp:
         raw = Path(tmp) / "upload"
@@ -458,7 +492,9 @@ def _frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
         label = label_for(name, used)
         frame = Path(tmp) / "frame.png"
         frame.write_bytes(data)
+        _answer_in_time(started)
         check_uploaded_frame(frame, data, label)
+        _answer_in_time(started)
     if not _owner_exists(db, owner_kind, owner_id):
         raise OpError(404, "owner not found")  # deleted while the video was prepared
     job = models.AssetGenerationJob(
@@ -701,11 +737,16 @@ def run_join(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerat
 #
 # Checks: it comes from outside the app, so before anything of it is stored
 # several frames across it (the first, the last and about one every 10 s
-# between, at most UPLOAD_MAX_FRAMES) go through the picture minors check
+# between, at most UPLOAD_MAX_FRAMES; on a clean deployment about one every
+# 5 s, at most UPLOAD_CLEAN_MAX_FRAMES) go through the picture minors check
 # (minor_check.check_pictures) and, on a clean deployment, the explicit
 # picture check (explicit_check.check_picture), as a frame of an uploaded
 # video does. Any frame failing, or a check that can't answer, refuses the
-# upload. It belongs to no Cast card and can't be saved onto one (only
+# upload. The upload is answered inside the request, so one whose checks
+# end after the proxy has given up on it (UPLOAD_ANSWER_BY) isn't kept: the
+# browser was told it failed, and a second try would keep it twice; the
+# verdicts are remembered, so that try is quicker and pays for nothing
+# judged already. It belongs to no Cast card and can't be saved onto one (only
 # pictures are): pipeline.studio_cast_source counts it as a frame of an
 # uploaded video, a picture of its owner when that is a Cast character with
 # no card picture behind it, so a frame of it, a continuation of it, or a
@@ -724,14 +765,23 @@ UPLOAD_MODEL = "local/upload"
 UPLOAD_LABEL = "Uploaded video"
 UPLOAD_MIN_FRAMES, UPLOAD_MAX_FRAMES = 3, 8
 UPLOAD_FRAME_EVERY = 10.0  # seconds
+# A clean deployment keeps no explicit video, so its uploads are looked at
+# more closely: about one frame every UPLOAD_CLEAN_EVERY seconds, at most
+# CLIP_CHECK_MAX_FRAMES (all judged by one minors call, as a clip used in
+# a project is), each also asked whether it is explicit.
+UPLOAD_CLEAN_EVERY = 5.0  # seconds
+UPLOAD_CLEAN_MAX_FRAMES = CLIP_CHECK_MAX_FRAMES
 UPLOAD_MAX_SECONDS = JOIN_MAX_SECONDS
 
 
-def upload_frame_times(seconds: float) -> list[float]:
+def upload_frame_times(seconds: float, *, clean: bool = False) -> list[float]:
     """The times of the frames checked in an uploaded video of `seconds`:
     the first, the last (math.inf: ffmpeg keeps it to the last frame) and
-    about one every UPLOAD_FRAME_EVERY seconds between, 3 to 8 in all."""
-    n = min(UPLOAD_MAX_FRAMES, max(UPLOAD_MIN_FRAMES, math.ceil(max(seconds, 0.0) / UPLOAD_FRAME_EVERY) + 1))
+    about one every UPLOAD_FRAME_EVERY seconds between, 3 to 8 in all. On a
+    clean deployment (`clean`): about one every UPLOAD_CLEAN_EVERY seconds,
+    3 to UPLOAD_CLEAN_MAX_FRAMES."""
+    every, most = (UPLOAD_CLEAN_EVERY, UPLOAD_CLEAN_MAX_FRAMES) if clean else (UPLOAD_FRAME_EVERY, UPLOAD_MAX_FRAMES)
+    n = min(most, max(UPLOAD_MIN_FRAMES, math.ceil(max(seconds, 0.0) / every) + 1))
     return [0.0] + [round(seconds * i / (n - 1), 3) for i in range(1, n - 1)] + [math.inf]
 
 
@@ -799,13 +849,78 @@ UPLOAD_TOO_LARGE = "That video is too large to prepare here; upload a shorter on
 # Sound in one of these codecs (or any PCM) is kept (re-encoded to AAC);
 # any other sound is dropped, not refused: the clip is kept without it.
 UPLOAD_AUDIO_CODECS = frozenset({"aac", "mp3", "opus", "vorbis", "flac", "ac3", "eac3", "alac"})
-# Uploads being prepared at once in one API process (each is a full
-# re-encode on the API's CPU); more are refused (429) rather than queued
-# behind them on the request threads.
+# Uploads being prepared at once on this machine, counted across every API
+# process (production runs several uvicorn workers; each upload is a full
+# re-encode on the API's CPU, with up to UPLOAD_MEMORY_LIMIT of memory);
+# more are refused (429) rather than queued behind them on the request
+# threads.
 UPLOAD_MAX_RUNNING = 2
 UPLOAD_BUSY = "Other videos are being prepared right now; try again in a minute"
 UPLOAD_TOO_SLOW = "That video took too long to prepare here; upload a shorter or smaller one"
-_upload_slots = threading.BoundedSemaphore(UPLOAD_MAX_RUNNING)
+# The proxy in front of the API (nginx: proxy_read_timeout 600 s) gives up
+# on a request after that long. An upload not answered within this much
+# of its start (some seconds to spare for reading the request) is not
+# kept, and its checks aren't started once it is that late (see above).
+UPLOAD_ANSWER_BY = 570.0
+UPLOAD_ANSWERED_LATE = ("Checking that video took too long, so it wasn't kept. Try again: what was already "
+                        "checked is remembered, so it is quicker the second time.")
+
+
+class _Places:
+    """At most `n` holders at once across every process on this machine
+    that uses the same data folder (the API's uvicorn workers): each place
+    is an exclusive flock(2) on its own file in <data>/locks, so a place is
+    given back when its holder lets it go, or when its process dies.
+    acquire(blocking=False) and release() as threading's semaphores (a
+    holder releases on the thread that acquired)."""
+
+    def __init__(self, name: str, n: int) -> None:
+        self.name, self.n = name, n
+        self._held = threading.local()
+
+    def _folder(self) -> Path:
+        from ..config import get_settings
+
+        folder = get_settings().data_path / "locks"
+        folder.mkdir(exist_ok=True)
+        return folder
+
+    def acquire(self, blocking: bool = False) -> bool:
+        if blocking:
+            raise ValueError("only acquire(blocking=False)")
+        folder = self._folder()
+        for i in range(self.n):
+            # Python opens files not inheritable: an ffmpeg started while the
+            # place is held never keeps it.
+            fd = os.open(folder / f"{self.name}-{i}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                continue
+            except BaseException:
+                os.close(fd)
+                raise
+            self._held.fds = [*getattr(self._held, "fds", []), fd]
+            return True
+        return False
+
+    def release(self) -> None:
+        fds = getattr(self._held, "fds", [])
+        if not fds:
+            raise ValueError("released more places than were taken")
+        self._held.fds = fds[:-1]
+        os.close(fds[-1])  # closing the file gives the place back
+
+
+_upload_slots = _Places("upload", UPLOAD_MAX_RUNNING)
+
+
+def _answer_in_time(started: float) -> None:
+    """OpError 504 (UPLOAD_ANSWERED_LATE) once UPLOAD_ANSWER_BY has passed
+    since the upload request `started` (time.monotonic())."""
+    if time.monotonic() - started > UPLOAD_ANSWER_BY:
+        raise OpError(504, UPLOAD_ANSWERED_LATE)
 
 
 def _input(path: Path, demuxer: str) -> list[str]:
@@ -1150,7 +1265,9 @@ def video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
     """Keep an uploaded video as a finished Studio clip owned by `owner`,
     once frames across it passed the picture checks (see above). OpError
     for a file that isn't a readable video, too long, refused, or when too
-    many uploads are being prepared (429)."""
+    many uploads are being prepared (429), or when it can't be answered in
+    time (UPLOAD_ANSWER_BY: 504, nothing kept)."""
+    started = time.monotonic()
     if not ffmpeg_here():
         raise OpError(503, NO_FFMPEG)
     if not _upload_slots.acquire(blocking=False):
@@ -1159,7 +1276,7 @@ def video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
         # No database connection is held while ffmpeg and the checks run.
         db.commit()
         return _video_from_upload(db, owner_kind=owner_kind, owner_id=owner_id, file=file, filename=filename,
-                                  limit=limit)
+                                  limit=limit, started=started)
     finally:
         _upload_slots.release()
 
@@ -1168,8 +1285,6 @@ def _upload_clock():
     """A step(limit) for one upload, its clock started now (the file is
     in): the time limit for the next ffmpeg run, `limit` or what is left of
     UPLOAD_DEADLINE when less; OpError "took too long" when nothing is."""
-    import time
-
     started = time.monotonic()
 
     def step(limit: float) -> float:
@@ -1238,8 +1353,8 @@ def prepare_upload(raw: Path, out: Path, step, *,
 
 
 def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: BinaryIO, filename: str,
-                       limit: int) -> models.AssetGenerationJob:
-    from . import events, storage
+                       limit: int, started: float) -> models.AssetGenerationJob:
+    from . import events, explicit_check, storage
 
     name = Path(filename or "video").name[:60] or "video"
     with tempfile.TemporaryDirectory(prefix="upload-video-") as tmp:
@@ -1249,7 +1364,7 @@ def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
         out = Path(tmp) / "clip.mp4"
         length, has_audio, size = prepare_upload(raw, out, step)
         frames: list[tuple[Path, bytes]] = []
-        for i, t in enumerate(upload_frame_times(length)):
+        for i, t in enumerate(upload_frame_times(length, clean=explicit_check.active())):
             try:
                 data, _used = grab(out, "last" if math.isinf(t) else t, timeout=step(UPLOAD_STEP_TIMEOUT))
             except TimeoutError:
@@ -1259,7 +1374,9 @@ def _video_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bin
             frame = Path(tmp) / f"frame{i}.png"
             frame.write_bytes(data)
             frames.append((frame, data))
+        _answer_in_time(started)
         check_uploaded_frames(frames, name, video=True)
+        _answer_in_time(started)  # the browser was already told it failed: not kept
         if not _owner_exists(db, owner_kind, owner_id):
             raise OpError(404, "owner not found")  # deleted while the video was prepared
         path = storage.save_generated_file(out, extension="mp4", subdir_name="clips")

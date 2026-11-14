@@ -1627,8 +1627,9 @@ async function postVideo(
   if (!r.ok) {
     const text = await r.text();
     // A proxy in front of the API may refuse a large upload with its own
-    // HTML page: never show that, say what went wrong instead.
-    let detail = r.status === 413 ? `This video is larger than ${FRAME_VIDEO_MAX_MB} MB.` : fallback;
+    // HTML page: never show that, say what went wrong instead. Its limit
+    // may be lower than the API's, so no size is named.
+    let detail = r.status === 413 ? "This video is too large for the server to accept. Pick a shorter or smaller one." : fallback;
     try {
       const parsed = JSON.parse(text);
       if (parsed?.detail) detail = typeof parsed.detail === "string" ? parsed.detail : JSON.stringify(parsed.detail);
