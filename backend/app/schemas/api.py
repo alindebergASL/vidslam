@@ -539,7 +539,10 @@ class StudioJobOut(BaseModel):
     # (source_job_id) or a Cast picture (source_asset_id), or
     # "extract_frame", a frame of a Studio clip (source_job_id) or of an
     # uploaded video (no source: the video isn't kept); options holds
-    # e.g. {"factor": 2} or {"at": "last", "seconds": 4.95}.
+    # e.g. {"factor": 2} or {"at": "last", "seconds": 4.95}. A clip can be
+    # "join_clips": finished Studio clips played back to back (no single
+    # source; options {"job_ids": [...], "transition", "crossfade",
+    # "has_audio"}).
     operation: str = ""
     source_job_id: Optional[int] = None
     source_asset_id: Optional[int] = None
@@ -655,6 +658,16 @@ class StudioFrameRequest(BaseModel):
     """Body for POST .../frame-to-picture: which frame of the clip to save,
     "first", "last" or a time in seconds (kept within the clip)."""
     at: Literal["first", "last"] | float = "last"
+
+
+class StudioJoinRequest(BaseModel):
+    """Body for POST /api/studio/join-clips: finished Studio clips, in the
+    order to play them (2 to 12; one may repeat), and how each one leads
+    into the next: "cut" or a "dissolve" of `crossfade` seconds (0.5 when
+    not given; kept to a third of the shortest clip)."""
+    job_ids: list[int] = Field(..., max_length=100)
+    transition: Literal["cut", "dissolve"] = "cut"
+    crossfade: Optional[float] = Field(None, ge=0, le=1.5)
 
 
 class ImageOpEstimateOut(BaseModel):

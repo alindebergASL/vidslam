@@ -274,6 +274,8 @@ def studio_cast_source(db: Session, job: Optional[models.AssetGenerationJob]) ->
     owner, with no picture, so it never skips the filter either."""
     seen: set[int] = set()
     while job is not None and job.operation and job.id not in seen:
+        if job.operation == "join_clips":
+            return None, None  # joined clips: a new clip, never a Cast picture
         seen.add(job.id)
         if job.source_asset_id:
             asset = db.get(models.Asset, job.source_asset_id)
@@ -2716,8 +2718,8 @@ def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models
     Studio result or a Cast picture), or save a frame of a Studio clip. No
     prompt, so no safety check: the operation makes nothing new, it only
     cuts out, enlarges or copies a frame of a clip made from a checked
-    prompt (a frame of an uploaded video is checked before it is stored,
-    in the API: services/video_ops.py)."""
+    prompt, or joins such clips (a frame of an uploaded video is checked
+    before it is stored, in the API: services/video_ops.py)."""
     from ..providers import get_image_op
     from . import image_ops, video_ops
     from . import model_registry as reg
@@ -2727,6 +2729,9 @@ def _run_studio_operation(db: Session, job: models.AssetGenerationJob) -> models
         # itself (no ffmpeg there), or run again: grabbed here, free.
         data, seconds = video_ops.grab_for_job(db, job)
         return video_ops.finish(db, job, data, seconds)
+    if job.operation == video_ops.JOIN_OP:
+        # Finished Studio clips played back to back, joined here: free.
+        return video_ops.run_join(db, job)
     kind = image_ops.kind_for(job.operation)
     model = job.provider_model or reg.active_model(kind)
     provider = get_image_op(kind, model)

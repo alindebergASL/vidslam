@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .captions import CaptionTiming, write_ass
 
@@ -57,9 +57,37 @@ def textfile_arg(path: Path) -> str:
     return f"textfile='{p}':expansion=none"
 
 
-def _run(cmd: list[str]) -> tuple[int, str]:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+def _run(cmd: list[str], timeout: Optional[float] = None,
+         should_stop: Optional[Callable[[], bool]] = None) -> tuple[int, str]:
+    """(exit code, output). With `timeout` (seconds) a run that takes longer
+    is killed and answers (-1, "timed out ..."). With `should_stop`, it is
+    asked about once a second while the command runs; when it says yes the
+    command is killed and the answer is (-2, "stopped")."""
+    if should_stop is None:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return -1, f"timed out after {timeout:.0f}s"
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    import time
+
+    deadline = None if timeout is None else time.monotonic() + timeout
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
+        while True:
+            try:
+                out, err = proc.communicate(timeout=1.0)
+                return proc.returncode, (out or "") + (err or "")
+            except subprocess.TimeoutExpired:
+                pass
+            stop = False
+            try:
+                stop = bool(should_stop())
+            except Exception:  # a failed check never stops the work
+                stop = False
+            if stop or (deadline is not None and time.monotonic() > deadline):
+                proc.kill()
+                proc.communicate()
+                return (-2, "stopped") if stop else (-1, f"timed out after {timeout:.0f}s")
 
 
 def _dims_for_aspect(aspect: str, resolution: str = "1080p") -> tuple[int, int]:
@@ -1156,12 +1184,30 @@ def extract_frame(src: Path, dst: Path, *, last: bool) -> Path:
     return dst
 
 
+def _frame_at(seconds: float) -> int:
+    """The first output frame (at FPS) whose time is not before `seconds`:
+    trimming by frame number, so a time on the frame grid (written with a
+    few decimals) never keeps or drops a frame by rounding."""
+    return max(0, math.ceil(seconds * FPS - 1e-6))
+
+
+def on_frame_grid(seconds: float) -> float:
+    """`seconds` rounded to whole output frames (at least one)."""
+    return max(1, round(seconds * FPS)) / FPS
+
+
 def join_graph(lengths: list[float], *, crossfade: float, width: int, height: int,
                sizes: Optional[list[Optional[tuple[int, int]]]] = None) -> str:
     """filter_complex text joining len(lengths) inputs with rounded linear
     dissolves of `crossfade` seconds; output label [out]. `sizes` (each
-    input's width x height, if known) lets near-frame shapes fill (fit_vf)."""
+    input's width x height, if known) lets near-frame shapes fill (fit_vf).
+    Trims are by output frame: a length on the FPS grid gives exactly
+    that many frames."""
     cf = crossfade
+
+    def trim(start: float, end: float) -> str:
+        return f"trim=start_frame={_frame_at(start)}:end_frame={_frame_at(end)}"
+
     n = len(lengths)
     sizes = list(sizes or []) + [None] * (n - len(sizes or []))
     parts: list[str] = []
@@ -1172,14 +1218,18 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
         tail_out = cf if (i < n - 1 and cf > 0) else 0.0  # dissolved into the next
         outs = ["b"] + (["h"] if head_in else []) + (["t"] if tail_out else [])
         labels = "".join(f"[{o}{i}]" for o in outs)
-        norm = f"{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},format=yuv420p"
+        # Timestamps from 0 first, so fps's rounding starts on the grid; one
+        # cloned frame at the end, so the trim below always finds every
+        # frame of L (its sound is cut to exactly L).
+        norm = (f"setpts=PTS-STARTPTS,{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},"
+                f"tpad=stop_mode=clone:stop=1,format=yuv420p")
         parts.append(f"[{i}:v]{norm},split={len(outs)}{labels}" if len(outs) > 1 else f"[{i}:v]{norm}[b{i}]")
         parts[-1] = parts[-1].replace(f"[b{i}]", f"[bb{i}]")
-        parts.append(f"[bb{i}]trim=start={head_in:.4f}:end={L - tail_out:.4f},setpts=PTS-STARTPTS[body{i}]")
+        parts.append(f"[bb{i}]{trim(head_in, L - tail_out)},setpts=PTS-STARTPTS[body{i}]")
         if head_in:
-            parts.append(f"[h{i}]trim=start=0:end={cf:.4f},setpts=PTS-STARTPTS[head{i}]")
+            parts.append(f"[h{i}]{trim(0.0, cf)},setpts=PTS-STARTPTS[head{i}]")
         if tail_out:
-            parts.append(f"[t{i}]trim=start={L - cf:.4f}:end={L:.4f},setpts=PTS-STARTPTS[tail{i}]")
+            parts.append(f"[t{i}]{trim(L - cf, L)},setpts=PTS-STARTPTS[tail{i}]")
     for i in range(n):
         order.append(f"[body{i}]")
         if i < n - 1 and cf > 0:
@@ -1229,6 +1279,219 @@ def join_segments(
     if rc != 0:
         raise RuntimeError(f"ffmpeg segment join failed: {log[-2000:]}")
     return dst, _probe_duration(dst)
+
+
+def _probe_clip(path: Path) -> tuple[float, bool, float]:
+    """(video length in seconds, whether the file has an audio stream,
+    when the picture starts in the file). The length is the video stream's
+    own when ffprobe knows it (a sound track a little longer than the
+    picture would otherwise stretch it), else the container's; 0.0 when
+    the file can't be read. The picture's start is its stream start_time
+    measured from the file's own start (the earliest stream's, which is
+    where ffmpeg puts 0 when it reads the file), at least 0: a picture
+    starting after its sound (start_time > 0, or a sound starting before 0
+    with AAC priming) has its sound laid on the picture's own timeline
+    (join_audio_graph)."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries",
+                    "stream=codec_type,duration,start_time:format=duration,start_time", str(path)])
+    if rc != 0:
+        return 0.0, False, 0.0
+    try:
+        info = json.loads(log)
+    except ValueError:
+        return 0.0, False, 0.0
+    streams = info.get("streams") or []
+    has_audio = any(s.get("codec_type") == "audio" for s in streams)
+    length = start = 0.0
+    for s in streams:
+        if s.get("codec_type") == "video":
+            try:
+                length = float(s.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                length = 0.0
+            try:
+                start = float(s.get("start_time") or 0.0)
+            except (TypeError, ValueError):
+                start = 0.0
+            break
+    else:
+        return 0.0, has_audio, 0.0  # no picture: not a clip
+    try:
+        start -= float((info.get("format") or {}).get("start_time") or 0.0)
+    except (TypeError, ValueError):
+        pass
+    start = max(start, 0.0) if math.isfinite(start) else 0.0
+    if length <= 0:
+        # No stream duration (Matroska/WebM): measure the picture itself,
+        # from its first packet to the end of its last. The container's
+        # length would include a sound track that outlasts the picture.
+        length = _video_packets_span(path)
+    if length <= 0:
+        try:
+            length = float((info.get("format") or {}).get("duration") or 0.0) - start
+        except (TypeError, ValueError):
+            length = 0.0
+    return max(length, 0.0), has_audio, start
+
+
+def _video_packets_span(path: Path) -> float:
+    """Seconds from the first video packet's start to the last one's end,
+    or 0.0 when they can't be read."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-show_entries",
+                    "packet=pts_time,duration_time", "-of", "csv=p=0", str(path)])
+    if rc != 0:
+        return 0.0
+    first = last_end = None
+    for line in log.splitlines():
+        bits = line.strip().split(",")
+        try:
+            pts = float(bits[0])
+        except (IndexError, ValueError):
+            continue
+        try:
+            dur = float(bits[1]) if len(bits) > 1 else 0.0
+        except ValueError:
+            dur = 0.0
+        first = pts if first is None else min(first, pts)
+        last_end = pts + dur if last_end is None else max(last_end, pts + dur)
+    if first is None or last_end is None:
+        return 0.0
+    return max(last_end - first, 0.0)
+
+
+# Below this a dissolve is too short to see (and leaves no whole frame to
+# blend): it is a cut.
+MIN_DISSOLVE = 0.1
+JOIN_AUDIO_RATE = 48000
+
+
+# The joined clip is at most 1080p (long side 1920, short side 1080): a 4K
+# first clip is scaled down so one join can't write a 10-minute 4K file.
+JOIN_MAX_LONG, JOIN_MAX_SHORT = 1920, 1080
+
+
+def join_size(size: tuple[int, int]) -> tuple[int, int]:
+    """The joined clip's size: the first clip's, scaled down (keeping its
+    shape) to fit 1080p, with even sides (x264 with 4:2:0 needs them)."""
+    w, h = size
+    long_max, short_max = (JOIN_MAX_LONG, JOIN_MAX_SHORT) if w >= h else (JOIN_MAX_SHORT, JOIN_MAX_LONG)
+    scale = min(1.0, long_max / max(w, 1), short_max / max(h, 1))
+    w, h = int(w * scale), int(h * scale)
+    return max(2, w - w % 2), max(2, h - h % 2)
+
+
+def join_timeout(total_seconds: float) -> float:
+    """How long the join's ffmpeg may run before it is killed: a few times
+    the clips' total length, and at least two minutes."""
+    return max(120.0, 6.0 * total_seconds)
+
+
+def join_crossfade(lengths: list[float], transition: str, crossfade: float) -> float:
+    """The dissolve actually used: 0 for a cut; else `crossfade` kept to a
+    third of the shortest clip, and 0 when that is too short to see."""
+    if transition != "dissolve" or len(lengths) < 2:
+        return 0.0
+    cf = max(0.0, min(float(crossfade), min(lengths) / 3.0))
+    return round(cf, 3) if cf >= MIN_DISSOLVE else 0.0
+
+
+def join_audio_graph(lengths: list[float], has_audio: list[bool], *, crossfade: float,
+                     video_starts: Optional[list[float]] = None) -> str:
+    """filter_complex text for the joined sound (output label [aout]): each
+    clip's own, or silence for a clip without any, fitted to exactly that
+    clip's picture length, then joined back to back (`crossfade` > 0: each
+    join crossfades over the same span as the picture's dissolve).
+    `video_starts`: when each clip's picture starts in its file (>= 0);
+    its sound is taken from that moment on, so it plays on the picture's
+    own timeline."""
+    fmt = "aformat=sample_fmts=fltp:channel_layouts=stereo"
+    starts = video_starts if video_starts is not None else [0.0] * len(lengths)
+    parts: list[str] = []
+    for i, (L, audio, vs) in enumerate(zip(lengths, has_audio, starts, strict=True)):
+        if audio:
+            # On the file's timeline from 0: a sound starting after 0 gets
+            # that gap filled with silence (async/first_pts=0), and one
+            # starting a little before it (AAC priming) loses that part.
+            # Then the part before the picture starts is cut off, so the
+            # sound lines up with the picture's first frame.
+            # Padded before the cut, so a sound that ends before the
+            # picture starts still gives L seconds (of silence).
+            vs = max(vs, 0.0)
+            parts.append(f"[{i}:a]aresample={JOIN_AUDIO_RATE}:async=1:first_pts=0,{fmt},apad,"
+                         f"atrim=start={vs:.4f}:end={vs + L:.4f},asetpts=PTS-STARTPTS[a{i}]")
+        else:
+            parts.append(f"anullsrc=r={JOIN_AUDIO_RATE}:cl=stereo,{fmt},"
+                         f"atrim=end={L:.4f},asetpts=PTS-STARTPTS[a{i}]")
+    n = len(lengths)
+    if crossfade > 0 and n > 1:
+        prev = "a0"
+        for i in range(1, n):
+            out = "aout" if i == n - 1 else f"ax{i}"
+            parts.append(f"[{prev}][a{i}]acrossfade=d={crossfade:.4f}:{AUDIO_XFADE_CURVES}[{out}]")
+            prev = out
+    else:
+        parts.append(f"{''.join(f'[a{i}]' for i in range(n))}concat=n={n}:v=0:a=1[aout]")
+    return ";".join(parts)
+
+
+class JoinStopped(RuntimeError):
+    """The join's FFmpeg was killed because the job was cancelled or deleted."""
+
+
+def join_clips_with_audio(
+    clips: list[Path],
+    dst: Path,
+    *,
+    transition: str = "cut",
+    crossfade: float = 0.5,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> tuple[Path, float, bool]:
+    """Play `clips` back to back as one clip (Studio's "Join clips").
+    `should_stop`: asked about once a second while FFmpeg runs; yes kills it
+    (JoinStopped).
+
+    The picture is the first clip's size; the others are fitted into it
+    (scaled and padded, or cropped when their shape is nearly the same:
+    fit_vf), at FPS with square pixels, as join_segments does. Sound: each
+    clip's own, silence for a clip without any so the track stays
+    continuous, and no sound track at all when no clip has sound.
+    `transition` "dissolve" crossfades picture and sound over `crossfade`
+    seconds (see join_crossfade); "cut" plays them straight on. Returns
+    (path, length, has sound). RuntimeError when a clip can't be read or
+    ffmpeg fails."""
+    if len(clips) < 2:
+        raise ValueError("join needs at least two clips")
+    probed = [_probe_clip(p) for p in clips]
+    lengths = [length for length, _, _ in probed]
+    has_audio = [audio for _, audio, _ in probed]
+    video_starts = [start for _, _, start in probed]
+    if any(length <= 0 for length in lengths):
+        raise RuntimeError("a clip to join can't be read")
+    size = _probe_size(clips[0])
+    if size is None:
+        raise RuntimeError("the first clip's size can't be read")
+    width, height = join_size(size)
+    # Each clip laid on the output frame grid once: picture, sound and the
+    # dissolve all use these lengths, so the sound can't drift from the
+    # picture by a part-frame per clip.
+    lengths = [on_frame_grid(length) for length in lengths]
+    cf = join_crossfade(lengths, transition, crossfade)
+    cf = on_frame_grid(cf) if cf > 0 else 0.0
+    graph = join_graph(lengths, crossfade=cf, width=width, height=height,
+                       sizes=[_probe_size(p) for p in clips])
+    audio = any(has_audio)
+    if audio:
+        graph += ";" + join_audio_graph(lengths, has_audio, crossfade=cf, video_starts=video_starts)
+    cmd = ["ffmpeg", "-y"]
+    for p in clips:
+        cmd += ["-i", str(p)]
+    cmd += ["-filter_complex", graph, "-map", "[out]"]
+    cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"] if audio else ["-an"]
+    cmd += [*_X264, "-r", str(FPS), "-movflags", "+faststart", str(dst)]
+    rc, log = _run(cmd, timeout=join_timeout(sum(lengths)))
+    if rc != 0 or not dst.exists():
+        raise RuntimeError(f"ffmpeg clip join failed: {log[-2000:]}")
+    return dst, _probe_duration(dst), audio
 
 
 def slice_audio(src: Path, dst: Path, *, start: float, duration: float) -> Path:

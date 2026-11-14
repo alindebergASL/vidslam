@@ -1,5 +1,7 @@
-"""Save a frame of a video as a Studio picture ("Save last frame as
-picture", "Save first frame", "Save this frame").
+"""Studio's free video operations, made here by ffmpeg: save a frame of
+a video as a Studio picture ("Save last frame as picture", "Save first
+frame", "Save this frame"), and join finished clips into one ("Join
+clips", at the end of this module).
 
 The source is either a finished Studio clip (source_job_id) or a video the
 owner uploads for this (not kept: only the frame is stored). Each grab is a
@@ -36,6 +38,7 @@ import hashlib
 import math
 import shutil
 import tempfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import BinaryIO, Optional, Union
@@ -287,3 +290,215 @@ def frame_from_upload(db: Session, *, owner_kind: str, owner_id: int, file: Bina
     db.commit()
     db.refresh(job)
     return finish(db, job, data, used)
+
+
+# ---------- join finished Studio clips into one ("Join clips") ----------
+#
+# 2 to 12 finished Studio clips, in the order picked (one may repeat), are
+# played back to back as one new Studio clip (renderer.join_clips_with_audio:
+# a cut or a short dissolve, each clip's own sound, silence for a clip
+# without any). Free: made here by ffmpeg, no provider, nothing billed, no
+# budget cap (the rate limit applies). It can take a while for long clips,
+# so it is queued like the other Studio operations (the worker runs it).
+#
+# Checks: none new. Every source is a Studio clip that was made from a
+# prompt that passed the minors checks (and, on a clean deployment, with
+# the providers' content filters on); the joined clip only puts them one
+# after another. It is a new Studio clip like any other: it carries no
+# Cast exemption (pipeline.studio_cast_source gives (None, None) for it, so
+# anything made from it keeps the content filter), whatever its sources.
+
+JOIN_OP = "join_clips"
+JOIN_MODEL = "local/join"
+JOIN_MODEL_NAME = "Join clips (free)"
+JOIN_MIN, JOIN_MAX = 2, 12
+JOIN_MAX_SECONDS = 600.0  # 10 minutes in all
+JOIN_TRANSITIONS = ("cut", "dissolve")
+JOIN_DEFAULT_CROSSFADE = 0.5
+JOIN_MAX_CROSSFADE = 1.5
+# Joins are free but each is a full re-encode on the shared worker queue:
+# at most this many may be queued or running at once (deployment-wide).
+JOIN_MAX_RUNNING = 2
+
+
+def join_label(n: int) -> str:
+    return f"Joined {n} clips"
+
+
+def _clip_length(job: models.AssetGenerationJob) -> float:
+    return float(job.result_duration_seconds or job.duration_seconds or 0.0)
+
+
+def join_source(db: Session, job_id: int) -> models.AssetGenerationJob:
+    """One clip to join: a finished Studio clip whose file is still there.
+    OpError 404 (unknown or deleted), 409 (a picture, not finished, file
+    missing)."""
+    src = db.get(models.AssetGenerationJob, job_id)
+    if src is None or src.status == STUDIO_DELETED:
+        raise OpError(404, f"Clip #{job_id} was deleted")
+    if src.output_kind != "video_clip":
+        raise OpError(409, f"#{job_id} is a picture, not a clip")
+    if src.status not in ("completed", "saved"):
+        raise OpError(409, f"Clip #{job_id} isn't finished yet")
+    if not src.result_path or not Path(src.result_path).exists():
+        raise OpError(409, f"Clip #{job_id}'s file is missing")
+    return src
+
+
+def join_sources(db: Session, job_ids: list[int]) -> list[models.AssetGenerationJob]:
+    """The clips to join, in order (a clip may be picked more than once).
+    OpError 422 for too few, too many or too long in all."""
+    ids = [int(i) for i in job_ids]
+    if len(ids) < JOIN_MIN:
+        raise OpError(422, f"Pick at least {JOIN_MIN} clips to join")
+    if len(ids) > JOIN_MAX:
+        raise OpError(422, f"Join at most {JOIN_MAX} clips at a time")
+    found: dict[int, models.AssetGenerationJob] = {}
+    for i in ids:
+        if i not in found:
+            found[i] = join_source(db, i)
+    sources = [found[i] for i in ids]
+    total = sum(_clip_length(s) for s in sources)
+    if total > JOIN_MAX_SECONDS:
+        raise OpError(422, f"Those clips are {clock(total)} long in all; the most is "
+                           f"{int(JOIN_MAX_SECONDS // 60)} minutes")
+    return sources
+
+
+def join_stale_after() -> timedelta:
+    """How long a join may run once a worker has claimed it ('submitted'):
+    its ffmpeg time limit for the longest join, and a margin. Older, it
+    was orphaned (a killed worker): it no longer holds one of the
+    JOIN_MAX_RUNNING places, and the sweeper fails it
+    (sweepers.sweep_studio). A join still waiting in the queue ('pending')
+    may wait longer, behind long renders on the one worker: it keeps its
+    place, and only the general pending rule (its queue entry gone) fails
+    it."""
+    from .renderer import join_timeout
+
+    return timedelta(seconds=join_timeout(JOIN_MAX_SECONDS)) + timedelta(minutes=5)
+
+
+def joins_running(db: Session, *, now: Optional[datetime] = None) -> int:
+    """Joins holding a place: every one still queued ('pending'), and those
+    a worker is running that were touched within join_stale_after()."""
+    from sqlalchemy import and_, func, or_
+
+    from .pipeline import STUDIO_RUNNING
+
+    Job = models.AssetGenerationJob
+    since = (now or datetime.utcnow()) - join_stale_after()
+    return (db.query(Job)
+            .filter(Job.operation == JOIN_OP, Job.status.in_(STUDIO_RUNNING),
+                    or_(Job.status == "pending",
+                        and_(Job.status != "pending",
+                             func.coalesce(Job.updated_at, Job.created_at) >= since)))
+            .count())
+
+
+def join_busy(db: Session) -> bool:
+    """Whether JOIN_MAX_RUNNING joins are already queued or running."""
+    return joins_running(db) >= JOIN_MAX_RUNNING
+
+
+def parse_crossfade(transition: str, crossfade: Optional[float]) -> float:
+    """The dissolve asked for (seconds, 0 to 1.5); 0 for a cut."""
+    if transition not in JOIN_TRANSITIONS:
+        raise OpError(422, 'Pick "cut" or "dissolve"')
+    if transition == "cut":
+        return 0.0
+    cf = JOIN_DEFAULT_CROSSFADE if crossfade is None else float(crossfade)
+    if not math.isfinite(cf) or cf < 0 or cf > JOIN_MAX_CROSSFADE:
+        raise OpError(422, f"The dissolve must be 0 to {JOIN_MAX_CROSSFADE} seconds")
+    return round(cf, 3)
+
+
+def new_join_job(sources: list[models.AssetGenerationJob], transition: str,
+                 crossfade: float) -> models.AssetGenerationJob:
+    """The unsaved (pending) job joining `sources`. Owner: the first clip's
+    owner (the clip the result looks like: its size, its character); clips
+    of other owners may follow it. The clips' ids, in order, are kept in
+    options_json["job_ids"] so Retry can join them again."""
+    first = sources[0]
+    label = join_label(len(sources))
+    from .renderer import join_crossfade
+
+    lengths = [_clip_length(s) for s in sources]
+    cf = join_crossfade(lengths, transition, crossfade)
+    estimate = max(sum(lengths) - (len(lengths) - 1) * cf, 0.0)
+    return models.AssetGenerationJob(
+        owner_kind=first.owner_kind, owner_id=first.owner_id, output_kind="video_clip",
+        duration_seconds=round(estimate, 3), aspect_ratio=first.aspect_ratio or "",
+        prompt=label, negative_prompt="", reference_asset_ids_json=[], provider=PROVIDER,
+        provider_model=JOIN_MODEL, label=label, operation=JOIN_OP, source_job_id=None,
+        options_json={"job_ids": [s.id for s in sources], "transition": transition, "crossfade": crossfade},
+        status="pending",
+    )
+
+
+def join_options(job: models.AssetGenerationJob) -> tuple[list[int], str, float]:
+    """(clip ids, transition, crossfade) a join job recorded."""
+    opts = job.options_json or {}
+    ids = [int(i) for i in opts.get("job_ids") or [] if str(i).isdigit()]
+    transition = opts.get("transition") if opts.get("transition") in JOIN_TRANSITIONS else "cut"
+    try:
+        cf = float(opts.get("crossfade") or 0.0)
+    except (TypeError, ValueError):
+        cf = 0.0
+    return ids, transition, min(max(cf, 0.0), JOIN_MAX_CROSSFADE)
+
+
+def run_join(db: Session, job: models.AssetGenerationJob) -> models.AssetGenerationJob:
+    """The worker's side: join the job's clips and complete it with the new
+    clip (its real size and length, a "completed" event). ValueError when a
+    clip is gone or isn't usable any more; RuntimeError when ffmpeg fails.
+    Deleted or cancelled meanwhile: the result is dropped."""
+    from sqlalchemy import update as _update
+
+    from . import events, storage
+    from .pipeline import STUDIO_RUNNING
+    from .renderer import JoinStopped, _probe_size, join_clips_with_audio
+
+    ids, transition, crossfade = join_options(job)
+    try:
+        sources = join_sources(db, ids)
+    except OpError as e:
+        raise ValueError(e.message) from None
+    def stopped() -> bool:
+        # Cancelled or deleted while FFmpeg runs: stop it, so a cancelled
+        # join doesn't go on re-encoding after giving up its place.
+        from ..db import SessionLocal
+
+        with SessionLocal() as check:
+            status = check.query(models.AssetGenerationJob.status).filter(
+                models.AssetGenerationJob.id == job.id).scalar()
+        return status not in STUDIO_RUNNING
+
+    with tempfile.TemporaryDirectory(prefix="join-") as tmp:
+        out = Path(tmp) / "joined.mp4"
+        try:
+            _, seconds, has_audio = join_clips_with_audio(
+                [Path(s.result_path) for s in sources], out, transition=transition, crossfade=crossfade,
+                should_stop=stopped)
+        except JoinStopped:
+            db.refresh(job)
+            return job
+        size = _probe_size(out)
+        path = storage.save_generated_file(out, extension="mp4", subdir_name="clips")
+    opts = dict(job.options_json or {})
+    opts["has_audio"] = has_audio
+    Job = models.AssetGenerationJob
+    done = db.execute(_update(Job).where(Job.id == job.id, Job.status.in_(STUDIO_RUNNING)).values(
+        result_path=str(path), status="completed", error="", options_json=opts,
+        result_width=size[0] if size else None, result_height=size[1] if size else None,
+        result_duration_seconds=round(seconds, 3) if seconds > 0 else None,
+    )).rowcount
+    db.commit()
+    if not done:
+        Path(path).unlink(missing_ok=True)
+        db.refresh(job)
+        return job
+    db.refresh(job)
+    events.studio_event(db, job, "completed")
+    db.commit()
+    return job

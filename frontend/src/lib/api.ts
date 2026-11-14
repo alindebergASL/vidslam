@@ -550,14 +550,22 @@ export type StudioJob = {
   /** Ids in reference_asset_ids whose picture was deleted since. */
   missing_reference_ids?: number[];
   /** "" = made from a prompt; else the picture operation that made it
-   *  ("extract_frame": a frame saved from a clip or an uploaded video). */
-  operation?: "" | ImageOp | "extract_frame";
+   *  ("extract_frame": a frame saved from a clip or an uploaded video;
+   *  "join_clips": finished clips played back to back, see options.job_ids). */
+  operation?: "" | ImageOp | "extract_frame" | "join_clips";
   /** The Studio picture (or, for a saved frame, the clip) an operation ran on ("from #12"). */
   source_job_id?: number | null;
   /** The Cast/ingredient picture an operation ran on. */
   source_asset_id?: number | null;
-  /** Operation options: {} for removal, {factor: 2|4} for upscale. */
-  options?: { factor?: number } & Record<string, unknown>;
+  /** Operation options: {} for removal, {factor: 2|4} for upscale; for joined
+   *  clips the clip ids in order, the transition and whether it has sound. */
+  options?: {
+    factor?: number;
+    job_ids?: number[];
+    transition?: JoinTransition;
+    crossfade?: number;
+    has_audio?: boolean;
+  } & Record<string, unknown>;
   /** A Sogni picture made from reference pictures runs on one of Sogni's
    *  editors: the one that really ran (name and id); null = the picked model ran. */
   ran_on_name?: string | null;
@@ -590,6 +598,13 @@ export type SogniEditor = {
 export type WithPictures = { identity: SogniEditor | null; guide: SogniEditor | null };
 
 export type ImageOp = "remove_background" | "upscale";
+
+/** How each joined clip leads into the next: a straight cut or a short dissolve. */
+export type JoinTransition = "cut" | "dissolve";
+
+/** Join clips: how many clips may be joined at once. */
+export const JOIN_MIN_CLIPS = 2;
+export const JOIN_MAX_CLIPS = 12;
 
 /** Which frame of a video to save as a picture: "first", "last" or a time in seconds. */
 export type FrameAt = "first" | "last" | number;
@@ -2364,6 +2379,13 @@ export const api = {
   /** A new Studio picture: a frame of a finished Studio clip (free; usually finished at once). */
   frameToPicture: (jobId: number, at: FrameAt) =>
     req<StudioJob>(`/api/studio/jobs/${jobId}/frame-to-picture`, { method: "POST", body: JSON.stringify({ at }) }),
+  /** A new Studio clip: finished Studio clips played back to back in this order
+   *  (free; queued, so it is usually still being made when this answers). */
+  joinClips: (jobIds: number[], transition: JoinTransition, crossfade?: number) =>
+    req<StudioJob>("/api/studio/join-clips", {
+      method: "POST",
+      body: JSON.stringify({ job_ids: jobIds, transition, ...(crossfade !== undefined ? { crossfade } : {}) }),
+    }),
   /** A new Studio picture: a frame of a video from this device (the video isn't kept;
    *  the picture safety check looks at the frame first). */
   frameFromVideo: async (file: File, owner: { kind: "avatar" | "ingredient"; id: number }, at: FrameAt) => {

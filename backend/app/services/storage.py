@@ -4,6 +4,7 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import uuid
 from pathlib import Path
 from typing import BinaryIO, Optional
@@ -281,6 +282,20 @@ def save_generated_bytes(
         extension.lstrip(".").lower(), "application/octet-stream"
     )
     mirror_to_s3(path, content_type=mime)
+    return path
+
+
+def save_generated_file(src: Path, *, extension: str, subdir_name: str) -> Path:
+    """Like save_generated_bytes for a file already on disk (a long clip
+    made here): moved, not read into memory."""
+    subdir = settings.data_path / "studio" / subdir_name
+    subdir.mkdir(parents=True, exist_ok=True)
+    path = subdir / f"{uuid.uuid4().hex}.{extension.lstrip('.')}"
+    shutil.move(str(src), path)
+    from .s3 import mirror_to_s3
+
+    mirror_to_s3(path, content_type="video/mp4" if extension.lstrip(".").lower() == "mp4"
+                 else "application/octet-stream")
     return path
 
 
