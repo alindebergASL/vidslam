@@ -476,16 +476,18 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
     shot = svc._loop_shot(project)
     if shot is None or not shot.clip_path or not Path(shot.clip_path).exists():
         raise HTTPException(409, "generate the loop clip first")
-    treatment = svc.seam_treatment(project)
-    if treatment["basis"] == "plan":
-        # No current reading: measure now (local, a few seconds).
-        from ..services import loop_health
+    from ..services import loop_health
 
+    cfg = svc._config_of(project)
+    if cfg.source == "video" and loop_health.unmeasured(project):
+        # A clip (the loop or a variation) has no current reading: measure
+        # now (local, a few seconds; current readings are kept).
         loop_health.measure_scene(db, project)
         db.refresh(project)
-        treatment = svc.seam_treatment(project)
+    treatment = svc.seam_treatment(project)
     if not accept_seam and svc.seam_needs_a_look(project, treatment):
-        every = svc.plan_loop(svc._config_of(project)).unit_seconds
+        # The join comes round once per seamless unit (each variation's too).
+        every = svc._plan_with_seam(svc.plan_loop(cfg), cfg, treatment).unit_seconds
         raise HTTPException(409, {
             "code": "seam_jump",
             "message": "The loop jumps at the join, and the blend won't hide it.",

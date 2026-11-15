@@ -2584,7 +2584,7 @@ def render_scene(db: Session, project_id: int) -> models.Render:
 
     try:
         _check_cancel(db, render)
-        if cfg.source == "video" and loop_health.current_entry(project, shot) is None:
+        if cfg.source == "video" and loop_health.unmeasured(project):
             loop_health.measure_quietly(db, project.id)  # local, a few seconds
             db.refresh(project)
         treatment = seam_treatment(project)

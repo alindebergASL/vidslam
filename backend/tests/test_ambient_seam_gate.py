@@ -210,3 +210,45 @@ def test_the_music_bed_loops_on_its_own_long_crossfade(auth_client, monkeypatch,
         project_id=0, out_dir=tmp_path / "out", clip_path=clip, total_seconds=10,
         crossfade_seconds=1.0, fade_seconds=0.0, music_path=music))
     assert xfades and xfades[0] == 6.0
+
+
+def test_a_jumping_variation_with_no_reading_is_measured_and_gated(auth_client):
+    """The loop clip's reading is current but a variation's clip changed
+    since: POST /render measures the variation too, and its visible jump
+    asks first (the scene's treatment is the worst join)."""
+    scene = _scene(auth_client, variety="takes", variations=2)
+    sid = scene["id"]
+    assert len(scene["variant_shots"]) == 1
+    assert scene["seam_treatment"]["verdict"] == "seamless"
+    _replace(Path(scene["variant_shots"][0]["clip_path"]), hard_cut)
+    r = auth_client.post(f"/api/ambient/{sid}/render")
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "seam_jump"
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    # The jump comes round once per seamless unit of the blend in use.
+    assert detail["repeat_every_seconds"] == out["plan"]["unit_seconds"]
+    assert out["plan"]["seam_crossfade"] == 2.0
+    # The loop clip's own (seamless) reading isn't alarmed by the variation.
+    assert out["loop_health"]["seam"]["level"] == "good"
+    vseam = out["variant_loop_health"][0]["seam"]
+    assert vseam["verdict"] == "visible_jump" and vseam["level"] == "bad"
+
+
+def test_the_worker_render_measures_an_unmeasured_variation(auth_client):
+    """A render queued while a variation had no reading still sizes the
+    blend from it (the render measures before composing)."""
+    from app.services import ambient
+
+    scene = _scene(auth_client, variety="takes", variations=2)
+    sid = scene["id"]
+    _replace(Path(scene["variant_shots"][0]["clip_path"]), hard_cut)
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        ambient.render_scene(db, sid)
+    finally:
+        db.close()
+    log = auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["render_log"]
+    assert "seam=visible_jump blend=2s" in log

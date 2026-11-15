@@ -375,13 +375,25 @@ def test_a_jump_the_render_blends_says_so(monkeypatch):
                           "basis": "measured", "covers": covers}
 
     monkeypatch.setattr(ambient, "seam_treatment", treat(2.0, True))
+    slight = {"seam": {"verdict": "slight_jump", "level": "warn", "text": "There's a slight jump at the join",
+                       "difference": 0.05, "typical": 0.01, "ratio": 4.0}, "clip_seconds": 10}
+    view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), slight)
+    assert view["seam"]["level"] == "warn" and view["seam"]["blend_seconds"] == 2.0
+    assert view["seam"]["raw_level"] == "warn" and view["seam"]["treatment"]["covers"] is True
+    assert "blends it over 2 s" in view["seam"]["text"]
+    # A variation's slight jump is covered even when another clip of the
+    # scene jumps visibly (the scene's treatment is the worst join).
+    monkeypatch.setattr(ambient, "seam_treatment", treat(2.0, False))
+    view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), slight)
+    assert view["seam"]["level"] == "warn" and "blends it over 2 s" in view["seam"]["text"]
     entry = {"seam": {"verdict": "visible_jump", "level": "bad", "text": "There's a visible jump at the join",
                       "difference": 0.3, "typical": 0.01, "ratio": 30.0}, "clip_seconds": 10}
     view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), entry)
-    assert view["seam"]["level"] == "warn" and view["seam"]["blend_seconds"] == 2.0
-    assert view["seam"]["raw_level"] == "bad" and view["seam"]["treatment"]["covers"] is True
-    assert "blends it over 2 s" in view["seam"]["text"]
-    monkeypatch.setattr(ambient, "seam_treatment", treat(2.0, False))
+    assert view["seam"]["level"] == "bad" and view["seam"]["raw_level"] == "bad"
+    assert "won't hide it" in view["seam"]["text"]
+    # Even when the scene's treatment says it covers (no reading of the loop
+    # clip yet), a visible jump is never softened.
+    monkeypatch.setattr(ambient, "seam_treatment", treat(2.0, True))
     view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), entry)
     assert view["seam"]["level"] == "bad" and "won't hide it" in view["seam"]["text"]
     monkeypatch.setattr(ambient, "seam_treatment", treat(0.0, True))

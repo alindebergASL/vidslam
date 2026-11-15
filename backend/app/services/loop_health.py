@@ -287,6 +287,12 @@ def current_entry(project: models.VideoProject, shot: Optional[models.VideoShot]
     return entry
 
 
+def unmeasured(project: models.VideoProject) -> bool:
+    """Whether any clip the scene uses (the loop or a variation) has no
+    current reading: never measured, or changed since."""
+    return any(current_entry(project, s) is None for s in clip_shots(project))
+
+
 def current(project: models.VideoProject, shot: Optional[models.VideoShot]) -> Optional[dict]:
     """The reading of the shot's clip as it is now, or None (never measured,
     no clip, or the clip changed since)."""
@@ -309,7 +315,10 @@ def out(project: models.VideoProject, shot: models.VideoShot, entry: dict) -> di
     except Exception:  # noqa: BLE001 — a note, never a failure
         treatment = None
     blend = float(treatment["blend_seconds"]) if treatment else 0.0
-    covers = bool(treatment["covers"]) if treatment else False
+    # Per clip: the scene's treatment is the worst join of all its clips, so
+    # a variation's slight jump is still covered when another clip jumps
+    # visibly, and a visible jump never is (whatever the blend).
+    covers = seam.get("verdict") != "visible_jump"
     seam["treatment"] = treatment
     seam["blend_seconds"] = round(blend, 2)
     if blend > 0 and seam.get("verdict") in ("slight_jump", "visible_jump"):

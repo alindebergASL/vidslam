@@ -155,9 +155,15 @@ function Inner() {
       const jump = seamJumpOf(e);
       if (!jump) throw e;
       setSeamAsk(jump);
+      // The render measured the join just now: show the verdict. (The saved
+      // config is unchanged, so the settings form keeps unsaved edits.)
+      reload();
       return null;
     }
   };
+  // A chosen blend renders with it this once and keeps "auto": a clip made
+  // later is still measured and asked about. (Auto never blends less than
+  // 2 s over a visible jump, so 2 s and 4 s are the blends used.)
   const renderWithBlend = (seconds: number) => {
     setSeamAsk(null);
     const cfg = scene?.config;
@@ -165,8 +171,8 @@ function Inner() {
     run(
       "render",
       async () => {
-        await api.updateAmbient(id, { config: { ...cfg, seam_mode: "blend", crossfade_seconds: seconds } });
-        return api.renderAmbient(id);
+        await api.updateAmbient(id, { config: { ...cfg, crossfade_seconds: seconds } });
+        return api.renderAmbient(id, true);
       },
       `Render started with a ${seconds} s blend`
     );
