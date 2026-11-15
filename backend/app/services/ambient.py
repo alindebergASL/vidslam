@@ -1727,6 +1727,7 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         seam_treatment=treatment,
         loop_point=loop_point_out(project),
         loop_point_state=loop_point_state(project),
+        loop_point_applies=loop_point_applies(project),
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         picture_ready=has_picture(project, cfg),
@@ -2584,8 +2585,16 @@ def _maybe_find_loop_point(db: Session, project: models.VideoProject, cfg: Ambie
 
 
 def loop_point_state(project: models.VideoProject) -> Optional[dict]:
+    """The last search, as the page shows it. A "running" flag left by a
+    worker that died (older than LOOP_POINT_STALE_SECONDS) reads as failed,
+    so the page stops waiting and the search can be started again."""
     st = (project.ambient_config_json or {}).get(_LOOP_POINT_KEY)
-    return dict(st) if st else None
+    if not st:
+        return None
+    st = dict(st)
+    if st.get("status") == "running" and not _running(st):
+        st.update(status="failed", message="The search didn't finish; try again.")
+    return st
 
 
 def _running(state: Optional[dict]) -> bool:

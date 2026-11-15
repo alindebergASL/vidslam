@@ -36,12 +36,14 @@ export function LoopPointCard({
   const running = state?.status === "running";
   const t = scene.seam_treatment;
 
-  // A search on the job queue: reload until it has finished.
+  // A search on the job queue: reload until it has finished. `scene` is a
+  // new object after every reload, so this re-arms each time while the
+  // search is still running (the page's own poll is off: nothing is in flight).
   useEffect(() => {
     if (!running) return;
     const h = window.setTimeout(() => void onChanged(), 2000);
     return () => window.clearTimeout(h);
-  }, [running, state?.started_at, onChanged]);
+  }, [running, scene, onChanged]);
 
   if (scene.config.source !== "video" || !scene.loop_shot) return null;
 
@@ -71,7 +73,7 @@ export function LoopPointCard({
     }
   };
 
-  const applies = lp ? lp.applies : true;
+  const applies = lp ? lp.applies : scene.loop_point_applies ?? true;
   const inUse = !!lp && !lp.off && lp.applies;
   const perHour = lp && lp.loop_seconds > 0 ? Math.round(3600 / lp.loop_seconds) : null;
 

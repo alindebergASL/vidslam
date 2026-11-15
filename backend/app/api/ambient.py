@@ -600,7 +600,7 @@ def find_loop_point(scene_id: int, db: Session = Depends(get_db)) -> dict:
     loop_point_state)."""
     project = _get_scene(db, scene_id)
     if project.status == "generating":
-        raise HTTPException(409, "The loop is still being made. Look for a loop point once it's ready.")
+        raise HTTPException(409, "The scene is busy (making the loop or rendering). Look for a loop point once it's done.")
     cfg = svc._config_of(project)
     if cfg.source != "video":
         raise HTTPException(409, "A Still + drift loop is seamless by construction: there's no loop point to find.")

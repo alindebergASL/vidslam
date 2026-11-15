@@ -1099,6 +1099,8 @@ export type AmbientScene = {
   /** The found loop stretch of the loop clip (null: the whole clip loops), and the last search. */
   loop_point?: LoopPoint | null;
   loop_point_state?: LoopPointState | null;
+  /** Whether "find a better loop point" applies (single-clip video loops only). */
+  loop_point_applies?: boolean;
   music_ready: boolean;
   sound_ready?: boolean;
   picture_ready?: boolean;

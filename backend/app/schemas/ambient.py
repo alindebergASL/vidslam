@@ -452,6 +452,9 @@ class AmbientOut(BaseModel):
     # The found loop stretch of the loop clip (None: the whole clip loops),
     # and the last finder run.
     loop_point: Optional[LoopPointOut] = None
+    # Whether "find a better loop point" applies to this scene (single-clip
+    # video loops only; variations and day-night loop whole clips).
+    loop_point_applies: bool = False
     loop_point_state: Optional[LoopPointStateOut] = None
     # True once a music bed exists on disk (generated or uploaded).
     music_ready: bool

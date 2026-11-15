@@ -298,3 +298,58 @@ def test_a_new_loop_that_jumps_gets_a_loop_point_by_itself(auth_client, monkeypa
     seen.clear()
     monkeypatch.setattr(loop_health, "measure", real_measure)
     assert _scene(auth_client)["loop_point"] is None and seen == []
+
+
+def test_the_scene_says_whether_a_loop_point_applies(auth_client):
+    """The page hides "Find a better loop point" where the API would refuse
+    it (variations), before any stretch has been found."""
+    assert _scene(auth_client)["loop_point_applies"] is True
+    assert _scene(auth_client, variety="takes", variations=2)["loop_point_applies"] is False
+    assert _scene(auth_client, source="image_drift")["loop_point_applies"] is False
+
+
+def test_a_search_whose_worker_died_reads_failed_and_can_run_again(auth_client):
+    from datetime import datetime, timedelta, timezone
+
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    old = (datetime.now(timezone.utc) - timedelta(seconds=ambient.LOOP_POINT_STALE_SECONDS + 5)).isoformat()
+    db = SessionLocal()
+    try:
+        p = db.get(models.VideoProject, sid)
+        ambient._set_state(p, ambient._LOOP_POINT_KEY, {"status": "running", "started_at": old})
+        db.commit()
+    finally:
+        db.close()
+    st = auth_client.get(f"/api/ambient/{sid}").json()["loop_point_state"]
+    assert st["status"] == "failed" and st["message"]  # the page stops showing "Looking…"
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    assert auth_client.get(f"/api/ambient/{sid}").json()["loop_point_state"]["status"] == "done"
+
+
+def test_a_running_search_turns_away_a_second_one(auth_client):
+    from datetime import datetime, timezone
+
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    db = SessionLocal()
+    try:
+        p = db.get(models.VideoProject, sid)
+        ambient._set_state(p, ambient._LOOP_POINT_KEY,
+                           {"status": "running", "started_at": datetime.now(timezone.utc).isoformat()})
+        db.commit()
+    finally:
+        db.close()
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["loop_point_state"]["status"] == "running"
+    r = auth_client.post(f"/api/ambient/{sid}/find-loop-point")
+    assert r.status_code == 409 and "Already" in r.json()["detail"]
+    assert auth_client.get(f"/api/ambient/{sid}").json()["status"] == out["status"]
