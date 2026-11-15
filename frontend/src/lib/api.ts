@@ -1524,7 +1524,7 @@ export type SpendSummary = {
   by_kind: SpendBucket[];
   by_provider: SpendBucket[];
   by_model: SpendBucket[];
-  top_projects: { project_id: number; title: string; cost_usd: number }[];
+  top_projects: { project_id: number; title: string; project_mode?: string | null; cost_usd: number }[];
   daily: { date: string; cost_usd: number }[];
 };
 export type SpendEntry = {
@@ -1540,6 +1540,7 @@ export type SpendEntry = {
   is_estimate: boolean;
   source: string;
   note: string;
+  project_mode?: string | null;
 };
 export type OpenRouterAccount = {
   available: boolean;
@@ -2249,6 +2250,7 @@ export const api = {
         render_id: number;
         project_id: number;
         project_title: string;
+        project_mode?: string;
         share_token: string;
         created_at: string;
       }[]

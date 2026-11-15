@@ -93,14 +93,19 @@ function Inner() {
 
   const load = useCallback(async () => {
     try {
-      const [p, l] = await Promise.all([api.getProject(projectId), api.hookLab(projectId)]);
+      const p = await api.getProject(projectId);
+      if (p.mode === "ambient_loop") {
+        router.replace(`/ambient/${projectId}`);
+        return;
+      }
+      const l = await api.hookLab(projectId);
       setProject(p);
       setLab(l);
       setError(null);
     } catch (e) {
       setError(errorText(e, "Couldn't load the hook lab"));
     }
-  }, [projectId]);
+  }, [projectId, router]);
   useEffect(() => {
     load();
   }, [load]);

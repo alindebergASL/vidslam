@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useToast } from "@/components/Toaster";
 import { api, OpenRouterAccount, SpendBucket, SpendEntry, SpendSummary } from "@/lib/api";
+import { projectHref } from "@/lib/labels";
 
 const KIND_LABEL: Record<string, string> = {
   video: "Video clips",
@@ -202,7 +203,7 @@ export function SpendPanel() {
             <ul className="space-y-1 text-xs">
               {summary.top_projects.slice(0, 6).map((p) => (
                 <li key={p.project_id} className="flex justify-between gap-2">
-                  <Link href={`/projects/${p.project_id}`} className="text-ink-200 hover:text-ink-100 truncate">
+                  <Link href={projectHref(p.project_id, p.project_mode)} className="text-ink-200 hover:text-ink-100 truncate">
                     {p.title || `Project ${p.project_id}`}
                   </Link>
                   <span className="text-ink-300 tabular-nums">{usd(p.cost_usd)}</span>
@@ -280,7 +281,7 @@ export function SpendPanel() {
                   </td>
                   <td className="py-1 pr-3">
                     {e.project_id ? (
-                      <Link href={`/projects/${e.project_id}`} className="text-ink-200 hover:text-ink-100">
+                      <Link href={projectHref(e.project_id, e.project_mode)} className="text-ink-200 hover:text-ink-100">
                         #{e.project_id}
                       </Link>
                     ) : (

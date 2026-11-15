@@ -36,6 +36,17 @@ from .auth import require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
+AMBIENT_REFUSED = "This is an Ambient scene: use the Ambient page"
+
+
+def refuse_ambient(project: Optional[models.VideoProject]) -> None:
+    """409 for the storyboard tools (plan, render, re-roll, shot and take
+    edits) on an Ambient scene: its loop clip is a shot row too, and a
+    storyboard re-roll or recompose of it makes an unrelated clip and leaves
+    the scene stuck. The Ambient page has its own routes for all of this."""
+    if project is not None and project.mode == "ambient_loop":
+        raise HTTPException(409, AMBIENT_REFUSED)
+
 
 def _apply_cast(db: Session, project: models.VideoProject, cast: list[CastMemberIn]) -> None:
     for cm in list(project.cast_members):
@@ -252,6 +263,7 @@ def update_shot(
     s = db.get(models.VideoShot, shot_id)
     if s is None or s.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
+    refuse_ambient(s.project)
     changes = body.model_dump(exclude_none=True)
     if "prompt" in changes or "negative_prompt" in changes:
         # The safety check now (a 422), not when the clip is sent.
@@ -286,6 +298,7 @@ def edit_plan(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    refuse_ambient(project)
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
 
@@ -355,6 +368,7 @@ def reorder_shots(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    refuse_ambient(project)
     refuse_while_busy(db, project, "The shot order")
     by_id = {s.id: s for s in project.shots}
     order = 1
@@ -451,6 +465,7 @@ def _project_with_plan(db: Session, project_id: int) -> models.VideoProject:
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    refuse_ambient(project)
     if not project.generated_plan_json:
         raise HTTPException(409, "generate a storyboard plan first")
     return project
@@ -611,6 +626,7 @@ def _shot_of(db: Session, project_id: int, shot_id: int) -> models.VideoShot:
     shot = db.get(models.VideoShot, shot_id)
     if shot is None or shot.project_id != project_id:
         raise HTTPException(404, "shot not found in project")
+    refuse_ambient(shot.project)  # an Ambient scene's loop clip has no takes to pick
     return shot
 
 

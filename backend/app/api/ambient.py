@@ -92,7 +92,7 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args,
     try:
         # The job consumes the token before it starts: a cancel while it is
         # queued (or a newer claim) makes it a no-op.
-        return enqueue(job, project.id, *args, claim_token=token)
+        job_id = enqueue(job, project.id, *args, claim_token=token)
     except Exception:
         # QueueUnavailable, or Redis dropping between the health check and
         # the enqueue: no job was accepted, so nothing would ever clear the
@@ -104,6 +104,18 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args,
         ).update({"status": previous, "claim_token": ""}, synchronize_session=False)
         db.commit()
         raise
+    _record_queue_entry(db, project.id, job_id)
+    return job_id
+
+
+def _record_queue_entry(db: Session, scene_id: int, job_id) -> None:  # noqa: ANN001
+    """Kept while the scene is generating, as the storyboard's claimed jobs
+    do, so Cancel and the sweeper can tell a job still waiting in the queue
+    from one whose entry is gone (and never read an older, finished entry)."""
+    db.query(models.VideoProject).filter(
+        models.VideoProject.id == scene_id, models.VideoProject.status == "generating",
+    ).update({"queue_job_id": str(job_id or "")[:80]}, synchronize_session=False)
+    db.commit()
 
 
 def _get_scene(db: Session, scene_id: int) -> models.VideoProject:
@@ -477,6 +489,7 @@ def render_scene(scene_id: int, db: Session = Depends(get_db)) -> dict:
         ).update({"status": previous, "claim_token": ""}, synchronize_session=False)
         db.commit()
         raise
+    _record_queue_entry(db, scene_id, job_id)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
 
 

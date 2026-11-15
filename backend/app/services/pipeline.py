@@ -1014,12 +1014,47 @@ def maybe_recompose(db: Session, project_id: int) -> None:
 
     if video_jobs.pending_for(db, project_id=project_id) > 0:
         return
+    project = db.get(models.VideoProject, project_id)
+    if project is not None:
+        db.refresh(project)
+    if project is not None and (project.mode == "ambient_loop" or not project.generated_plan_json):
+        # Nothing a storyboard recompose could put together (an Ambient
+        # scene, or no plan): give the project back instead of queueing a
+        # recompose that would fail and leave it stuck in "generating".
+        db.execute(sa_update(models.VideoProject)
+                   .where(models.VideoProject.id == project_id, models.VideoProject.status == "regenerating")
+                   .values(status=stranded_status(project)))
+        db.commit()
+        return
+    # The placeholder queue id goes in with the status change, so a Cancel
+    # landing before the real id is recorded never reads the project's older,
+    # finished queue entry as "gone" and frees a recompose about to be queued.
     res = db.execute(sa_update(models.VideoProject)
                      .where(models.VideoProject.id == project_id, models.VideoProject.status == "regenerating")
-                     .values(status="generating"))
+                     .values(status="generating", queue_job_id=RECOMPOSE_QUEUING))
     db.commit()
     if res.rowcount == 1:
-        enqueue(recompose_after_regen_job, project_id)
+        qid = enqueue(recompose_after_regen_job, project_id)
+        # Recorded like a claimed job's, so Cancel and the sweeper see this
+        # recompose waiting in the queue rather than an older, finished entry.
+        db.execute(sa_update(models.VideoProject)
+                   .where(models.VideoProject.id == project_id, models.VideoProject.status == "generating")
+                   .values(queue_job_id=str(qid or "")[:80]))
+        db.commit()
+
+
+RECOMPOSE_QUEUING = "recompose:queuing"
+
+
+def stranded_status(project: models.VideoProject) -> str:
+    """Where a project goes back to when a storyboard re-roll or recompose
+    can't run for it: an Ambient scene whose loop clip is made is "planned"
+    (ready to render, as after making the loop), anything else "failed"."""
+    if project.mode == "ambient_loop":
+        loop = next((s for s in project.shots if s.shot_type == "ambient_loop"), None)
+        if loop is not None and loop.clip_path and Path(loop.clip_path).exists():
+            return "planned"
+    return "failed"
 
 
 def _fail_render(db: Session, render: models.Render, project: models.VideoProject, error: str) -> None:
@@ -2627,6 +2662,10 @@ def regenerate_shot(
     shot = db.get(models.VideoShot, shot_id)
     if not project or not shot or shot.project_id != project.id:
         raise ValueError("shot not found in project")
+    if project.mode == "ambient_loop":
+        # Backstop for the API's 409: an Ambient loop clip is made on the
+        # Ambient page (from the scene picture), never re-rolled here.
+        raise ValueError("an Ambient scene's clip can't be re-rolled as a storyboard shot")
     if recompose:
         project.status = "regenerating"
         db.commit()
@@ -2641,6 +2680,8 @@ def regenerate_shots_bulk(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise ValueError(f"project {project_id} not found")
+    if project.mode == "ambient_loop":
+        raise ValueError("an Ambient scene's clip can't be re-rolled as a storyboard shot")
     by_id = {s.id: s for s in project.shots}
     targets = [by_id[i] for i in shot_ids if i in by_id and by_id[i].shot_type != "end_card"]
     if recompose and targets:
@@ -2767,6 +2808,11 @@ def recompose_project(db: Session, project_id: int) -> models.Render:
     if project is None:
         raise ValueError(f"project {project_id} not found")
     if not project.generated_plan_json:
+        if project.status == "generating":
+            # Claimed (Retry, or a re-roll's recompose) but nothing to put
+            # together: don't leave it spinning with its claim consumed.
+            project.status = stranded_status(project)
+            db.commit()
         raise ValueError("project has no storyboard plan yet")
 
     plan = StoryboardPlan.model_validate(project.generated_plan_json)

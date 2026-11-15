@@ -70,6 +70,18 @@ def _run(cmd: list[str], timeout: Optional[float] = None,
         rc, out, err = _run_parts(cmd, timeout)
         return rc, out + err
     deadline = None if timeout is None else time.monotonic() + timeout
+
+    def _asked_to_stop() -> bool:
+        try:
+            return bool(should_stop())
+        except Exception:  # a failed check never stops the work
+            return False
+
+    # Asked once before the command starts too: a stop that is already
+    # requested must win even when the command would finish within the
+    # first second's wait (a short join on a fast machine).
+    if _asked_to_stop():
+        return -2, "stopped"
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as proc:
         while True:
             try:
@@ -77,11 +89,7 @@ def _run(cmd: list[str], timeout: Optional[float] = None,
                 return proc.returncode, (out or "") + (err or "")
             except subprocess.TimeoutExpired:
                 pass
-            stop = False
-            try:
-                stop = bool(should_stop())
-            except Exception:  # a failed check never stops the work
-                stop = False
+            stop = _asked_to_stop()
             if stop or (deadline is not None and time.monotonic() > deadline):
                 proc.kill()
                 proc.communicate()

@@ -200,6 +200,11 @@ def generate_music(
     project = db.get(models.VideoProject, project_id)
     if project is None:
         raise HTTPException(404, "project not found")
+    if project.mode == "ambient_loop":
+        # The storyboard track would replace the scene's music bed (and be
+        # cut to the provider's longest track): the Ambient page makes it.
+        raise HTTPException(409, f"This is an Ambient scene: make its music on the Ambient page "
+                                 f"(POST /api/ambient/{project_id}/music).")
     try:
         pipeline.generate_music_for_project(
             db, project_id, prompt=body.prompt, duration_seconds=body.duration_seconds

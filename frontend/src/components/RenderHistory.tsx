@@ -9,7 +9,14 @@ import { statusLabel } from "@/lib/labels";
 
 const DONE = ["completed", "failed", "cancelled", "expired"];
 
-export function RenderHistory({ projectId }: { projectId: number }) {
+export function RenderHistory({
+  projectId,
+  linkFor,
+}: {
+  projectId: number;
+  /** Where a version's tile links (default: the render page). */
+  linkFor?: (renderId: number) => string;
+}) {
   const [renders, setRenders] = useState<Render[]>([]);
 
   const reload = () =>
@@ -76,7 +83,7 @@ export function RenderHistory({ projectId }: { projectId: number }) {
               className="card overflow-hidden card-hover flex flex-col relative"
             >
               <Link
-                href={`/projects/${projectId}/render?id=${r.id}`}
+                href={linkFor ? linkFor(r.id) : `/projects/${projectId}/render?id=${r.id}`}
                 className="block"
               >
                 <div className="aspect-9/16 max-h-44 bg-ink-800 relative">

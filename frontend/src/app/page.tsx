@@ -6,7 +6,7 @@ import { OnboardingChecklist } from "@/components/OnboardingChecklist";
 import { StatusBadge } from "@/components/StatusBadge";
 import { useToast } from "@/components/Toaster";
 import { api, Avatar, Ingredient, Project } from "@/lib/api";
-import { formatDuration, modeLabel } from "@/lib/labels";
+import { formatDuration, modeLabel, projectHref } from "@/lib/labels";
 
 const PROVIDER_NAMES: Record<string, string> = {
   openrouter: "OpenRouter", elevenlabs: "ElevenLabs", gemini: "Google", replicate: "Replicate",
@@ -82,7 +82,7 @@ function Dashboard() {
   } | null>(null);
   const [healthBusy, setHealthBusy] = useState(false);
   const [recent, setRecent] = useState<
-    { render_id: number; project_id: number; project_title: string; created_at: string }[]
+    { render_id: number; project_id: number; project_title: string; project_mode?: string; created_at: string }[]
   >([]);
 
   const [seeding, setSeeding] = useState(false);
@@ -289,7 +289,7 @@ function Dashboard() {
               const rid = thumbnails[p.id];
               return (
                 <Link
-                  href={p.mode === "ambient_loop" ? `/ambient/${p.id}` : `/projects/${p.id}`}
+                  href={projectHref(p.id, p.mode)}
                   key={p.id}
                   className="card overflow-hidden card-hover flex flex-col"
                 >
