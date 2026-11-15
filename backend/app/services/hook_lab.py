@@ -196,19 +196,35 @@ def check_opening(db: Session, base: models.Render, hook: str, window: Optional[
     What is heard is the new opening, then the base voiceover from `window`
     on, and the window can be moved anywhere, even inside the original first
     sentence. So the opening is also checked with what of the original may
-    be heard after it (heard_checks). Raises HookLabError (422) when refused."""
-    from . import minor_check
-    from .safety import UnsafeScriptError
+    be heard after it (heard_checks).
 
+    Every form goes through the word filter; the model is asked once, on
+    the longest combined text (opening_text: the opening with the whole
+    original script, the script it makes, what is heard and the joins), so
+    an opening costs one call whatever the window. Raises HookLabError
+    (422) when refused."""
+    from . import minor_check
+    from .safety import UnsafeScriptError, check_script
+
+    opening = opening_script(db, base, hook)
     try:
-        minor_check.check_generation(hook or "", kind="script")
-        minor_check.check_generation(opening_script(db, base, hook), kind="script")
+        check_script(hook or "")
+        check_script(opening)
     except UnsafeScriptError as e:
         raise HookLabError(f"This opening can't be used: {e}", 422) from None
     try:
-        heard_checks(db, base, hook, window)
+        heard = heard_checks(db, base, hook, window)
     except UnsafeScriptError as e:
         raise HookLabError(f"This opening can't be used: {e} {HEARD_NOTE}", 422) from None
+    judged = opening_text(hook, opening, heard)
+    try:
+        minor_check.check_generation(judged, kind="script")
+    except UnsafeScriptError as e:
+        note = f" {HEARD_NOTE}" if heard else ""
+        raise HookLabError(f"This opening can't be used: {e}{note}", 422) from None
+    # The model read the opening inside that text: its own voice (synth_hook
+    # speaks the opening alone) isn't asked about again.
+    minor_check.vouch_ok(judged, [" ".join((hook or "").split()), (hook or "").strip()])
     from . import explicit_check
 
     if explicit_check.active():
@@ -220,12 +236,32 @@ def check_opening(db: Session, base: models.Render, hook: str, window: Optional[
             raise HookLabError(f"This opening can't be used: {e}", 422) from None
 
 
-def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> None:
-    """The opening with the original words that may be heard after it.
+def opening_text(hook: str, opening: str, heard: list[str]) -> str:
+    """What the model reads of an opening, once: the opening alone when
+    nothing of an original is heard, else each form on lines of its own
+    (the opening with the whole original script, the script it makes,
+    what is heard and the joins). A form already in the text isn't
+    repeated."""
+    hook = " ".join((hook or "").split())
+    forms: list[str] = []
+    for text in (*heard[:1], " ".join((opening or "").split()), *heard[1:]):
+        text = (text or "").strip()
+        if text and text not in forms:
+            forms.append(text)
+    if not heard:
+        return forms[0] if forms else hook
+    return "\n".join(forms)
 
-    1. The opening, then the whole original script (the safety check, with
-       the AI check): every word of the original that can be heard after
-       the opening is in it, wherever the window is.
+
+def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> list[str]:
+    """The opening with the original words that may be heard after it:
+    the word filter on each form, and the forms the model reads
+    (check_opening joins them into one text). [] when no original script
+    is heard.
+
+    1. The opening, then the whole original script: every word of the
+       original that can be heard after the opening is in it, wherever the
+       window is.
     2. With the window known: the opening joined to the original where the
        voiceover picks up (heard_cuts). The safety check sees that best
        guess as it is heard, without the replaced words around it (they
@@ -239,21 +275,22 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
        opening joined at every word of that sentence (heard_joins), a few
        at a time.
     Raises UnsafeScriptError."""
-    from . import minor_check
     from .renderer import _probe_duration
     from .safety import check_script
 
     hook = " ".join((hook or "").split())
     script = base_script(db, base).strip()
     if not hook or not script:
-        return
-    minor_check.check_generation(f"{hook} {script}", kind="script")
+        return []
+    whole = f"{hook} {script}"
+    check_script(whole)
+    texts = [whole]
     path = Path(base.audio_path or "")
     if not window or window <= 0 or not path.is_file():
-        return
+        return texts
     total = _probe_duration(path)
     if window >= total - 0.05:
-        return  # nothing of the original is heard after the opening
+        return texts  # nothing of the original is heard after the opening
     try:
         end_of_first: Optional[float] = find_hook_window(base, script)
     except HookLabError:
@@ -267,14 +304,15 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     for cut in cuts:
         check_script(f"{hook} {script[cut:]}")
         check_script(f"{bare} {script[cut:].lstrip(_PUNCT)}")
-    if rest and best == rest_at:
-        heard = replace_first_sentence(script, hook)  # the usual join: checked already
-    else:
+    if not (rest and best == rest_at):  # else the usual join: the script the opening makes
         heard = f"{hook} {script[best:]}"
-    minor_check.check_generation(heard, kind="script")
+        check_script(heard)
+        texts.append(heard)
     if inside:
         for text in heard_joins(hook, script, [c for c in cuts if c < rest_at], rest_at):
-            minor_check.check_generation(text, kind="script")
+            check_script(text)
+            texts.append(text)
+    return texts
 
 
 _PUNCT = " \t.,;:!?…-–—\"'“”‘’()"

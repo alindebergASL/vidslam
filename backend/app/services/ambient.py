@@ -492,7 +492,7 @@ def _generate_sound_bed(db: Session, project: models.VideoProject, cfg: AmbientC
     sound = get_sound()
     data = sound.generate(prompt=prompt, duration_seconds=30)
     out.write_bytes(data)
-    _log_provider_call(db, project_id=project.id, provider=type(sound).__name__, endpoint="sound.generate",
+    _log_provider_call(db, project_id=project.id, provider=sound.__class__.__name__, endpoint="sound.generate",
                        request_summary={"sound": cfg.sound, "prompt": prompt[:120]},
                        response_summary={"bytes": len(data)})
     return out
@@ -1327,9 +1327,12 @@ def generate_music_bed(db: Session, project: models.VideoProject, cfg: AmbientCo
 
 def _generate_music_bed(db: Session, project: models.VideoProject, cfg: AmbientConfig, prompt: str) -> Path:
     from ..providers import get_music
+    from ..providers.registry import music_part_prompt
     from .pipeline import _log_provider_call, check_audio_prompt, generate_music_for_project
 
-    check_audio_prompt(prompt)  # once for every part: the parts add only the joining words
+    # Once for every part: the parts add only the app's joining words, which
+    # the guarded provider leaves out of its checks (the verdict is cached).
+    check_audio_prompt(prompt)
     parts = music_parts(cfg)
     if len(parts) == 1:
         return generate_music_for_project(db, project.id, prompt=prompt, duration_seconds=parts[0])["path"]
@@ -1337,17 +1340,13 @@ def _generate_music_bed(db: Session, project: models.VideoProject, cfg: AmbientC
     out_dir = storage.render_subdir(project.id)
     files: list[Path] = []
     for i, secs in enumerate(parts):
-        variation = (
-            f" Part {i + 1} of {len(parts)} of one continuous piece: keep the same key, tempo, "
-            "instruments and mood; let it evolve gently, no ending or fade."
-        )
-        data = music.generate(prompt=prompt + variation, duration_seconds=secs)
+        data = music.generate(prompt=music_part_prompt(prompt, i + 1, len(parts)), duration_seconds=secs)
         ext = (music.output_extension() or "mp3").lstrip(".")
         f = out_dir / f"music_part_{i + 1}.{ext}"
         f.write_bytes(data)
         files.append(f)
         _log_provider_call(
-            db, project_id=project.id, provider=type(music).__name__, endpoint="music.generate(part)",
+            db, project_id=project.id, provider=music.__class__.__name__, endpoint="music.generate(part)",
             request_summary={"part": i + 1, "of": len(parts), "duration": secs},
             response_summary={"bytes": len(data)},
         )
@@ -1970,23 +1969,32 @@ def checked_prompts(project: models.VideoProject, cfg: AmbientConfig, plan: Loop
 
 def precheck(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPlanOut,
              clip_prompts: Optional[list[str]] = None) -> None:
-    """A clean deployment: the checks every paid step of the loop will meet
-    (checked_prompts, and the music and sound prompts), before the first
+    """The checks every paid step of the loop will meet, before the first
     one is paid for, so a refusal (or a check that can't run) never comes
     after a still or clip was bought. Verdicts are cached, so the checks at
-    the providers are then hits. Nothing on a deployment with adult
-    features. Raises UnsafeScriptError."""
+    the providers are then hits.
+
+    - Every mode: the music and sound prompts get the checks get_music()
+      and get_sound() run on them (registry.audio_guard: the word filter,
+      the minors check, asked when a prompt is sexual or mentions a minor,
+      and on a clean deployment the explicit-content check). Sound and
+      music prompts are guarded in every mode, so their refusal comes here.
+    - A clean deployment: also the picture and clip prompts
+      (checked_prompts).
+
+    Raises UnsafeScriptError."""
+    from ..providers.registry import audio_guard
     from . import explicit_check
     from .minor_check import check_generation
 
+    for text in (resolve_music_prompt(cfg), resolve_sound_prompt(cfg)):
+        if text:
+            audio_guard(text)
     if not explicit_check.active():
         return
     for text, negative, kind in dict.fromkeys(checked_prompts(project, cfg, plan, clip_prompts)):
         if text.strip():
             check_generation(text, negative, kind=kind)
-    for text in (resolve_music_prompt(cfg), resolve_sound_prompt(cfg)):
-        if text:
-            explicit_check.check_prompt(text)
 
 
 # Chain state: in flight, or kept (with "failed": True) when a clip failed so

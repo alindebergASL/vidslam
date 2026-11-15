@@ -55,6 +55,8 @@ def _isolated_env(monkeypatch, tmp_path: Path) -> None:
     _mc.PICTURE_CALLS.clear()
     _mc.PICTURE_EXPLICIT_REPLY = None
     _mc.PICTURE_EXPLICIT_CALLS.clear()
+    _mc.STORY_FACTS_REPLY = None
+    _mc.STORY_FACTS_CALLS.clear()
 
     # Rebind the engine + SessionLocal to this test's own SQLite file so tests are
     # truly isolated (the engine is module-bound at import; without this every test

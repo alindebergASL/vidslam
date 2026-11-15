@@ -636,7 +636,8 @@ def test_adult_mode_pauses_suggestive_prompts_when_the_check_cant_run(client, pr
         with pytest.raises(safety.UnsafePromptError) as e:
             minor_check.check_generation(prompt, kind=kind)
         assert str(e.value) == minor_check.UNAVAILABLE
-    minor_check.check_generation(prompt, kind="script")  # a voice script: no picture, as before
+    with pytest.raises(safety.UnsafePromptError, match="couldn't run"):  # round 10: a script waits too
+        minor_check.check_generation(prompt, kind="script")
     with pytest.raises(safety.UnsafePromptError):  # every picture waits in adult mode now
         minor_check.check_generation("a mountain lake at dawn", kind="image")
     _adult(False)

@@ -219,15 +219,16 @@ def test_a_phrase_formed_across_the_join_is_refused_only_where_it_is_heard(auth_
 def test_the_ai_check_sees_the_opening_with_what_is_heard_after_it(auth_client, monkeypatch):
     """The replaced words ("my wife is thirty") can make the joined text read
     as being about an adult. The AI check also sees the opening with only the
-    words heard after it."""
+    words heard after it, on a line of its own in the one text it is asked
+    about (hook_lab.opening_text)."""
     from app.providers import mock_chat
 
     seen: list[str] = []
 
     def judge(self, text):
         seen.append(text)
-        # A check misled by the adult in the replaced words.
-        bad = "braces" in text and "bikini" in text and "thirty" not in text
+        # A check misled by the adult in the replaced words, read line by line.
+        bad = any("braces" in ln and "bikini" in ln and "thirty" not in ln for ln in text.split("\n"))
         return {"minor_sexual": bad, "reason": "probe"}
 
     monkeypatch.setattr(mock_chat.MockChatProvider, "classify_minor", judge)

@@ -40,6 +40,54 @@ def pcm16_to_wav(pcm: bytes, rate: int = PCM_RATE) -> bytes:
     return buf.getvalue()
 
 
+def with_tag_instructions(text: str, settings: dict) -> tuple[str, dict]:
+    """These models have no audio tags: the voice tags in `text` ([whispers],
+    [short pause]...; services/story_script.VOICE_TAGS) become the request's
+    spoken `instructions` and leave the text, which would otherwise be read
+    out. Other bracketed text is left alone, and text without a tag is
+    returned exactly as given. A tag this deployment doesn't allow (an adult
+    one on a clean deployment) is removed, never turned into a direction. A
+    line that is only a tag ("[sighs]") is sent as NONVERBAL_TEXT with the
+    direction. Used on story markup only (settings story_markup). Returns
+    (text, settings)."""
+    from ..services.story_script import (
+        NONVERBAL_TEXT,
+        allowed_tags,
+        has_tags,
+        split_tags,
+        tags_to_instructions,
+    )
+
+    if not has_tags(text):
+        return text, settings
+    tags, plain = split_tags(text, allowed=allowed_tags())
+    out = dict(settings)
+    said = tags_to_instructions(tags)
+    if said:
+        out["instructions"] = f"{settings['instructions'].rstrip()} {said}" if settings.get("instructions") else said
+    return plain or NONVERBAL_TEXT, out
+
+
+CHAT_AUDIO_SYSTEM = "Read the user's text aloud exactly as written, warmly and naturally. Do not add anything."
+
+
+def chat_audio_system(instructions: str = "") -> str:
+    """The chat-audio model's system message when a story line's tags were
+    turned into directions: the read-it-verbatim guard, with the directions
+    after it (never instead of it)."""
+    said = " ".join((instructions or "").split())
+    return f"{CHAT_AUDIO_SYSTEM} {said}" if said else CHAT_AUDIO_SYSTEM
+
+
+def _rate(model: str, settings: dict) -> float:
+    """USD per 1,000 characters: a story voice's per-model rate; any other
+    caller's the flat COST_TTS_PER_1K_CHARS, as it always was."""
+    from ..services.story_script import is_story
+
+    s = get_settings()
+    return s.tts_rate(model) if is_story(settings) else float(s.cost_tts_per_1k_chars)
+
+
 class OpenRouterTTSProvider(TTSProvider):
     def __init__(self, *, model: str, voice: str = "", api_key: str | None = None,
                  chat_audio: bool | None = None, voices: list[str] | None = None) -> None:
@@ -77,11 +125,26 @@ class OpenRouterTTSProvider(TTSProvider):
             return voice_id
         return self.voice or (self.voices[0] if self.voices else "alloy")
 
+    def resolve_voice(self, voice_id: str) -> str:
+        """The voice a request for `voice_id` is really read with (an empty
+        or unlisted id falls back to the configured voice)."""
+        return self._voice_for(" ".join(str(voice_id or "").split()))
+
     def synthesize(self, *, text: str, voice_id: str, settings: dict | None = None) -> bytes:
+        from ..services.story_script import is_story
+
         voice = self._voice_for(voice_id)
+        extra = settings or {}
+        # Story markup only (settings story_markup): any other caller's text
+        # and instructions are sent exactly as before.
+        # A story line always gets the read-it-verbatim guard first, with its
+        # instructions (the caller's and its tags') after it, never instead.
+        story = is_story(extra)
+        if story:
+            text, extra = with_tag_instructions(text, extra)
         if self.chat_audio:
-            return self._chat_audio(text, voice, settings or {})
-        return self._speech(text, voice, settings or {})
+            return self._chat_audio(text, voice, extra, guard=story)
+        return self._speech(text, voice, extra)
 
     def _speech(self, text: str, voice: str, extra: dict) -> bytes:
         body = {"model": self.model, "input": text, "voice": voice, "response_format": "mp3"}
@@ -101,21 +164,25 @@ class OpenRouterTTSProvider(TTSProvider):
 
         spend.record_openrouter("tts", self.model, cost=None,
                                 generation_id=r.headers.get("x-generation-id", ""),
-                                estimate=len(text) / 1000 * get_settings().cost_tts_per_1k_chars,
+                                estimate=len(text) / 1000 * _rate(self.model, extra),
                                 note=f"{len(text)} chars")
         if "pcm" in ctype or body["response_format"] == "pcm" and "mpeg" not in ctype:
             return pcm16_to_wav(data)
         return data
 
-    def _chat_audio(self, text: str, voice: str, extra: dict) -> bytes:
+    def _chat_audio(self, text: str, voice: str, extra: dict, *, guard: bool = False) -> bytes:
+        """`guard` (story markup): the read-it-verbatim guard goes first and
+        the instructions after it (chat_audio_system); otherwise the caller's
+        instructions, or the guard alone, as they always were."""
+        system = (chat_audio_system(extra.get("instructions") or "") if guard
+                  else extra.get("instructions") or CHAT_AUDIO_SYSTEM)
         body = {
             "model": self.model,
             "modalities": ["text", "audio"],
             "audio": {"voice": voice, "format": "pcm16"},
             "stream": True,
             "messages": [
-                {"role": "system", "content": extra.get("instructions")
-                 or "Read the user's text aloud exactly as written, warmly and naturally. Do not add anything."},
+                {"role": "system", "content": system},
                 {"role": "user", "content": text},
             ],
         }
@@ -149,6 +216,6 @@ class OpenRouterTTSProvider(TTSProvider):
 
         spend.record_openrouter("tts", self.model, cost=spend.usage_cost(usage),
                                 generation_id=str(usage.get("id") or ""),
-                                estimate=len(text) / 1000 * get_settings().cost_tts_per_1k_chars,
+                                estimate=len(text) / 1000 * _rate(self.model, extra),
                                 note=f"{len(text)} chars")
         return pcm16_to_wav(b"".join(chunks))

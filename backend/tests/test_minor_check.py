@@ -82,10 +82,17 @@ def test_adult_mode_checks_every_prompt(client):
     minor_check.check_generation(IMPLIED + " again", kind="video")  # filters on: not asked
 
 
-def test_scripts_are_checked_only_when_sexual(client):
+def test_scripts_are_always_checked(client):
+    # Round 11: every voice script is judged in every mode (one cached call).
+    _adult(False)
+    minor_check.check_generation("Our new coffee blend is here.", kind="script")
+    minor_check.check_generation("Our new coffee blend is here.", kind="script")
+    assert _calls() == 1
+    # Round 9: in adult mode too (the same text: the cached verdict).
     _adult(True)
     minor_check.check_generation("Our new coffee blend is here.", kind="script")
-    assert _calls() == 0
+    minor_check.check_generation("Our new garden chairs are here.", kind="script")
+    assert _calls() == 2
     with pytest.raises(safety.UnsafePromptError):
         minor_check.check_generation(MINOR_SEXUAL, kind="script")
 
@@ -546,7 +553,7 @@ def test_plan_check_asks_once_per_unique_shot_prompt(client, monkeypatch):
                                  ShotPlan(order=2, visual_prompt=PLAIN, **shot),
                                  ShotPlan(order=3, visual_prompt="a forest path", **shot)])
     pipeline._check_plan(plan)
-    assert _calls() == 2
+    assert _calls() == 3  # two distinct shot prompts, and (adult mode) the voice script
     plan.shots[2].visual_prompt = IMPLIED
     with pytest.raises(safety.UnsafePromptError):
         pipeline._check_plan(plan)
@@ -564,9 +571,12 @@ def test_adult_mode_status_names_the_safety_check(auth_client):
 @pytest.mark.parametrize("text", ["grilled chicken breast with herbs", "Breast Cancer Awareness walk",
                                   "kids splashing in swimsuits at the beach", "a swimwear ad on a yacht"])
 def test_unavailable_allows_everyday_words(client, text):
+    """A picture prompt goes ahead outside adult mode; a voice script with
+    the same words is asked about (round 10), so it waits."""
     mock_chat.MINOR_REPLY = RuntimeError("HTTP 402")
     minor_check.check_generation(text, kind="image")
-    minor_check.check_generation(text, kind="script")
+    with pytest.raises(safety.UnsafePromptError, match="couldn't run"):
+        minor_check.check_generation(text, kind="script")
 
 
 def test_everyday_word_alone_is_not_asked_outside_adult_mode(client):

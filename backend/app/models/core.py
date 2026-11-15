@@ -714,3 +714,113 @@ class PromptCheck(Base):
     model: Mapped[str] = mapped_column(String(120), default="")
     reason: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+# --- Sound Studio (audio stories; services/story_script.py) ---
+
+
+class SoundStory(Base):
+    """An audio story: its script (services/story_script.py markup), its cast
+    and how it is mixed. Kept apart from VideoProject: no video path ever
+    runs on it. Spend goes to the ledger with ref "sound_story:<id>"."""
+
+    __tablename__ = "sound_stories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    kind: Mapped[str] = mapped_column(String(20), default="story")  # story|asmr
+    premise: Mapped[str] = mapped_column(Text, default="")
+    target_minutes: Mapped[int] = mapped_column(Integer, default=10)
+    # style, sfx_density, beds on/off, loudness preset, formats, writer model
+    settings_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    script_text: Mapped[str] = mapped_column(Text, default="")
+    script_version: Mapped[int] = mapped_column(Integer, default=0)
+    # name → {voice_id, provider, model, seed, voice_settings, style, pan, adult}
+    cast_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    mix_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # draft|scripting|ready|generating|rendering|completed|failed|cancelled
+    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)
+    claim_token: Mapped[str] = mapped_column(String(40), default="")
+    queue_job_id: Mapped[str] = mapped_column(String(80), default="")
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    progress_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    estimated_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    actual_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now, index=True)
+
+
+class SoundClip(Base):
+    """One generated piece of a story (a voice clip, a sound effect, a bed or
+    music), kept as takes. `fingerprint` hashes everything that shapes the
+    audio, so an unchanged clip is never paid for twice."""
+
+    __tablename__ = "sound_clips"
+    __table_args__ = (Index("ix_sound_clips_story_chapter_seq", "story_id", "chapter", "seq"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    story_id: Mapped[int] = mapped_column(ForeignKey("sound_stories.id", ondelete="CASCADE"))
+    cue_key: Mapped[str] = mapped_column(String(64), default="")
+    chapter: Mapped[int] = mapped_column(Integer, default=0)
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    kind: Mapped[str] = mapped_column(String(10), default="voice")  # voice|sfx|bed|music
+    take_no: Mapped[int] = mapped_column(Integer, default=1)
+    selected: Mapped[bool] = mapped_column(Boolean, default=True)
+    fingerprint: Mapped[str] = mapped_column(String(64), default="", index=True)
+    text_or_prompt: Mapped[str] = mapped_column(Text, default="")
+    params_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    path: Mapped[str] = mapped_column(String(500), default="")
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    model: Mapped[str] = mapped_column(String(200), default="")
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|done|failed|flagged
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)
+
+
+class SoundAsset(Base):
+    """The sound library, and the cache of generated sound effects shared by
+    every story: the same prompt, length, loop and model is paid for once
+    (`key_hash`; empty for uploads)."""
+
+    __tablename__ = "sound_assets"
+    __table_args__ = (UniqueConstraint("key_hash", name="uq_sound_assets_key_hash"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(20), default="sfx")  # sfx|ambience|music|voice
+    name: Mapped[str] = mapped_column(String(200), default="")
+    tags: Mapped[str] = mapped_column(String(500), default="")
+    prompt: Mapped[str] = mapped_column(Text, default="")
+    key_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    loop: Mapped[bool] = mapped_column(Boolean, default=False)
+    provider: Mapped[str] = mapped_column(String(40), default="")
+    model: Mapped[str] = mapped_column(String(200), default="")
+    path: Mapped[str] = mapped_column(String(500), default="")
+    source: Mapped[str] = mapped_column(String(20), default="generated")  # generated|upload
+    story_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("sound_stories.id", ondelete="SET NULL"), nullable=True, index=True)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class SoundRender(Base):
+    """One mix of a story into finished files (free: local ffmpeg)."""
+
+    __tablename__ = "sound_renders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    story_id: Mapped[int] = mapped_column(ForeignKey("sound_stories.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="queued")  # queued|rendering|completed|failed
+    script_version: Mapped[int] = mapped_column(Integer, default=0)
+    files_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # {mp3, m4a, wav, cue, chapters}
+    chapters_json: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    loudness_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)  # {I, TP, LRA, preset}
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now, onupdate=_now)

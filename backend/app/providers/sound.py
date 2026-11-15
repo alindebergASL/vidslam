@@ -1,4 +1,6 @@
-"""Nature-sound beds (rain, waves, fire…) for ambient scenes.
+"""Sound effects: nature-sound beds (rain, waves, fire…) for ambient scenes,
+and one-shot effects (a door creak) for audio stories (loop=False, billed
+by the second).
 
 ElevenLabs text-to-sound-effects: POST /v1/sound-generation with `text`,
 `duration_seconds` (0.5–30), `loop: true` for a seamless loop, and an
@@ -31,11 +33,15 @@ class ElevenLabsSoundProvider:
         if not self.api_key:
             raise RuntimeError("ELEVENLABS_API_KEY missing for real sound provider")
 
-    def generate(self, *, prompt: str, duration_seconds: float = MAX_SECONDS) -> bytes:
+    def generate(self, *, prompt: str, duration_seconds: float = MAX_SECONDS, loop: bool = True,
+                 prompt_influence: float = 0.5) -> bytes:
+        """`loop`: a seamless loop (an ambient bed, the default) or a
+        one-shot effect (a door creak); `prompt_influence` 0–1: how
+        literally the prompt is followed."""
         s = get_settings()
         secs = max(0.5, min(MAX_SECONDS, float(duration_seconds)))
-        body = {"text": prompt, "duration_seconds": secs, "loop": True,
-                "prompt_influence": 0.5, "model_id": self.model_id}
+        body = {"text": prompt, "duration_seconds": secs, "loop": bool(loop),
+                "prompt_influence": max(0.0, min(1.0, float(prompt_influence))), "model_id": self.model_id}
         with httpx.Client(timeout=180.0) as client:
             r = client.post(f"{s.elevenlabs_base_url.rstrip('/')}/sound-generation",
                             params={"output_format": "mp3_44100_128"},
@@ -45,8 +51,12 @@ class ElevenLabsSoundProvider:
                 raise RuntimeError(f"sound generation {r.status_code}: {r.text[:300]}")
         from ..services import spend
 
-        spend.record_rate_card("elevenlabs", "sound", self.model_id, s.cost_sound_per_generation,
-                               note=f"{secs:.0f}s loop")
+        if loop:
+            spend.record_rate_card("elevenlabs", "sound", self.model_id, s.cost_sound_per_generation,
+                                   note=f"{secs:.0f}s loop")
+        else:
+            spend.record_rate_card("elevenlabs", "sound", self.model_id, secs * s.cost_sound_per_second,
+                                   note=f"{secs:g}s one-shot")
         return r.content
 
 
@@ -57,15 +67,18 @@ class MockSoundProvider:
     name = "mock"
     model_id = "mock/sound"
 
-    def generate(self, *, prompt: str, duration_seconds: float = MAX_SECONDS) -> bytes:
+    def generate(self, *, prompt: str, duration_seconds: float = MAX_SECONDS, loop: bool = True,
+                 prompt_influence: float = 0.5) -> bytes:
         if not shutil.which("ffmpeg"):
             raise RuntimeError("ffmpeg required for the mock sound provider")
         secs = max(0.5, min(MAX_SECONDS, float(duration_seconds)))
+        fade = ("afade=t=in:d=0.5" if loop
+                else f"afade=t=in:d=0.05,afade=t=out:st={max(0.0, secs - 0.2):g}:d=0.2")
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "sound.mp3"
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-f", "lavfi", "-i", f"anoisesrc=color=brown:amplitude=0.25:d={secs}",
-                 "-af", "lowpass=f=1800,afade=t=in:d=0.5", "-ac", "2", "-ar", "44100",
+                 "-af", f"lowpass=f=1800,{fade}", "-ac", "2", "-ar", "44100",
                  "-c:a", "libmp3lame", "-b:a", "128k", str(out)],
                 capture_output=True, text=True,
             )
