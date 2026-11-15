@@ -1015,7 +1015,59 @@ AUDIO_XFADE_CURVES = "c1=qsin:c2=qsin"
 AUDIO_UNIT_CODEC = ("-c:a", "pcm_f32le")
 
 
-def _make_seamless_audio_unit(music: Path, dst: Path, *, crossfade: float) -> tuple[str, float]:
+class EmptyAudioUnit(RuntimeError):
+    """The audio unit came out shorter than it must be (a header with no
+    samples, say). Looping it would never reach the video's length."""
+
+
+# A unit must hold at least this share of what it was asked for.
+AUDIO_UNIT_MIN_SHARE = 0.98
+# A bed shorter than this is treated as empty and never looped.
+AUDIO_UNIT_EMPTY_SECONDS = 0.05
+
+
+def _audio_unit_ok(dst: Path, expected: float) -> float:
+    """dst's decoded length when it holds at least AUDIO_UNIT_MIN_SHARE of
+    `expected` seconds and is not empty, else 0."""
+    if not dst.exists():
+        return 0.0
+    got = _probe_duration(dst)
+    if got < AUDIO_UNIT_EMPTY_SECONDS or got < expected * AUDIO_UNIT_MIN_SHARE:
+        return 0.0
+    return got
+
+
+def _audio_transcode(src: Path, dst: Path, *, fade: float = 0.0, length: float = 0.0) -> str:
+    """src as a PCM unit, with an optional fade at both ends."""
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vn"]
+    if fade > 0 and length > 2 * fade:
+        cmd += ["-af", f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={length - fade:.3f}:d={fade:.3f}"]
+    cmd += [*AUDIO_UNIT_CODEC, str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg audio unit failed: {log[-2000:]}")
+    return log
+
+
+def _crossfade_unit(src: Path, dst: Path, cf: float) -> str:
+    flt = (
+        f"[0:a]asetpts=PTS-STARTPTS,atrim=start={cf:.3f},asetpts=PTS-STARTPTS[body];"
+        f"[1:a]asetpts=PTS-STARTPTS,atrim=end={cf:.3f},asetpts=PTS-STARTPTS[head];"
+        f"[body][head]acrossfade=d={cf:.3f}:{AUDIO_XFADE_CURVES}[a]"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", str(src), "-i", str(src),
+        "-filter_complex", flt, "-map", "[a]",
+        *AUDIO_UNIT_CODEC, str(dst),
+    ]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg audio unit failed: {log[-2000:]}")
+    return log
+
+
+def _make_seamless_audio_unit(music: Path, dst: Path, *, crossfade: float,
+                              loops: bool = True) -> tuple[str, float]:
     """Same trick for audio: crossfade the bed's tail into its own head so the
     file loops cleanly. `dst` should be a .wav (see AUDIO_UNIT_CODEC).
     Returns (log, unit_seconds).
@@ -1026,32 +1078,65 @@ def _make_seamless_audio_unit(music: Path, dst: Path, *, crossfade: float) -> tu
     reported duration is never used as a cut point: for MP3/AAC it counts
     encoder delay and padding the decoder drops (ElevenLabs' 30 s MP3 probes
     as 30.04 s), and cutting there replayed or skipped 10–50 ms at every loop
-    point — a click on tonal music."""
+    point — a click on tonal music.
+
+    With `loops=False` (a bed at least as long as the video, so it is never
+    replayed) the bed is only transcoded.
+
+    The unit's length is always checked. Some ffmpeg builds make an empty
+    file (a WAV header, no samples) from the crossfade graph on certain
+    PCM/FLAC beds while still exiting 0; looping that forever would hang the
+    mux. Then the crossfade is retried from an MP3 copy of the bed, then the
+    bed is used with a short fade at both ends, and if the unit is still
+    short EmptyAudioUnit is raised."""
     length = _probe_duration(music)
     if length <= 0:
         raise RuntimeError("music bed has no readable duration")
     cf = min(crossfade, max(0.0, length / 3.0))
-    if cf < 0.05:
-        # Too short to crossfade meaningfully — just transcode as-is.
-        cmd = ["ffmpeg", "-y", "-i", str(music), "-vn", *AUDIO_UNIT_CODEC, str(dst)]
-        rc, log = _run(cmd)
-        if rc != 0:
-            raise RuntimeError(f"ffmpeg audio unit failed: {log[-2000:]}")
-        return log, _probe_duration(dst) or length
-    flt = (
-        f"[0:a]asetpts=PTS-STARTPTS,atrim=start={cf:.3f},asetpts=PTS-STARTPTS[body];"
-        f"[1:a]asetpts=PTS-STARTPTS,atrim=end={cf:.3f},asetpts=PTS-STARTPTS[head];"
-        f"[body][head]acrossfade=d={cf:.3f}:{AUDIO_XFADE_CURVES}[a]"
+    logs: list[str] = []
+    if not loops or cf < 0.05:
+        # Never replayed, or too short to crossfade meaningfully: transcode as-is.
+        logs.append(_audio_transcode(music, dst))
+        got = _audio_unit_ok(dst, length)
+        if got:
+            return "\n".join(logs), got
+    else:
+        logs.append(_crossfade_unit(music, dst, cf))
+        got = _audio_unit_ok(dst, length - cf)
+        if got:
+            return "\n".join(logs), got
+        # Retry the crossfade from an MP3 copy of the bed.
+        mp3 = dst.with_name(dst.stem + "_src.mp3")
+        try:
+            rc, log = _run(["ffmpeg", "-y", "-i", str(music), "-vn", "-c:a", "libmp3lame",
+                            "-q:a", "2", str(mp3)])
+            logs.append(log)
+            if rc == 0:
+                mlen = _probe_duration(mp3)
+                mcf = min(crossfade, max(0.0, mlen / 3.0))
+                if mlen > 0 and mcf >= 0.05:
+                    logs.append(_crossfade_unit(mp3, dst, mcf))
+                    got = _audio_unit_ok(dst, mlen - mcf)
+                    if got:
+                        return "\n".join(logs), got
+        finally:
+            mp3.unlink(missing_ok=True)
+    # Last resort: the bed itself, faded in and out so its loop point is
+    # a soft dip rather than a click.
+    fade = min(1.0, length / 4.0) if loops else 0.0
+    logs.append(_audio_transcode(music, dst, fade=fade, length=length))
+    got = _audio_unit_ok(dst, length)
+    if got:
+        return "\n".join(logs), got
+    raise EmptyAudioUnit(
+        f"audio unit from {music.name} is empty or short "
+        f"({_probe_duration(dst) if dst.exists() else 0:.2f}s of {length:.2f}s)"
     )
-    cmd = [
-        "ffmpeg", "-y", "-i", str(music), "-i", str(music),
-        "-filter_complex", flt, "-map", "[a]",
-        *AUDIO_UNIT_CODEC, str(dst),
-    ]
-    rc, log = _run(cmd)
-    if rc != 0:
-        raise RuntimeError(f"ffmpeg audio unit failed: {log[-2000:]}")
-    return log, _probe_duration(dst) or (length - cf)
+
+
+def _mux_timeout(total: float) -> float:
+    """How long the final mux may take: 3× the video plus 10 minutes."""
+    return 3.0 * max(0.0, total) + 600.0
 
 
 def _tile_and_mux(
@@ -1077,6 +1162,10 @@ def _tile_and_mux(
     # Each audio bed (music, nature sound) loops forever at its own volume;
     # with both, they're mixed. Fades apply to the mix.
     beds = [(p, v) for p, v in ((music_unit, music_volume), (sound_unit, sound_volume)) if p is not None]
+    for bed, _ in beds:
+        # -stream_loop -1 on an empty input never reaches -t: refuse it.
+        if not bed.exists() or _probe_duration(bed) < AUDIO_UNIT_EMPTY_SECONDS:
+            raise EmptyAudioUnit(f"audio bed {bed.name} is empty; refusing to loop it")
     if beds:
         chains: list[str] = []
         for i, (bed, vol) in enumerate(beds, start=1):
@@ -1100,7 +1189,7 @@ def _tile_and_mux(
     else:
         cmd += ["-map", "0:v:0", *vcodec, "-an"]
     cmd += ["-t", f"{total:.3f}", "-movflags", "+faststart", str(out)]
-    rc, log = _run(cmd)
+    rc, log = _run(cmd, timeout=_mux_timeout(total))
     if rc != 0:
         raise RuntimeError(f"ffmpeg ambient mux failed: {log[-2000:]}")
     return log
@@ -1383,7 +1472,8 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     if inputs.music_path is not None and inputs.music_path.exists():
         music_unit = out / "ambient_music_unit.wav"
         mlog, _ = _make_seamless_audio_unit(
-            inputs.music_path, music_unit, crossfade=max(1.0, inputs.crossfade_seconds)
+            inputs.music_path, music_unit, crossfade=max(1.0, inputs.crossfade_seconds),
+            loops=_probe_duration(inputs.music_path) < total,
         )
         logs.append(mlog)
 
@@ -1391,7 +1481,8 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     sound_unit: Optional[Path] = None
     if inputs.sound_path is not None and inputs.sound_path.exists():
         sound_unit = out / "ambient_sound_unit.wav"
-        slog, _ = _make_seamless_audio_unit(inputs.sound_path, sound_unit, crossfade=1.5)
+        slog, _ = _make_seamless_audio_unit(inputs.sound_path, sound_unit, crossfade=1.5,
+                                            loops=_probe_duration(inputs.sound_path) < total)
         logs.append(slog)
 
     # 5. Tile + mux. The tail piece's fade-out lands at the end of the last
