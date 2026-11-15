@@ -8,7 +8,9 @@ be matched to the log of the same kind that follows it within a few
 seconds.
 
 Only unambiguous matches are applied: every candidate log in the window must
-name the same project. Dry run by default; pass --apply to write.
+name the same project. Logs with no project (a preset preview's picture, say)
+count as candidates too, so a row near one of them is left alone rather than
+charged to a scene whose log happens to follow. Dry run by default; pass --apply to write.
 
     python -m scripts.backfill_spend_project_ids            # show what would change
     python -m scripts.backfill_spend_project_ids --apply    # write it
@@ -38,7 +40,7 @@ class Row:
 
 @dataclass(frozen=True)
 class Log:
-    project_id: int
+    project_id: Optional[int]
     endpoint: str
     at: datetime
 
@@ -55,7 +57,9 @@ def match(rows: Iterable[Row], logs: Iterable[Log], window: timedelta = WINDOW) 
         found = {lg.project_id for lg in logs
                  if lg.endpoint.startswith(prefixes) and r.at <= lg.at <= r.at + window}
         if len(found) == 1:
-            out[r.id] = found.pop()
+            pid = found.pop()
+            if pid is not None:
+                out[r.id] = pid
     return out
 
 
@@ -75,8 +79,7 @@ def run(apply: bool, window: timedelta = WINDOW, db=None) -> dict[int, int]:  # 
         start = min(e.created_at for e in spend_rows)
         end = max(e.created_at for e in spend_rows) + window
         logs = (db.query(models.ProviderLog)
-                .filter(models.ProviderLog.project_id.isnot(None),
-                        models.ProviderLog.status == "ok",
+                .filter(models.ProviderLog.status == "ok",
                         models.ProviderLog.created_at >= start,
                         models.ProviderLog.created_at <= end)
                 .all())

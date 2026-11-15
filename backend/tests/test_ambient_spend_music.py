@@ -266,6 +266,41 @@ def test_backfill_matches_only_unambiguous_rows():
     assert match(rows, logs) == {1: 7, 3: 7}
 
 
+def test_backfill_leaves_a_row_near_a_projectless_log_alone():
+    """A preset preview's picture has no project; its spend row must not be
+    charged to a scene whose picture log follows within the window."""
+    from datetime import datetime, timedelta
+
+    from scripts.backfill_spend_project_ids import Log, Row, match
+
+    t = datetime(2026, 11, 1, 12, 0, 0)
+    logs = [
+        Log(None, "image.generate(preview)", t + timedelta(seconds=2)),
+        Log(7, "image.generate(picture)", t + timedelta(seconds=20)),
+    ]
+    assert match([Row(1, "image", t)], logs) == {}
+    assert match([Row(2, "image", t)], [Log(None, "image.generate", t + timedelta(seconds=1))]) == {}
+
+
+def test_backfill_run_reads_projectless_logs(auth_client):
+    from app.db import SessionLocal
+    from app.services import pipeline, spend
+    from scripts.backfill_spend_project_ids import run
+
+    pid = _project(auth_client)
+    db = SessionLocal()
+    try:
+        spend.record_rate_card("openrouter", "image", "m", 0.04)  # the preview's picture
+        pipeline._log_provider_call(db, project_id=None, provider="X", endpoint="image.generate(preview)",
+                                    request_summary={}, response_summary={})
+        pipeline._log_provider_call(db, project_id=pid, provider="X", endpoint="image.generate(picture)",
+                                    request_summary={}, response_summary={})
+        assert run(True, db=db) == {}
+        assert _rows("image")[0].project_id is None
+    finally:
+        db.close()
+
+
 def test_backfill_is_a_dry_run_unless_applied(auth_client):
     from app import models
     from app.db import SessionLocal
