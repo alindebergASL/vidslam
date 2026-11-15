@@ -197,9 +197,9 @@ def test_the_music_bed_loops_on_its_own_long_crossfade(auth_client, monkeypatch,
     xfades = []
     real_unit = renderer._make_seamless_audio_unit
 
-    def spy_unit(src, dst, *, crossfade):
+    def spy_unit(src, dst, *, crossfade, loops=True):
         xfades.append(crossfade)
-        return real_unit(src, dst, crossfade=crossfade)
+        return real_unit(src, dst, crossfade=crossfade, loops=loops)
 
     monkeypatch.setattr(renderer, "_make_seamless_audio_unit", spy_unit)
     clip = seamless(tmp_path / "clip.mp4")
