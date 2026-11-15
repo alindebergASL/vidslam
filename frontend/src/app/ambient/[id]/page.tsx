@@ -12,6 +12,7 @@ import { useToast } from "@/components/Toaster";
 import { EnhanceButton } from "@/components/EnhanceButton";
 import { ScenePicture } from "@/components/ambient/ScenePicture";
 import { LoopHealthCard } from "@/components/ambient/LoopHealthCard";
+import { LoopPointCard } from "@/components/ambient/LoopPointCard";
 import {
   aboutUsd,
   askBeforeDiscard,
@@ -559,6 +560,7 @@ function Inner() {
                 }}
               />
             )}
+            {loopReady && <LoopPointCard scene={scene} disabled={inFlight} onChanged={reload} />}
             {scene.loop_shot?.prompt && (
               <details className="px-4 py-3 text-xs text-ink-300 border-t border-ink-800">
                 <summary className="cursor-pointer text-ink-200">Prompt sent to the model</summary>

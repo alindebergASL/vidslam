@@ -195,6 +195,16 @@ export function seamVerdictView(
 ): { label: string; tone: "good" | "warn" | "bad"; title: string } | null {
   if (!t || t.basis !== "measured" || !t.verdict) return null;
   const blend = fmtSec(t.blend_seconds);
+  if (t.loop_point) {
+    const what = t.verdict === "seamless" ? "joins seamlessly" : t.verdict === "slight_jump" ? "jumps slightly" : "still jumps";
+    const label =
+      t.verdict === "seamless" ? "Seamless loop point" : t.verdict === "slight_jump" ? `Loop point · ${blend} blend` : "Loop point jumps";
+    return {
+      label,
+      tone: t.verdict === "seamless" ? "good" : t.covers ? "warn" : "bad",
+      title: `The render loops the stretch of the clip that joins best; it ${what} (${t.ratio ?? "?"}× a normal frame step), blended over ${blend}.`,
+    };
+  }
   if (t.verdict === "seamless") {
     return { label: "Seamless join", tone: "good", title: `The join measured seamless; the render blends ${blend} as a hedge.` };
   }
@@ -227,6 +237,8 @@ export function seamBlendFor(cfg: AmbientConfig, treatment: SeamTreatment | null
   if (cfg.source === "image_drift") return 0;
   const user = Math.max(0, cfg.crossfade_seconds || 0);
   if (!treatment || treatment.basis !== "measured" || !treatment.verdict || cfg.seam_mode === "blend") return user;
+  // A found loop stretch: sized from its join (and the room either side), as the server says.
+  if (treatment.loop_point) return treatment.blend_seconds;
   if (treatment.verdict === "seamless") return Math.min(user, 0.5);
   if (treatment.verdict === "slight_jump") return Math.max(user, 1.5);
   return Math.max(user, 2.0);
@@ -250,6 +262,11 @@ export function seamBlendHint(cfg: AmbientConfig, treatment: SeamTreatment | nul
         : treatment!.verdict === "snap"
           ? "a jump at the very end"
           : "a visible jump";
+  if (treatment!.loop_point) {
+    return cfg.seam_mode === "blend"
+      ? `The render loops the found loop point and blends ${fmtSec(blend)}, as set (within the room around it).`
+      : `The found loop point's join measured ${what}; the render blends ${fmtSec(blend)}.`;
+  }
   if (cfg.seam_mode === "blend") return `The join measured ${what}; the render blends ${fmtSec(blend)}, as set.`;
   return blend === cfg.crossfade_seconds
     ? `The join measured ${what}; the render blends ${fmtSec(blend)}.`

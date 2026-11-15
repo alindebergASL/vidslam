@@ -980,6 +980,41 @@ export type SeamTreatment = {
   basis: "measured" | "plan" | "drift";
   /** False: the blend won't hide the jump, so a render asks first. */
   covers: boolean;
+  /** True: the render loops a found stretch of the clip (see LoopPoint); verdict and ratio are its join's. */
+  loop_point?: boolean;
+};
+
+/** The stretch of the loop clip the render loops (backend loop_point), in clip seconds. */
+export type LoopPoint = {
+  in_seconds: number;
+  out_seconds: number;
+  /** out − in in the finished video (slow-down applied). */
+  loop_seconds: number;
+  crossfade: number;
+  ratio: number;
+  raw_ratio: number | null;
+  verdict: SeamVerdict;
+  calm: boolean;
+  /** Grey RMS (0-255) between the two pictures the dissolve mixes; above ~30 a double image. */
+  mismatch: number | null;
+  mismatch_ok: boolean;
+  /** The take snaps to its last frame; its snapping tail is left out of the loop. */
+  snap: boolean;
+  /** The video opens on the clip's own first frames before the first loop. */
+  intro: boolean;
+  /** "Use the whole clip": kept but not used. */
+  off: boolean;
+  /** False with variations: they loop whole clips. */
+  applies: boolean;
+};
+
+/** The last "find a better loop point" run. */
+export type LoopPointState = {
+  status: "running" | "done" | "failed";
+  found: boolean | null;
+  message: string;
+  started_at?: string | null;
+  finished_at?: string | null;
 };
 
 /** POST /render's 409 for a loop that visibly jumps (see SeamTreatment.covers). */
@@ -1019,6 +1054,7 @@ export type LoopHealth = {
     text: string;
     difference: number;
     typical: number;
+    max_step?: number | null;
     ratio: number;
     blend_seconds?: number;
   };
@@ -1060,6 +1096,9 @@ export type AmbientScene = {
   loop_health_outdated?: boolean[];
   /** The blend the render will use at the loop's join, and why. */
   seam_treatment?: SeamTreatment | null;
+  /** The found loop stretch of the loop clip (null: the whole clip loops), and the last search. */
+  loop_point?: LoopPoint | null;
+  loop_point_state?: LoopPointState | null;
   music_ready: boolean;
   sound_ready?: boolean;
   picture_ready?: boolean;
@@ -2214,6 +2253,11 @@ export const api = {
   setClipCheckSettings: (body: { auto_check?: boolean; model?: string; reset_model?: boolean; allow_unlisted?: boolean }) =>
     req<ClipCheckSettings>("/api/settings/clip-check", { method: "PUT", body: JSON.stringify(body) }),
   clipCheckModels: () => req<{ models: ClipCheckModel[]; active: string }>("/api/settings/clip-check/models"),
+  /** Look for the stretch of the loop clip that joins best. Free; runs as a job (see loop_point_state). */
+  findLoopPoint: (id: number) =>
+    req<{ scene_id: number; job_id: string; status: string }>(`/api/ambient/${id}/find-loop-point`, { method: "POST" }),
+  /** Loop the whole clip again (the found stretch is kept). */
+  useWholeClip: (id: number) => req<AmbientScene>(`/api/ambient/${id}/find-loop-point`, { method: "DELETE" }),
   /** Measure the loop (and each variation) again. Free. */
   measureLoopHealth: (id: number) => req<LoopHealthResult>(`/api/ambient/${id}/loop-health`, { method: "POST" }),
   /** A path the API returned (e.g. a take's or a voiceover's `url`) as a full URL. */
