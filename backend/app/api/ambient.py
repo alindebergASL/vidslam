@@ -321,11 +321,19 @@ def resume_loop(scene_id: int, db: Session = Depends(get_db)) -> dict:
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued", "clip": info.clip, "take": info.take}
 
 
+def _bed_busy(project: models.VideoProject, what: str) -> None:
+    """A generation makes (and overwrites) the beds itself: a second paid
+    call now would race it for the same file."""
+    if project.status == "generating":
+        raise HTTPException(409, f"the scene is generating; make the {what} again when it's done")
+
+
 @router.post("/{scene_id}/music", dependencies=[Depends(rate_limit("generation")), Depends(budget_guard)])
 def regenerate_music(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
     """(Re)generate the scene's music bed at its configured length —
     multi-part + crossfaded when longer than the provider's per-call cap."""
     project = _get_scene(db, scene_id)
+    _bed_busy(project, "music")
     cfg = svc._config_of(project)
     prompt = svc.resolve_music_prompt(cfg)
     if not prompt:
@@ -342,6 +350,7 @@ def regenerate_music(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut
 def regenerate_sound(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
     """(Re)generate the scene's nature-sound bed (one 30 s seamless loop)."""
     project = _get_scene(db, scene_id)
+    _bed_busy(project, "nature sound")
     cfg = svc._config_of(project)
     if not svc.resolve_sound_prompt(cfg):
         raise HTTPException(409, "nature sound is off for this scene")

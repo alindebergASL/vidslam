@@ -55,11 +55,12 @@ class ElevenLabsMusicProvider(MusicProvider):
         s = get_settings()
         url = f"{s.elevenlabs_base_url.rstrip('/')}/music"
         # elevenlabs.io/docs/api-reference/music/compose: prompt +
-        # music_length_ms (3 s–5 min per the FAQ; the schema allows 10 min),
+        # music_length_ms (3 s – 10 min: a 600000 ms request returns a
+        # 600 s track; ambient.music_cap_seconds says the same),
         # force_instrumental (prompt mode only). model_id is sent
         # explicitly: the API default, music_v1, is deprecated and will be
         # removed on 2027-01-31.
-        length_ms = int(min(300.0, max(3.0, duration_seconds)) * 1000)
+        length_ms = int(min(600.0, max(3.0, duration_seconds)) * 1000)
         body: dict = {
             "prompt": prompt,
             "music_length_ms": length_ms,
@@ -73,6 +74,9 @@ class ElevenLabsMusicProvider(MusicProvider):
             r.raise_for_status()
         from ..services import spend
 
-        spend.record_rate_card("elevenlabs", "music", self.model_id, s.cost_music_per_generation,
-                               note=f"{length_ms / 1000:.0f}s track")
+        delivered = length_ms / 1000
+        note = f"{delivered:.0f}s track"
+        if delivered < duration_seconds:  # clamped to the 10 min a call makes; the renderer loops it
+            note += f" ({duration_seconds:.0f}s asked)"
+        spend.record_rate_card("elevenlabs", "music", self.model_id, s.cost_music_per_generation, note=note)
         return r.content

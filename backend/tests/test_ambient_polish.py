@@ -27,9 +27,11 @@ def test_music_parts_respect_provider_caps():
     from app.services.ambient import music_parts
 
     ten = AmbientConfig(music_bed_seconds=600)
-    parts = music_parts(ten, "elevenlabs")
-    assert len(parts) == 3  # 5-min cap, 6 s overlaps → 3 calls
-    assert all(p <= 300 for p in parts) and sum(parts) - 6 * (len(parts) - 1) >= 599
+    assert music_parts(ten, "elevenlabs") == [600.0]  # 10-min cap: one call
+    twenty = AmbientConfig(music_bed_seconds=1200)
+    parts = music_parts(twenty, "elevenlabs")
+    assert len(parts) == 3  # 10-min cap, 6 s overlaps → 3 calls
+    assert all(p <= 600 for p in parts) and sum(parts) - 6 * (len(parts) - 1) >= 1199
     # 30 s clips net 24 s each after the 6 s crossfade → 25 calls for 10 min.
     assert len(music_parts(ten, "google/lyria-3-clip-preview")) == 25
     assert music_parts(AmbientConfig(), "elevenlabs") == [60.0]  # auto bed: one call

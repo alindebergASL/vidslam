@@ -8,6 +8,9 @@ import { AutoTextarea } from "@/components/AutoTextarea";
 import { useAdultFeatures } from "@/components/AdultModePanel";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
+// One music call makes at most 10 minutes (ambient.music_cap_seconds); the
+// render loops the track under a longer video.
+const MUSIC_TRACK_MAX_SECONDS = 600;
 
 const MUSIC_PRESETS: { label: string; prompt: string }[] = [
   { label: "Lo-fi", prompt: "warm lo-fi hip hop, mellow Rhodes piano, soft drums, 70 bpm" },
@@ -502,7 +505,9 @@ export function AudioPanel({
                   {busy === "music" ? "Generating…" : "Generate music →"}
                 </button>
                 <span className="text-[10px] text-ink-400">
-                  ~{project.target_duration_seconds}s, matches video length
+                  {project.target_duration_seconds > MUSIC_TRACK_MAX_SECONDS
+                    ? "10 min track; longer videos loop it"
+                    : `~${project.target_duration_seconds}s, matches video length`}
                 </span>
               </div>
             </div>
