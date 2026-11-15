@@ -370,7 +370,15 @@ def _claim_looks_stranded(db: Session, project: models.VideoProject) -> bool:
     from ..services import video_jobs
     from ..workers import queue as _queue
 
-    if video_jobs.pending_for(db, project_id=project.id) != 0:
+    # An Ambient loop's clips (ambient_segment) count too, and so does its
+    # chain: between one clip landing and the next being sent, and while the
+    # finished loop's music bed is made, nothing is queued or in flight but
+    # the scene is still being made.
+    if video_jobs.pending_for(db, project_id=project.id,
+                              purposes=("shot", "avatar", "ambient_segment")) != 0:
+        return False
+    chain = (project.ambient_config_json or {}).get("_chain") if project.mode == "ambient_loop" else None
+    if chain and not chain.get("failed"):
         return False
     return _queue.queue_entry_state(project.queue_job_id or "") == "gone"
 

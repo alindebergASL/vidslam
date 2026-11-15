@@ -1031,7 +1031,13 @@ def maybe_recompose(db: Session, project_id: int) -> None:
                      .values(status="generating"))
     db.commit()
     if res.rowcount == 1:
-        enqueue(recompose_after_regen_job, project_id)
+        qid = enqueue(recompose_after_regen_job, project_id)
+        # Recorded like a claimed job's, so Cancel and the sweeper see this
+        # recompose waiting in the queue rather than an older, finished entry.
+        db.execute(sa_update(models.VideoProject)
+                   .where(models.VideoProject.id == project_id, models.VideoProject.status == "generating")
+                   .values(queue_job_id=str(qid or "")[:80]))
+        db.commit()
 
 
 def stranded_status(project: models.VideoProject) -> str:

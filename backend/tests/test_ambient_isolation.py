@@ -278,3 +278,99 @@ def test_cancel_leaves_a_consumed_claim_without_an_rq_entry(auth_client, monkeyp
     _set(sid, status="generating", claim_token="", queue_job_id=qid)
     assert auth_client.post(f"/api/projects/{sid}/cancel").json()["action"] == "noop"
     assert _state(sid)[0] == "generating"
+
+
+# ---------- 5b. Cancel never takes a scene from a job that is still at work ----------
+
+
+def _qid(pid: int) -> str:
+    from app import models
+    from app.db import SessionLocal
+
+    with SessionLocal() as db:
+        return db.get(models.VideoProject, pid).queue_job_id
+
+
+def test_storyboard_recompose_after_a_reroll_records_its_queue_entry(auth_client, monkeypatch):
+    """maybe_recompose's recompose is not a claimed job: before, the project
+    kept an older, finished queue entry, so a Cancel while the recompose was
+    still queued read "gone" and gave the project back from under it."""
+    from app.db import SessionLocal
+    from app.services import pipeline
+    from app.workers import queue
+
+    pid = _storyboard(auth_client)
+    assert auth_client.post(f"/api/projects/{pid}/generate-video").status_code == 202
+    _set(pid, status="regenerating", claim_token="", queue_job_id="rq-old")
+    monkeypatch.setattr(queue, "enqueue", lambda *a, **k: "rq-recompose")
+    with SessionLocal() as db:
+        pipeline.maybe_recompose(db, pid)
+    assert _state(pid)[0] == "generating"
+    assert _qid(pid) == "rq-recompose"
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "alive" if qid == "rq-recompose" else "gone")
+    assert auth_client.post(f"/api/projects/{pid}/cancel").json()["action"] == "noop"
+    assert _state(pid)[0] == "generating"
+    # Once that entry is gone too (the recompose raised), Cancel frees it.
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "gone")
+    assert auth_client.post(f"/api/projects/{pid}/cancel").json()["action"] == "released"
+    assert _state(pid)[0] == "cancelled"
+
+
+@pytest.mark.parametrize("route", ["render", "generate"])
+def test_ambient_claims_record_their_queue_entry(auth_client, monkeypatch, route):
+    """The Ambient routes' jobs are recorded like the storyboard's, so a
+    stuck scene can be freed by Cancel and a queued one is left alone."""
+    from app.api import ambient as ambient_api
+    from app.workers import queue
+
+    sid = _scene(auth_client)["id"]
+    monkeypatch.setattr(ambient_api, "enqueue", lambda *a, **k: "rq-amb")
+    r = auth_client.post(f"/api/ambient/{sid}/render" if route == "render" else f"/api/ambient/{sid}/generate-loop")
+    assert r.status_code == 202, r.text
+    assert _state(sid)[0] == "generating" and _qid(sid) == "rq-amb"
+    _set(sid, claim_token="")  # the job took the claim
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "alive")
+    r = auth_client.post(f"/api/projects/{sid}/cancel")  # no render yet: 409 "no render in flight"
+    assert r.status_code == 409 or r.json()["action"] == "noop", r.text
+    assert _state(sid)[0] == "generating"
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "gone")
+    assert auth_client.post(f"/api/projects/{sid}/cancel").json()["action"] == "released"
+    assert _state(sid)[0] == "cancelled"
+
+
+def test_cancel_leaves_an_ambient_loop_whose_clips_are_being_made(auth_client, monkeypatch):
+    from app import models
+    from app.db import SessionLocal
+    from app.workers import queue
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _set(sid, status="generating", claim_token="", queue_job_id="rq-123")
+    with SessionLocal() as db:
+        db.add(models.VideoJob(purpose="ambient_segment", ref_id=scene["loop_shot"]["id"], project_id=sid,
+                               status="submitted"))
+        db.commit()
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "gone")
+    r = auth_client.post(f"/api/projects/{sid}/cancel")
+    assert r.status_code in (200, 409), r.text
+    assert _state(sid)[0] == "generating"
+
+
+@pytest.mark.parametrize("failed,status", [(False, "generating"), (True, "cancelled")])
+def test_cancel_leaves_an_ambient_loop_chain_in_flight(auth_client, monkeypatch, failed, status):
+    """Between one clip landing and the next being sent, and while the
+    finished loop's music is made, only the chain says the scene is busy."""
+    from app import models
+    from app.db import SessionLocal
+    from app.workers import queue
+
+    sid = _scene(auth_client)["id"]
+    with SessionLocal() as db:
+        p = db.get(models.VideoProject, sid)
+        p.ambient_config_json = {**(p.ambient_config_json or {}),
+                                 "_chain": {"segment_ids": [], "failed": failed}}
+        p.status, p.claim_token, p.queue_job_id = "generating", "", "rq-123"
+        db.commit()
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "gone")
+    auth_client.post(f"/api/projects/{sid}/cancel")
+    assert _state(sid)[0] == status
