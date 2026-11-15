@@ -181,3 +181,85 @@ def test_cost_fields(auth_client):
 
     quiet = auth_client.get(f"/api/ambient/{_scene(auth_client, music_mood='none')}").json()
     assert quiet["music_cost"] == 0 and quiet["sound_cost"] == 0
+
+
+def test_stuck_follows_what_cancel_can_free(auth_client, monkeypatch):
+    """Stuck is only shown where the page's Reset (the project cancel) can
+    free the scene, and never while a loop chain is still working."""
+    from app.services.pipeline import HOOK_CLAIM
+    from app.workers import queue
+
+    monkeypatch.setattr(queue, "queue_entry_state", lambda job_id: "gone")
+    sid = _scene(auth_client)
+    get = lambda: auth_client.get(f"/api/ambient/{sid}").json()["stuck"]  # noqa: E731
+    long_ago = datetime.utcnow() - timedelta(hours=1)
+
+    # A claim no job took (its entry lost): stuck, and Reset frees it.
+    _set(sid, status="generating", claim_token="tok", queue_job_id="rq-lost", updated_at=long_ago)
+    assert get() is True
+    r = auth_client.post(f"/api/projects/{sid}/cancel")
+    assert r.status_code == 200 and r.json()["action"] == "released", r.text
+    assert auth_client.get(f"/api/ambient/{sid}").json()["stuck"] is False
+
+    # The job took the claim but ran inline / in the background: its entry
+    # always reads as gone, so it can't tell; left to the sweeper.
+    _set(sid, status="generating", claim_token="", queue_job_id="inline:generate_ambient_loop_job",
+         updated_at=long_ago)
+    assert get() is False
+    _set(sid, queue_job_id="", updated_at=long_ago)
+    assert get() is False
+
+    # A loop chain under way (between clips, or making the music bed): working.
+    from app import models
+    from app.db import SessionLocal
+
+    def chain(value):
+        db = SessionLocal()
+        p = db.get(models.VideoProject, sid)
+        p.ambient_config_json = {**(p.ambient_config_json or {}), "_chain": value}
+        db.commit()
+        db.close()
+        _set(sid, updated_at=long_ago)
+
+    _set(sid, queue_job_id="rq-1")
+    chain({"segment_ids": [], "variant": 0})
+    assert get() is False
+    chain({"segment_ids": [], "variant": 0, "failed": True})
+    assert get() is True
+
+    # The hook lab's claim is stopped there, never here.
+    _set(sid, claim_token=f"{HOOK_CLAIM}planned", updated_at=long_ago)
+    assert get() is False
+
+
+def test_batch_records_its_queue_entry(auth_client, monkeypatch):
+    from app import models
+    from app.api import ambient as api_ambient
+    from app.db import SessionLocal
+
+    monkeypatch.setattr(api_ambient, "enqueue", lambda *a, **k: "rq-batch-7")
+    r = auth_client.post("/api/ambient/batch", json={
+        "presets": ["ocean", "waterfall"], "render": False, "aspect_ratio": "16:9", "config": SHORT})
+    assert r.status_code == 201, r.text
+    db = SessionLocal()
+    assert {db.get(models.VideoProject, i).queue_job_id for i in r.json()["scene_ids"]} == {"rq-batch-7"}
+    db.close()
+
+
+def test_queue_entry_not_written_over_a_finished_scene(auth_client, monkeypatch):
+    """A job that already finished (inline, or a fast worker) leaves the
+    scene alone: no entry is recorded after it."""
+    from app import models
+    from app.api import ambient as api_ambient
+    from app.db import SessionLocal
+
+    def finish(*a, **k):
+        _set(sid, status="planned", claim_token="")
+        return "rq-done"
+
+    monkeypatch.setattr(api_ambient, "enqueue", finish)
+    sid = _scene(auth_client)
+    assert auth_client.post(f"/api/ambient/{sid}/generate-loop").status_code == 202
+    db = SessionLocal()
+    assert db.get(models.VideoProject, sid).queue_job_id == ""
+    db.close()

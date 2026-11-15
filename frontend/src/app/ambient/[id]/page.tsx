@@ -291,7 +291,9 @@ function Inner() {
             {pictureSrc ? (
               <span className="chip text-xs py-0.5 inline-flex items-center gap-1.5">
                 <img src={pictureSrc} alt="" className="w-5 h-3.5 rounded-xs object-cover" />
-                Your picture
+                {OWN_PICTURE.includes(scene.config.picture_origin)
+                  ? "Your picture"
+                  : preset?.label ?? scene.config.scene_preset}
               </span>
             ) : (
               <span className="chip text-xs py-0.5">
@@ -946,6 +948,9 @@ function TitleEditor({ title, onSave }: { title: string; onSave: (t: string) => 
     </form>
   );
 }
+
+/** Pictures the user brought (services.ambient.OWN_PICTURE). */
+const OWN_PICTURE = ["upload", "studio", "asset"];
 
 /** services.ambient.INDOOR_PRESETS: their light is from the fire or candles. */
 const INDOOR_PRESETS = ["fireplace", "candles"];

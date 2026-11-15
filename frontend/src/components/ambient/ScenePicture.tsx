@@ -117,8 +117,10 @@ export function ScenePicture({
   const own = has && OWN_PICTURE.includes(origin);
   const cost = scene.picture_cost != null && scene.picture_cost >= 0.005 ? `~$${scene.picture_cost.toFixed(2)}` : "";
   // Nothing to make a picture from: no description, and the preset is the default one.
+  // (/new stores "the scene in the given image" for a picture with no description.)
+  const described = scene.config.scene_prompt.trim();
   const nothingToDescribe =
-    !scene.config.scene_prompt.trim() &&
+    (!described || described.toLowerCase() === "the scene in the given image") &&
     (scene.config.scene_preset === "custom" || scene.config.scene_preset === DEFAULT_AMBIENT_CONFIG.scene_preset);
 
   // Every picture change needs a new loop: when one is already made, ask

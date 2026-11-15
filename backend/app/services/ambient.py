@@ -1717,13 +1717,31 @@ _DONE_RENDER = ("completed", "failed", "cancelled", "expired")
 
 def is_stuck(db: Session, project: models.VideoProject, *, now: Optional[datetime] = None) -> bool:
     """A scene left "generating" with nothing making it: no live render, no
-    clip still being made, and its queue entry gone (or never recorded).
-    Not while Redis doesn't answer ("unknown")."""
+    clip still being made, and its queue entry gone. Only where the project
+    cancel can then free it (the page's Reset), so it follows that cancel:
+    - a claim no job has taken yet (token still set): its entry is gone;
+    - a claim a job took (token consumed): its RQ entry is gone and no loop
+      chain is under way. A chain between clips, or making the finished
+      loop's music and sound, has nothing queued or in flight but is still
+      working; an inline or background run always reads as gone. Both are
+      left to the sweeper's time limit.
+    Never while Redis doesn't answer ("unknown")."""
     if project.status != "generating":
         return False
     from ..workers.queue import queue_entry_state
     from . import video_jobs
+    from .pipeline import HOOK_CLAIM
 
+    token = project.claim_token or ""
+    if token.startswith(HOOK_CLAIM):
+        return False  # the hook lab's "Make videos": stopped there, not here
+    qid = (project.queue_job_id or "").strip()
+    if not token:
+        if not qid or ":" in qid:
+            return False
+        chain = (project.ambient_config_json or {}).get(_CHAIN_KEY)
+        if chain and not chain.get("failed"):
+            return False
     R = models.Render
     if db.query(R.id).filter(R.project_id == project.id, R.status.notin_(_DONE_RENDER)).first() is not None:
         return False
@@ -1735,7 +1753,7 @@ def is_stuck(db: Session, project: models.VideoProject, *, now: Optional[datetim
     last = max((t for t in (project.updated_at, last_job) if t is not None), default=None)
     if last is not None and last > now - STUCK_GRACE:
         return False
-    return queue_entry_state(project.queue_job_id or "") == "gone"
+    return queue_entry_state(qid) == "gone"
 
 
 def music_cost(cfg: AmbientConfig) -> float:
