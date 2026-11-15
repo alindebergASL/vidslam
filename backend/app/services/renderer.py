@@ -897,6 +897,18 @@ class AmbientRenderInputs:
     watermark_opacity: float = 0.6
     timer: str = "none"
     timer_position: str = "top_right"
+    # A found loop stretch of the clip (services.loop_point), in the clip's
+    # own seconds: the unit loops [loop_in, loop_out) with the dissolve
+    # centred on the join. `intro`: the video opens on the clip's own start
+    # (clip[0 : unit start]) before the first unit. Single-clip renders
+    # only: with extra_clips they are ignored.
+    loop_in: Optional[float] = None
+    loop_out: Optional[float] = None
+    intro: bool = False
+    # The last clip second a loop stretch may use, its dissolve included:
+    # a take that snaps to its last frame keeps its snapping tail out of the
+    # unit and the blend (None: the whole clip).
+    loop_usable_end: Optional[float] = None
 
 
 @dataclass
@@ -1056,6 +1068,58 @@ def seamless_unit_graph(*, length: float, crossfade: float, src: str = "0:v", ou
         f"[tl][hd]blend=all_expr='{_dissolve_expr(cf)}':shortest=1[x];"
         f"[mid][x]concat=n=2:v=1:a=0,format=yuv420p[{out}]"
     )
+
+
+def loop_unit_graph(*, start_frame: int, end_frame: int, half: int, src: str = "0:v", out: str = "v",
+                    fps: float = FPS) -> str:
+    """filter_complex text for a loop unit cut from frames [start, end) of a
+    longer clip, the dissolve centred on the join (`half` frames each side):
+
+    unit = clip[s+h, e-h)  ++  blend(clip[e-h, e+h) → clip[s-h, s+h))
+
+    The dissolve's midpoint mixes clip[e] with clip[s] (the matched pair),
+    the unit is exactly e − s frames, and it wraps onto clip[s+h], where it
+    starts. Frame-indexed trims, so nothing rounds onto a neighbouring
+    frame. Needs s ≥ h and e + h ≤ the clip's frame count."""
+    a, b, h = int(start_frame), int(end_frame), max(0, int(half))
+    if h == 0:
+        return f"[{src}]trim=start_frame={a}:end_frame={b},setpts=PTS-STARTPTS,format=yuv420p[{out}]"
+    cf = 2 * h / fps
+    return (
+        f"[{src}]split=3[a][b][c];"
+        f"[a]trim=start_frame={a + h}:end_frame={b - h},setpts=PTS-STARTPTS[mid];"
+        f"[b]trim=start_frame={b - h}:end_frame={b + h},setpts=PTS-STARTPTS[tl];"
+        f"[c]trim=start_frame={a - h}:end_frame={a + h},setpts=PTS-STARTPTS[hd];"
+        f"[tl][hd]blend=all_expr='{_dissolve_expr(cf)}':shortest=1[x];"
+        f"[mid][x]concat=n=2:v=1:a=0,format=yuv420p[{out}]"
+    )
+
+
+def loop_frames(length: float, loop_in: float, loop_out: float, crossfade: float, *,
+                fps: float = FPS, usable_end: Optional[float] = None) -> Optional[tuple[int, int, int]]:
+    """(start, end, half) frames of a loop stretch in a clip of `length`
+    seconds at `fps`, with the dissolve shrunk to the room there is either
+    side (and to a quarter of the stretch); None when the stretch is
+    unusable (under a second, or outside the clip). `usable_end`: no frame
+    from there on is used, the dissolve's far side included (a snapping
+    tail)."""
+    n = int(math.floor(length * fps + 1e-6))
+    if usable_end is not None:
+        n = min(n, int(math.floor(max(0.0, usable_end) * fps + 1e-6)))
+    a, b = int(round(loop_in * fps)), min(int(round(loop_out * fps)), n)
+    if a < 0 or b - a < fps:
+        return None
+    h = min(int(round(max(0.0, crossfade) * fps / 2.0)), a, n - b, (b - a) // 4)
+    return a, b, max(0, h)
+
+
+def _cut_piece(norm: Path, dst: Path, graph: str, x264: Optional[list[str]] = None) -> str:
+    cmd = ["ffmpeg", "-y", "-i", str(norm), "-filter_complex", graph, "-map", "[v]", "-an",
+           *(x264 or _X264), "-r", str(FPS), str(dst)]
+    rc, log = _run(cmd)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg loop-point piece failed: {log[-2000:]}")
+    return log
 
 
 def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: float,
@@ -1472,8 +1536,14 @@ def _variety_pieces(units: list[Path], lengths: list[float], out: Path, *, varie
 
 def _single_unit_pieces(unit: Path, unit_len: float, out: Path, *, total: float,
                         fade_seconds: float, logs: list[str], title_vf: str = "",
-                        title_seconds: float = 0.0) -> tuple[list[Path], int, float]:
-    """Pieces covering exactly `total` for one loop unit."""
+                        title_seconds: float = 0.0, intro: Optional[Path] = None,
+                        intro_len: float = 0.0) -> tuple[list[Path], int, float]:
+    """Pieces covering exactly `total` for one loop unit (after `intro`,
+    when given: the clip's own opening, which leads straight into the unit)."""
+    if intro is not None and intro_len > 0:
+        return _intro_unit_pieces(unit, unit_len, out, total=total, fade_seconds=fade_seconds, logs=logs,
+                                  title_vf=title_vf, title_seconds=title_seconds, intro=intro,
+                                  intro_len=intro_len)
     # Tile plan. The pieces cover exactly `total`: head (fade-in), plain
     #    units, and an end piece cut to the remaining time whose fade-out
     #    ends at `total`. (Fading the last full unit instead got cut off
@@ -1556,10 +1626,19 @@ def _run_bytes(cmd: list[str]) -> tuple[int, bytes]:
 
 
 def _build_unit(clip: Path, norm: Path, unit: Path, *, width: int, height: int, slow_factor: float,
-                extra_vf: str, crossfade: float, logs: list[str], label: str = "") -> float:
+                extra_vf: str, crossfade: float, logs: list[str], label: str = "",
+                stretch: Optional[dict] = None) -> float:
     """Normalize `clip` and make its seamless unit; rebuilt with grain kept
     when the unit pulses at its wrap (see GRAIN_PULSE_RATIO). Returns the
-    normalized length."""
+    normalized length.
+
+    `stretch`: a found loop stretch ({"in", "out"} clip seconds, optional
+    "usable_end" and "intro": a path for the clip's opening). The unit is
+    cut from it (loop_unit_graph) with the same encode, grain check and
+    colour as a whole-clip unit; on success "frames" (start, end, half) and
+    "intro_len" are filled in. A stretch that doesn't fit leaves "frames"
+    None and the whole clip is looped."""
+    slow = slow_factor if slow_factor and abs(slow_factor - 1.0) > 1e-3 else 1.0
 
     def make(x264: list[str]) -> float:
         logs.append(_encode_normalized(clip, norm, width=width, height=height, slow_factor=slow_factor,
@@ -1567,7 +1646,25 @@ def _build_unit(clip: Path, norm: Path, unit: Path, *, width: int, height: int, 
         length = _probe_duration(norm)
         if length <= 0.5:
             raise RuntimeError(f"normalized loop clip{label} is empty or unreadable")
-        if crossfade > 0 and length > (2 * crossfade + 0.5):
+        frames = None
+        if stretch is not None:
+            end = stretch.get("usable_end")
+            frames = loop_frames(length, float(stretch["in"]) * slow, float(stretch["out"]) * slow, crossfade,
+                                 usable_end=None if end is None else float(end) * slow)
+            stretch["frames"], stretch["intro_len"] = frames, 0.0
+            if frames is None:
+                logs.append(f"loop point {stretch['in']}-{stretch['out']}s unusable; looping the whole clip")
+        if frames is not None:
+            a, b, h = frames
+            logs.append(_cut_piece(norm, unit, loop_unit_graph(start_frame=a, end_frame=b, half=h), x264))
+            intro = stretch.get("intro")
+            if intro is not None and a + h > 0:
+                # The clip's own opening (the picture it starts on), straight
+                # into the unit's first frame.
+                logs.append(_cut_piece(norm, intro, f"[0:v]trim=end_frame={a + h},setpts=PTS-STARTPTS,"
+                                                    "format=yuv420p[v]", x264))
+                stretch["intro_len"] = (a + h) / FPS
+        elif crossfade > 0 and length > (2 * crossfade + 0.5):
             logs.append(_make_seamless_unit(norm, unit, length=length, crossfade=crossfade, x264=x264))
         else:
             shutil.copyfile(norm, unit)
@@ -1582,6 +1679,14 @@ def _build_unit(clip: Path, norm: Path, unit: Path, *, width: int, height: int, 
     keep_norm = norm.with_name(norm.stem + "_std" + norm.suffix)
     shutil.copyfile(unit, keep)
     shutil.copyfile(norm, keep_norm)
+    # A found stretch's intro is encoded with its unit: kept and put back with it.
+    intro = stretch.get("intro") if stretch is not None else None
+    std_frames = stretch.get("frames") if stretch is not None else None
+    std_intro_len = stretch.get("intro_len") if stretch is not None else None
+    keep_intro = None
+    if intro is not None and Path(intro).exists():
+        keep_intro = Path(intro).with_name(Path(intro).stem + "_std" + Path(intro).suffix)
+        shutil.copyfile(intro, keep_intro)
     grain_len = make(_X264_GRAIN)
     grain = unit_wrap_ratio(unit)
     if grain and grain < ratio * 0.8:
@@ -1589,10 +1694,16 @@ def _build_unit(clip: Path, norm: Path, unit: Path, *, width: int, height: int, 
                     "(crf 21, tune grain)")
         keep.unlink(missing_ok=True)
         keep_norm.unlink(missing_ok=True)
+        if keep_intro is not None:
+            keep_intro.unlink(missing_ok=True)
         return grain_len
     # Not the encoder (e.g. the clip's own seam): the smaller file wins.
     os.replace(keep, unit)
     os.replace(keep_norm, norm)
+    if keep_intro is not None:
+        os.replace(keep_intro, intro)
+    if stretch is not None:
+        stretch["frames"], stretch["intro_len"] = std_frames, std_intro_len
     logs.append(f"grain check{label}: wrap {ratio:.2f}x, grain encode {grain:.2f}x did not help; "
                 "kept standard encode")
     return length
@@ -1605,6 +1716,44 @@ def _render_log(logs: list[str], limit: int = 8000) -> str:
     summary = [line for line in logs if line.startswith("grain check")]
     tail = "\n".join(logs)[-limit:]
     return "\n".join(summary) + "\n...\n" + tail if summary else tail
+
+
+def _intro_unit_pieces(unit: Path, unit_len: float, out: Path, *, total: float, fade_seconds: float,
+                       logs: list[str], title_vf: str, title_seconds: float, intro: Path,
+                       intro_len: float) -> tuple[list[Path], int, float]:
+    """The intro, then units, then an end piece, covering exactly `total`.
+    The opening piece (intro, plus as many units as the title or the
+    fade-in needs) carries the fade-in and the title; plain units are
+    stream-copied after it."""
+    fade = max(0.0, min(fade_seconds, unit_len / 2.5, total / 2.5))
+    need = max(title_seconds if title_vf else 0.0, fade)
+    n = max(0, math.ceil((need - intro_len) / unit_len - 1e-6))
+    head_len = intro_len + n * unit_len
+    rest = total - head_len
+    if rest < fade + 0.5:
+        # A short video: one piece, intro then as many units as it takes.
+        k = max(0, math.ceil((total - intro_len) / unit_len + 1e-6))
+        single = out / "ambient_single.mp4"
+        logs.append(_end_piece_from([intro, *([unit] * k)], single, length=total,
+                                    fade_in=fade, fade_out=fade, extra_vf=title_vf))
+        return [single], 1, fade
+    full = int(rest // unit_len)
+    remainder = rest - full * unit_len
+    if remainder < 0.05:  # lands on a unit boundary
+        full, remainder = full - 1, unit_len
+    if full >= 1 and remainder < fade + 0.5:
+        full, remainder = full - 1, remainder + unit_len
+    full = max(0, full)
+    end = out / "ambient_tail.mp4"
+    logs.append(_end_piece(unit, end, unit_len=unit_len, length=remainder, fade_in=0.0, fade_out=fade))
+    if fade > 0 or title_vf:
+        head = out / "ambient_head.mp4"
+        logs.append(_end_piece_from([intro, *([unit] * n)], head, length=head_len, fade_in=fade,
+                                    fade_out=0.0, extra_vf=title_vf))
+        opening = [head]
+    else:
+        opening = [intro, *([unit] * n)]
+    return [*opening, *([unit] * full), end], n + full + 1, fade
 
 
 def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
@@ -1629,9 +1778,25 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     cf = 0.0 if inputs.clip_is_periodic else max(0.0, inputs.crossfade_seconds)
     norm = out / "ambient_norm.mp4"
     unit = out / "ambient_unit.mp4"
+    stretch: Optional[dict] = None
+    if (inputs.loop_in is not None and inputs.loop_out is not None and not inputs.extra_clips
+            and not inputs.clip_is_periodic):
+        # A found loop stretch: times are the clip's own (the normalized clip
+        # may be slowed down; _build_unit scales them).
+        stretch = {"in": inputs.loop_in, "out": inputs.loop_out, "usable_end": inputs.loop_usable_end,
+                   "intro": (out / "ambient_intro.mp4") if inputs.intro else None}
     length = _build_unit(inputs.clip_path, norm, unit, width=width, height=height,
-                         slow_factor=inputs.slow_factor, extra_vf=wm_vf, crossfade=cf, logs=logs)
-    unit_len = _probe_duration(unit) or (length - cf)
+                         slow_factor=inputs.slow_factor, extra_vf=wm_vf, crossfade=cf, logs=logs,
+                         stretch=stretch)
+    intro: Optional[Path] = None
+    intro_len = 0.0
+    if stretch is not None and stretch.get("frames") is not None:
+        a, b, _h = stretch["frames"]
+        unit_len = _probe_duration(unit) or (b - a) / FPS
+        if stretch.get("intro_len"):
+            intro, intro_len = stretch["intro"], float(stretch["intro_len"])
+    else:
+        unit_len = _probe_duration(unit) or (length - cf)
 
     total = float(inputs.total_seconds)
     pieces: list[Path]
@@ -1663,7 +1828,8 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
                                 seconds=title_secs)
         pieces, repeats, fade = _single_unit_pieces(unit, unit_len, out, total=total,
                                                     fade_seconds=inputs.fade_seconds, logs=logs,
-                                                    title_vf=title_vf, title_seconds=title_secs)
+                                                    title_vf=title_vf, title_seconds=title_secs,
+                                                    intro=intro, intro_len=intro_len)
 
     # 4. Music unit (optional).
     music_unit: Optional[Path] = None

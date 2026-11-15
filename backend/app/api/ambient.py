@@ -35,6 +35,7 @@ from ..services.safety import UnsafeScriptError
 from ..services.spend import budget_guard
 from ..workers.jobs import (
     ambient_batch_job,
+    find_loop_point_job,
     generate_ambient_loop_job,
     generate_previews_job,
     render_ambient_job,
@@ -587,6 +588,49 @@ def measure_loop_health(scene_id: int, db: Session = Depends(get_db)) -> LoopHea
     return _health_result(project)
 
 
+# ---------- loop point (local search, free) ----------
+
+
+@router.post("/{scene_id}/find-loop-point", status_code=202,
+             dependencies=[Depends(rate_limit("generation"))])
+def find_loop_point(scene_id: int, db: Session = Depends(get_db)) -> dict:
+    """Look for the stretch of the loop clip that joins best (free: local
+    ffmpeg, a few seconds). Runs as a job under its own flag: the scene's
+    status is left alone. The result shows on the scene (loop_point,
+    loop_point_state)."""
+    project = _get_scene(db, scene_id)
+    if project.status == "generating":
+        raise HTTPException(409, "The loop is still being made. Look for a loop point once it's ready.")
+    cfg = svc._config_of(project)
+    if cfg.source != "video":
+        raise HTTPException(409, "A Still + drift loop is seamless by construction: there's no loop point to find.")
+    if not svc.loop_point_applies(project):
+        raise HTTPException(409, "Loop points apply to single-clip scenes for now; variations loop whole clips.")
+    shot = svc._loop_shot(project)
+    if shot is None or not shot.clip_path or shot.status != "completed" or not Path(shot.clip_path).is_file():
+        raise HTTPException(409, "There's no loop clip yet. Generate the loop first.")
+    if not svc.claim_loop_point_search(db, project):
+        raise HTTPException(409, "Already looking for a loop point.")
+    try:
+        job_id = enqueue(find_loop_point_job, scene_id)
+    except Exception:
+        svc.release_loop_point_search(db, project, "Couldn't start the search; try again.")
+        raise
+    return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
+
+
+@router.delete("/{scene_id}/find-loop-point", response_model=AmbientOut)
+def use_whole_clip(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut:
+    """Loop the whole clip again (the found stretch is kept; finding again
+    switches it back on)."""
+    project = _get_scene(db, scene_id)
+    if project.status == "generating":
+        raise HTTPException(409, "The scene is busy. Try again once it's done.")
+    svc.use_whole_clip(db, project, True)
+    db.refresh(project)
+    return svc.to_out(db, project)
+
+
 @router.get("/{scene_id}/seam-preview")
 def seam_preview(scene_id: int, shot_id: Optional[int] = None, db: Session = Depends(get_db)) -> FileResponse:
     """The last 3 s of the loop followed by its first 3 s (MP4), made once
@@ -600,8 +644,17 @@ def seam_preview(scene_id: int, shot_id: Optional[int] = None, db: Session = Dep
         raise HTTPException(404, "no such loop clip in this scene")
     if not shot.clip_path or shot.status != "completed" or not Path(shot.clip_path).is_file():
         raise HTTPException(404, "this loop has no clip yet")
+    # The found loop stretch plays as the render makes it (its join,
+    # dissolved); otherwise the raw clip's own join.
+    loop_shot = svc._loop_shot(project)
+    lp = svc.active_loop_point(project) if loop_shot is not None and shot.id == loop_shot.id else None
+    loop, blend = None, 0.0
+    if lp is not None:
+        cfg = svc._config_of(project)
+        loop = (float(lp["in"]), float(lp["out"]))
+        blend = float(svc.seam_treatment(project)["blend_seconds"]) / svc._slow(cfg)
     try:
-        path, join_at = loop_health.seam_preview(Path(shot.clip_path))
+        path, join_at = loop_health.seam_preview(Path(shot.clip_path), loop=loop, blend=blend)
     except RuntimeError as e:
         raise HTTPException(500, str(e)) from None
     return FileResponse(path, media_type="video/mp4", headers={"X-Join-At": f"{join_at:.2f}",

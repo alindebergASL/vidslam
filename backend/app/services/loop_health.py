@@ -88,6 +88,12 @@ FROZEN_LONG = 3.0
 DRIFT_SLIGHT = 0.02
 DRIFT_STRONG = 0.06
 
+# The loop-point finder (services/loop_point.py) compares its candidate
+# joins as if the clip ran at this rate: a 50 fps clip's steps are half a 25
+# fps clip's for the same motion. The seam verdict above is not scaled (its
+# thresholds were calibrated on real takes as measured).
+REFERENCE_FPS = 24.0
+
 SEAM_PREVIEW_SECONDS = 3.0
 PART_ABANDONED_SECONDS = 600  # a half-written preview older than this is a crash's leftover
 
@@ -104,6 +110,20 @@ def _probe(clip: Path, budget: Optional[Callable[[], float]] = None) -> tuple[fl
         return _probe_duration(clip), (_probe_size(clip) or (16, 9))
     duration = _probe_duration(clip, timeout=budget())
     return duration, (_probe_size(clip, timeout=budget()) or (16, 9))
+
+
+def _probe_fps(clip: Path) -> float:
+    """The clip's frame rate (0 when ffprobe can't tell)."""
+    from .renderer import _probe_video
+
+    info = _probe_video(clip)
+    return float(info.fps) if info is not None and info.fps > 0 else 0.0
+
+
+def step_scale(fps: float) -> float:
+    """Multiplier that turns a difference between neighbouring frames at
+    `fps` into one at REFERENCE_FPS (1 when the rate is unknown)."""
+    return fps / REFERENCE_FPS if fps > 0 else 1.0
 
 
 def _analysis_size(size: tuple[int, int]) -> tuple[int, int]:
@@ -462,10 +482,39 @@ def out(project: models.VideoProject, shot: models.VideoShot, entry: dict) -> di
         else:
             seam["text"] = (f"The raw clip has {jump} at the join; a {blend:g} s blend won't hide it, "
                             "so the loop will jump")
-    view["seam"] = seam
     view["seam_preview_url"] = f"/api/ambient/{project.id}/seam-preview?shot_id={shot.id}"
     view["join_at_seconds"] = round(min(SEAM_PREVIEW_SECONDS, float(entry.get("clip_seconds") or 0) / 2.0), 2)
+    lp = _loop_point_for(project, shot)
+    if lp is not None and treatment:
+        # The render loops a found stretch of this clip: the whole clip's
+        # join no longer plays. Say which stretch, and how its join reads.
+        verdict = treatment.get("verdict")
+        level = {"seamless": "good", "slight_jump": "warn"}.get(verdict, "bad")
+        if verdict == "visible_jump" and treatment.get("covers"):
+            level = "warn"
+        what = {"seamless": "joins seamlessly", "slight_jump": "has a slight jump at its join"}.get(
+            verdict, "still jumps at its join")
+        seam["level"] = level
+        seam["text"] = (f"The render loops {lp['in']:.1f}–{lp['out']:.1f} s of the clip, which {what} "
+                        f"(blended over {blend:g} s)")
+        unit = float(lp["out"]) - float(lp["in"])
+        view["join_at_seconds"] = round(min(SEAM_PREVIEW_SECONDS, unit / 2.0), 2)
+        view["seam_preview_url"] += f"&lp={lp['in']:g}-{lp['out']:g}-{blend:g}"
+    view["seam"] = seam
     return view
+
+
+def _loop_point_for(project: models.VideoProject, shot: models.VideoShot) -> Optional[dict]:
+    """The loop stretch the render uses for this shot's clip, if any."""
+    try:
+        from .ambient import _loop_shot, active_loop_point
+
+        loop = _loop_shot(project)
+        if loop is None or loop.id != shot.id:
+            return None
+        return active_loop_point(project)
+    except Exception:  # noqa: BLE001 — a note, never a failure
+        return None
 
 
 def measure_shot(db: Session, project: models.VideoProject, shot: models.VideoShot, *,
@@ -581,21 +630,61 @@ def _playable(path: Path) -> bool:
         return False
 
 
-def seam_preview(clip: Path) -> tuple[Path, float]:
+def _preview_graph(clip: Path, duration: float, loop: Optional[tuple[float, float]],
+                   blend: float) -> tuple[str, float, str]:
+    """(filter_complex, join time, cache key) for the seam preview: the raw
+    join (the end, then the start), or with `loop` / `blend` the join as the
+    render makes it: the loop unit's end, then its start."""
+    if loop is None and blend <= 0:
+        tail = round(min(SEAM_PREVIEW_SECONDS, duration / 2.0), 3)
+        return ("[0:v]setpts=PTS-STARTPTS[a];[1:v]setpts=PTS-STARTPTS[b];"
+                "[a][b]concat=n=2:v=1:a=0,format=yuv420p[v]"), tail, ""
+    from .renderer import loop_frames, loop_unit_graph, seamless_unit_graph
+
+    fps = _probe_fps(clip) or 30.0
+    if loop is not None:
+        frames = loop_frames(duration, loop[0], loop[1], blend, fps=fps)
+        if frames is None:
+            raise RuntimeError("the loop point is outside the clip")
+        a, b, h = frames
+        unit_graph = loop_unit_graph(start_frame=a, end_frame=b, half=h, out="u", fps=fps)
+        unit_len = (b - a) / fps
+        key = f"{a}-{b}-{h}"
+    else:
+        cf = min(blend, duration / 3.0)
+        unit_graph = seamless_unit_graph(length=duration, crossfade=cf, out="u")
+        unit_len = duration - cf
+        key = f"0-{cf:.3f}"
+    tail = round(min(SEAM_PREVIEW_SECONDS, unit_len / 2.0), 3)
+    graph = (unit_graph + ";[u]split[u1][u2];"
+             f"[u1]trim=start={unit_len - tail:.4f},setpts=PTS-STARTPTS[a];"
+             f"[u2]trim=end={tail:.4f},setpts=PTS-STARTPTS[b];"
+             "[a][b]concat=n=2:v=1:a=0,format=yuv420p[v]")
+    import hashlib
+
+    return graph, tail, "_b" + hashlib.sha1(key.encode()).hexdigest()[:8]
+
+
+def seam_preview(clip: Path, *, loop: Optional[tuple[float, float]] = None,
+                 blend: float = 0.0) -> tuple[Path, float]:
     """A short MP4: the last few seconds of the loop, then its first few,
     so the join plays in the middle. Made once per version of the clip and
     kept next to it; returns (path, join time in seconds). Overlapping
     requests (a second tab, the player asking again) wait for the one
-    making it; only a file that plays is kept."""
+    making it; only a file that plays is kept.
+
+    `loop` (clip seconds in, out) and `blend` (seconds of dissolve): play
+    the join as the render makes it (the found loop stretch, dissolved);
+    without them, the raw clip's own join."""
     stamp = clip.stat().st_mtime_ns
     from .renderer import _probe_duration
 
     duration = _probe_duration(clip)
     if duration <= 0:
         raise RuntimeError("could not read the clip")
-    tail = round(min(SEAM_PREVIEW_SECONDS, duration / 2.0), 3)
+    graph, tail, key = _preview_graph(clip, duration, loop, blend)
     prefix = f"seam_{clip.stem}_"
-    dst = clip.with_name(f"{prefix}{stamp}.mp4")
+    dst = clip.with_name(f"{prefix}{stamp}{key}.mp4")
     if _playable(dst):
         return dst, tail
     with _clip_lock(clip):
@@ -603,25 +692,25 @@ def seam_preview(clip: Path) -> tuple[Path, float]:
             return dst, tail
         # Under the lock nobody else is writing one for this clip: older
         # versions (and a cached file that doesn't play) go. Only this clip's
-        # own files ("seam_loop_<n>", never "seam_loop_2_<n>"); a .part file
-        # only once it is clearly a crashed attempt's leftover.
-        mine = re.compile(rf"^{re.escape(prefix)}\d+(\.[0-9a-f]{{32}}\.part)?\.mp4$")
+        # own files ("seam_loop_<n>[_b<key>]", never "seam_loop_2_<n>"); a
+        # .part file only once it is clearly a crashed attempt's leftover.
+        mine = re.compile(rf"^{re.escape(prefix)}\d+(_b[0-9a-f]{{8}})?(\.[0-9a-f]{{32}}\.part)?\.mp4$")
         for old in clip.parent.glob(f"{prefix}*.mp4"):
             m = mine.match(old.name)
             if m is None:
                 continue
             try:
-                if m.group(1) and time.time() - old.stat().st_mtime < PART_ABANDONED_SECONDS:
+                if m.group(2) and time.time() - old.stat().st_mtime < PART_ABANDONED_SECONDS:
                     continue
             except OSError:
                 continue
             old.unlink(missing_ok=True)
         tmp = dst.with_name(f"{dst.stem}.{uuid.uuid4().hex}.part.mp4")
-        cmd = ["ffmpeg", "-y", "-v", "error", "-sseof", f"-{tail:.3f}", "-i", str(clip),
-               "-t", f"{tail:.3f}", "-i", str(clip),
-               "-filter_complex",
-               "[0:v]setpts=PTS-STARTPTS[a];[1:v]setpts=PTS-STARTPTS[b];"
-               "[a][b]concat=n=2:v=1:a=0,format=yuv420p[v]",
+        if key:
+            inputs = ["-i", str(clip)]
+        else:
+            inputs = ["-sseof", f"-{tail:.3f}", "-i", str(clip), "-t", f"{tail:.3f}", "-i", str(clip)]
+        cmd = ["ffmpeg", "-y", "-v", "error", *inputs, "-filter_complex", graph,
                "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
                "-movflags", "+faststart", str(tmp)]
         try:

@@ -392,6 +392,11 @@ def test_chained_30s_loop_pins_first_and_last_frames(auth_client, monkeypatch):
         return real_submit(self, **kw)
 
     monkeypatch.setattr(mock_video.MockVideoProvider, "submit", spy)
+    # This is about the whole clip's join; the loop-point search that would
+    # otherwise trim to a better stretch is covered in test_loop_point.py.
+    from app.services import ambient
+
+    monkeypatch.setattr(ambient, "_maybe_find_loop_point", lambda *a, **k: None)
 
     cfg = {**SHORT, "loop_seconds": 30, "total_seconds": 120}
     scene = auth_client.post("/api/ambient", json={"config": cfg, "generate": True}).json()

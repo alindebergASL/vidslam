@@ -14,7 +14,7 @@ import math
 import re
 import secrets
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -45,7 +45,7 @@ from ..schemas.ambient import (
     SoundPresetOut,
 )
 from ..schemas.api import RenderOut, ShotOut
-from . import alerts, events, loop_health, render_files, storage
+from . import alerts, events, loop_health, loop_point, render_files, storage
 from .image_settings import best_image_settings
 from .model_registry import active_model as _active_model
 from .model_registry import switched_off as _switched_off
@@ -1019,6 +1019,7 @@ def _drop_loop_work(project: models.VideoProject) -> None:
     _reset_clips(project)
     _set_state(project, _GENERATED_KEY, None)
     _set_state(project, _CHAIN_KEY, None)
+    _set_state(project, _LOOP_POINT_KEY, None)
 
 
 def _invalidate_loop(project: models.VideoProject) -> None:
@@ -1704,6 +1705,9 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
     music = Path(project.music_upload_path) if project.music_upload_path else None
     treatment = seam_treatment(project)
     plan = _plan_with_seam(plan_loop(cfg), cfg, treatment)
+    if cfg.source == "video" and not loop_point_applies(project):
+        plan = plan.model_copy(update={"notes": [
+            *plan.notes, "Loop points apply to single-clip scenes for now: variations loop their whole clips."]})
     return AmbientOut(
         id=project.id,
         title=project.title,
@@ -1721,6 +1725,8 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         loop_health_outdated=[loop_health.outdated(project, s)
                               for s in [shot, *_variant_shots(project)[:variant_count(cfg) - 1]]],
         seam_treatment=treatment,
+        loop_point=loop_point_out(project),
+        loop_point_state=loop_point_state(project),
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         picture_ready=has_picture(project, cfg),
@@ -2207,6 +2213,12 @@ def _finalize_generation(
     # Loop health: local and free, a few seconds; never in the way. The
     # join's verdict is kept with the loop's record.
     loop_health.measure_quietly(db, project.id)
+    # A free loop-point search when the join isn't seamless (or the plan is
+    # open): the render then loops the stretch that joins best.
+    _maybe_find_loop_point(db, project, cfg, plan, generated)
+    _set_state(project, _GENERATED_KEY, generated)
+    _set_state(project, _LOOP_POINT_KEY, None)  # an earlier search was of an earlier clip
+    db.commit()
     treatment = seam_treatment(project)
     generated["seam_verdict"] = treatment["verdict"]
     generated["seam_ratio"] = treatment["ratio"]
@@ -2469,6 +2481,221 @@ def generate_cost(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPl
     return round(sum(ln["cost"] for ln in estimate_ambient_cost(cfg, plan)["lines"] if ln["unit"] not in skip), 2)
 
 
+# ---------- loop points (services.loop_point) ----------
+
+_LOOP_POINT_KEY = "_loop_point"  # the last "find a better loop point" run
+LOOP_POINT_STALE_SECONDS = 600   # a "running" flag older than this is a crash's leftover
+
+
+def _loop_record(project: models.VideoProject) -> Optional[dict]:
+    """The found loop stretch of the loop clip as it is now: None when none
+    was found, or the clip has changed since."""
+    lp = _generated_of(project).get("loop")
+    shot = _loop_shot(project)
+    if not lp or shot is None or not shot.clip_path or shot.status != "completed":
+        return None
+    if lp.get("clip_path") != shot.clip_path or lp.get("clip_mtime_ns") != loop_health._clip_stamp(shot.clip_path):
+        return None
+    return lp
+
+
+def loop_point_applies(project: models.VideoProject) -> bool:
+    """Loop points apply to single-clip video loops only (for now:
+    variations and day-night play their whole clips)."""
+    cfg = _config_of(project)
+    k = max(int(_generated_of(project).get("variants") or 1), variant_count(cfg))
+    return cfg.source == "video" and k == 1
+
+
+def active_loop_point(project: models.VideoProject) -> Optional[dict]:
+    """The stretch the render loops (current, switched on, and applicable),
+    or None: the whole clip loops."""
+    lp = _loop_record(project)
+    if lp is None or lp.get("off") or not loop_point_applies(project):
+        return None
+    return lp
+
+
+def _slow(cfg: AmbientConfig) -> float:
+    return float(cfg.slow_factor or 1.0) if cfg.source == "video" else 1.0
+
+
+def _loop_seconds(lp: dict, cfg: AmbientConfig) -> float:
+    return (float(lp["out"]) - float(lp["in"])) * _slow(cfg)
+
+
+def _loop_room(lp: dict, cfg: AmbientConfig) -> float:
+    """The longest dissolve there is room for (it is centred on the join:
+    half before `in`, half after `out`), in finished-video seconds."""
+    clip = float(lp.get("usable_end") or lp.get("clip_seconds") or lp["out"])
+    raw = 2.0 * min(float(lp["in"]), max(0.0, clip - float(lp["out"])), (float(lp["out"]) - float(lp["in"])) / 4)
+    return max(0.0, raw * _slow(cfg))
+
+
+def _loop_entry(found: dict, shot: models.VideoShot) -> dict:
+    keep = ("in", "out", "crossfade", "ratio", "raw_ratio", "calm", "mismatch", "mismatch_ok", "verdict",
+            "clip_seconds", "snap", "usable_end")
+    return {**{k: found[k] for k in keep if k in found}, "intro": True,
+            "clip_path": shot.clip_path, "clip_mtime_ns": loop_health._clip_stamp(shot.clip_path),
+            "found_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()}
+
+
+def _improves(found: dict) -> bool:
+    """The found stretch beats looping the whole clip. A snapping take's
+    whole-clip join reads small (its last frame does land on the target),
+    but it jumps there in its final frames: any stretch found clear of that
+    tail is better."""
+    raw = found.get("raw_ratio")
+    if not found.get("found"):
+        return False
+    return bool(found.get("snap")) or raw is None or float(found["ratio"]) < float(raw)
+
+
+def _snaps(project: models.VideoProject, shot: models.VideoShot) -> bool:
+    entry = loop_health.current_entry(project, shot)
+    return ((entry or {}).get("seam") or {}).get("verdict") == "snap"
+
+
+def _maybe_find_loop_point(db: Session, project: models.VideoProject, cfg: AmbientConfig,
+                           plan: LoopPlanOut, generated: dict) -> None:
+    """After a loop is made: look for a better loop point when the clip's
+    join isn't seamless (a snap included: the take jumps to its last frame
+    at the very end) or the plan is open (free, a few seconds; never in the
+    way). Kept in generated["loop"] when it beats the whole clip. A snapping
+    take is searched clear of its snapping tail."""
+    if cfg.source != "video" or plan.strategy == "drift" or not loop_point_applies(project):
+        return
+    shot = _loop_shot(project)
+    if shot is None or not shot.clip_path or not Path(shot.clip_path).is_file():
+        return
+    entry = loop_health.current_entry(project, shot)
+    raw_verdict = ((entry or {}).get("seam") or {}).get("verdict")
+    if raw_verdict == "seamless" and plan.closed:
+        return
+    try:
+        found = loop_point.find_loop_point(Path(shot.clip_path), snap=raw_verdict == "snap")
+    except Exception as e:  # noqa: BLE001 — a nicety, never a failure
+        log.warning("loop point of scene %s not found: %s", project.id, e)
+        return
+    # A seamless clip keeps looping whole (an open plan's clip that joins
+    # well needs no trim).
+    if raw_verdict != "seamless" and _improves(found):
+        generated["loop"] = _loop_entry(found, shot)
+
+
+def loop_point_state(project: models.VideoProject) -> Optional[dict]:
+    st = (project.ambient_config_json or {}).get(_LOOP_POINT_KEY)
+    return dict(st) if st else None
+
+
+def _running(state: Optional[dict]) -> bool:
+    if not state or state.get("status") != "running":
+        return False
+    try:
+        started = datetime.fromisoformat(str(state.get("started_at")))
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - started).total_seconds() < LOOP_POINT_STALE_SECONDS
+
+
+def claim_loop_point_search(db: Session, project: models.VideoProject) -> bool:
+    """Mark a search running (False when one already is). The scene's own
+    status is left alone: a search never claims the scene."""
+    db.refresh(project)
+    if _running(loop_point_state(project)):
+        return False
+    _set_state(project, _LOOP_POINT_KEY, {
+        "status": "running", "started_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()})
+    db.commit()
+    return True
+
+
+def _finish_loop_point_search(db: Session, project: models.VideoProject, status: str, *,
+                              found: Optional[bool] = None, message: str = "") -> None:
+    st = loop_point_state(project) or {}
+    _set_state(project, _LOOP_POINT_KEY, {
+        **st, "status": status, "found": found, "message": message[:300],
+        "finished_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()})
+    db.commit()
+
+
+def release_loop_point_search(db: Session, project: models.VideoProject, message: str) -> None:
+    db.refresh(project)
+    _finish_loop_point_search(db, project, "failed", message=message)
+
+
+def find_better_loop_point(db: Session, project_id: int) -> None:
+    """The "find a better loop point" job: look, keep the stretch when it
+    beats the whole clip, and say what happened. Never touches the scene's
+    status; never raises."""
+    project = db.get(models.VideoProject, project_id)
+    if project is None:
+        return
+    try:
+        shot = _loop_shot(project)
+        if shot is None or not shot.clip_path or not Path(shot.clip_path).is_file():
+            _finish_loop_point_search(db, project, "failed", message="There's no loop clip to look at.")
+            return
+        clip, stamp = shot.clip_path, loop_health._clip_stamp(shot.clip_path)
+        found = loop_point.find_loop_point(Path(clip), snap=_snaps(project, shot))
+        db.refresh(project)  # the scene may have moved on while we looked
+        shot = _loop_shot(project)
+        if shot is None or shot.clip_path != clip or loop_health._clip_stamp(clip) != stamp:
+            _finish_loop_point_search(db, project, "failed",
+                                      message="The loop clip changed while looking; try again.")
+            return
+        if _improves(found):
+            gen = _generated_of(project)
+            gen["loop"] = _loop_entry(found, shot)
+            _set_state(project, _GENERATED_KEY, gen)
+            treatment = seam_treatment(project)
+            gen["seam_verdict"], gen["seam_ratio"] = treatment["verdict"], treatment["ratio"]
+            _set_state(project, _GENERATED_KEY, gen)
+            _finish_loop_point_search(
+                db, project, "done", found=True,
+                message=f"Loops {found['in']:.1f}–{found['out']:.1f} s ({found['out'] - found['in']:.1f} s).")
+        else:
+            why = (f"the best join found still jumps ({found['ratio']:g}× a normal frame step)"
+                   if found["ratio"] > loop_health.SEAM_SLIGHT_RATIO
+                   else "its dissolve would mix two different pictures" if not found.get("mismatch_ok", True)
+                   else "the whole clip already joins as well")
+            _finish_loop_point_search(db, project, "done", found=False, message=f"No better loop point: {why}.")
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        log.warning("loop point search for scene %s failed: %s", project_id, e)
+        project = db.get(models.VideoProject, project_id)
+        if project is not None:
+            _finish_loop_point_search(db, project, "failed", message=f"Couldn't look for a loop point: {e}")
+
+
+def use_whole_clip(db: Session, project: models.VideoProject, whole: bool = True) -> None:
+    """"Use the whole clip" (or the found stretch again): the stretch is kept."""
+    gen = _generated_of(project)
+    if not gen.get("loop"):
+        return
+    gen["loop"] = {**gen["loop"], "off": bool(whole)}
+    _set_state(project, _GENERATED_KEY, gen)
+    treatment = seam_treatment(project)
+    gen["seam_verdict"], gen["seam_ratio"] = treatment["verdict"], treatment["ratio"]
+    _set_state(project, _GENERATED_KEY, gen)
+    db.commit()
+
+
+def loop_point_out(project: models.VideoProject) -> Optional[dict]:
+    lp = _loop_record(project)
+    if lp is None:
+        return None
+    cfg = _config_of(project)
+    return {"in_seconds": float(lp["in"]), "out_seconds": float(lp["out"]),
+            "loop_seconds": round(_loop_seconds(lp, cfg), 2),
+            "crossfade": float(lp.get("crossfade") or 0.0), "ratio": float(lp.get("ratio") or 0.0),
+            "raw_ratio": lp.get("raw_ratio"), "verdict": loop_point.verdict_for(float(lp.get("ratio") or 0.0)),
+            "calm": bool(lp.get("calm")), "mismatch": lp.get("mismatch"),
+            "mismatch_ok": bool(lp.get("mismatch_ok", True)), "snap": bool(lp.get("snap")),
+            "intro": bool(lp.get("intro", True)),
+            "off": bool(lp.get("off")), "applies": loop_point_applies(project)}
+
+
 def _seam_reading(project: models.VideoProject) -> Optional[dict]:
     """The worst current seam reading among the scene's clips (the loop and
     its variations), or None while the loop clip has no current reading."""
@@ -2503,12 +2730,31 @@ def seam_treatment(project: models.VideoProject) -> dict:
     cfg = _config_of(project)
     if cfg.source == "image_drift":
         return {"blend_seconds": 0.0, "verdict": None, "ratio": None, "basis": "drift", "covers": True,
-                "clip": None}
+                "clip": None, "loop_point": False}
     user = max(0.0, float(cfg.crossfade_seconds or 0.0))
+    lp = active_loop_point(project)
+    if lp is not None:
+        # The render loops a found stretch of the clip: its join, its blend
+        # (never below the setting unless it joins seamlessly), within the
+        # room there is either side of the stretch.
+        ratio = float(lp.get("ratio") or 0.0)
+        verdict = loop_point.verdict_for(ratio)
+        found_cf = float(lp.get("crossfade") or 0.0)
+        if cfg.seam_mode == "blend":
+            blend = user
+        elif verdict == "seamless":
+            blend = found_cf
+        else:
+            blend = max(user, found_cf)
+        blend = min(blend, _loop_room(lp, cfg))
+        return {"blend_seconds": round(blend, 2), "verdict": verdict, "ratio": round(ratio, 2),
+                "basis": "measured", "loop_point": True, "clip": 0,
+                "covers": ratio <= loop_health.SEAM_SLIGHT_RATIO and bool(lp.get("mismatch_ok", True)),
+                "loop_seconds": round(_loop_seconds(lp, cfg), 2)}
     seam = _seam_reading(project)
     if seam is None:
         return {"blend_seconds": round(user, 2), "verdict": None, "ratio": None, "basis": "plan", "covers": True,
-                "clip": None}
+                "clip": None, "loop_point": False}
     verdict = seam["verdict"]
     if cfg.seam_mode == "blend":
         blend = user
@@ -2521,7 +2767,8 @@ def seam_treatment(project: models.VideoProject) -> dict:
         blend = max(user, SEAM_VISIBLE_BLEND)
     return {"blend_seconds": round(blend, 2), "verdict": verdict,
             "ratio": round(float(seam.get("ratio") or 0.0), 2), "basis": "measured",
-            "covers": verdict not in ("visible_jump", "snap"), "clip": int(seam.get("clip") or 0)}
+            "covers": verdict not in ("visible_jump", "snap"), "clip": int(seam.get("clip") or 0),
+            "loop_point": False}
 
 
 def seam_clip_name(treatment: dict) -> str:
@@ -2557,6 +2804,17 @@ def _plan_with_seam(plan: LoopPlanOut, cfg: AmbientConfig, treatment: dict) -> L
     if treatment["basis"] != "measured" or plan.strategy == "drift":
         return plan
     blend = float(treatment["blend_seconds"])
+    if treatment.get("loop_point"):
+        # A found stretch: the unit is the stretch itself (the dissolve sits
+        # either side of it), after the clip's own opening.
+        unit = max(1.0, float(treatment["loop_seconds"]))
+        return plan.model_copy(update={
+            "seam_crossfade": blend, "unit_seconds": round(unit, 2),
+            "repeats": max(1, math.ceil(cfg.total_seconds / unit)),
+            "repeat_every_seconds": round(unit, 2),
+            "notes": [*plan.notes, f"Loops a {unit:g}s stretch of the clip that joins best, "
+                                   "after opening on the clip's own first frames."],
+        })
     unit = max(1.0, plan.loop_seconds - blend)
     per_unit = plan.repeat_every_seconds / plan.unit_seconds if plan.unit_seconds else 1.0
     return plan.model_copy(update={
@@ -2723,6 +2981,7 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
             # tell whether that clip jumps. Ask, as the page does.
             raise SeamJumpStop(SEAM_UNMEASURED_MESSAGE, treatment)
         seam = float(treatment["blend_seconds"])
+        lp = active_loop_point(project) if k == 1 else None
         outputs = compose_ambient(
             AmbientRenderInputs(
                 project_id=project.id,
@@ -2749,6 +3008,10 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
                 watermark_opacity=cfg.watermark_opacity,
                 timer=cfg.timer,
                 timer_position=cfg.timer_position,
+                loop_in=float(lp["in"]) if lp else None,
+                loop_out=float(lp["out"]) if lp else None,
+                loop_usable_end=(float(lp["usable_end"]) if lp and lp.get("usable_end") is not None else None),
+                intro=bool(lp and lp.get("intro", True)),
             )
         )
         _check_cancel(db, render)
@@ -2768,7 +3031,8 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
             f"repeats={outputs.repeats} total={project.target_duration_seconds}s "
             f"res={cfg.output_resolution} overlays={overlay_summary(cfg) or 'none'} "
             f"seam={treatment['verdict'] or ('drift' if treatment['basis'] == 'drift' else 'unmeasured')} "
-            f"blend={seam:g}s\n" + outputs.log[-7000:]
+            f"blend={seam:g}s" + (f" loop={float(lp['in']):g}-{float(lp['out']):g}s" if lp else "")
+            + "\n" + outputs.log[-7000:]
         )
         render.actual_cost = 0.0
         render.status = "completed"

@@ -156,6 +156,17 @@ def render_ambient_job(project_id: int, claim_token: str = "", accept_seam: Opti
         db.close()
 
 
+def find_loop_point_job(project_id: int) -> None:
+    """Look for a better loop point (free, local). Never claims the scene."""
+    from ..services import ambient
+
+    db = SessionLocal()
+    try:
+        ambient.find_better_loop_point(db, project_id)
+    finally:
+        db.close()
+
+
 def generate_previews_job(preset_ids: list[str]) -> None:
     from ..services import ambient
 

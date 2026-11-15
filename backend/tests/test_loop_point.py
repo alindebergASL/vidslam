@@ -1,0 +1,300 @@
+"""Loop-point finder (services/loop_point.py): the stretch of a loop clip
+whose end matches its start best, looped instead of the whole clip, with
+the video opening on the clip's own first frames. Synthetic ffmpeg clips
+and mock providers."""
+from __future__ import annotations
+
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+from .test_ambient import SHORT, _assert_linear_dissolve, _duration, _raw_yavg, _slow_drift_clip
+from .test_loop_health import _replace
+
+ENC = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "18"]
+
+
+def repeating(path: Path, *, seconds: float = 30.0, period: float = 10.0, size: str = "320x180",
+              rate: int = 24) -> Path:
+    """A box circling once every `period` seconds; the last 3 s are a
+    different (red) picture, so the whole clip's own join jumps."""
+    w, h = (int(x) for x in size.split("x"))
+    box = max(8, w // 8)
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-y",
+        "-f", "lavfi", "-i", f"color=c=0x336699:s={size}:d={seconds}:r={rate}",
+        "-f", "lavfi", "-i", f"color=c=0xEEDD22:s={box}x{box}:d={seconds}:r={rate}",
+        "-filter_complex",
+        f"[0][1]overlay=x='{w / 2 - box / 2}+{w / 4}*sin(2*PI*t/{period})':"
+        f"y='{h / 2 - box / 2}+{h / 4}*cos(2*PI*t/{period})',"
+        f"drawbox=x=0:y=0:w=iw:h=ih:color=0xCC3311:t=fill:enable='gte(t,{seconds - 3})'",
+        "-t", str(seconds), *ENC, "-r", str(rate), str(path)], check=True)
+    return path
+
+
+def drifting_gradient(path: Path, seconds: float = 30.0) -> Path:
+    """A picture that keeps brightening and never comes back: no stretch
+    of it loops."""
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"nullsrc=s=320x180:r=24:d={seconds},"
+                    f"geq=lum='60+150*T/{seconds}+20*sin(2*PI*X/W)':cb=128:cr=128",
+                    *ENC, str(path)], check=True)
+    return path
+
+
+def stripes(path: Path, rate: int, seconds: float = 4.3) -> Path:
+    """Stripes drifting sideways at a steady speed; the clip stops part-way
+    through a cycle, so its join jumps by the same amount at any rate."""
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"nullsrc=s=320x180:r={rate}:d={seconds},"
+                    "geq=lum='128+60*sin(2*PI*(4*X/W-T/2))':cb=128:cr=128",
+                    *ENC, "-r", str(rate), str(path)], check=True)
+    return path
+
+
+# ---------- the finder ----------
+
+
+def test_a_repeating_clip_loops_on_a_whole_number_of_periods(tmp_path):
+    from app.services import loop_health as lh
+    from app.services import loop_point as lp
+
+    clip = repeating(tmp_path / "rep.mp4")
+    assert lh.measure(clip)["seam"]["verdict"] == "visible_jump"  # control: the whole clip jumps
+    r = lp.find_loop_point(clip)
+    span = r["out"] - r["in"]
+    assert span >= lp.default_min_loop(30.0) - 1e-6
+    assert abs(span - 10 * round(span / 10)) <= 1 / 24 + 1e-3, r
+    assert r["out"] <= 27.0  # never into the mismatched end
+    assert r["ratio"] < lh.SEAM_SEAMLESS_RATIO and r["verdict"] == "seamless" and r["found"] is True
+    assert r["raw_ratio"] > lh.SEAM_SLIGHT_RATIO
+    assert r["ghost_ok"] is True and r["ghost_dip"] <= lp.GHOST_DIP_MAX
+    assert r["crossfade"] in (0.5, 1.5)  # seamless, +1 s when the join is calm
+    assert r["crossfade"] <= 2 * min(r["in"], 30.0 - r["out"]) + 1e-6
+
+
+def test_a_clip_that_never_repeats_finds_nothing(tmp_path):
+    from app.services import loop_point as lp
+
+    r = lp.find_loop_point(drifting_gradient(tmp_path / "drift.mp4"))
+    assert r["ratio"] > 6 and r["verdict"] == "visible_jump" and r["found"] is False
+
+
+def test_the_crossfade_rule():
+    from app.services import loop_point as lp
+
+    assert lp.crossfade_for(2.0, False) == 0.5 and lp.crossfade_for(2.0, True) == 1.5
+    assert lp.crossfade_for(3.5, False) == 1.0 and lp.crossfade_for(5.9, False) == 2.0
+    assert lp.crossfade_for(5.9, True) == 3.0 and lp.crossfade_for(6.1, False) is None
+
+
+def test_a_half_and_half_mix_of_two_different_pictures_reads_as_a_ghost():
+    from PIL import Image, ImageDraw
+
+    from app.services import loop_point as lp
+
+    def bars(offset: int) -> Image.Image:
+        im = Image.new("RGB", (160, 90), (40, 40, 40))
+        d = ImageDraw.Draw(im)
+        for x in range(offset, 160, 16):
+            d.rectangle([x, 0, x + 7, 89], fill=(220, 220, 220))
+        return im
+
+    assert lp.ghost_dip(bars(0), bars(0)) < 0.02
+    assert lp.ghost_dip(bars(0), bars(8)) > lp.GHOST_DIP_MAX  # stripes in each other's gaps
+
+
+def test_ratios_do_not_depend_on_the_frame_rate(tmp_path):
+    from app.services import loop_health as lh
+    from app.services import loop_point as lp
+
+    r25 = lh.measure(stripes(tmp_path / "s25.mp4", 25))["seam"]
+    r50 = lh.measure(stripes(tmp_path / "s50.mp4", 50))["seam"]
+    assert r25["typical"] > lh.TYPICAL_FLOOR  # the steps, not the floor, set the ratio
+    assert r50["ratio"] == pytest.approx(r25["ratio"], rel=0.15), (r25, r50)
+    f25 = lp.find_loop_point(tmp_path / "s25.mp4")
+    f50 = lp.find_loop_point(tmp_path / "s50.mp4")
+    assert f50["raw_ratio"] == pytest.approx(f25["raw_ratio"], rel=0.15), (f25, f50)
+
+
+def test_the_search_is_quick(tmp_path):
+    from app.services import loop_point as lp
+
+    clip = repeating(tmp_path / "hd.mp4", size="1280x720", rate=30)
+    t = time.monotonic()
+    r = lp.find_loop_point(clip)
+    assert time.monotonic() - t < 30, r
+    assert r["coarse_seconds"] < 15, r
+
+
+# ---------- the render ----------
+
+
+def test_the_loop_unit_dissolves_centred_on_the_join_and_unbiased(tmp_path):
+    from app.services.renderer import loop_unit_graph
+
+    clip = tmp_path / "drift.mp4"
+    _slow_drift_clip(clip, seconds=6, start=0)
+    src = _raw_yavg([clip], "[0:v]null[o]", "o")
+    a, b, h = 45, 135, 15
+    unit = _raw_yavg([clip], loop_unit_graph(start_frame=a, end_frame=b, half=h, out="o"), "o")
+    assert len(unit) == b - a
+    mid = b - a - 2 * h
+    # unit = src[a+h : b-h] ++ dissolve(src[b-h : b+h] → src[a-h : a+h])
+    assert all(abs(unit[i] - src[a + h + i]) < 0.05 for i in range(mid))
+    _assert_linear_dissolve(unit[mid:], src[b - h:b + h], src[a - h:a + h], "loop-point unit")
+
+
+def test_compose_with_a_loop_point_opens_on_the_clip_and_lasts_exactly(tmp_path):
+    from app.services.renderer import FPS, AmbientRenderInputs, compose_ambient
+
+    clip = tmp_path / "drift.mp4"
+    _slow_drift_clip(clip, seconds=10, start=0)
+    total = 13.0
+    out = compose_ambient(AmbientRenderInputs(
+        project_id=0, out_dir=tmp_path / "out", clip_path=clip, total_seconds=total,
+        crossfade_seconds=1.0, fade_seconds=0.0, loop_in=2.0, loop_out=7.0, intro=True))
+    assert abs(_duration(out.final_video_path) - total) <= 1.5 / FPS
+    assert out.unit_seconds == pytest.approx(5.0, abs=1.5 / FPS)
+    scale = "scale=320:180,setsar=1"
+    final = _raw_yavg([out.final_video_path], f"[0:v]{scale}[o]", "o")
+    src = _raw_yavg([clip], f"[0:v]{scale}[o]", "o")
+    assert len(final) == pytest.approx(total * FPS, abs=1)
+    # The video opens on the clip's own first frame (the photo) ...
+    assert abs(final[0] - src[0]) < 1.0, (final[0], src[0])
+    # ... plays the clip's opening up to the unit's start (2 s + half the
+    # blend), then the unit carries on from exactly there.
+    k = int(round((2.0 + 0.5) * FPS))
+    assert abs(final[k - 1] - src[k - 1]) < 1.0 and abs(final[k] - src[k]) < 1.0
+    # One unit later the loop has wrapped back onto the same frame.
+    assert abs(final[k + 5 * FPS] - src[k]) < 1.5
+
+
+def test_compose_ignores_a_loop_point_with_variations(tmp_path):
+    from app.services.renderer import AmbientRenderInputs, compose_ambient
+
+    a, b = tmp_path / "a.mp4", tmp_path / "b.mp4"
+    _slow_drift_clip(a, seconds=4, start=0)
+    _slow_drift_clip(b, seconds=4, start=4)
+    out = compose_ambient(AmbientRenderInputs(
+        project_id=0, out_dir=tmp_path / "out", clip_path=a, extra_clips=[b], variety="takes",
+        total_seconds=10, crossfade_seconds=1.0, fade_seconds=0.0, loop_in=1.0, loop_out=2.5, intro=True))
+    assert out.unit_seconds == pytest.approx(3.0, abs=0.1)  # the whole clip less the blend
+    assert not (tmp_path / "out" / "ambient_intro.mp4").exists()
+
+
+# ---------- the scene ----------
+
+
+def _scene(client, **cfg) -> dict:
+    r = client.post("/api/ambient", json={"config": {**SHORT, "music_mood": "none", **cfg}, "generate": True})
+    assert r.status_code == 201, r.text
+    scene = r.json()
+    assert scene["loop_status"] == "completed", scene
+    return scene
+
+
+def test_find_a_better_loop_point_then_render_it_then_use_the_whole_clip(auth_client):
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), repeating)
+    assert auth_client.post(f"/api/ambient/{sid}/loop-health").status_code == 200
+    before = auth_client.get(f"/api/ambient/{sid}").json()
+    assert before["loop_point"] is None and before["seam_treatment"]["verdict"] == "visible_jump"
+    r = auth_client.post(f"/api/ambient/{sid}/find-loop-point")
+    assert r.status_code == 202, r.text
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["status"] == before["status"]  # a search never claims the scene
+    assert out["loop_point_state"]["status"] == "done" and out["loop_point_state"]["found"] is True
+    lp = out["loop_point"]
+    assert lp["verdict"] == "seamless" and lp["off"] is False and lp["intro"] is True and lp["applies"]
+    assert abs(lp["loop_seconds"] - 20.0) <= 0.05
+    st = out["seam_treatment"]
+    assert st["loop_point"] is True and st["verdict"] == "seamless" and st["covers"] is True
+    assert out["plan"]["unit_seconds"] == pytest.approx(lp["loop_seconds"], abs=0.01)
+    # The seam card describes the stretch, and its preview plays it.
+    health = out["loop_health"]
+    assert health["seam"]["level"] == "good" and "The render loops" in health["seam"]["text"]
+    assert health["seam"]["raw_level"] == "bad"
+    p = auth_client.get(health["seam_preview_url"])
+    assert p.status_code == 200 and float(p.headers["x-join-at"]) == pytest.approx(3.0, abs=0.05)
+
+    # The render loops the stretch, with no question about the whole clip's jump.
+    r = auth_client.post(f"/api/ambient/{sid}/render")
+    assert r.status_code == 202, r.text
+    log = auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["render_log"]
+    assert "seam=seamless" in log and f"loop={lp['in_seconds']:g}-{lp['out_seconds']:g}s" in log
+
+    # Use the whole clip: back to the whole clip's (jumping) join.
+    r = auth_client.delete(f"/api/ambient/{sid}/find-loop-point")
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["loop_point"]["off"] is True
+    assert out["seam_treatment"]["loop_point"] is False and out["seam_treatment"]["verdict"] == "visible_jump"
+    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 409
+    # Finding again switches it back on.
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    assert auth_client.get(f"/api/ambient/{sid}").json()["loop_point"]["off"] is False
+
+
+def test_no_loop_point_in_a_clip_that_never_repeats(auth_client):
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), drifting_gradient)
+    status = auth_client.get(f"/api/ambient/{sid}").json()["status"]
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["status"] == status
+    assert out["loop_point"] is None
+    assert out["loop_point_state"]["found"] is False and "No better loop point" in out["loop_point_state"]["message"]
+    assert auth_client.post(f"/api/ambient/{sid}/loop-health").status_code == 200
+    assert auth_client.get(f"/api/ambient/{sid}").json()["seam_treatment"]["verdict"] == "visible_jump"
+
+
+def test_find_loop_point_refusals(auth_client):
+    from app import models
+    from app.db import SessionLocal
+
+    drift = _scene(auth_client, source="image_drift")
+    assert auth_client.post(f"/api/ambient/{drift['id']}/find-loop-point").status_code == 409
+    takes = _scene(auth_client, variety="takes", variations=2)
+    r = auth_client.post(f"/api/ambient/{takes['id']}/find-loop-point")
+    assert r.status_code == 409 and "single-clip" in r.json()["detail"]
+    assert any("single-clip" in n for n in takes["plan"]["notes"])
+    scene = _scene(auth_client)
+    db = SessionLocal()
+    try:
+        db.get(models.VideoProject, scene["id"]).status = "generating"
+        db.commit()
+    finally:
+        db.close()
+    assert auth_client.post(f"/api/ambient/{scene['id']}/find-loop-point").status_code == 409
+
+
+def test_a_new_loop_that_jumps_gets_a_loop_point_by_itself(auth_client, monkeypatch, tmp_path):
+    """After generating, a join that isn't seamless starts a search; a
+    stretch that beats the whole clip is kept and the render uses it."""
+    from app.services import loop_health, loop_point
+
+    rep = repeating(tmp_path / "rep.mp4")
+    real_measure = loop_health.measure
+    monkeypatch.setattr(loop_health, "measure", lambda clip, still=False: real_measure(rep, still=still))
+    seen = []
+    real_find = loop_point.find_loop_point
+
+    def spy(clip, min_loop=None):
+        seen.append(clip)
+        return real_find(rep, min_loop)
+
+    monkeypatch.setattr(loop_point, "find_loop_point", spy)
+    scene = _scene(auth_client)
+    assert len(seen) == 1
+    lp = scene["loop_point"]
+    assert lp is not None and lp["verdict"] == "seamless" and lp["intro"] is True
+    assert scene["seam_treatment"]["loop_point"] is True and scene["seam_treatment"]["verdict"] == "seamless"
+    # A clean loop isn't searched.
+    seen.clear()
+    monkeypatch.setattr(loop_health, "measure", real_measure)
+    assert _scene(auth_client)["loop_point"] is None and seen == []
