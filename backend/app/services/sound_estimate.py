@@ -68,11 +68,15 @@ def _digest(*parts: object) -> str:
 def cue_fingerprint(item: Item, cast: Optional[dict] = None, settings: Optional[dict] = None) -> str:
     """What a cue's clip is made from, hashed (64 hex characters, as
     SoundClip.fingerprint stores it): a line's text with its tags and its
-    voice (voice_params); a sound's prompt, seconds or library id; a bed's
+    voice (voice_params) and any delivery instructions; a sound's prompt, seconds or library id; a bed's
     layer and prompt. A finished clip with the same fingerprint is reused
     for free; anything else is generated (and priced) again."""
     if item.kind == "speech":
-        return _digest("voice", item.voice_text, voice_params(item.speaker, cast, settings))
+        params = voice_params(item.speaker, cast, settings)
+        if item.instructions:
+            # A retake with new delivery instructions is new audio.
+            return _digest("voice", item.voice_text, params, item.instructions)
+        return _digest("voice", item.voice_text, params)
     if item.kind == "sfx":
         return _digest("sfx", item.asset_id or "", item.prompt.lower(),
                        float(item.seconds or story_script.DEFAULT_SFX_SECONDS))
