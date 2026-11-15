@@ -18,6 +18,10 @@ class MockTTSProvider(TTSProvider):
     def list_voices(self) -> list[dict]:
         return [{"voice_id": "mock-voice", "name": "Mock Voice", "preview_url": ""}]
 
+    def resolve_voice(self, voice_id: str) -> str:
+        """The mock reads every request with the voice asked for."""
+        return voice_id or ""
+
     def synthesize(
         self,
         *,
@@ -27,7 +31,11 @@ class MockTTSProvider(TTSProvider):
     ) -> bytes:
         if not shutil.which("ffmpeg"):
             raise RuntimeError("ffmpeg required for mock tts provider")
-        seconds = (settings or {}).get("duration") or _estimate_seconds(text)
+        from ..services.story_script import is_story, split_tags
+
+        # In story markup, voice tags ([whispers], [short pause]...) aren't words.
+        words = split_tags(text)[1] if is_story(settings) else text
+        seconds = (settings or {}).get("duration") or _estimate_seconds(words)
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "voice.m4a"
             cmd = [

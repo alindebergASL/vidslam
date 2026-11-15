@@ -154,6 +154,12 @@ class Settings(BaseSettings):
     # Sound effects (ambient nature-sound beds). v2 is deprecated (removed
     # 2027-03-01), so the model is always sent explicitly.
     elevenlabs_sound_model_id: str = "eleven_text_to_sound_v3"
+    # Sound Studio stories: a model that reads audio tags ([whispers],
+    # [short pause]...). eleven_v3 and eleven_v4_turbo can be picked per
+    # story or per character.
+    elevenlabs_story_model_id: str = "eleven_v4"
+    # Longest audio story (minutes) the Sound Studio writes and voices.
+    sound_story_max_minutes: int = 90
     elevenlabs_base_url: str = "https://api.elevenlabs.io/v1"
 
     # S3-backed object storage (optional, for production deploys). When
@@ -272,6 +278,18 @@ class Settings(BaseSettings):
     # Live: HeyGen Avatar IV ~$0.23 for a 4.6 s clip ≈ $0.05/s.
     cost_avatar_per_second: float = 0.05
     cost_tts_per_1k_chars: float = 0.20
+    # Per voice model (ElevenLabs list prices, Nov 2026), for Sound Studio
+    # story voices only; a model not listed costs cost_tts_per_1k_chars
+    # (Settings.tts_rate). Every other voice (video voiceover, hook lab)
+    # costs cost_tts_per_1k_chars, as its estimate does.
+    cost_tts_per_1k_chars_by_model: dict[str, float] = {
+        "eleven_v4": 0.08, "eleven_v4_turbo": 0.04, "eleven_v3": 0.08,
+        # The same credits per character as v3; flash and turbo half that.
+        "eleven_multilingual_v2": 0.08, "eleven_flash_v2_5": 0.04, "eleven_turbo_v2_5": 0.04}
+    # One-shot sound effects, by the second (ElevenLabs: $0.12 a minute).
+    cost_sound_per_second: float = 0.002
+    # One writer call of a Sound Studio story (an outline or a chapter).
+    cost_chat_per_story_call: float = 0.005
     cost_music_per_generation: float = 0.05
     # One 30 s looping sound effect (ElevenLabs bills ~40 credits/s).
     cost_sound_per_generation: float = 0.10
@@ -280,6 +298,12 @@ class Settings(BaseSettings):
     # once the month's spend reaches the cap; otherwise only alert.
     spend_monthly_budget_usd: float = 0.0
     spend_hard_stop: bool = True
+
+    def tts_rate(self, model: str = "") -> float:
+        """USD per 1,000 characters for a voice model."""
+        rates = self.cost_tts_per_1k_chars_by_model or {}
+        rate = rates.get(model or "")
+        return float(rate) if rate is not None else float(self.cost_tts_per_1k_chars)
 
     @property
     def data_path(self) -> Path:

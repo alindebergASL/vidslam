@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from ..config import get_settings
@@ -95,10 +96,218 @@ class GuardedAvatarProvider(_Guarded):
 
 
 class GuardedTTSProvider(_Guarded):
-    def synthesize(self, *, text: str, voice_id: str, settings: dict | None = None, **kw) -> bytes:
-        _guard(text, "", "script")
-        _explicit(text)
+    """`story`: a Sound Studio voice (get_tts_for), whose text is story
+    markup: every request is sent with settings story_markup set. Any other
+    caller (a video voiceover through pipeline.synthesize, the hook lab) is
+    checked exactly as before story voices existed: check_generation on the
+    raw text, kind "script". `voice_provider`: the voice provider a story
+    voice was made for (get_tts_for), checked against the voice the story
+    pass binds each speaker to."""
+
+    def __init__(self, inner, *, story: bool = False, voice_provider: str = "") -> None:
+        super().__init__(inner)
+        self.story = story
+        self.voice_provider = voice_provider
+
+    def synthesize(self, *, text: str, voice_id: str, settings: dict | None = None, context: str = "",
+                   story_pass: str = "", speaker: str = "", **kw) -> bytes:
+        """The story path (a story voice, story markup in `settings`, or a
+        story `context`): `context` is the story's context and `story_pass`
+        its signed pass (by default the one the context carries), both from
+        story_script.check_story; `speaker` is who says the line (a cast
+        member). The line is sent only when the pass covers this speaker,
+        text and delivery instructions with this context, and `voice_id` is
+        the voice the pass binds the speaker to (check_story's `voices`;
+        the default voice "" when none was given); anything else (no
+        speaker, a speaker not in the cast, a line or instructions changed
+        since the check, a different cast or voice, a forged or expired
+        pass) is refused: run check_story on the current story again. On a
+        clean deployment, what a pass covers was judged by the
+        explicit-content check in check_story, so it isn't asked again."""
+        from ..services import story_pass as passes
+        from ..services import story_script
+        from ..services.minor_check import split_context
+        from ..services.safety import UnsafePromptError
+
+        token = passes.of(context, story_pass)
+
+        if self.story and not story_script.is_story(settings):
+            settings = {**(settings or {}), story_script.STORY_MARKUP: True}
+        instructions = str((settings or {}).get("instructions") or "")
+        if not story_script.is_story(settings) and not (context or "").strip():
+            _guard(text, "", "script")
+            if instructions.strip():
+                _guard(instructions, "", "script")
+                _explicit(f"{text}\n{instructions}")
+            else:
+                _explicit(text)
+            return self.inner.synthesize(text=text, voice_id=voice_id, settings=settings, **kw)
+
+        # The story path. Fullwidth brackets and look-alikes ("［moans］")
+        # read as the tags they look like, in the checks and in what is
+        # sent; dash look-alikes are folded in the checks only (an em dash
+        # is a pause to a voice).
+        who = " ".join((speaker or "").split()).upper()
+        if not who:
+            raise UnsafePromptError("A story line needs its speaker to be voiced. Check the story again.")
+        cast = {line.split(":", 1)[0].strip().upper()
+                for line in split_context(str(context or ""))[1].split("\n")[1:] if line.strip()}
+        if who not in cast:
+            raise UnsafePromptError(f"{who} isn't in this story's cast. Check the story again.")
+        text = story_script.normalize(text, dashes=False)
+        if instructions:
+            instructions = story_script.normalize(instructions, dashes=False)
+            settings = {**(settings or {}), "instructions": instructions}
+        if not passes.covers(token, context, passes.line_item(who, text, instructions)):
+            raise UnsafePromptError(passes.STALE)
+        # The voice really used: an empty or unlisted id falls back to the
+        # provider's own (OpenRouter's configured voice, ElevenLabs' default),
+        # which may be another speaker's. That is what the binding is
+        # compared with, and what is sent.
+        resolve = getattr(self.inner, "resolve_voice", None)
+        resolved = resolve(voice_id) if callable(resolve) else voice_id
+        default = resolve("") if callable(resolve) else ""
+        if not passes.voice_bound(token, who, resolved, self.voice_provider, default_voice=default):
+            raise UnsafePromptError(passes.WRONG_VOICE.format(speaker=who))
+        voice_id = resolved
+        # A clean deployment voices general-audience directions only: an
+        # adult tag, or any other words in brackets a tag-reading model
+        # would perform ("[moaning]"), are taken out (check_story judged the
+        # line with them).
+        if story_script.allowed_tags() == story_script.GENERAL_TAGS:  # a clean deployment
+            text = story_script.drop_directions(text, story_script.GENERAL_TAGS)
+        if not passes.clean_checked(token):
+            _explicit("\n".join(x for x in (text, instructions) if x.strip()) if instructions.strip() else text)
         return self.inner.synthesize(text=text, voice_id=voice_id, settings=settings, **kw)
+
+
+# What the app adds to a music prompt for each part of a long bed
+# (ambient.generate_music_bed): fixed words, only the numbers change.
+MUSIC_PART_NOTE = (" Part {i} of {n} of one continuous piece: keep the same key, tempo, instruments and mood; "
+                   "let it evolve gently, no ending or fade.")
+_MUSIC_PART_RE = re.compile(re.escape(MUSIC_PART_NOTE).replace(r"\{i\}", r"\d+").replace(r"\{n\}", r"\d+") + "$")
+
+
+def music_part_prompt(prompt: str, i: int, n: int) -> str:
+    """`prompt` for part `i` of `n` of one long music bed."""
+    return prompt + MUSIC_PART_NOTE.format(i=i, n=n)
+
+
+def _base_music_prompt(prompt: str) -> str:
+    """The prompt without the app's part note: every part of a bed is the
+    same prompt to the checks (checked, and paid for, once)."""
+    return _MUSIC_PART_RE.sub("", prompt or "")
+
+
+def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force: bool = False) -> None:
+    """A sound or music prompt: the word filter, the minors check and, on a
+    clean deployment, the explicit-content check. Every caller of
+    get_sound() and get_music() comes through here, whatever screen the
+    prompt came from. An adult word ("moaning", "panting", [moans]) is
+    marked (story_script.safety_text), so with a child in view the model
+    is asked, never refused by the words alone.
+
+    `context`: a story's context (story_script.check_story): with one, the
+    prompt is a story part, sent only when `story_pass` (by default the one
+    the context carries) covers this prompt with this context (check_story
+    judged it, with the story's facts and cast in front); anything else is
+    refused (story_pass.STALE: check the story again). Without one, kind
+    "audio": asked when it's sexual or mentions a minor, or `force`
+    (lyrics or a composition plan)."""
+    from ..services import story_pass as passes
+    from ..services.minor_check import check_long
+    from ..services.safety import UnsafePromptError, check_prompt
+    from ..services.story_script import safety_text
+
+    token = passes.of(context, story_pass)
+    text = (prompt or "").strip()
+    if not text:
+        return
+    check_prompt(text)
+    context = (context or "").strip()
+    if context:
+        if not passes.covers(token, context, passes.prompt_item(text)):
+            raise UnsafePromptError(passes.STALE)
+        # Covered: on a clean deployment check_story's explicit-content
+        # check judged it (the pass says so), so it isn't asked again.
+        if passes.clean_checked(token):
+            return
+    else:
+        check_long(safety_text(text, "", prose=True), kind="audio", force=force)
+    _explicit_prompt(text)
+
+
+def audio_guard(prompt: str, context: str = "", story_pass: str = "") -> None:
+    """The checks get_sound() and get_music() run on a prompt, for a caller
+    that wants a refusal before anything is paid for (ambient.precheck)."""
+    _audio_guard(_base_music_prompt(prompt), context, story_pass)
+
+
+class GuardedSoundProvider(_Guarded):
+    def generate(self, *, prompt: str, duration_seconds: float = 30.0, context: str = "", story_pass: str = "",
+                 **kw) -> bytes:
+        """`context`: the story's context (story callers pass it); never
+        sent. `story_pass`: check_story's pass (see _audio_guard)."""
+        _audio_guard(prompt, context, story_pass)
+        return self.inner.generate(prompt=prompt, duration_seconds=duration_seconds, **kw)
+
+
+# Music `settings` reach the provider's request as they are (ElevenLabs
+# merges them into the body), so only these keys are allowed: plain
+# switches and numbers, and for model_id and output_format a short plain
+# name (MUSIC_NAME_RE). A text-bearing key (a second prompt, lyrics, a
+# composition plan with sections and lines) is refused unless it is one of
+# MUSIC_TEXT_KEYS, whose every string is joined to the prompt and judged
+# with it as one text (the model always asked). Any other key, or a text
+# value under a plain key, is refused.
+MUSIC_SETTING_KEYS = frozenset({"force_instrumental", "music_length_ms", "seed", "output_format", "model_id",
+                                "respect_sections_durations"})
+MUSIC_NAME_KEYS = frozenset({"output_format", "model_id"})
+MUSIC_NAME_RE = re.compile(r"[a-z0-9_.-]{1,64}")
+MUSIC_TEXT_KEYS = frozenset({"composition_plan", "lyrics"})
+
+
+def _strings(value) -> list[str]:
+    """Every string inside a settings value (dicts and lists walked)."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in (*_strings(k), *_strings(v))]
+    if isinstance(value, (list, tuple)):
+        return [s for v in value for s in _strings(v)]
+    return []
+
+
+def _music_texts(settings: dict | None) -> list[str]:
+    """Every string of the MUSIC_TEXT_KEYS values; raises ValueError for a
+    key that could carry unchecked text (see MUSIC_SETTING_KEYS)."""
+    texts: list[str] = []
+    for key, value in (settings or {}).items():
+        if key in MUSIC_TEXT_KEYS:
+            texts += [t for t in _strings(value) if t.strip()]
+        elif key in MUSIC_NAME_KEYS and isinstance(value, str):
+            if not MUSIC_NAME_RE.fullmatch(value):
+                raise ValueError(f"music setting {key!r} is not allowed")
+        elif key not in MUSIC_SETTING_KEYS or _strings(value):
+            raise ValueError(f"music setting {key!r} is not allowed")
+    return texts
+
+
+class GuardedMusicProvider(_Guarded):
+    """Every get_music() caller's prompt goes through the guard, joined with
+    any text in its `settings` (lyrics, a composition plan) and judged as
+    one text (MUSIC_SETTING_KEYS: anything else, such as a second "prompt",
+    is refused)."""
+
+    def generate(self, *, prompt: str, duration_seconds: float, settings: dict | None = None,
+                 context: str = "", story_pass: str = "", **kw) -> bytes:
+        """`context`: the story's context (story callers pass it); never
+        sent. `story_pass`: check_story's pass, for a prompt alone."""
+        texts = _music_texts(settings)
+        base = _base_music_prompt(prompt)
+        _audio_guard("\n".join(x for x in (base, *texts) if (x or "").strip()), context, story_pass,
+                     force=bool(texts))
+        return self.inner.generate(prompt=prompt, duration_seconds=duration_seconds, settings=settings, **kw)
 
 
 def unwrap(provider):
@@ -320,6 +529,65 @@ def get_tts() -> TTSProvider:
     return GuardedTTSProvider(_tts())
 
 
+TTS_PROVIDERS = ("elevenlabs", "openrouter", "mock")
+
+
+def story_voice(provider: str = "", model: str = "") -> tuple[str, str]:
+    """(provider, model) a story voice uses: ElevenLabs when no provider is
+    set, with the story model (ELEVENLABS_STORY_MODEL_ID) when no model is.
+    The one place this default is decided: the generator (get_tts_for) and
+    the estimate and fingerprints (sound_estimate.voice_route) both ask it."""
+    provider = (provider or "").strip().lower() or "elevenlabs"
+    model = (model or "").strip()
+    if provider == "elevenlabs" and not model:
+        model = get_settings().elevenlabs_story_model_id
+    return provider, model
+
+
+def get_tts_for(provider: str = "", model: str = "", voice: str = "") -> TTSProvider:
+    """A voice provider picked per story or per character (Sound Studio):
+    `provider` "elevenlabs" with an ElevenLabs model id (default: the story
+    model, ELEVENLABS_STORY_MODEL_ID), "openrouter" with an OpenRouter
+    voice model id (gpt-4o-mini-tts, gpt-audio...), or "" for the story
+    default (story_voice, which the estimate uses too). The mock stands in
+    in mock mode or without a key, as for the active voice; a provider
+    switched off is refused. Guarded like get_tts(), as a story voice (its
+    text is story markup: GuardedTTSProvider story)."""
+    from ..services import model_catalog
+
+    provider, model = story_voice(provider, model)
+    if provider not in TTS_PROVIDERS:
+        raise ValueError(f"unknown voice provider: {provider!r}")
+    if provider == "mock":
+        from .mock_tts import MockTTSProvider
+
+        return GuardedTTSProvider(MockTTSProvider(), story=True, voice_provider=provider)
+    if provider == "elevenlabs":
+        route = _checked("tts", "elevenlabs")
+    else:
+        if not model or model == "elevenlabs":
+            raise ValueError("an OpenRouter voice needs a model id")
+        route = _checked("tts", model)
+    if route == "mock":
+        from .mock_tts import MockTTSProvider
+
+        return GuardedTTSProvider(MockTTSProvider(), story=True, voice_provider=provider)
+    if provider == "elevenlabs":
+        from .elevenlabs_tts import ElevenLabsTTSProvider
+
+        return GuardedTTSProvider(ElevenLabsTTSProvider(model_id=model), story=True,
+                                  voice_provider=provider)
+    from .openrouter_tts import OpenRouterTTSProvider
+
+    entry = model_catalog.find("tts", model) or {}
+    outs = entry.get("output_modalities") or []
+    return GuardedTTSProvider(OpenRouterTTSProvider(
+        model=model, voice=voice or "",
+        voices=entry.get("supported_voices") or [],
+        chat_audio=("audio" in outs and "speech" not in outs) if outs else None,
+    ), story=True, voice_provider=provider)
+
+
 def _tts() -> TTSProvider:
     from ..services import model_catalog
     from ..services import model_registry as reg
@@ -346,6 +614,11 @@ def _tts() -> TTSProvider:
 
 
 def get_music() -> MusicProvider:
+    """The music provider; every prompt goes through the safety check."""
+    return GuardedMusicProvider(_music())
+
+
+def _music() -> MusicProvider:
     model, provider = _active("music")
     if provider == "mock":
         from .mock_music import MockMusicProvider
@@ -366,9 +639,14 @@ def get_music() -> MusicProvider:
 
 
 def get_sound():
-    """Nature-sound beds for ambient scenes: ElevenLabs sound effects when a
+    """Sound effects and nature-sound beds: ElevenLabs sound effects when a
     key is set and providers are live, else a generated noise placeholder
-    (never when ElevenLabs is merely switched off: then it's refused)."""
+    (never when ElevenLabs is merely switched off: then it's refused). Every
+    prompt goes through the safety check."""
+    return GuardedSoundProvider(_sound())
+
+
+def _sound():
     if get_settings().music_is_mocked():
         from .sound import MockSoundProvider
 

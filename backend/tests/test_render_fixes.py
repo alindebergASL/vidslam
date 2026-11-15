@@ -917,7 +917,7 @@ def test_migration_0011_adds_composition_and_hook_variants(tmp_path, monkeypatch
             "error", "render_id", "cost_estimate", "created_at", "updated_at"} <= cols
     with dbmod.engine.connect() as conn:
         assert tuple(conn.execute(text("SELECT composition_json, hook_variant_id FROM renders")).one()) == (None, None)
-        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0011"
+        assert conn.execute(text("SELECT version_num FROM alembic_version")).scalar() == "0012"
         diff = compare_metadata(MigrationContext.configure(conn), dbmod.Base.metadata)
     assert diff == [], diff  # same as `alembic check`
     command.downgrade(dbmod._alembic_config(), "0010")

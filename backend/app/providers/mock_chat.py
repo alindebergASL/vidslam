@@ -39,6 +39,11 @@ VISION_CALLS: list[tuple[str, int]] = []
 MINOR_REPLY: dict | BaseException | None = None
 # Every mock safety-check call (the text sent), for tests.
 MINOR_CALLS: list[str] = []
+# The mock story facts (minor_check.story_facts): a reply tests set (a dict
+# {"characters": [...]}, or an exception); None = the rules in
+# mock_story_characters. Every text it was asked about, for tests.
+STORY_FACTS_REPLY: dict | BaseException | None = None
+STORY_FACTS_CALLS: list[str] = []
 # The mock content check of a clean deployment: a verdict dict ({"explicit":
 # True, "reason": ...}) or an exception tests set; None = a word list
 # (safety.is_hard_sexual). Every text it was asked about, for tests.
@@ -69,15 +74,281 @@ _UNDRESS = re.compile(
 # first (so a long prompt can't push it out of view), then the prompt.
 AVOID_MARK = "Avoid list (negative prompt): "
 PROMPT_MARK = "Prompt: "
+# A story part: the app's block (the story note, facts and cast), then the
+# user's text (minor_check.classifier_text).
+CONTEXT_MARK = "Story context (from the app):\n"
+USER_MARK = "User text:\n"
+
+
+# How services/minor_check.py lays out a story facts request: the cast
+# header, then this mark, then (a part of) the script.
+STORY_SCRIPT_MARK = "\n\nScript:\n"
+# Before the script: the minors found in earlier windows, and on a second
+# ask, the cast members the first answer left out (minor_check.story_facts).
+SO_FAR_MARK = "So far: "
+# Before the script, too: the characters shown as minors in the part just
+# before this one (a flashback that may go on).
+EARLIER_MARK = "Earlier parts: "
+FACTS_RETRY_MARK = "Also list every one of these cast members: "
+# ... and, asked again when a reply to a first-person text has no narrator:
+FACTS_NARRATOR_MARK = ("Also say who the first-person narrator (I/me) is (\"narrator\"): this text is told in the "
+                       "first person.")
+_MOCK_NUM = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+             "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+             "sixteen": 16, "seventeen": 17}
+_MOCK_N = r"(1[0-7]|[2-9]|" + "|".join(_MOCK_NUM) + r")"
+_MOCK_ORD = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7,
+             "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11, "twelfth": 12, "thirteenth": 13,
+             "fourteenth": 14, "fifteenth": 15, "sixteenth": 16, "seventeenth": 17}
+_MOCK_O = r"(1[0-7]th|1st|2nd|3rd|[4-9]th|" + "|".join(_MOCK_ORD) + r")"
+_MOCK_AGES = [re.compile(p, re.I) for p in (
+    rf"\b(?:was|is|turned|turns|turn|turning|aged?|age\s*[:=]?)\s+(?:(?:only|just|barely|nearly|almost|about|"
+    rf"an?|now)\s+)?{_MOCK_N}\b"
+    r"(?!\s*(?:pm|am|feet|foot|ft|minutes?|hours?|days?|o'clock|in the|of the|of us|of them|percent)\b)",
+    rf"\(\s*{_MOCK_N}\s*\)", rf"\b{_MOCK_N}\s*-?\s*(?:years?|yrs?)\s*-?\s*(?:old|of age)\b",
+    rf"\b{_MOCK_N}\s*-?\s*(?:yo|y\.o\.?|y/o)\b",
+    rf"\b{_MOCK_N}\s+(?:candles|ans|jahre|años)\b", rf"^\s*{_MOCK_N}\b",
+    rf"[A-Z][a-z]+,\s*{_MOCK_N}\s*,",
+    rf"\b{_MOCK_O}\s+(?:birthday|year)\b")]
+# A minor without a number: a school stage or a word for a child's age.
+_MOCK_STAGE = re.compile(
+    rf"\b(?:grade|year)\s+{_MOCK_N}\b|\b{_MOCK_O}[ -]grade(?:rs?)?\b|\bgrade\s+(?:[1-9]|1[0-2])\b|"
+    r"\b(?:tween|preteen|pre-teen|underage|under-age|a minor|kindergarten\w*|preschool\w*|middle school|"
+    r"elementary school|primary school|junior high|(?:freshman|sophomore|junior|senior) in high school|"
+    r"baby tooth|baby teeth)\b", re.I)
+_MOCK_ADULT = re.compile(r"\b(?:adult|woman|man|wife|husband|mother|father|uncle|aunt|grand\w+|narrator|"
+                         r"(?:1[89]|[2-9]\d)\b)", re.I)
+_MOCK_NOT_NAMES = frozenset({
+    "The", "A", "An", "That", "This", "Then", "When", "Later", "He", "She", "They", "It", "His", "Her", "Their",
+    "Year", "Grade", "One", "Two", "In", "On", "At", "And", "But", "Next", "Last", "Every", "Cast", "Script",
+    "Story", "Sound", "Music", "Title", "Premise", "Effect", "Bed", "Ambience", "Again", "Yes", "No", "Don't", "My",
+    *(w.capitalize() for w in _MOCK_NUM)})
+
+
+_MOCK_SCHOOL = re.compile(rf"\b(?:grade|year)\s+{_MOCK_N}\b", re.I)
+
+
+def _mock_age(text: str, *, words: bool = False) -> "int | None | bool":
+    """An age under 18 in `text` (a number), True for a minor without a
+    number (a school grade or year; with `words`, any minor word), None
+    when there's none."""
+    from ..services.safety import mentions_minor
+
+    for rx in _MOCK_AGES:
+        m = rx.search(text)
+        if m:
+            g = m.group(1).lower()
+            n = _MOCK_NUM.get(g) or _MOCK_ORD.get(g) or int(re.sub(r"\D", "", g))
+            if n < 18:
+                return n
+    if _MOCK_SCHOOL.search(text) or _MOCK_STAGE.search(text) or (words and mentions_minor(text)):
+        return True
+    return None
+
+
+# Mock facts: a sentence that gives a character's age as a thing of the
+# past ("since she was twelve", "twenty years ago, at eleven") makes them a
+# minor in the past only; a part that says time has moved on ("twenty years
+# later") shows the characters it names as they are now.
+_MOCK_PAST_REF = re.compile(r"\b(?:since|ago|back then|used to|remember\w*|as a (?:child|kid|girl|boy)|"
+                            r"when (?:she|he|they|i|we|you) (?:was|were))\b", re.I)
+_MOCK_TIME_JUMP = re.compile(r"\b(?:(?:\w+|\d+) years? later|decades? later|present day|nowadays|"
+                             r"all grown up|as an adult)\b", re.I)
+
+
+# Mock facts of the first-person narrator: "when I was nine" (a minor in the
+# past), "I'm 34" / "I am thirty-four" (an adult now, 18 to 99).
+_MOCK_FP_PAST = re.compile(r"\b(?:when|since|back when)\s+i\s+was\s+(?:only\s+|just\s+)?" + _MOCK_N + r"\b", re.I)
+_MOCK_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80,
+              "ninety": 90}
+_MOCK_FP_ADULT = re.compile(r"\b(?:i\s*['’]?\s*m|i\s+am)\s+(?:now\s+)?(?:(1[89]|[2-9]\d)|(" + "|".join(_MOCK_TENS)
+                            + r")(?:[- ](one|two|three|four|five|six|seven|eight|nine))?)\b(?!\s*(?:minutes?|"
+                            r"hours?|percent|pages?|miles?|feet|steps?)\b)", re.I)
+
+
+def _mock_narrator(script: str, names: list[str]) -> "dict | None":
+    """The mock facts' first-person narrator: a present age under 18
+    (minor_check.first_person_age, on the lines no cast member speaks), a
+    past one ("when I was nine"), or an adult age ("I'm 34": an adult in
+    this part)."""
+    from ..services import minor_check
+
+    young = [x for x in minor_check.first_person_minors([script], known=names) if x[2]]
+    cast = [n for n in names if n.strip().lower() != "narrator"]
+    own = "\n".join(re.sub(r"^\s*narrator\s*(?:\[[^\]\n]*\]\s*)?:\s*", "", line, flags=re.I)
+                    for line in script.split("\n")
+                    if not (cast and re.match(r"^\s*(" + "|".join(re.escape(n) for n in cast) + r")\s*:", line,
+                                              re.I)))
+    m = _MOCK_FP_NAME.search(own)
+    name = m.group(1) if m else None
+    past = _MOCK_FP_PAST.search(own)
+    adult = _MOCK_FP_ADULT.search(own)
+    if young:
+        memoir = _mock_memoir(own, adult)
+        if memoir is not None:
+            return {"name": young[0][0] or name, "status": "adult", "age": memoir or None, "minor_in_past": True,
+                    "in_this_part": "minor", "past_age": young[0][1],
+                    "minor_when": minor_check._fp_when(own) or None}
+        return {"name": young[0][0] or name, "status": "minor", "age": young[0][1], "minor_in_past": False,
+                "in_this_part": "minor", "minor_when": None}
+    if not past and not adult:
+        return None
+    age = None
+    if adult:
+        if adult.group(1):
+            age = int(adult.group(1))
+        else:
+            age = _MOCK_TENS[adult.group(2).lower()] + (_MOCK_NUM.get((adult.group(3) or "").lower()) or 0)
+    out = {"name": name, "status": "adult" if adult else "unknown", "age": age, "minor_in_past": bool(past),
+           "in_this_part": "adult" if adult else None, "minor_when": None}
+    if past:
+        g = past.group(1).lower()
+        out["past_age"] = _MOCK_NUM.get(g) or int(re.sub(r"\D", "", g))
+        out["minor_when"] = " ".join(past.group(0).split())
+    return out
+
+
+# A memoir told in the present, as a model reads it: the child's age set in
+# a year long past ("I'm nine years old in the summer of 1990"), or an
+# adult age after a time jump later in the same part ("... Twenty-five
+# years later I'm thirty-four").
+_MOCK_MEMOIR_YEAR = re.compile(r"\b(?:in|of)\s+(?:the\s+(?:\w+\s+){0,2}of\s+)?(?:19\d\d|200\d|201[0-4])\b", re.I)
+
+
+def _mock_memoir(own: str, adult: "re.Match | None") -> "int | bool | None":
+    """For a narrator who says "I'm nine": their adult age now (or False:
+    an adult of no stated age) when `own` reads as a memoir told in the
+    present, else None. Test-only: the mock simulates a facts model."""
+    from ..services import minor_check
+
+    when = minor_check._fp_when(own)
+    hits = minor_check._fp_minor_hits(minor_check._fp_unquoted(own))
+    jump = _MOCK_TIME_JUMP.search(own, hits[0][0]) if hits else None
+    if adult and jump:
+        later = _MOCK_FP_ADULT.search(own, jump.start())
+        if later:
+            if later.group(1):
+                return int(later.group(1))
+            return _MOCK_TENS[later.group(2).lower()] + (_MOCK_NUM.get((later.group(3) or "").lower()) or 0)
+    if when and _MOCK_MEMOIR_YEAR.search(when):
+        return False
+    return None
+
+
+_MOCK_FP_NAME = re.compile(r"\b(?i:my\s+name\s+is)\s+([A-Z][a-z]{1,20})\b")
+
+
+def mock_story_characters(text: str) -> dict:
+    """The rules the mock story facts apply (deterministic): a cast member
+    whose description gives an age under 18 or a minor word is a minor, an
+    adult word makes an adult, anything else is unknown. In the script, a
+    sentence that gives an age under 18 or a school grade or year about a
+    name: a minor now, unless the cast says that character is an adult
+    (then a minor in the past, and in this part unless the sentence speaks
+    of the past). A character shown as a minor in the part before stays
+    one in this part unless it says time has moved on."""
+    cast, _, script = text.partition(STORY_SCRIPT_MARK)
+    chars: dict[str, dict] = {}
+    rank = {"adult": 0, "unknown": 1, "minor": 2}
+
+    def put(name: str, status: str, age, **extra) -> None:  # noqa: ANN001
+        key = name.strip().upper()
+        if not key:
+            return
+        old = chars.get(key)
+        if old is None:
+            chars[key] = {"name": key, "status": status, "age": age, "minor_in_past": False,
+                          "in_this_part": None}
+        elif rank[status] > rank[old["status"]]:
+            old.update(status=status, age=age)
+        for k, v in extra.items():
+            if k == "in_this_part" and chars[key]["in_this_part"] == "minor":
+                continue
+            chars[key][k] = v
+
+    names: list[str] = []
+    cast_status: dict[str, str] = {}
+    earlier: set[str] = set()
+    for line in cast.splitlines():
+        if line.startswith(SO_FAR_MARK):
+            # Minors from earlier windows stay minors.
+            for part in line[len(SO_FAR_MARK):].rstrip(".").split(";"):
+                m = re.match(r"^\s*(.+?) is a minor(?: \((\d+)\))?\s*$", part)
+                if m:
+                    put(m.group(1), "minor", int(m.group(2)) if m.group(2) else None)
+            continue
+        if line.startswith(EARLIER_MARK):
+            body = line[len(EARLIER_MARK):].split(" shown as a minor")[0]
+            earlier |= {re.sub(r"\s*\(\d+\)\s*$", "", x).strip().upper() for x in body.split(",") if x.strip()}
+            continue
+        if line.startswith((FACTS_RETRY_MARK, FACTS_NARRATOR_MARK)) or line.strip() == "Cast:":
+            continue
+        m = re.match(r"^\s*([^:\n]{1,40}?)\s*(?::\s*(.*))?$", line)
+        if not m:
+            continue
+        name, desc = m.group(1), m.group(2) or ""
+        names.append(name)
+        age = _mock_age(desc, words=True)
+        if age is not None:
+            put(name, "minor", age if age is not True else None)
+            cast_status[name.upper()] = "minor"
+        else:
+            st = "adult" if _MOCK_ADULT.search(desc) else "unknown"
+            put(name, st, None)
+            cast_status[name.upper()] = st
+    jump = bool(_MOCK_TIME_JUMP.search(script))
+    for sentence in re.split(r"(?<=[.!?])\s+|\n", script):
+        # A line's speaker label is who says it, not who it is about.
+        sentence = re.sub(r"^\s*[A-Z][A-Z .'-]{0,39}:\s*", "", sentence)
+        age = _mock_age(sentence)
+        if age is None:
+            continue
+        found = {w for w in re.findall(r"\b[A-Z][a-z]{1,20}\b", sentence) if w not in _MOCK_NOT_NAMES}
+        found |= {n for n in names if re.search(rf"\b{re.escape(n)}\b", sentence, re.I)}
+        n = age if age is not True else None
+        for name in found:
+            if cast_status.get(name.upper()) == "adult":
+                past_only = bool(_MOCK_PAST_REF.search(sentence))
+                put(name, "adult", None, minor_in_past=True, past_age=n, minor_when=" ".join(sentence.split())[:60],
+                    **({} if past_only else {"in_this_part": "minor"}))
+            else:
+                put(name, "minor", n)
+    for name in names:
+        key = name.strip().upper()
+        if key in chars and chars[key]["in_this_part"] is None and re.search(rf"\b{re.escape(name)}\b", script,
+                                                                              re.I):
+            if key in earlier and not jump:
+                chars[key]["in_this_part"] = "minor"
+            elif chars[key]["status"] == "adult":
+                chars[key]["in_this_part"] = "adult"
+    for key in earlier:
+        if key in chars and chars[key]["in_this_part"] is None and not jump:
+            chars[key]["in_this_part"] = "minor"
+    out: dict = {"characters": list(chars.values())}
+    narrator = _mock_narrator(script, names)
+    if narrator is not None:
+        out["narrator"] = narrator
+    return out
+
+
+_MOCK_RULE_RE = re.compile(r"Sexual content involving [^.\n]*? adult years\.")
 
 
 def mock_minor_verdict(text: str) -> dict:
     """The rules the mock safety check applies (deterministic)."""
-    from ..services.safety import is_sexual, mentions_minor, steers_young
+    from ..services.safety import is_sexual, mentions_minor, mentions_minor_wide, steers_young
 
     negative = ""
     if text.startswith(AVOID_MARK):
         negative, _, text = text[len(AVOID_MARK):].partition("\n\n" + PROMPT_MARK)
+    if text.startswith(CONTEXT_MARK):
+        # A story part: the app's block and the user's text, read together,
+        # with the wider hints of a minor the story path uses.
+        context, _, user = text[len(CONTEXT_MARK):].partition("\n\n" + USER_MARK)
+        # The app's rule sentence (whole-story and part facts) isn't the story.
+        context = _MOCK_RULE_RE.sub(" ", context)
+        text = f"{context}\n\n{user}"
+        mentions_minor = mentions_minor_wide  # noqa: N806
     prompt = text.removeprefix(PROMPT_MARK)
     if mentions_minor(prompt) and is_sexual(prompt):
         return {"minor_sexual": True, "reason": "A minor in a sexual context."}
@@ -99,6 +370,15 @@ class MockChatProvider(ChatProvider):
         if MINOR_REPLY is not None:
             return dict(MINOR_REPLY)
         return mock_minor_verdict(text)
+
+    def story_characters(self, text: str) -> dict:
+        """Deterministic (see mock_story_characters), unless STORY_FACTS_REPLY is set."""
+        STORY_FACTS_CALLS.append(text)
+        if isinstance(STORY_FACTS_REPLY, BaseException):
+            raise STORY_FACTS_REPLY
+        if STORY_FACTS_REPLY is not None:
+            return dict(STORY_FACTS_REPLY)
+        return mock_story_characters(text)
 
     def classify_explicit(self, text: str) -> dict:
         """Deterministic: explicit when a plainly sexual word is in the text

@@ -149,6 +149,15 @@ class ChatProvider(Protocol):
         verdict came back (refusal, error, unreadable reply)."""
         ...
 
+    def story_characters(self, text: str) -> dict:
+        """The story facts of the minors check (services/minor_check.py
+        story_facts): the characters of a story (its cast and a part of
+        its script) and whether each is a minor, an adult or of unknown
+        age. Returns {"characters": [{"name": str, "status": "minor" |
+        "adult" | "unknown", "age": int | None}]}; raises when no answer
+        came back (refusal, error, unreadable reply)."""
+        ...
+
     def classify_explicit(self, text: str) -> dict:
         """The content check of a clean deployment (services/explicit_check.py):
         is `text` sexually explicit or pornographic? Returns {"explicit":
@@ -218,6 +227,10 @@ class TTSProvider(Protocol):
     ) -> bytes: ...
 
     def list_voices(self) -> list[dict]: ...
+
+    # Optional: resolve_voice(voice_id) -> the voice a request for voice_id
+    # is really read with (GuardedTTSProvider compares it with a story's
+    # voice binding).
 
 
 class MusicProvider(Protocol):

@@ -54,29 +54,91 @@ def text_hash(text: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def parts(text: str) -> list[str]:
-    """The text in parts the model reads whole, each starting a little
-    before the last one ended, so no phrase is only ever seen cut in two."""
+def parts(text: str, *, size: int = PART, overlap: int = OVERLAP, lines: bool = False) -> list[str]:
+    """The text in parts the model reads whole (at most `size` characters),
+    each starting a little before the last one ended, so no phrase is only
+    ever seen cut in two.
+
+    `lines` (story windows): the text keeps its line structure. Each part
+    is whole lines joined by "\n", cut only between lines, and starts with
+    the last whole lines of the part before (about `overlap` characters,
+    at least one line when it is short). A line longer than a part is cut
+    between words first (line_units)."""
+    if lines:
+        units = line_units(text, size=size, overlap=overlap)
+        return ["\n".join(units[a:b]) for a, b in line_windows([len(u) for u in units], size=size,
+                                                                 overlap=overlap)]
     text = " ".join((text or "").split())
-    if len(text) <= PART:
+    size = max(2 * overlap + 100, int(size))
+    if len(text) <= size:
         return [text] if text else []
     out: list[str] = []
     start = 0
     while start < len(text):
-        end = min(start + PART, len(text))
+        end = min(start + size, len(text))
         if end < len(text):
-            space = text.rfind(" ", start + PART // 2, end)
+            space = text.rfind(" ", start + size // 2, end)
             end = space if space > start else end
         out.append(text[start:end].strip())
         if end >= len(text):
             break
-        # Start the next part about OVERLAP characters back, at the word
+        # Start the next part about `overlap` characters back, at the word
         # boundary nearest that point, so a phrase across the cut is read
         # whole in one of the two parts.
-        target = max(start + 1, end - OVERLAP)
+        target = max(start + 1, end - overlap)
         back = text.find(" ", target, end)
         start = back + 1 if back != -1 and back + 1 < end else target
     return [p for p in out if p]
+
+
+def piece_size(size: int) -> int:
+    """The longest a single line may be before line_units cuts it: half a
+    part, so a part always holds a long line's piece and some context."""
+    return max(2 * OVERLAP + 100, int(size) // 2)
+
+
+def line_units(text: str, *, size: int = PART, overlap: int = OVERLAP) -> list[str]:
+    """The lines of `text` (whitespace inside each collapsed, empty ones
+    dropped), a line longer than piece_size(size) cut between words into
+    overlapping pieces (parts)."""
+    out: list[str] = []
+    for line in (text or "").split("\n"):
+        line = " ".join(line.split())
+        if not line:
+            continue
+        if len(line) > piece_size(size):
+            out += parts(line, size=piece_size(size), overlap=overlap)
+        else:
+            out.append(line)
+    return out
+
+
+def line_windows(lengths: list[int], *, size: int = PART, overlap: int = OVERLAP) -> list[tuple[int, int]]:
+    """[(first, end)] ranges of units (lines) whose lengths are `lengths`:
+    each range, joined with "\n", at most `size` characters (a single unit
+    longer than that is a range of its own), the next range starting with
+    the last whole units of the one before, up to about `overlap`
+    characters (at least one unit when it is at most twice that)."""
+    size = max(2 * overlap + 100, int(size))
+    n = len(lengths)
+    out: list[tuple[int, int]] = []
+    start = 0
+    while start < n:
+        end, total = start, 0
+        while end < n and (end == start or total + 1 + lengths[end] <= size):
+            total += lengths[end] + (1 if end > start else 0)
+            end += 1
+        out.append((start, end))
+        if end >= n:
+            break
+        back, acc = end, 0
+        while back - 1 > start and acc + lengths[back - 1] + 1 <= overlap:
+            back -= 1
+            acc += lengths[back] + 1
+        if back == end and end - 1 > start and lengths[end - 1] <= 2 * overlap:
+            back = end - 1
+        start = back
+    return out
 
 
 def _judge(text: str) -> tuple[bool, str, str]:
@@ -161,8 +223,10 @@ def plan_texts(plan: dict) -> list[str]:
 # paid for. Same question, cache and failing closed as the script check.
 # The avoid list is judged too, read as one (check_avoid); a lip-sync's
 # motion is judged on its own (registry.GuardedAvatarProvider); a music or
-# sound prompt goes through pipeline.check_audio_prompt; an ambient loop
-# checks all its prompts before its first paid call (ambient.precheck).
+# sound prompt goes through pipeline.check_audio_prompt early and again at
+# the provider (registry.GuardedSoundProvider / GuardedMusicProvider); an
+# ambient loop checks all its prompts before its first paid call
+# (ambient.precheck).
 
 PROMPT_REFUSED = ("This prompt was refused: this app is for a general audience, and the content check found it "
                   "sexually explicit. Reword it without sexual content.")

@@ -114,6 +114,21 @@ music at its own volume, or on its own with music set to "No music".
 
 The clip is crossfaded into a seamless loop at render, like the music bed.
 
+Sound and music prompts are safety-checked in every mode, not only on a
+clean deployment: the word filter, then the minors check (the model is asked
+when a prompt is sexual or mentions a minor, so "children laughing on a
+playground" costs one check call). A loop runs these checks on its music and
+sound prompts before its first paid step, so a refused prompt stops the loop
+before any still or clip is bought.
+
+Music `settings` are passed to the provider's request as they are (ElevenLabs
+merges them into the request body), so the music guard allow-lists them
+(`registry.MUSIC_SETTING_KEYS`): only plain switches and numbers such as
+`force_instrumental`, `seed` or `music_length_ms`. Text-bearing keys are
+refused (a second `prompt`, `text`, or any key the list doesn't name), except
+`lyrics` and `composition_plan` (`registry.MUSIC_TEXT_KEYS`), whose every
+string is checked with the same guard as the prompt, story context included.
+
 ### ElevenLabs Music licensing (for ambient channels)
 
 From ElevenLabs' Music Terms (Exhibit A, updated 9 Oct 2026). Check the

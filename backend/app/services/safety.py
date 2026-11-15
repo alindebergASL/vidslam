@@ -332,6 +332,56 @@ def mentions_minor(text: str) -> bool:
         _any(_CONTEXT_PROMPT_RE, forms) and (_any(_SEXUAL_RE, forms) or _any(_SOFT_RE, forms)))
 
 
+# ---------- wider hints (audio and story only) ----------
+#
+# Dash look-alikes NFKC leaves alone ("a 12‑year‑old", "12–year–old"),
+# read as "-" by mentions_minor_wide and story_script.normalize, so an age
+# written with them is still an age on the audio and story paths. The
+# filter everyone else uses (mentions_minor, check_prompt, check_script)
+# reads them as before.
+DASHES = ("\u2010\u2011\u2012\u2013\u2014\u2015\u2212\u2043\u2e3a\u2e3b\u2e17\u2e1a\u2e40"
+          "\u058a\u05be\u1806\u30a0\ufe31\ufe32\ufe58\ufe63\uff0d")
+_DASH_FOLD = str.maketrans(dict.fromkeys(DASHES, "-"))
+# Wider hints of a minor that only ever add a model question, never a
+# refusal by the words alone: a school grade or year ("in Grade 5", "Year
+# 6", "grade five"; not "Year 2025"), an age after "was", "is" or "turned"
+# that ends the phrase ("Lily was eleven.", "she is barely 12,", "would
+# turn thirteen"; not "was 10 pm", "is one of"), "in her eleventh year", a
+# bracketed age after a capitalised name ("Lily (11)"; not "Chapter (2)")
+# and a name labelled with an age ("LILY: 11,").
+_HINT_AGE = (r"(?:1[0-7]|[2-9]|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|"
+             r"fourteen|fifteen|sixteen|seventeen)")
+_HINT_END = (r"(?=\s*(?:$|[,;:!?)\]]|\.(?!\d)|-?\s*(?:years?|yrs?)\b(?!\s+(?:ago|later|earlier|of|as|"
+             r"together|married|since|before|after)\b)|\s+(?:and|now|then|today|tomorrow|soon|next|"
+             r"last|this|that|at\s+the\s+time)\b))")
+_NOT_LABEL = (r"(?:Chapter|Part|Figure|Fig|Step|Section|Table|Page|Track|Scene|Act|Episode|Season|Volume|Vol|"
+              r"Item|Note|Option|Level|Round|Take|Room|Line|Verse|Psalm|Article|Rule|Score|Day|Week|Hour|"
+              r"Minute|Number|No|Size|Version|Phase|Stage|Grade|Year|Floor|Gate|Platform|Bus|Route|Exit)")
+_MINOR_HINTS = (
+    r"\b(?:grade|year)\s*(?:1[0-3]|[1-9])\b(?!\s*(?:anniversary|anniversaries|warranty|guarantee|plan|"
+    r"later|ago|of|olds?)\b)(?![.,:/]\d)"
+    r"|\b(?:grade|year)\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen)\b"
+    r"(?!\s+(?:of|anniversary|later|ago)\b)"
+    r"|\b(?:was|is|turned|turns|turn|turning)\s+(?:(?:only|just|barely|nearly|almost|about|around|"
+    rf"not\s+yet|still|already|now)\s+)?{_HINT_AGE}\b{_NOT_AGE}{_HINT_END}"
+    rf"|\b(?:was|is|turned)\s+in\s+(?:her|his|their)\s+{_ORD}\s+year\b"
+    rf"|(?-i:\b(?!{_NOT_LABEL}\b)[A-Z][A-Za-z'’-]{{1,30}})\s*\(\s*(?:1[0-7]|[1-9])\s*\)"
+    rf"|(?-i:\b(?!{_NOT_LABEL}\b)[A-Z][A-Za-z'’-]{{1,30}})\s*:\s*(?:1[0-7]|{_HINT_AGE})\b"
+    r"(?=\s*(?:$|[,;]|\.(?!\d)|\s+(?:years?|yrs?)\b))"
+)
+_MINOR_HINT_RE = re.compile(_MINOR_HINTS, re.I)
+
+
+def mentions_minor_wide(text: str) -> bool:
+    """mentions_minor with dash look-alikes read as "-" and the wider hints
+    (_MINOR_HINTS). Only the audio and story paths use it (minor_check
+    needs_ai for kinds "audio" and "story", story_script.story_has_minor
+    and safety_text): it adds model questions, never a refusal by the
+    words. Every other caller keeps mentions_minor."""
+    folded = str(text or "").translate(_DASH_FOLD)
+    return mentions_minor(folded) or _any(_MINOR_HINT_RE, _forms(folded))
+
+
 def is_sexual(text: str) -> bool:
     forms = _forms(text)
     return _any(_SEXUAL_RE, forms) or _any(_SOFT_RE, forms)
