@@ -228,11 +228,7 @@ function Dashboard() {
             {recent.map((r) => (
               <Link
                 key={r.render_id}
-                href={
-                  r.project_mode === "ambient_loop"
-                    ? `/ambient/${r.project_id}?render=${r.render_id}`
-                    : `/projects/${r.project_id}/render?id=${r.render_id}`
-                }
+                href={`/projects/${r.project_id}/render?id=${r.render_id}`}
                 className="shrink-0 w-32 group"
                 title={r.project_title}
               >

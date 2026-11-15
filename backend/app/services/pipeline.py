@@ -1026,9 +1026,12 @@ def maybe_recompose(db: Session, project_id: int) -> None:
                    .values(status=stranded_status(project)))
         db.commit()
         return
+    # The placeholder queue id goes in with the status change, so a Cancel
+    # landing before the real id is recorded never reads the project's older,
+    # finished queue entry as "gone" and frees a recompose about to be queued.
     res = db.execute(sa_update(models.VideoProject)
                      .where(models.VideoProject.id == project_id, models.VideoProject.status == "regenerating")
-                     .values(status="generating"))
+                     .values(status="generating", queue_job_id=RECOMPOSE_QUEUING))
     db.commit()
     if res.rowcount == 1:
         qid = enqueue(recompose_after_regen_job, project_id)
@@ -1038,6 +1041,9 @@ def maybe_recompose(db: Session, project_id: int) -> None:
                    .where(models.VideoProject.id == project_id, models.VideoProject.status == "generating")
                    .values(queue_job_id=str(qid or "")[:80]))
         db.commit()
+
+
+RECOMPOSE_QUEUING = "recompose:queuing"
 
 
 def stranded_status(project: models.VideoProject) -> str:

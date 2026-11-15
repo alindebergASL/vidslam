@@ -626,7 +626,7 @@ function Inner() {
             </div>
           )}
 
-          <RenderHistory projectId={id} linkFor={(rid) => `/ambient/${id}?render=${rid}`} />
+          <RenderHistory projectId={id} />
         </div>
 
         {/* ---- Settings ---- */}

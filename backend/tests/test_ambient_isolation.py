@@ -316,6 +316,32 @@ def test_storyboard_recompose_after_a_reroll_records_its_queue_entry(auth_client
     assert _state(pid)[0] == "cancelled"
 
 
+def test_cancel_while_the_recompose_is_being_queued_leaves_it_alone(auth_client, monkeypatch):
+    """Between the switch to "generating" and the recompose's queue id being
+    recorded, the project must not still show its older, finished entry: a
+    Cancel in that gap would free it while the recompose is about to run."""
+    from app.db import SessionLocal
+    from app.services import pipeline
+    from app.workers import queue
+
+    pid = _storyboard(auth_client)
+    assert auth_client.post(f"/api/projects/{pid}/generate-video").status_code == 202
+    _set(pid, status="regenerating", claim_token="", queue_job_id="rq-old")
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "gone")
+    seen = {}
+
+    def enqueue_with_a_cancel(*a, **k):
+        assert _qid(pid) == pipeline.RECOMPOSE_QUEUING
+        seen["cancel"] = auth_client.post(f"/api/projects/{pid}/cancel").json()["action"]
+        return "rq-recompose"
+
+    monkeypatch.setattr(queue, "enqueue", enqueue_with_a_cancel)
+    with SessionLocal() as db:
+        pipeline.maybe_recompose(db, pid)
+    assert seen["cancel"] == "noop"
+    assert _state(pid)[0] == "generating" and _qid(pid) == "rq-recompose"
+
+
 @pytest.mark.parametrize("route", ["render", "generate"])
 def test_ambient_claims_record_their_queue_entry(auth_client, monkeypatch, route):
     """The Ambient routes' jobs are recorded like the storyboard's, so a
