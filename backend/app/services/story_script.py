@@ -1362,9 +1362,17 @@ def check_story(doc: StoryDoc, *, music_prompts: tuple[str, ...] = (), title: st
                                     summary=facts.summary_line())
     clean = explicit_check.active()
     if clean:
-        lines = "\n".join(f"{i.speaker}: {i.voice_text}" + (f"\n{i.instructions}" if i.instructions.strip() else "")
+        # Judged as the guards send it (normalize: NFKC, bracket look-alikes
+        # as [ ]), the same string the voice gets: the guards skip their own
+        # explicit-content check under this pass, so "𝒻𝓊𝒸𝓀" or fullwidth
+        # letters are judged as the plain words they are sent as.
+        def sent(x: str) -> str:
+            return normalize(x, dashes=False)
+
+        lines = "\n".join(f"{i.speaker}: {sent(i.voice_text)}"
+                          + (f"\n{sent(i.instructions)}" if i.instructions.strip() else "")
                           for i in doc.speech())
-        explicit_check.check(header, lines, _prompt_lines(doc, music_prompts, marked=False))
+        explicit_check.check(sent(header), lines, sent(_prompt_lines(doc, music_prompts, marked=False)))
     items = [story_pass.line_item(i.speaker, i.voice_text, i.instructions) for i in doc.speech()]
     items += [story_pass.prompt_item(p) for p in (*prompts_text(doc), *music_prompts)]
     digest = story_hash(doc, music_prompts, title, premise)
