@@ -1209,7 +1209,13 @@ def _read_entries(out: object) -> list[tuple]:
     smallest number under 18 in it, or not given; an adult's with a number
     under 18 in it is shown as a minor at another time, `past_age`). A
     nameless character that isn't a minor is left out."""
-    from ..providers.openrouter_chat import no_narrator, read_ages, read_part, read_status, read_when
+    from ..providers.openrouter_chat import (
+        no_narrator,
+        read_ages,
+        read_part,
+        read_status,
+        read_when,
+    )
 
     chars = out.get("characters") if isinstance(out, dict) else None
     if not isinstance(chars, list):
