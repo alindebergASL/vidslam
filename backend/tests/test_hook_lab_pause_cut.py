@@ -202,3 +202,63 @@ def test_clause_breaks_are_cuts():
 
     s = "One, two; three: four - five \u2014 six"
     assert [s[c:c + 3] for c in hook_lab.pause_cuts(s, 10.0, 0.0, 10.0)] == ["two", "thr", "fou", "fiv", "six"]
+
+
+_TIGHT_SCRIPTS = [
+    "Hi there friends of the channel and welcome\nLily is 30...tonight she wants sex with me. Follow for more.",
+    "Hi there friends of the channel and welcome\nLily is 30—tonight she wants sex with me. Follow for more.",
+    "Hi there friends of the channel and welcome\nLily is 30…tonight she wants sex with me. Follow for more.",
+    "Hi there friends of the channel and welcome\nLily (30) tonight she wants sex with me. Follow for more.",
+]
+
+
+@pytest.mark.parametrize("script", _TIGHT_SCRIPTS)
+def test_a_pause_at_punctuation_with_no_space_after_it_is_a_place(monkeypatch, tmp_path, script):
+    """The host's review cases: the voice pauses right after "30..." (or a
+    dash, an ellipsis, a closing bracket) and picks up at "tonight". That
+    heard form is judged, so the opening is refused."""
+    from app.services import hook_lab
+
+    n, total = len(script), 10.0
+    at = total * script.index("tonight") / n
+    audio = _voice(tmp_path / "vo.m4a", [("tone", at - 0.2), ("gap", 0.4), ("tone", total - at - 0.2)])
+    base = _base(monkeypatch, audio, script)
+    found = hook_lab.hook_window(base, script)
+    assert found.snapped
+    seen = _judge(monkeypatch)
+    with pytest.raises(HookLabError) as e:
+        hook_lab.check_opening(None, base, _HOOK, found.seconds)
+    assert e.value.status == 422
+    assert f"{_HOOK} tonight she wants sex with me. Follow for more." in seen
+
+
+def test_tight_punctuation_cuts_but_not_decimals_hyphens_or_apostrophes():
+    from app.services import hook_lab
+
+    def places(s):
+        return [s[c:c + 3] for c in hook_lab.pause_cuts(s, 10.0, 0.0, 10.0)]
+
+    assert places("Lily is 30...tonight") == ["ton"]
+    assert places("Lily is 30—tonight") == ["ton"]
+    assert places("Lily is 30--tonight") == ["ton"]
+    assert places("Lily is 30…tonight") == ["ton"]
+    assert places("Lily (30) tonight") == ["30)", "ton"]
+    assert places("It costs 3.5 dollars, well-known and it's fine") == ["wel"]
+
+
+def test_no_break_near_a_found_pause_reads_the_pace_band(monkeypatch, tmp_path):
+    """A pause at a breath, with no punctuation near it: the places near it
+    at an even pace are judged, not only the first sentence's end."""
+    from app.services import hook_lab
+
+    script = "Hi there friends of the channel and welcome to my page. Lily is 30 tonight she wants sex with me so follow for more"
+    n, total = len(script), 10.0
+    at = total * script.index("tonight") / n
+    audio = _voice(tmp_path / "vo.m4a", [("tone", at - 0.2), ("gap", 0.4), ("tone", total - at - 0.2)])
+    base = _base(monkeypatch, audio, script)
+    found = hook_lab.hook_window(base, script)
+    assert found.snapped
+    seen = _judge(monkeypatch)
+    with pytest.raises(HookLabError):
+        hook_lab.check_opening(None, base, _HOOK, found.seconds)
+    assert any(t.startswith(f"{_HOOK} tonight") for t in seen)

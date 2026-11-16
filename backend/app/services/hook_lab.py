@@ -16,6 +16,13 @@ import re
 _END = re.compile(r"""[.!?…]+["'”’»)\]]*(?=\s|$)|\n""")
 # A clause break a voice may pause at: , ; : or a dash, before a space.
 _CLAUSE = re.compile(r"""(?:[,;:]+["'”’»)\]]*|\s[-–—]+)(?=\s)""")
+# A pause can also follow punctuation with no space after it ("30...tonight",
+# "30—tonight", "30…tonight", "(30) tonight"): a run of sentence ends, an
+# em/en dash or "--", or a closing bracket, right before a letter or digit;
+# a closing bracket before a space; and an opening bracket. A single dot
+# between digits ("3.5"), a hyphen or an apostrophe inside a word is not one.
+_TIGHT = re.compile(
+    r"""(?:[!?…]+|\.{2,}|\.(?=[^\W\d_])|[–—]+|-{2,}|[)\]])(?=\w)|[)\]](?=\s)|[(\[](?=\w)""")
 
 
 def split_first_sentence(text: str) -> tuple[str, str]:
@@ -329,8 +336,17 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
         # voiceover has no pause to find, and none of it is heard: the
         # same sentence ends are judged.)
         check_script(f"{bare} {script[rest_at:].lstrip(_PUNCT)}")
-        # The first sentence's own end is the script the opening makes.
-        cuts = [c for c in pause_cuts(script, total, found.lo, found.hi) if c != rest_at]
+        places = pause_cuts(script, total, found.lo, found.hi)
+        n = len(script)
+        if found.snapped and not any(abs(total * c / n - found.seconds) <= _PACE_SECONDS
+                                     for c in [*places, rest_at]):
+            # No break near the pause the lab found (a breath, say): the
+            # places near it at an even pace, as for any other window.
+            _best, cuts = heard_cuts(script, float(window), total, end_of_first)
+            cuts = [c for c in cuts if c != rest_at]
+        else:
+            # The first sentence's own end is the script the opening makes.
+            cuts = [c for c in places if c != rest_at]
     else:
         _best, cuts = heard_cuts(script, float(window), total, end_of_first)
     for cut in cuts:
@@ -349,7 +365,8 @@ def pause_cuts(script: str, total: float, lo: float, hi: float) -> list[int]:
     """The places the voiceover may pick up after a pause found between
     `lo` and `hi` seconds of `total`: the first word after each sentence or
     line end (.!?…, a line break), or clause break (, ; : and dashes, where a
-    voice pauses too), whose even-pace time is in that stretch,
+    voice pauses too), with or without a space after it (_TIGHT), whose
+    even-pace time is in that stretch,
     as character offsets in the stripped script. Ends with nothing after
     them aren't places (nothing of the original is heard)."""
     script = (script or "").strip()
@@ -357,7 +374,8 @@ def pause_cuts(script: str, total: float, lo: float, hi: float) -> list[int]:
     if not n or total <= 0:
         return []
     cuts: list[int] = []
-    for m in sorted([*_END.finditer(script), *_CLAUSE.finditer(script)], key=lambda m: m.end()):
+    marks = [*_END.finditer(script), *_CLAUSE.finditer(script), *_TIGHT.finditer(script)]
+    for m in sorted(marks, key=lambda m: m.end()):
         if not lo <= total * m.end() / n <= hi:
             continue
         after = script[m.end():]
