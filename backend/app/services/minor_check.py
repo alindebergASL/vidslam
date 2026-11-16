@@ -185,29 +185,70 @@ def classifier_text(prompt: str, negative: str = "", context: str = "") -> str:
 
 
 # Look-alikes of the app's labels in a user's text, read on a skeleton of
-# it (_skeleton): "story" then "context", "facts" or "note", "user" then
-# "text", and "first-person narrator", with any run of non-letters between
-# the words ("Story_context", "Story-context", "STORY  con\u200btext") and
-# with or without a colon.
-_LOOKALIKE_RE = re.compile(r"(?<![a-z])(?:story[^a-z\n]*(?:context|facts?|notes?)|user[^a-z\n]*text|"
-                           r"first[^a-z\n]*person[^a-z\n]*narrator)(?![a-z])")
+# it (_skeleton): "story" (or "story's", "storys", "stories") then
+# "context", "facts" or "notes"; "context" then "from the app"; "from the
+# app" by itself; "user" then "text"; and "first-person narrator" ("1st
+# person narrator", "narrator (first person)"). Any run of non-letters,
+# newlines included, may come between the words and between the letters
+# of a word ("Story\ncontext", "Story_context", "S t o r y context",
+# "STORY  con​text"); with or without a colon.
+def _spaced(*words: str) -> str:
+    """`words` in order, any run of non-letters between them and between
+    their letters; a word may be a regex alternation of plain words."""
+    def one(word: str) -> str:
+        return "(?:" + "|".join(_GAP.join(w) for w in word.split("|")) + ")"
+
+    return _GAP.join(one(w) for w in words)
+
+
+_GAP = "[^a-z]*"
+_APP = _spaced("from", "the", "app")
+_LOOKALIKE_RE = re.compile(
+    r"(?<![a-z])(?:"
+    rf"{_spaced('story|storys|stories', 'context|contexts|fact|facts|note|notes')}(?:{_GAP}{_APP})?|"
+    rf"{_spaced('context|contexts')}{_GAP}{_APP}|"
+    rf"\({_GAP}{_APP}|{_APP}|"
+    rf"{_spaced('user', 'text|texts')}|"
+    rf"{_spaced('first|1st', 'person', 'narrator|narrators|narration')}|"
+    rf"{_spaced('narrator|narration', 'first|1st', 'person')}"
+    r")(?![a-z])")
+# Look-alike letters safety's table (_CONFUSABLE) doesn't fold: Cherokee
+# ("Ꮪtory"), Lisu, Armenian and a few Latin and Cyrillic ones. Cherokee
+# has lower case forms too (str.lower turns "Ꮪ" into "ꮪ"): both are folded.
+_MORE_CONFUSABLE_PAIRS = {
+    "Ꭰ": "d", "Ꭱ": "r", "Ꭲ": "t", "Ꭵ": "i", "Ꭹ": "y", "Ꭺ": "a", "Ꭻ": "j", "Ꭼ": "e", "Ꮃ": "w",
+    "Ꮇ": "m", "Ꮋ": "h", "Ꮍ": "y", "Ꮐ": "g", "Ꮒ": "h", "Ꮓ": "z", "Ꮟ": "b", "Ꮢ": "r", "Ꮤ": "w",
+    "Ꮥ": "s", "Ꮪ": "s", "Ꮩ": "v", "Ꮮ": "l", "Ꮯ": "c", "Ꮲ": "p", "Ꮶ": "k", "Ꮷ": "d", "Ᏼ": "b",
+    "Ꮻ": "o", "Ꮎ": "o", "Ꮜ": "u", "Ꭴ": "u", "Ꮖ": "t", "Ꮏ": "h",
+    "ꓮ": "a", "ꓐ": "b", "ꓚ": "c", "ꓓ": "d", "ꓰ": "e", "ꓝ": "f", "ꓖ": "g", "ꓧ": "h", "ꓲ": "i",
+    "ꓙ": "j", "ꓗ": "k", "ꓡ": "l", "ꓟ": "m", "ꓠ": "n", "ꓳ": "o", "ꓑ": "p", "ꓣ": "r", "ꓢ": "s",
+    "ꓔ": "t", "ꓴ": "u", "ꓦ": "v", "ꓪ": "w", "ꓫ": "x", "ꓬ": "y", "ꓜ": "z",
+    "օ": "o", "Օ": "o", "ս": "u", "Ս": "u", "հ": "h", "ո": "n", "ց": "g", "զ": "q", "ա": "w",
+    "Տ": "s", "ք": "p", "ռ": "n", "ɑ": "a", "ɡ": "g", "ı": "i", "ȷ": "j", "ɩ": "i", "ʋ": "u",
+    "ԛ": "q", "ԝ": "w", "ү": "y", "һ": "h", "ԍ": "g", "ꭓ": "x", "ꮪ": "s",
+}
+_MORE_CONFUSABLE = str.maketrans({
+    **_MORE_CONFUSABLE_PAIRS,
+    **{k.lower(): v for k, v in _MORE_CONFUSABLE_PAIRS.items() if k.lower() != k and len(k.lower()) == 1},
+})
 QUOTED = "quoted: "
 
 
 def _skeleton(text: str) -> tuple[str, list[int]]:
     """(skeleton, where): `text` read as the model may read it, NFKC, lower
-    case, Cyrillic and Greek look-alikes as Latin letters (safety's
-    table), accents and hidden characters gone; where[i] is the index in
-    `text` of the skeleton's character i."""
+    case, Cyrillic, Greek, Cherokee and other look-alikes as Latin letters
+    (safety's table and _MORE_CONFUSABLE), accents and hidden characters
+    gone; where[i] is the index in `text` of the skeleton's character i."""
     out: list[str] = []
     where: list[int] = []
     for i, c in enumerate(text):
         if unicodedata.category(c) in ("Cf", "Co"):
             continue
-        for d in unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", c).lower()):
+        folded = unicodedata.normalize("NFKC", c).translate(_MORE_CONFUSABLE).lower()
+        for d in unicodedata.normalize("NFKD", folded):
             if unicodedata.combining(d):
                 continue
-            for e in d.translate(safety._CONFUSABLE):
+            for e in d.translate(safety._CONFUSABLE).translate(_MORE_CONFUSABLE):
                 out.append(e)
                 where.append(i)
     return "".join(out), where
