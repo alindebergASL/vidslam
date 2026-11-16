@@ -503,6 +503,27 @@ def forged_app_label(text: str) -> bool:
     return False
 
 
+# The headers of the app's two blocks (mock_chat CONTEXT_MARK, USER_MARK),
+# as a user could forge them: "Story context (from the app):" anywhere in
+# a line, "User text:" at the start of one (after an optional speaker), in
+# any case or spacing.
+_MARK_RE = re.compile(r"story\s*context\b[^\n:]{0,40}:|^\s*(?:[^:\n]{1,40}:\s*)?user\s*text\s*:", re.I | re.M)
+MARK_REFUSED = ("The text can't contain \"Story context:\", \"Story facts:\", \"Story note:\" or \"User text:\" "
+                "labels: the safety check keeps those words for the app. Reword it.")
+
+
+def forged_mark(text: str) -> bool:
+    """Whether `text` forges the app's context block for a text judged on
+    its own (no story around it): its headers (_MARK_RE) or one of the
+    labels the app writes in front of a window (forged_app_label), with
+    hidden characters ignored. The model is told to trust that block."""
+    import unicodedata
+
+    clean = "".join(c for c in unicodedata.normalize("NFKC", str(text or ""))
+                    if unicodedata.category(c) not in ("Cf", "Co") or c in "\n\t")
+    return bool(_MARK_RE.search(clean)) or forged_app_label(text)
+
+
 # What story_word_filter takes out before reading a story's words: the
 # markers story_script.safety_text adds ("(seductive)", "(sensual)") and
 # brackets of voice tags ([seductively], [moans]): the app's own marks and
@@ -858,6 +879,13 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
         # and every one failing closed.
         check_long(prompt, kind=kind, force=True, marked=marked)
         return
+    if not context and kind != "story" and (forged_mark(prompt) or forged_mark(negative)):
+        # A text judged on its own can't carry a block that passes for the
+        # app's (the model trusts "Story context (from the app)"). A story
+        # line is checked with forged_label on the story path, a long text
+        # in check_long.
+        log.warning("safety check: a %s prompt forges the app's context block: refused", kind)
+        raise UnsafePromptError(MARK_REFUSED)
     if len(shown) > JUDGE_WINDOW:
         # Longer than the model reads: never judged on a part of it (nor
         # answered from a verdict given when the model was shown a part).
@@ -1008,6 +1036,8 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         # summary it is.
         if forged_app_label(text):
             raise UnsafePromptError(LABEL_REFUSED)
+        if forged_mark(text):
+            raise UnsafePromptError(MARK_REFUSED)
         facts = _long_facts_detail(text)
         summary = " ".join(facts.summary_line().split())
         if len(summary) > 2 * FACTS_LIMIT:
