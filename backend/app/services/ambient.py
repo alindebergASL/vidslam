@@ -2488,11 +2488,13 @@ def seam_treatment(project: models.VideoProject) -> dict:
 
     basis "drift": Still + drift loops by construction, no blend. "plan":
     no reading yet, so the scene's crossfade. "measured": from the join's
-    reading — seamless gets a short hedge, a slight jump at least 1.5 s, a
-    visible jump at least 2 s (and covers=False: no blend hides it, so a
-    render asks first). The blend is never shorter than the scene's setting
-    unless the join measured seamless. seam_mode "blend" uses the setting
-    as it is."""
+    reading — seamless gets a short hedge of 0.5 s, a slight jump at least
+    1.5 s, a visible jump at least 2 s (and covers=False: no blend hides
+    it, so a render asks first). The blend is never shorter than the
+    scene's setting unless the join measured seamless. A seamless join
+    takes min(setting, 0.5): a setting below the hedge is the person's
+    explicit choice and wins (0 = "no blend" stays 0). seam_mode "blend"
+    uses the setting as it is. The page mirrors this (seamBlendFor)."""
     cfg = _config_of(project)
     if cfg.source == "image_drift":
         return {"blend_seconds": 0.0, "verdict": None, "ratio": None, "basis": "drift", "covers": True}
@@ -2504,6 +2506,7 @@ def seam_treatment(project: models.VideoProject) -> dict:
     if cfg.seam_mode == "blend":
         blend = user
     elif verdict == "seamless":
+        # A shorter setting (0 disables the blend) is an explicit choice.
         blend = min(user, SEAM_SEAMLESS_BLEND)
     elif verdict == "slight_jump":
         blend = max(user, SEAM_SLIGHT_BLEND)
@@ -2542,8 +2545,21 @@ def render_seam_blend_seconds(project: models.VideoProject) -> float:
     return float(seam_treatment(project)["blend_seconds"])
 
 
-def render_scene(db: Session, project_id: int) -> models.Render:
-    """Tile the loop clip to the full target duration under the music bed."""
+class SeamJumpStop(RuntimeError):
+    """The render found a visibly jumping join that nobody accepted."""
+
+
+SEAM_STOP_MESSAGE = ("Not rendered: the loop clip jumps visibly at the join and the blend won't hide it. "
+                     "Open the scene to choose a longer blend or render anyway.")
+
+
+def render_scene(db: Session, project_id: int, *, accept_seam: bool = False) -> models.Render:
+    """Tile the loop clip to the full target duration under the music bed.
+
+    `accept_seam`: the person said a visibly jumping join is OK (POST
+    /render?accept_seam=true). Without it, a reading taken here that finds
+    a visible jump (seam_mode "auto") stops the render before composing:
+    the render fails with SEAM_STOP_MESSAGE and the scene is released."""
     from .pipeline import RenderCancelled, _check_cancel, _music_path_if_any
 
     project = db.get(models.VideoProject, project_id)
@@ -2588,6 +2604,10 @@ def render_scene(db: Session, project_id: int) -> models.Render:
             loop_health.measure_quietly(db, project.id)  # local, a few seconds
             db.refresh(project)
         treatment = seam_treatment(project)
+        if not accept_seam and seam_needs_a_look(project, treatment):
+            # A reading taken just now (the request's own may have failed):
+            # don't render an hour of a jumping loop nobody agreed to.
+            raise SeamJumpStop(SEAM_STOP_MESSAGE)
         seam = float(treatment["blend_seconds"])
         outputs = compose_ambient(
             AmbientRenderInputs(
@@ -2647,6 +2667,16 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         render.status = "cancelled"
         render.error = ""
         project.status = "cancelled"
+        db.commit()
+        return render
+    except SeamJumpStop as e:
+        # Not a fault (no alert, no retry): the render stops and says why;
+        # the scene is free to render again from the page.
+        log.info("ambient render of scene %s stopped: visible jump at the join", project.id)
+        render.status = "failed"
+        render.error = str(e)
+        project.status = "failed"
+        events.render_event(db, render, project, "failed", error=str(e))
         db.commit()
         return render
     except Exception as e:  # noqa: BLE001

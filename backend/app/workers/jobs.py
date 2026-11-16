@@ -127,7 +127,7 @@ def generate_ambient_loop_job(project_id: int, regenerate_music: bool = True, cl
         db.close()
 
 
-def render_ambient_job(project_id: int, claim_token: str = "") -> None:
+def render_ambient_job(project_id: int, claim_token: str = "", accept_seam: bool = False) -> None:
     from ..services import ambient
 
     db = SessionLocal()
@@ -138,7 +138,7 @@ def render_ambient_job(project_id: int, claim_token: str = "") -> None:
                 db.rollback()
                 return
             db.commit()
-        ambient.render_scene(db, project_id)
+        ambient.render_scene(db, project_id, accept_seam=accept_seam)
     finally:
         db.close()
 

@@ -46,9 +46,9 @@ import {
   LoopPlan,
   PhotoRewrite,
   Render,
-  SeamJump,
+  SeamAsk,
   errorText,
-  seamJumpOf,
+  seamAskOf,
 } from "@/lib/api";
 import { Dialog } from "@/components/Dialog";
 import { AutoTextarea } from "@/components/AutoTextarea";
@@ -145,36 +145,41 @@ function Inner() {
     }
   };
 
-  // Render: a loop whose join jumps visibly comes back 409 seam_jump, and
-  // the dialog asks what to do (null: nothing happened yet).
-  const [seamAsk, setSeamAsk] = useState<SeamJump | null>(null);
+  // Render: a loop whose join jumps visibly comes back 409 seam_jump, one
+  // whose join couldn't be measured 409 seam_unmeasured, and the dialog asks
+  // what to do (null: nothing happened yet).
+  const [seamAsk, setSeamAsk] = useState<SeamAsk | null>(null);
   const startRender = async () => {
     try {
       return await api.renderAmbient(id);
     } catch (e) {
-      const jump = seamJumpOf(e);
-      if (!jump) throw e;
-      setSeamAsk(jump);
+      const ask = seamAskOf(e);
+      if (!ask) throw e;
+      setSeamAsk(ask);
       // The render measured the join just now: show the verdict. (The saved
       // config is unchanged, so the settings form keeps unsaved edits.)
       reload();
       return null;
     }
   };
-  // A chosen blend renders with it this once and keeps "auto": a clip made
-  // later is still measured and asked about. (Auto never blends less than
-  // 2 s over a visible jump, so 2 s and 4 s are the blends used.)
+  // A chosen blend is saved and rendered, and keeps "auto": a clip made
+  // later is still measured and asked about. Only blends longer than the
+  // one the render would use are offered (auto already blends at least 2 s
+  // over a visible jump), and the saved blend is never lowered from here.
   const renderWithBlend = (seconds: number) => {
     setSeamAsk(null);
     const cfg = scene?.config;
     if (!cfg) return;
+    const blend = Math.max(cfg.crossfade_seconds || 0, seconds);
     run(
       "render",
       async () => {
-        await api.updateAmbient(id, { config: { ...cfg, crossfade_seconds: seconds } });
+        if (blend !== cfg.crossfade_seconds) {
+          await api.updateAmbient(id, { config: { ...cfg, crossfade_seconds: blend } });
+        }
         return api.renderAmbient(id, true);
       },
-      `Render started with a ${seconds} s blend`
+      `Render started with a ${blend} s blend`
     );
   };
   const renderAnyway = () => {
@@ -690,22 +695,49 @@ function Inner() {
           <RenderHistory projectId={id} />
         </div>
 
-        {seamAsk && (
+        {seamAsk && seamAsk.code === "seam_unmeasured" && (
+          <Dialog title="The join couldn't be measured" onClose={() => setSeamAsk(null)}>
+            <p className="text-sm text-ink-200">
+              The loop clip&apos;s join couldn&apos;t be measured just now, so the render can&apos;t tell whether the
+              loop jumps. It would blend {fmtSeconds(seamAsk.blend_seconds)} at the join. Watch the seam under Loop
+              health to judge, or measure it again there.
+            </p>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" className="btn-ghost text-sm" onClick={() => setSeamAsk(null)}>
+                Not now
+              </button>
+              <button type="button" className="btn-primary text-sm ml-auto" disabled={busy !== null} onClick={renderAnyway}>
+                Render anyway
+              </button>
+            </div>
+          </Dialog>
+        )}
+        {seamAsk && seamAsk.code === "seam_jump" && (
           <Dialog title="The loop jumps at the join" onClose={() => setSeamAsk(null)}>
             <p className="text-sm text-ink-200">
               The loop jumps every {fmtSeconds(seamAsk.repeat_every_seconds)}
               {seamAsk.ratio ? ` (the join is ${seamAsk.ratio}× a normal frame step)` : ""}: a{" "}
-              {fmtSeconds(seamAsk.blend_seconds)} blend won&apos;t hide it. A longer blend turns the jump into a slow
-              dissolve. Watch the seam under Loop health to judge.
+              {fmtSeconds(seamAsk.blend_seconds)} blend won&apos;t hide it.
+              {longerBlends(seamAsk.blend_seconds).length > 0
+                ? " A longer blend turns the jump into a slow dissolve."
+                : " That is already the longest blend."}{" "}
+              Watch the seam under Loop health to judge.
             </p>
             <div className="flex flex-wrap gap-2">
-              <button type="button" className="btn-primary text-sm" disabled={busy !== null} onClick={() => renderWithBlend(2)}>
-                Blend 2 s
-              </button>
-              <button type="button" className="btn-primary text-sm" disabled={busy !== null} onClick={() => renderWithBlend(4)}>
-                Blend 4 s
-              </button>
-              <span className="self-center text-xs text-ink-400">free</span>
+              {longerBlends(seamAsk.blend_seconds).map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  className="btn-primary text-sm"
+                  disabled={busy !== null}
+                  onClick={() => renderWithBlend(s)}
+                >
+                  Blend {s} s
+                </button>
+              ))}
+              {longerBlends(seamAsk.blend_seconds).length > 0 && (
+                <span className="self-center text-xs text-ink-400">free</span>
+              )}
               <button type="button" className="btn-ghost text-sm ml-auto" disabled={busy !== null} onClick={renderAnyway}>
                 Render anyway
               </button>
@@ -737,6 +769,13 @@ function Inner() {
 }
 
 /** "12.5 s", "2 s". */
+// The seam blends the jump dialog can offer (the setting's maximum is 6 s):
+// only those longer than the blend the render would already use.
+const SEAM_DIALOG_BLENDS = [4, 6];
+function longerBlends(current: number): number[] {
+  return SEAM_DIALOG_BLENDS.filter((s) => s > current);
+}
+
 function fmtSeconds(n: number): string {
   return `${Number.isInteger(n) ? n : n.toFixed(1)} s`;
 }

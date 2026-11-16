@@ -35,8 +35,9 @@ GAP_WAIT_SECONDS = 10.0
 LATE_LIMIT = 1000
 # Tests bound the stream so TestClient returns; honoured only under pytest.
 ALLOW_MAX_SECONDS = "pytest" in sys.modules
-# Unread events that count toward the badge: finished and failed work.
-_BADGE_STATUSES = ("completed", "failed")
+# Unread events that count toward the badge: finished and failed work, and
+# work that stopped to ask (the live badge counts the same three).
+_BADGE_STATUSES = ("completed", "failed", "needs_look")
 
 
 def _sse(data: dict | str, *, event: Optional[str] = None, eid: Optional[int] = None) -> str:

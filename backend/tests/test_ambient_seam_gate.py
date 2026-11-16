@@ -129,7 +129,7 @@ def test_a_batch_scene_with_a_jumping_loop_is_not_rendered(auth_client, monkeypa
 
     jump = hard_cut(tmp_path / "jump.mp4")
     real_measure = loop_health.measure
-    monkeypatch.setattr(loop_health, "measure", lambda clip, still=False: real_measure(jump, still=still))
+    monkeypatch.setattr(loop_health, "measure", lambda clip, still=False, **kw: real_measure(jump, still=still, **kw))
     renders = []
     real_enqueue = queue.enqueue
 
@@ -237,7 +237,8 @@ def test_a_jumping_variation_with_no_reading_is_measured_and_gated(auth_client):
 
 def test_the_worker_render_measures_an_unmeasured_variation(auth_client):
     """A render queued while a variation had no reading still sizes the
-    blend from it (the render measures before composing)."""
+    blend from it (the render measures before composing), once a jump was
+    accepted."""
     from app.services import ambient
 
     scene = _scene(auth_client, variety="takes", variations=2)
@@ -247,8 +248,180 @@ def test_the_worker_render_measures_an_unmeasured_variation(auth_client):
 
     db = SessionLocal()
     try:
-        ambient.render_scene(db, sid)
+        ambient.render_scene(db, sid, accept_seam=True)
     finally:
         db.close()
     log = auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["render_log"]
     assert "seam=visible_jump blend=2s" in log
+
+
+# ---------- no reading at request time ----------
+
+
+def _boom(*a, **kw):
+    raise RuntimeError("ffmpeg took too long")
+
+
+def test_a_loop_that_cannot_be_measured_asks_before_rendering(auth_client, monkeypatch):
+    """The inline measurement gets no reading (it failed or timed out):
+    the request can't tell whether the loop jumps, so it asks."""
+    from app.services import loop_health
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), hard_cut)
+    monkeypatch.setattr(loop_health, "measure", _boom)
+    r = auth_client.post(f"/api/ambient/{sid}/render")
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["code"] == "seam_unmeasured" and detail["message"]
+    assert detail["blend_seconds"] == 1.0
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["status"] != "generating" and out["latest_render"] is None
+    assert out["seam_treatment"]["basis"] == "plan"
+
+
+def test_blend_mode_renders_an_unmeasured_loop_without_asking(auth_client, monkeypatch):
+    from app.services import loop_health
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _patch(auth_client, sid, seam_mode="blend")
+    _replace(Path(scene["loop_shot"]["clip_path"]), hard_cut)
+    monkeypatch.setattr(loop_health, "measure", _boom)
+    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
+
+
+def test_the_inline_measurement_uses_a_short_timeout(auth_client, monkeypatch):
+    from app.api import ambient as ambient_api
+    from app.services import loop_health
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), seamless)
+    seen = []
+    real_measure = loop_health.measure
+
+    def spy(clip, still=False, **kw):
+        seen.append(kw.get("timeout"))
+        return real_measure(clip, still=still, **kw)
+
+    monkeypatch.setattr(loop_health, "measure", spy)
+    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
+    # The request's own reading is short; the worker had a current one.
+    assert seen == [ambient_api.INLINE_MEASURE_TIMEOUT] and ambient_api.INLINE_MEASURE_TIMEOUT <= 30
+    assert loop_health.MEASURE_TIMEOUT_SECONDS == 120  # the worker's is unchanged
+
+
+def test_accept_seam_reaches_the_worker(auth_client, monkeypatch):
+    """Render anyway after an unmeasured join: the worker measures, finds a
+    visible jump, and renders it because the person said so."""
+    from app.services import loop_health
+    from app.workers import jobs, queue
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), hard_cut)
+    real_measure = loop_health.measure
+    calls = {"n": 0}
+
+    def first_fails(clip, still=False, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("ffmpeg took too long")
+        return real_measure(clip, still=still, **kw)
+
+    monkeypatch.setattr(loop_health, "measure", first_fails)
+    kwargs = []
+    real_enqueue = queue.enqueue
+
+    def spy(fn, *a, **kw):
+        if fn is jobs.render_ambient_job:
+            kwargs.append(kw)
+        return real_enqueue(fn, *a, **kw)
+
+    monkeypatch.setattr("app.api.ambient.enqueue", spy)
+    assert auth_client.post(f"/api/ambient/{sid}/render").json()["detail"]["code"] == "seam_unmeasured"
+    r = auth_client.post(f"/api/ambient/{sid}/render?accept_seam=true")
+    assert r.status_code == 202, r.text
+    assert kwargs[-1]["accept_seam"] is True
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["latest_render"]["status"] == "completed"
+    assert "seam=visible_jump blend=2s" in out["latest_render"]["render_log"]
+
+
+def test_the_worker_stops_an_unasked_jumping_render(auth_client):
+    """A render queued without accept_seam whose own reading finds a visible
+    jump stops before composing: the render fails with a clear message, the
+    scene is released, and the person is told."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+    from app.workers import jobs
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), hard_cut)
+    db = SessionLocal()
+    try:
+        # As POST /render claims the scene before queueing.
+        db.query(models.VideoProject).filter(models.VideoProject.id == sid).update(
+            {"status": "generating", "claim_token": "tok"}, synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+    jobs.render_ambient_job(sid, claim_token="tok")
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["status"] == "failed"  # not left "generating"
+    latest = out["latest_render"]
+    assert latest["status"] == "failed" and latest["error"] == ambient.SEAM_STOP_MESSAGE
+    assert out["seam_treatment"]["verdict"] == "visible_jump"
+    db = SessionLocal()
+    try:
+        ev = (db.query(models.Event).filter(models.Event.project_id == sid,
+                                            models.Event.kind == "ambient_render",
+                                            models.Event.status == "failed").one())
+        assert "jumps visibly" in ev.detail
+        assert not db.query(models.Render).filter(models.Render.project_id == sid,
+                                                  models.Render.final_video_path.isnot(None),
+                                                  models.Render.final_video_path != "").count()
+    finally:
+        db.close()
+    # Render anyway from the page now goes ahead.
+    r = auth_client.post(f"/api/ambient/{sid}/render?accept_seam=true")
+    assert r.status_code == 202, r.text
+    assert auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["status"] == "completed"
+
+
+# ---------- a seamless join and an explicit short setting ----------
+
+
+@pytest.mark.parametrize("setting, blend", [(0.0, 0.0), (0.3, 0.3), (2.0, 0.5), (6.0, 0.5)])
+def test_a_seamless_join_hedges_but_an_explicit_shorter_setting_wins(auth_client, monkeypatch, setting, blend):
+    from app.services import loop_health
+
+    sid = _scene(auth_client, crossfade_seconds=setting)["id"]
+    entry = {"seam": {"verdict": "seamless", "ratio": 1.0}}
+    monkeypatch.setattr(loop_health, "current_entry", lambda p, s: entry if s is not None else None)
+    t = _treatment(sid)
+    assert t["verdict"] == "seamless" and t["basis"] == "measured" and t["blend_seconds"] == blend
+
+
+# ---------- the "needs a look" event counts toward the badge ----------
+
+
+def test_a_needs_look_event_counts_as_unread(auth_client):
+    from app.api import events as ev_api
+    from app.db import SessionLocal
+    from app.services import events
+
+    assert "needs_look" in events.STATUSES and "needs_look" in ev_api._BADGE_STATUSES
+    before = auth_client.get("/api/events/recent").json()["unread"]
+    db = SessionLocal()
+    try:
+        events.emit(db, "ambient_loop", "project", 1, "needs_look", "Loop needs a look: x", severity="warning")
+        events.emit(db, "ambient_loop", "project", 1, "progress", "half way")
+        db.commit()
+    finally:
+        db.close()
+    assert auth_client.get("/api/events/recent").json()["unread"] == before + 1

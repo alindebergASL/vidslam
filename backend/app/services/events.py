@@ -25,7 +25,9 @@ log = logging.getLogger("avs.events")
 
 KINDS = ("render", "plan", "ambient_loop", "ambient_render", "studio_job", "training", "publish", "budget",
          "hook_lab")
-STATUSES = ("started", "progress", "completed", "failed", "cancelled")
+# needs_look: work that stopped short and wants the person (an Ambient
+# batch scene whose loop jumps at the join was not rendered).
+STATUSES = ("started", "progress", "completed", "failed", "cancelled", "needs_look")
 RETENTION_DAYS = 30
 
 

@@ -89,11 +89,15 @@ def _analysis_size(size: tuple[int, int]) -> tuple[int, int]:
     return aw, ah
 
 
-def _read_frames(cmd_in: list[str], vf_pre: str, size: tuple[int, int]) -> list[Image.Image]:
+MEASURE_TIMEOUT_SECONDS = 120.0
+
+
+def _read_frames(cmd_in: list[str], vf_pre: str, size: tuple[int, int], *,
+                 timeout: float = MEASURE_TIMEOUT_SECONDS) -> list[Image.Image]:
     w, h = size
     vf = ",".join(x for x in (vf_pre, f"scale={w}:{h}:flags=area", "format=rgb24") if x)
     cmd = ["ffmpeg", "-v", "error", *cmd_in, "-vf", vf, "-an", "-f", "rawvideo", "-"]
-    proc = subprocess.run(cmd, capture_output=True, timeout=120)
+    proc = subprocess.run(cmd, capture_output=True, timeout=max(1.0, timeout))
     if proc.returncode != 0:
         raise RuntimeError(f"could not read the clip: {proc.stderr.decode(errors='replace')[-300:]}")
     n = w * h * 3
@@ -219,18 +223,20 @@ def _drift(frames: list[Image.Image], fps: float) -> dict:
     return {"verdict": verdict, "level": level, "text": text, "distance": round(dist, 4)}
 
 
-def measure(clip: Path, *, still: bool = False) -> dict:
+def measure(clip: Path, *, still: bool = False, timeout: float = MEASURE_TIMEOUT_SECONDS) -> dict:
     """The four readings for `clip`. `still`: an image-drift loop (a still
-    picture with slow camera motion), where freezing isn't meaningful."""
+    picture with slow camera motion), where freezing isn't meaningful.
+    `timeout`: seconds each FFmpeg read may take (subprocess.TimeoutExpired
+    past it)."""
     duration, size = _probe(clip)
     if duration <= 0:
         raise RuntimeError("could not read the clip")
     asize = _analysis_size(size)
     fps = min(SAMPLE_FPS, MAX_SAMPLES / duration)
-    frames = _read_frames(["-i", str(clip)], f"fps={fps:.4f}", asize)
+    frames = _read_frames(["-i", str(clip)], f"fps={fps:.4f}", asize, timeout=timeout)
     win = min(WINDOW_SECONDS, duration / 2.0)
-    first = _read_frames(["-t", f"{win:.3f}", "-i", str(clip)], "", asize)
-    last = _read_frames(["-sseof", f"-{win:.3f}", "-i", str(clip)], "", asize)
+    first = _read_frames(["-t", f"{win:.3f}", "-i", str(clip)], "", asize, timeout=timeout)
+    last = _read_frames(["-sseof", f"-{win:.3f}", "-i", str(clip)], "", asize, timeout=timeout)
     if len(frames) < 2 or not first or not last:
         raise RuntimeError("the clip is too short to measure")
     luma = [ImageStat.Stat(f.convert("L")).mean[0] / 255.0 for f in frames]
@@ -337,7 +343,7 @@ def out(project: models.VideoProject, shot: models.VideoShot, entry: dict) -> di
 
 
 def measure_shot(db: Session, project: models.VideoProject, shot: models.VideoShot, *,
-                 force: bool = False) -> Optional[dict]:
+                 force: bool = False, timeout: float = MEASURE_TIMEOUT_SECONDS) -> Optional[dict]:
     """Measure the shot's clip (unless a current reading exists and not
     `force`), keep it in the scene's state, and return it."""
     if not force:
@@ -347,7 +353,7 @@ def measure_shot(db: Session, project: models.VideoProject, shot: models.VideoSh
     if not shot.clip_path or shot.status != "completed" or not Path(shot.clip_path).is_file():
         return None
     stamp = _clip_stamp(shot.clip_path)
-    entry = measure(Path(shot.clip_path), still=_is_still(project))
+    entry = measure(Path(shot.clip_path), still=_is_still(project), timeout=timeout)
     entry.update({"measured_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
                   "clip_path": shot.clip_path, "clip_mtime_ns": stamp})
     db.refresh(project)  # the state may have moved on while we measured
@@ -362,13 +368,15 @@ def measure_shot(db: Session, project: models.VideoProject, shot: models.VideoSh
     return out(project, shot, entry)
 
 
-def measure_scene(db: Session, project: models.VideoProject, *, force: bool = False) -> list[dict]:
+def measure_scene(db: Session, project: models.VideoProject, *, force: bool = False,
+                  timeout: float = MEASURE_TIMEOUT_SECONDS) -> list[dict]:
     """Measure every clip the scene has (loop + variations). Never raises
-    for one bad clip: it's logged and skipped."""
+    for one bad clip: it's logged and skipped. `timeout`: per FFmpeg read
+    (a request that waits on it passes a shorter one)."""
     results = []
     for shot in clip_shots(project):
         try:
-            got = measure_shot(db, project, shot, force=force)
+            got = measure_shot(db, project, shot, force=force, timeout=timeout)
         except Exception as e:  # noqa: BLE001 — a reading is a nicety, never a failure
             db.rollback()
             log.warning("loop health of shot %s failed: %s", shot.id, e)

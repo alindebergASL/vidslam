@@ -38,12 +38,12 @@ export function errorText(e: unknown, fallback = "Something went wrong"): string
   return typeof m === "string" && m ? m : fallback;
 }
 
-/** The render's "this loop jumps" refusal (409 {code: "seam_jump"}), or null. */
-export function seamJumpOf(e: unknown): SeamJump | null {
+/** The render's "ask first" refusal (409 {code: "seam_jump" | "seam_unmeasured"}), or null. */
+export function seamAskOf(e: unknown): SeamAsk | null {
   if (!(e instanceof ApiError) || e.status !== 409) return null;
   try {
     const d = JSON.parse(e.detail);
-    return d && d.code === "seam_jump" ? (d as SeamJump) : null;
+    return d && (d.code === "seam_jump" || d.code === "seam_unmeasured") ? (d as SeamAsk) : null;
   } catch {
     return null;
   }
@@ -984,6 +984,16 @@ export type SeamJump = {
   repeat_every_seconds: number;
 };
 
+/** POST /render's 409 when the loop clip's join couldn't be measured (the
+ *  measurement failed or took too long): it may jump; render anyway? */
+export type SeamUnmeasured = {
+  code: "seam_unmeasured";
+  message: string;
+  blend_seconds: number;
+};
+
+export type SeamAsk = SeamJump | SeamUnmeasured;
+
 /** Local measurement of one loop clip: how it joins, flickers, freezes, drifts. */
 export type LoopHealth = {
   shot_id: number;
@@ -1618,7 +1628,8 @@ export type AppEventKind =
   | "budget"
   | "hook_lab";
 
-export type AppEventStatus = "started" | "progress" | "completed" | "failed" | "cancelled";
+/** needs_look: work that stopped to ask (a batch loop that jumps); counts toward the badge. */
+export type AppEventStatus = "started" | "progress" | "completed" | "failed" | "cancelled" | "needs_look";
 
 /** One row of the events table, as the stream and /api/events/recent send it. */
 export type AppEvent = {
@@ -1938,7 +1949,8 @@ export const api = {
   /** Backend-relative paths (e.g. thumbnail_url) → absolute URL. */
   backendUrl: (path: string) => `${API_BASE}${path}`,
 
-  /** 409 with a SeamJump detail (see seamJumpOf) when the loop visibly jumps; acceptSeam renders anyway. */
+  /** 409 with a SeamAsk detail (see seamAskOf) when the loop visibly jumps or its join couldn't be
+   *  measured; acceptSeam renders anyway (and the worker won't stop on a jump it finds). */
   renderAmbient: (id: number, acceptSeam = false) =>
     req<{ scene_id: number; job_id: string; status: string }>(
       `/api/ambient/${id}/render${acceptSeam ? "?accept_seam=true" : ""}`,

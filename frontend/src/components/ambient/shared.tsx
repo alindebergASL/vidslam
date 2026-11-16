@@ -213,7 +213,9 @@ export function seamVerdictView(
 }
 
 /** The blend the render will use at the join for these settings (the
- *  backend's seam_treatment rule, so an unsaved form shows the real value). */
+ *  backend's seam_treatment rule, so an unsaved form shows the real value).
+ *  A seamless join takes min(setting, 0.5): a shorter setting is the
+ *  person's explicit choice and wins (0 = no blend stays 0). */
 export function seamBlendFor(cfg: AmbientConfig, treatment: SeamTreatment | null | undefined): number {
   if (cfg.source === "image_drift") return 0;
   const user = Math.max(0, cfg.crossfade_seconds || 0);
