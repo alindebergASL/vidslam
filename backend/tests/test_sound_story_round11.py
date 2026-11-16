@@ -274,8 +274,8 @@ def test_the_word_lists_still_refuse_obvious_cases_before_the_call(client, monke
 
 
 def test_hook_lab_suggest_is_one_call_per_opening_outside_adult_mode(auth_client, monkeypatch):
-    """check_opening's single combined call still holds now that every
-    script is judged."""
+    """One call per opening at the found window (the script it makes, the
+    only text heard there) now that every script is judged."""
     from app.providers import mock_chat
     from app.services import minor_check
 

@@ -881,9 +881,9 @@ def test_every_new_prompt_meets_the_safety_check_before_anything_is_paid(auth_cl
 
     monkeypatch.setattr(minor_check, "check_generation", spy)
     assert _make(auth_client, pid, [ok, bad]).status_code == 202
-    # The opening is asked about once, with what is heard after it
-    # (hook_lab.opening_text), then again at the guarded providers (TTS and
-    # video), not only up front.
+    # The opening is asked about inside the script it makes and with what is
+    # heard after it (each its own text: hook_lab.judged_texts), then again
+    # at the guarded providers (TTS and video), not only up front.
     scripts = [p for p, k in seen if k == "script" and "Fact: stop the scroll." in p]
     assert len(scripts) >= 2 and seen.count(("a blue kite", "video")) >= 2
     v = _get(models.HookVariant, bad)

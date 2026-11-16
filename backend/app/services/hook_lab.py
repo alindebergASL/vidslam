@@ -188,21 +188,23 @@ HEARD_NOTE = "It was checked together with the original voiceover heard after it
 
 
 def check_opening(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> None:
-    """The minors check an opening meets: on its own, and inside the script
-    it joins. The script check only refuses a minor and a sexual word in
-    the same text, so "She just turned 15." passes alone but not in front
-    of an adult script.
+    """The minors check an opening meets: inside the script it makes, and
+    with what of the original is heard after it. The script check only
+    refuses a minor and a sexual word in the same text, so "She just turned
+    15." passes alone but not in front of an adult script.
 
     What is heard is the new opening, then the base voiceover from `window`
     on, and the window can be moved anywhere, even inside the original first
     sentence. So the opening is also checked with what of the original may
     be heard after it (heard_checks).
 
-    Every form goes through the word filter; the model is asked once, on
-    the longest combined text (opening_text: the opening with the whole
-    original script, the script it makes, what is heard and the joins), so
-    an opening costs one call whatever the window. Raises HookLabError
-    (422) when refused."""
+    Every form goes through the word filter. The model is asked about each
+    text that can really be heard (judged_texts: the script the opening
+    makes, then each heard form), one call each, so no text it judges has
+    the replaced words, which are never heard, beside it: those words can
+    make an opening read as being about someone else ("Lily is my
+    30-year-old wife." in front of "Lily wears her pigtails and braces.").
+    Raises HookLabError (422) when refused."""
     from . import minor_check
     from .safety import UnsafeScriptError, check_script
 
@@ -216,15 +218,12 @@ def check_opening(db: Session, base: models.Render, hook: str, window: Optional[
         heard = heard_checks(db, base, hook, window)
     except UnsafeScriptError as e:
         raise HookLabError(f"This opening can't be used: {e} {HEARD_NOTE}", 422) from None
-    judged = opening_text(hook, opening, heard)
-    try:
-        minor_check.check_generation(judged, kind="script")
-    except UnsafeScriptError as e:
-        note = f" {HEARD_NOTE}" if heard else ""
-        raise HookLabError(f"This opening can't be used: {e}{note}", 422) from None
-    # The model read the opening inside that text: its own voice (synth_hook
-    # speaks the opening alone) isn't asked about again.
-    minor_check.vouch_ok(judged, [" ".join((hook or "").split()), (hook or "").strip()])
+    for i, text in enumerate(judged_texts(opening, heard)):
+        try:
+            minor_check.check_generation(text, kind="script")
+        except UnsafeScriptError as e:
+            note = f" {HEARD_NOTE}" if i else ""
+            raise HookLabError(f"This opening can't be used: {e}{note}", 422) from None
     from . import explicit_check
 
     if explicit_check.active():
@@ -236,45 +235,52 @@ def check_opening(db: Session, base: models.Render, hook: str, window: Optional[
             raise HookLabError(f"This opening can't be used: {e}", 422) from None
 
 
-def opening_text(hook: str, opening: str, heard: list[str]) -> str:
-    """What the model reads of an opening, once: the opening alone when
-    nothing of an original is heard, else each form on lines of its own
-    (the opening with the whole original script, the script it makes,
-    what is heard and the joins). A form already in the text isn't
-    repeated."""
-    hook = " ".join((hook or "").split())
-    forms: list[str] = []
-    for text in (*heard[:1], " ".join((opening or "").split()), *heard[1:]):
-        text = (text or "").strip()
-        if text and text not in forms:
-            forms.append(text)
-    if not heard:
-        return forms[0] if forms else hook
-    return "\n".join(forms)
+def judged_texts(opening: str, heard: list[str]) -> list[str]:
+    """The texts the model is asked about for an opening, each on its own:
+    the script the opening makes, then each form of it that can be heard
+    (heard_checks). A form the same as one before it isn't repeated."""
+    out: list[str] = []
+    for text in (opening, *heard):
+        text = " ".join((text or "").split())
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+# The most places inside the original first sentence the voiceover may pick
+# up at that are each judged: a window inside a longer first sentence is
+# refused (move it to where that sentence ends).
+MAX_JOINS = 40
+JOINS_TOO_MANY = ("The original first sentence is too long to check every place the voiceover could pick up "
+                  "inside it. Move where the opening ends to the end of that sentence.")
 
 
 def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> list[str]:
     """The opening with the original words that may be heard after it:
-    the word filter on each form, and the forms the model reads
-    (check_opening joins them into one text). [] when no original script
-    is heard.
+    the word filter on each form, and the forms the model reads, each
+    alone (check_opening). [] when what is heard is the script the opening
+    makes (or the window isn't known yet: it is checked again with the
+    window before anything is made).
 
-    1. The opening, then the whole original script: every word of the
-       original that can be heard after the opening is in it, wherever the
-       window is.
+    1. The opening, then the whole original script: the word filter only.
+       Every word of the original that can be heard after the opening is
+       in it, wherever the window is. The model never reads it: the
+       replaced first sentence is in it, and it isn't heard.
     2. With the window known: the opening joined to the original where the
-       voiceover picks up (heard_cuts). The safety check sees that best
-       guess as it is heard, without the replaced words around it (they
-       could make it read as being about someone else). The word filter
-       also sees the joins near the guess, since the words aren't timed: a
-       phrase can form only across the join ("she is" + "sixteen tips").
-       Each join is also read without the punctuation at the end of the
-       opening, which a listener doesn't hear ("Her age?" + "fifteen, and").
+       voiceover picks up (heard_cuts). The model reads that best guess as
+       it is heard, without the replaced words around it (they could make
+       it read as being about someone else). The word filter also sees the
+       joins near the guess, since the words aren't timed: a phrase can
+       form only across the join ("she is" + "sixteen tips"). Each join is
+       also read without the punctuation at the end of the opening, which
+       a listener doesn't hear ("Her age?" + "fifteen, and").
     3. When the voiceover may pick up inside the original first sentence,
-       speech is too uneven to trust the guess: the safety check sees the
-       opening joined at every word of that sentence (heard_joins), a few
-       at a time.
-    Raises UnsafeScriptError."""
+       speech is too uneven to trust the guess: the model reads the
+       opening joined at every word of that sentence, each join as heard
+       to the end, one text each (at most MAX_JOINS).
+    4. When the opening fills the whole voiceover, the opening alone is
+       what is heard.
+    Raises UnsafeScriptError (refused) or HookLabError (too many joins)."""
     from .renderer import _probe_duration
     from .safety import check_script
 
@@ -282,15 +288,13 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     script = base_script(db, base).strip()
     if not hook or not script:
         return []
-    whole = f"{hook} {script}"
-    check_script(whole)
-    texts = [whole]
+    check_script(f"{hook} {script}")
     path = Path(base.audio_path or "")
     if not window or window <= 0 or not path.is_file():
-        return texts
+        return []
     total = _probe_duration(path)
     if window >= total - 0.05:
-        return texts  # nothing of the original is heard after the opening
+        return [hook]  # nothing of the original is heard after the opening
     try:
         end_of_first: Optional[float] = find_hook_window(base, script)
     except HookLabError:
@@ -304,51 +308,32 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     for cut in cuts:
         check_script(f"{hook} {script[cut:]}")
         check_script(f"{bare} {script[cut:].lstrip(_PUNCT)}")
+    texts: list[str] = []
     if not (rest and best == rest_at):  # else the usual join: the script the opening makes
         heard = f"{hook} {script[best:]}"
         check_script(heard)
         texts.append(heard)
     if inside:
-        for text in heard_joins(hook, script, [c for c in cuts if c < rest_at], rest_at):
-            check_script(text)
-            texts.append(text)
+        joins = [c for c in cuts if c < rest_at]
+        if len(joins) > MAX_JOINS:
+            raise HookLabError(JOINS_TOO_MANY, 422)
+        texts += heard_joins(hook, script, joins)
     return texts
 
 
 _PUNCT = " \t.,;:!?…-–—\"'“”‘’()"
 _HOOK_END = re.compile(r"[\s.,;:!?…\-–—\"'“”‘’()]+$")
-# How much of the script after the first sentence each join shows.
-_JOIN_TAIL = 160
-
-
 def word_starts(script: str, upto: int) -> list[int]:
     """The offsets of the words that start before `upto`."""
     return [m.start() for m in re.finditer(r"\S+", script) if m.start() < upto]
 
 
-def heard_joins(hook: str, script: str, cuts: list[int], rest_at: int) -> list[str]:
-    """The opening joined to the original at each cut inside the first
-    sentence, as numbered lines, packed into texts the safety check reads
-    whole (minor_check.JUDGE_WINDOW). Each line runs to a little past the
-    first sentence; the rest of the script was checked with the opening
-    already (heard_checks, step 1)."""
-    from .minor_check import JUDGE_WINDOW
-
-    head = "The opening may be heard joined to the original voiceover at any of these points:"
-    tail = script[rest_at:rest_at + _JOIN_TAIL]
-    lines = [f"{i}. {hook} {script[c:rest_at]}{tail}".strip() for i, c in enumerate(cuts, 1)]
-    texts: list[str] = []
-    room = JUDGE_WINDOW - 200
-    cur = head
-    for line in lines:
-        line = line[:room - len(head) - 1]
-        if len(cur) + 1 + len(line) > room and cur != head:
-            texts.append(cur)
-            cur = head
-        cur += "\n" + line
-    if cur != head:
-        texts.append(cur)
-    return texts
+def heard_joins(hook: str, script: str, cuts: list[int]) -> list[str]:
+    """The opening joined to the original at each cut, as heard: the
+    opening, then the original from the cut to its end. One text per cut,
+    each judged alone (never beside the words of another cut, which aren't
+    heard with it)."""
+    return [f"{hook} {script[c:]}".strip() for c in cuts]
 
 
 def heard_cuts(script: str, window: float, total: float,

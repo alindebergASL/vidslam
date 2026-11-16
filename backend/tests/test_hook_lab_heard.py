@@ -361,7 +361,7 @@ def test_the_ai_check_sees_every_join_in_the_first_sentence(auth_client, monkeyp
     seen: list[str] = []
 
     def judge(self, text):
-        seen.append(text)
+        seen.append(text.removeprefix("Prompt: "))
         bad = "braces and tonight she slips into a bikini" in text
         return {"minor_sexual": bad, "reason": "probe"}
 
@@ -371,15 +371,31 @@ def test_the_ai_check_sees_every_join_in_the_first_sentence(auth_client, monkeyp
     # The window says "thirty"; the voiceover may really pick up at "tonight".
     r = _post(auth_client, pid, base_id, "She still wears braces and", _window_at(base_id, "thirty"))
     assert r.status_code == 422 and "minor" in r.json()["detail"]
-    joins = [t for t in seen if "may be heard joined" in t]
-    assert joins and any("\n1. She still wears braces and My wife" in t for t in joins)
+    # Every join is its own text, as heard to the end: never beside another
+    # join's words, which aren't heard with it.
+    assert "She still wears braces and My wife is thirty and tonight she slips into a bikini for you! " \
+           "Follow for more." in seen
+    assert "She still wears braces and tonight she slips into a bikini for you! Follow for more." in seen
+    assert all(t.count("She still wears braces and") <= 1 for t in seen)
 
 
-def test_heard_joins_fit_what_the_check_reads():
-    from app.services import hook_lab, minor_check
+def test_heard_joins_are_one_text_each_and_a_long_first_sentence_is_refused(auth_client):
+    from app import models
+    from app.services import hook_lab
 
     script = ("word " * 400).strip() + ". Follow for more."
     rest_at = script.index("Follow")
-    texts = hook_lab.heard_joins("Hi there", script, hook_lab.word_starts(script, rest_at), rest_at)
-    assert len(texts) > 1 and all(len(t) <= minor_check.JUDGE_WINDOW for t in texts)
-    assert sum(t.count("\n") for t in texts) == 400  # every join, once
+    cuts = hook_lab.word_starts(script, rest_at)
+    texts = hook_lab.heard_joins("Hi there", script, cuts)
+    assert len(texts) == 400 and texts[0] == f"Hi there {script}" and texts[-1] == f"Hi there {script[cuts[-1]:]}"
+    # A window inside a first sentence that long would need 400 checks: refused.
+    pid, base_id = _spliced_base(auth_client, script)
+    db = _db()
+    try:
+        base = db.get(models.Render, base_id)
+        end = hook_lab.find_hook_window(base, script)
+        with pytest.raises(hook_lab.HookLabError) as e:
+            hook_lab.check_opening(db, base, "Hi there", round(end / 2, 2))
+        assert e.value.status == 422 and str(e.value) == hook_lab.JOINS_TOO_MANY
+    finally:
+        db.close()

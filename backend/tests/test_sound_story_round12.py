@@ -312,12 +312,14 @@ def test_a_story_keeps_its_cap(client, narr):
     assert str(e.value) == minor_check.FACTS_TOO_MANY
 
 
-# ---------- 3) the hook lab asks once ----------
+# ---------- 3) the hook lab asks once per text ----------
 
 @pytest.mark.parametrize("adult", [False, True])
-def test_a_hook_costs_one_call_from_create_to_its_voice(auth_client, monkeypatch, adult):
-    """rt11_1 test_rt11_cost test_cost_hook: the preview's voice asked about
-    the opening again, alone."""
+def test_a_hook_costs_one_call_per_text_from_create_to_its_voice(auth_client, monkeypatch, adult):
+    """rt11_1 test_rt11_cost test_cost_hook. Since the #57 review (findings
+    1 and 2) the draft judges the script the opening makes, and its voice
+    asks about the opening alone once: an "ok" for a text inside another is
+    never recorded for the part (a part can read differently alone)."""
     from app.config import get_settings
     from app.providers import mock_chat
     from app.services import minor_check
@@ -327,14 +329,18 @@ def test_a_hook_costs_one_call_from_create_to_its_voice(auth_client, monkeypatch
     monkeypatch.setattr(get_settings(), "adult_features", True)
     monkeypatch.setattr(get_settings(), "adult_mode", adult)
     pid, base_id = _base(auth_client)
+    hook = f"Ever wondered why, {'friend' if adult else 'buddy'}?"
     minor_check.reset_cache()
     mock_chat.MINOR_CALLS.clear()
-    made = _create(auth_client, pid, base_id, [{"hook_text": "Ever wondered why, friend?", "style": "question"}])
-    assert len(mock_chat.MINOR_CALLS) == 1
+    made = _create(auth_client, pid, base_id, [{"hook_text": hook, "style": "question"}])
+    # The script it makes, and what is heard at the window (2.5 s): one each.
+    drafted = list(mock_chat.MINOR_CALLS)
+    assert drafted == [f"Prompt: {hook} Here is the rest of it. And one more line.",
+                       f"Prompt: {hook} rest of it. And one more line."]
     vid = made["variants"][0]["id"]
     r = auth_client.post(f"/api/hook-variants/{vid}/preview-audio")
     assert r.status_code == 200, r.text
-    assert len(mock_chat.MINOR_CALLS) == 1
+    assert mock_chat.MINOR_CALLS == [*drafted, f"Prompt: {hook}"]
 
 
 def test_vouching_needs_an_ok_and_a_part_inside(client):
