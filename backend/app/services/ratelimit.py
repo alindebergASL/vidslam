@@ -82,8 +82,12 @@ def _client_key(request: Request) -> str:
     return f"ip:{host}"
 
 
-def rate_limit(bucket: str):
+def rate_limit(bucket: str, scale: float = 1.0):
     """FastAPI dependency: one token per call from the client's `bucket`.
+
+    `scale` multiplies the generation burst and refill for a lighter limit
+    (endpoints that only make cheap calls, such as a safety check, and are
+    called more often).
 
     Raises 429 with a Retry-After header when the bucket is empty. Disabled
     entirely when RATE_LIMIT_ENABLED=false (e.g. load tests).
@@ -96,8 +100,8 @@ def rate_limit(bucket: str):
         key = f"{bucket}:{_client_key(request)}"
         allowed, retry_after = get_limiter().check(
             key,
-            capacity=s.rate_limit_generation_burst,
-            refill_per_minute=s.rate_limit_generation_per_minute,
+            capacity=max(1, int(s.rate_limit_generation_burst * scale)),
+            refill_per_minute=s.rate_limit_generation_per_minute * scale,
         )
         if not allowed:
             raise HTTPException(

@@ -3,11 +3,11 @@ finished storyboard video, made without paying for the whole video again.
 
 GET    /api/projects/{id}/hook-lab               base versions, their openings, window, shot 1 options
 POST   /api/projects/{id}/hook-lab/suggest       opening ideas from the planner (rate-limited, ~$0.001)
-POST   /api/projects/{id}/hook-lab/variants      create drafts (no spend) + their price
+POST   /api/projects/{id}/hook-lab/variants      create drafts + their price (only the safety checks are paid)
 POST   /api/projects/{id}/hook-lab/plan          price of making some drafts (no spend)
 POST   /api/projects/{id}/hook-lab/make          make + compose them (guarded, claimed)
 GET    /api/hook-variants/{id}                   one opening
-PATCH  /api/hook-variants/{id}                   edit a draft (or a failed one)
+PATCH  /api/hook-variants/{id}                   edit a draft (or a failed one; safety checks only)
 DELETE /api/hook-variants/{id}                   remove (?delete_render=true for a finished one)
 POST   /api/hook-variants/{id}/cancel           stop one being made (it fails; clips in flight are billed)
 POST   /api/hook-variants/{id}/preview-audio     make its voice to listen to (paid TTS)
@@ -336,10 +336,25 @@ def suggest(project_id: int, body: SuggestIn, db: Session = Depends(get_db)) -> 
             "suggestions": ideas, "cost_estimate": 0.001}
 
 
-@router.post("/projects/{project_id}/hook-lab/variants", status_code=201)
+# The draft endpoints make no clips or voices, but each opening's safety
+# checks are paid model calls (a fraction of a cent each): a light limit,
+# DRAFT_LIMIT_SCALE times the generation one, in a bucket of their own.
+DRAFT_LIMIT_SCALE = 4
+
+
+@router.post("/projects/{project_id}/hook-lab/variants", status_code=201,
+             dependencies=[Depends(rate_limit("hook_drafts", DRAFT_LIMIT_SCALE))])
 def create_variants(project_id: int, body: VariantsIn, db: Session = Depends(get_db)) -> dict:
-    """Drafts only: nothing is made or paid for. Returns them with their price."""
+    """Drafts only: no voice or clip is made. The safety checks of each
+    opening are paid model calls, charged to the project. Returns the
+    drafts with their price."""
     project = _project(db, project_id)
+    with spend.scope(project_id=project.id):
+        return _create_variants(db, project, body)
+
+
+def _create_variants(db: Session, project: models.VideoProject, body: VariantsIn) -> dict:
+    project_id = project.id
     base = _base(db, project_id, body.base_render_id)
     for spec in body.variants:
         _check_spec(spec)
@@ -484,9 +499,17 @@ def get_variant(variant_id: int, db: Session = Depends(get_db)) -> dict:
     return variant_out(db, v, base_hook=hook_lab.base_hook(db, base) if base else "")
 
 
-@router.patch("/hook-variants/{variant_id}")
+@router.patch("/hook-variants/{variant_id}",
+              dependencies=[Depends(rate_limit("hook_drafts", DRAFT_LIMIT_SCALE))])
 def patch_variant(variant_id: int, body: VariantPatch, db: Session = Depends(get_db)) -> dict:
+    """Edit a draft. A new opening or window is checked again (paid model
+    calls, charged to the project)."""
     v = _variant(db, variant_id)
+    with spend.scope(project_id=v.project_id):
+        return _patch_variant(db, v, body)
+
+
+def _patch_variant(db: Session, v: models.HookVariant, body: VariantPatch) -> dict:
     if v.status not in hook_lab.EDITABLE:
         raise HTTPException(409, "Only an opening that isn't made yet (or failed) can be changed.")
     _check_spec(body)

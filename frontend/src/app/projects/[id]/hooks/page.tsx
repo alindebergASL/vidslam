@@ -649,7 +649,7 @@ function Drafts({
         <div>
           <h2 id="hl-new" className="text-base font-medium">New openings</h2>
           <p className="text-[11px] text-ink-400">
-            Up to {lab.max_per_request} at a time. Nothing is paid until you listen or make the videos.
+            Up to {lab.max_per_request} at a time. Only the safety check is paid (a fraction of a cent) until you listen or make the videos.
           </p>
           {full && (
             <p className="text-[11px] text-amber-200" role="status">
