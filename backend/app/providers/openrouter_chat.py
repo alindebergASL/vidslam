@@ -388,11 +388,31 @@ class OpenRouterChatProvider(ChatProvider):
     def story_characters(self, text: str) -> dict:
         """One short call: {"characters": [{"name", "status", "age"}]}.
         Raises on an error body, a refusal or a reply that isn't that JSON
-        (the caller refuses the story for all of those)."""
+        (the caller refuses the story for all of those). A window can name
+        dozens of people (a history of 56 presidents puts 41 in its first),
+        so the reply gets plenty of room (STORY_FACTS_TOKENS), and a reply
+        the model ran out of room for (finish_reason "length", or JSON cut
+        off before its end) is asked for once more with more room, never
+        read as "the check couldn't run" at once."""
+        for attempt, room in enumerate(STORY_FACTS_TOKENS):
+            content, finish = self._story_facts_call(text, room)
+            last = attempt == len(STORY_FACTS_TOKENS) - 1
+            try:
+                return parse_story_characters(content)
+            except ModelDeclined:
+                raise
+            except ValueError:
+                if last or not (finish == "length" or _cut_off(content)):
+                    raise
+                log.info("story facts: the reply ran out of room (%s tokens), asking with more", room)
+        raise AssertionError("unreachable")
+
+    def _story_facts_call(self, text: str, max_tokens: int) -> tuple[str, str]:
+        """(reply text, finish_reason) of one story facts call."""
         body: dict = {
             "model": self.model,
             "temperature": 0.0,
-            "max_tokens": 800,
+            "max_tokens": max_tokens,
             "reasoning": {"effort": "low", "exclude": True},
             "messages": [
                 {"role": "system", "content": STORY_FACTS_SYSTEM},
@@ -409,12 +429,16 @@ class OpenRouterChatProvider(ChatProvider):
                                 generation_id=str(data.get("id") or ""), estimate=MINOR_CHECK_ESTIMATE,
                                 note="safety check")
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (IndexError, KeyError, TypeError):
             raise RuntimeError("OpenRouter returned no message") from None
         if isinstance(content, list):
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-        return parse_story_characters(content if isinstance(content, str) else "")
+        finish = str(choice.get("finish_reason") or choice.get("native_finish_reason") or "").lower()
+        if finish in ("max_tokens", "max_output_tokens"):  # some providers' names for it
+            finish = "length"
+        return (content if isinstance(content, str) else ""), finish
 
     def classify_explicit(self, text: str) -> dict:
         """One short call: {"explicit": bool, "reason": str}. Raises on an
@@ -450,6 +474,41 @@ class OpenRouterChatProvider(ChatProvider):
 
 # The safety check's rate-card cost per call (a short reply from the planner).
 MINOR_CHECK_ESTIMATE = 0.0005
+
+# The room a story facts reply gets (max_tokens): the first ask, then the one
+# more ask when the model ran out of room. A character's entry is about 40
+# tokens, so the first fits about 100 people.
+STORY_FACTS_TOKENS = (4000, 12000)
+
+
+def _cut_off(reply: str) -> bool:
+    """Whether a reply reads as JSON the model was cut off in: it starts an
+    object (bare or in a fence) whose braces never close."""
+    text = _clean_reply(reply)
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.rstrip("`").strip()
+    if not text.startswith("{"):
+        return False
+    depth, in_str, esc = 0, False, False
+    for c in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+            if depth == 0:
+                return False
+    return True
 
 # The content check of a clean deployment (services/explicit_check.py).
 EXPLICIT_CHECK_SYSTEM = """You are a content classifier for a video app made for a general audience. The text is words that will be spoken or shown in a video (a voiceover script, an opening line, a caption), or a prompt for a picture, video, music or sound model. Your only question: is the text sexually explicit or pornographic, or does it ask for such content?
