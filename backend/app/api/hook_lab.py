@@ -651,7 +651,8 @@ def preview_audio(variant_id: int, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(409, "This opening is being made or is already made.")
     base = _base(db, v.project_id, v.base_render_id)
     project = db.get(models.VideoProject, v.project_id)
-    _check_opening(db, base, v.hook_text, v.window_seconds)  # before any voice is made
+    with spend.scope(project_id=project.id):
+        _check_opening(db, base, v.hook_text, v.window_seconds)  # before any voice is made
     cost = 0.0
     if not hook_lab.is_original(db, v, base) and not hook_lab.raw_hook_path(db, project, v).is_file():
         cost = round(hook_lab.tts_cost(v.hook_text), 4)

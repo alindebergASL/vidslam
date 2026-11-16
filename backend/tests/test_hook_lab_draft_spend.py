@@ -61,3 +61,27 @@ def test_draft_endpoints_are_rate_limited_lightly_in_a_bucket_of_their_own(auth_
     # Its own bucket: the paid generation endpoints still have theirs.
     r = auth_client.post(f"/api/projects/{pid}/hook-lab/suggest", json={"base_render_id": base_id})
     assert r.status_code == 200, r.text
+
+
+def test_listen_charges_its_opening_check_to_the_project(auth_client, monkeypatch):
+    """Listen (preview-audio) checks the opening before its voice is made:
+    that check runs inside the project's spend scope, so its calls (when
+    not cached) are charged to the project too."""
+    from app.services import hook_lab, spend
+
+    pid, base_id = _base(auth_client)
+    made = _create(auth_client, pid, base_id, [{"hook_text": "Who pays to listen?", "style": "question"}])
+    vid = made["variants"][0]["id"]
+    scopes: list[dict] = []
+    real = hook_lab.check_opening
+
+    def check(*a, **kw):  # noqa: ANN002, ANN003, ANN202
+        scopes.append(dict(spend._scope.get() or {}))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(hook_lab, "check_opening", check)
+    seen = _scopes(monkeypatch)
+    r = auth_client.post(f"/api/hook-variants/{vid}/preview-audio")
+    assert r.status_code == 200, r.text
+    assert scopes and all(s.get("project_id") == pid for s in scopes), scopes
+    assert all(s.get("project_id") == pid for s in seen), seen
