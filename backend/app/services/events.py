@@ -144,13 +144,16 @@ def ambient_loop_event(db: Session, project: models.VideoProject, status: str, *
 
 
 def ambient_seam_event(db: Session, project: models.VideoProject, treatment: dict) -> None:
-    """A batch scene's loop jumps at the join: it was not rendered."""
+    """A batch scene's loop jumps at the join (or its join couldn't be
+    measured, treatment basis "plan"): it was not rendered."""
     name = _name(project)
     ratio = treatment.get("ratio")
+    if treatment.get("basis") == "plan":
+        what = "the loop clip's join couldn't be measured, so it may jump"
+    else:
+        what = "the loop clip jumps at the join" + (f" ({ratio:g}× a normal frame step)" if ratio else "")
     emit(db, "ambient_loop", "project", project.id, "needs_look", f"Loop needs a look: {name}",
-         detail=(f"{name}: the loop clip jumps at the join"
-                 + (f" ({ratio:g}× a normal frame step)" if ratio else "")
-                 + ", so it wasn't rendered. Open the scene to blend it or render anyway."),
+         detail=f"{name}: {what}, so it wasn't rendered. Open the scene to blend it or render anyway.",
          url=project_url(project), project_id=project.id, severity="warning")
 
 

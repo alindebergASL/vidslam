@@ -129,11 +129,13 @@ def _dims_for_aspect(aspect: str, resolution: str = "1080p") -> tuple[int, int]:
 FILL_TOLERANCE = 0.06
 
 
-def _probe_size(path: Path) -> Optional[tuple[int, int]]:
+def _probe_size(path: Path, timeout: Optional[float] = None) -> Optional[tuple[int, int]]:
     """(width, height) of a file's first video stream as ffmpeg shows it,
-    i.e. after rotation metadata (a phone's portrait clip), or None."""
+    i.e. after rotation metadata (a phone's portrait clip), or None (also
+    when ffprobe takes longer than `timeout` seconds)."""
     rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate", str(path)])
+                    "-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate", str(path)],
+                   timeout=timeout)
     if rc != 0:
         return None
     try:
@@ -285,11 +287,12 @@ def _concat(clips: list[Path], out: Path) -> str:
     return log
 
 
-def _probe_duration(path: Path) -> float:
+def _probe_duration(path: Path, timeout: Optional[float] = None) -> float:
+    """Seconds, or 0.0 when unreadable (or ffprobe outlasts `timeout`)."""
     cmd = [
         "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path),
     ]
-    rc, log = _run(cmd)
+    rc, log = _run(cmd, timeout=timeout)
     if rc != 0:
         return 0.0
     try:

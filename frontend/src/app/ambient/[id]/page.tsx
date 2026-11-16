@@ -48,6 +48,7 @@ import {
   Render,
   SeamAsk,
   errorText,
+  renderStopped,
   seamAskOf,
 } from "@/lib/api";
 import { Dialog } from "@/components/Dialog";
@@ -383,9 +384,18 @@ function Inner() {
                 </div>
               ) : (
                 <div className="p-6 text-sm">
-                  <div className="text-red-300">
-                    {render.status === "cancelled" ? "Render cancelled." : `Render failed: ${render.error || "unknown error"}`}
-                  </div>
+                  {renderStopped(render) ? (
+                    // Stopped to ask (a batch's loop jumps or couldn't be
+                    // measured), not cancelled by the person: say why.
+                    <div className="text-amber-300">
+                      <div className="font-medium">Loop needs a look.</div>
+                      <div className="mt-1">{render.error}</div>
+                    </div>
+                  ) : (
+                    <div className="text-red-300">
+                      {render.status === "cancelled" ? "Render cancelled." : `Render failed: ${render.error || "unknown error"}`}
+                    </div>
+                  )}
                   <button
                     type="button"
                     className="btn-ghost text-sm mt-3"

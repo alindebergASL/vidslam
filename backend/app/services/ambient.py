@@ -2556,6 +2556,62 @@ class SeamJumpStop(RuntimeError):
 
 SEAM_STOP_MESSAGE = ("Not rendered: the loop clip jumps visibly at the join and the blend won't hide it. "
                      "Open the scene to choose a longer blend or render anyway.")
+SEAM_UNMEASURED_MESSAGE = ("Not rendered: the loop clip's join couldn't be measured, so it may jump. "
+                           "Open the scene to measure it again, choose a blend or render anyway.")
+
+# POST /render's claim token says whether the person accepted a jumping
+# join, so the job needs no new argument (a worker deployed before this
+# would fail on an unknown keyword; it just uses the token as it is).
+# A token without either prefix was queued before the gate travelled with
+# the job: its request already passed the gate, so it counts as accepted.
+SEAM_ACCEPTED_CLAIM = "seam:ok:"
+SEAM_ASK_CLAIM = "seam:ask:"
+
+
+def render_claim_token(accept_seam: bool) -> str:
+    return (SEAM_ACCEPTED_CLAIM if accept_seam else SEAM_ASK_CLAIM) + secrets.token_hex(12)
+
+
+def claim_accepts_seam(token: str) -> bool:
+    return not (token or "").startswith(SEAM_ASK_CLAIM)
+
+
+def _stop_for_seam(db: Session, project: models.VideoProject, render: models.Render, stop: SeamJumpStop,
+                   *, batch: bool, claim_token: str) -> models.Render:
+    """End a render the seam gate stopped. Both writes are conditional: a
+    cancel committed meanwhile keeps the render "cancelled" (no reason, no
+    event), and the scene is released only while it is still this render's
+    (a newer Generate or render claim is left alone).
+
+    Asked from the page: the render fails with the reason. Queued by a
+    batch (nobody was asked): the render ends "cancelled" with the reason
+    in its error (the page shows it as stopped, not cancelled), the scene
+    goes back to "planned" and a needs_look event asks."""
+    from sqlalchemy import or_
+
+    db.rollback()
+    stopped = (db.query(models.Render)
+               .filter(models.Render.id == render.id, models.Render.status == "rendering")
+               .update({"status": "cancelled" if batch else "failed", "error": str(stop)},
+                       synchronize_session=False))
+    if not stopped:
+        db.commit()
+        db.refresh(render)
+        log.info("ambient render %s was cancelled before its seam stop landed", render.id)
+        return render
+    P = models.VideoProject
+    held = (P.claim_token == claim_token) if claim_token else or_(P.claim_token == "", P.claim_token.is_(None))
+    (db.query(P).filter(P.id == project.id, P.status == "generating", held)
+     .update({"status": "planned" if batch else "failed"}, synchronize_session=False))
+    db.commit()
+    db.refresh(render)
+    db.refresh(project)
+    if batch:
+        events.ambient_seam_event(db, project, stop.treatment)
+    else:
+        events.render_event(db, render, project, "failed", error=str(stop))
+    db.commit()
+    return render
 
 
 def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
@@ -2569,8 +2625,9 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
     SEAM_STOP_MESSAGE and the scene is released. Queued by a batch after
     its loop was made (`batch`), nobody was asked: as when the batch finds
     the jump at generate time, the scene goes back to "planned" with a
-    needs_look event, and the render row ends "cancelled" (no failure
-    event, no alert)."""
+    needs_look event, and the render row ends "cancelled" with the reason
+    in its error (no failure event, no alert). A batch render also stops
+    and asks when the join can't be measured at all (SEAM_UNMEASURED_MESSAGE)."""
     from .pipeline import RenderCancelled, _check_cancel, _music_path_if_any
 
     project = db.get(models.VideoProject, project_id)
@@ -2601,6 +2658,9 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
 
     # Tiling is local FFmpeg work: nothing is billed at render time. The
     # provider spend was incurred (and recorded) when the loop was generated.
+    # What the claim holds while this render runs ("" once a job took a
+    # plain claim over): a seam stop releases the scene only if it still is.
+    claim_token = project.claim_token or ""
     render = models.Render(project_id=project.id, status="rendering", estimated_cost=0.0)
     db.add(render)
     project.status = "generating"
@@ -2622,6 +2682,11 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
             # or skipped a variation): don't render an hour of a jumping
             # loop nobody agreed to.
             raise SeamJumpStop(SEAM_STOP_MESSAGE, treatment)
+        if (batch and not accept_seam and cfg.source == "video" and cfg.seam_mode == "auto"
+                and treatment["basis"] == "plan"):
+            # Nobody was asked and even the worker's own reading failed: the
+            # render can't tell whether the loop jumps. Ask, as the page does.
+            raise SeamJumpStop(SEAM_UNMEASURED_MESSAGE, treatment)
         seam = float(treatment["blend_seconds"])
         outputs = compose_ambient(
             AmbientRenderInputs(
@@ -2686,22 +2751,8 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
     except SeamJumpStop as e:
         # Not a fault (no alert, no retry): the render stops and says why;
         # the scene is free to render again from the page.
-        log.info("ambient render of scene %s stopped: visible jump at the join", project.id)
-        if batch:
-            # Nobody was asked: ask now, as the batch does when it finds
-            # the jump at generate time.
-            render.status = "cancelled"
-            render.error = str(e)
-            project.status = "planned"
-            events.ambient_seam_event(db, project, e.treatment)
-            db.commit()
-            return render
-        render.status = "failed"
-        render.error = str(e)
-        project.status = "failed"
-        events.render_event(db, render, project, "failed", error=str(e))
-        db.commit()
-        return render
+        log.info("ambient render of scene %s stopped at the join: %s", project.id, e)
+        return _stop_for_seam(db, project, render, e, batch=batch, claim_token=claim_token)
     except Exception as e:  # noqa: BLE001
         log.exception("ambient render failed")
         render.status = "failed"

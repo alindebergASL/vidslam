@@ -425,12 +425,19 @@ export type Render = {
   version_label?: string;
 };
 
+/** A render that stopped itself to ask (an Ambient loop that jumps at the
+ * join, or whose join couldn't be measured): status "cancelled" with the
+ * reason in `error`. A cancel by the person leaves `error` empty. */
+export function renderStopped(r: Pick<Render, "status" | "error">): boolean {
+  return r.status === "cancelled" && !!r.error;
+}
+
 /** The label to show for a render, whatever the backend sent. */
-export function renderLabel(r: Pick<Render, "status" | "version" | "version_label">): string {
+export function renderLabel(r: Pick<Render, "status" | "version" | "version_label"> & { error?: string }): string {
   if (r.version_label) return r.version_label;
   if (r.version != null) return `Version ${r.version}`;
   if (r.status === "failed") return "Failed attempt";
-  if (r.status === "cancelled") return "Cancelled attempt";
+  if (r.status === "cancelled") return r.error ? "Stopped: loop needs a look" : "Cancelled attempt";
   return r.status === "completed" ? "Version" : "In progress";
 }
 

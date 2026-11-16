@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import { api, Render, renderLabel } from "@/lib/api";
+import { api, Render, renderLabel, renderStopped } from "@/lib/api";
 import { StatusBadge } from "./StatusBadge";
 import { useEvents, useLiveConnected } from "./NotificationsProvider";
 import { usePoll } from "@/lib/usePoll";
@@ -73,6 +73,8 @@ export function RenderHistory({
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
         {renders.map((r) => {
           const completed = r.status === "completed";
+          // Stopped to ask (not cancelled by the person): say why in full.
+          const stopped = renderStopped(r);
           const isLatest = r.id === latest.id;
           const label = renderLabel(r);
           const canCompare =
@@ -95,7 +97,7 @@ export function RenderHistory({
                     />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center text-ink-400 text-xs px-2 text-center">
-                      {statusLabel(r.status)}
+                      {stopped ? "Stopped: loop needs a look" : statusLabel(r.status)}
                     </div>
                   )}
                   {isLatest && (
@@ -107,13 +109,16 @@ export function RenderHistory({
                 <div className="p-3">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-medium min-w-0 truncate" title={label}>{label}</span>
-                    <StatusBadge status={r.status} />
+                    <StatusBadge status={stopped ? "stopped" : r.status} />
                   </div>
                   <div className="text-[10px] text-ink-400 mt-1">
                     {new Date(r.created_at).toLocaleString()}
                   </div>
                   {r.error && (
-                    <div className="text-[10px] text-accent mt-1 truncate" title={r.error}>
+                    <div
+                      className={`text-[10px] text-accent mt-1 ${stopped ? "line-clamp-4" : "truncate"}`}
+                      title={r.error}
+                    >
                       {r.error}
                     </div>
                   )}

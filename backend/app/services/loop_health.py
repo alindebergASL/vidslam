@@ -28,7 +28,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PIL import Image, ImageChops, ImageStat
 from sqlalchemy.orm import Session
@@ -76,10 +76,15 @@ PART_ABANDONED_SECONDS = 600  # a half-written preview older than this is a cras
 # ---------- frame reading ----------
 
 
-def _probe(clip: Path) -> tuple[float, tuple[int, int]]:
+def _probe(clip: Path, budget: Optional[Callable[[], float]] = None) -> tuple[float, tuple[int, int]]:
+    """Duration and size. `budget`: asked before each ffprobe for the
+    seconds it may take (a measurement under a deadline); None: no limit."""
     from .renderer import _probe_duration, _probe_size
 
-    return _probe_duration(clip), (_probe_size(clip) or (16, 9))
+    if budget is None:
+        return _probe_duration(clip), (_probe_size(clip) or (16, 9))
+    duration = _probe_duration(clip, timeout=budget())
+    return duration, (_probe_size(clip, timeout=budget()) or (16, 9))
 
 
 def _analysis_size(size: tuple[int, int]) -> tuple[int, int]:
@@ -239,8 +244,9 @@ def measure(clip: Path, *, still: bool = False, timeout: float = MEASURE_TIMEOUT
             raise TimeoutError("the measurement ran out of time")
         return min(timeout, left)
 
-    duration, size = _probe(clip)
+    duration, size = _probe(clip, budget if deadline is not None else None)
     if duration <= 0:
+        budget()  # a probe that ran out of time: TimeoutError, not "unreadable"
         raise RuntimeError("could not read the clip")
     asize = _analysis_size(size)
     fps = min(SAMPLE_FPS, MAX_SAMPLES / duration)

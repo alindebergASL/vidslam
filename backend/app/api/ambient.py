@@ -489,7 +489,11 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
     from ..services import loop_health
 
     cfg = svc._config_of(project)
-    if cfg.source == "video" and loop_health.current_entry(project, shot) is None:
+    # The reading can only change the answer when the gate applies: not
+    # after "Render anyway", and not in seam_mode "blend" (the worker still
+    # measures before it renders).
+    gated = not accept_seam and cfg.seam_mode == "auto"
+    if gated and cfg.source == "video" and loop_health.current_entry(project, shot) is None:
         # The loop clip has no current reading: measure it now (local, a few
         # seconds). Its reading alone decides whether the request can tell
         # if the loop jumps; variations are left to the worker.
@@ -519,7 +523,9 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
     # second tab can't queue a second render, and the page keeps polling
     # while the job waits for a worker.
     previous = project.status
-    token = uuid.uuid4().hex
+    # The token carries accept_seam to the worker (no new job argument: a
+    # worker deployed before the web would reject one).
+    token = svc.render_claim_token(accept_seam)
     claimed = (
         db.query(models.VideoProject)
         .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
@@ -531,7 +537,7 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
     try:
         # The job consumes the token before rendering: cancelled while
         # queued (or replaced by a newer claim) → it does nothing.
-        job_id = enqueue(render_ambient_job, scene_id, claim_token=token, accept_seam=accept_seam)
+        job_id = enqueue(render_ambient_job, scene_id, claim_token=token)
     except Exception:
         db.query(models.VideoProject).filter(
             models.VideoProject.id == project.id, models.VideoProject.status == "generating",
