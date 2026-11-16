@@ -187,28 +187,44 @@ def classifier_text(prompt: str, negative: str = "", context: str = "") -> str:
 # Look-alikes of the app's labels in a user's text, read on a skeleton of
 # it (_skeleton): "story" (or "story's", "storys", "stories") then
 # "context", "facts" or "notes"; "context" then "from the app"; "from the
-# app" by itself; "user" then "text"; and "first-person narrator" ("1st
-# person narrator", "narrator (first person)"). Any run of non-letters,
-# newlines included, may come between the words and between the letters
-# of a word ("Story\ncontext", "Story_context", "S t o r y context",
-# "STORY  con​text"); with or without a colon.
+# app" by itself; "user" then "text"; "app" or "system" then "note",
+# "message", "context" or "facts"; and "first-person narrator" ("1st
+# person narrator", "narrator (first person)"). A few non-letters, newlines
+# included, may come between the letters of a word (up to 6) and between
+# the words (up to 12): "Story\ncontext", "Story_context", "S t o r y
+# context", "STORY  con​text"; with or without a colon. A digit that looks like
+# a letter counts as it (_DIGIT_LOOKALIKES: "St0ry c0ntext (fr0m the app)").
+# The gaps are bounded and every branch starts with a letter or "(", so a
+# long run of digits, brackets or text with no Latin letters is read in
+# linear time.
+_DIGIT_LOOKALIKES = {"o": "0", "l": "1", "i": "1", "e": "3", "a": "4", "s": "5", "t": "7"}
+_LETTER_GAP = "[^a-z]{0,6}"
+_WORD_GAP = "[^a-z]{0,12}"
+
+
+def _letter(c: str) -> str:
+    d = _DIGIT_LOOKALIKES.get(c)
+    return f"[{c}{d}]" if d else re.escape(c)
+
+
 def _spaced(*words: str) -> str:
-    """`words` in order, any run of non-letters between them and between
-    their letters; a word may be a regex alternation of plain words."""
+    """`words` in order, a few non-letters between them and between their
+    letters (a letter may be a digit that looks like it); a word may be a
+    regex alternation of plain words."""
     def one(word: str) -> str:
-        return "(?:" + "|".join(_GAP.join(w) for w in word.split("|")) + ")"
+        return "(?:" + "|".join(_LETTER_GAP.join(_letter(c) for c in w) for w in word.split("|")) + ")"
 
-    return _GAP.join(one(w) for w in words)
+    return _WORD_GAP.join(one(w) for w in words)
 
 
-_GAP = "[^a-z]*"
 _APP = _spaced("from", "the", "app")
 _LOOKALIKE_RE = re.compile(
     r"(?<![a-z])(?:"
-    rf"{_spaced('story|storys|stories', 'context|contexts|fact|facts|note|notes')}(?:{_GAP}{_APP})?|"
-    rf"{_spaced('context|contexts')}{_GAP}{_APP}|"
-    rf"\({_GAP}{_APP}|{_APP}|"
+    rf"{_spaced('story|storys|stories', 'context|contexts|fact|facts|note|notes')}(?:{_WORD_GAP}{_APP})?|"
+    rf"{_spaced('context|contexts')}{_WORD_GAP}{_APP}|"
+    rf"\({_WORD_GAP}{_APP}|{_APP}|"
     rf"{_spaced('user', 'text|texts')}|"
+    rf"{_spaced('app|system', 'note|notes|message|messages|context|contexts|fact|facts')}|"
     rf"{_spaced('first|1st', 'person', 'narrator|narrators|narration')}|"
     rf"{_spaced('narrator|narration', 'first|1st', 'person')}"
     r")(?![a-z])")
@@ -263,13 +279,15 @@ def quote_marks(text: str) -> str:
     if not text:
         return text
     skel, where = _skeleton(text)
-    out = text
-    for m in reversed(list(_LOOKALIKE_RE.finditer(skel))):
-        if skel[:m.start()].rstrip().endswith(QUOTED.strip()):
+    pieces: list[str] = []
+    last = 0
+    for m in _LOOKALIKE_RE.finditer(skel):
+        if skel[max(0, m.start() - 64):m.start()].rstrip().endswith(QUOTED.strip()):
             continue
         at = where[m.start()]
-        out = out[:at] + QUOTED + out[at:]
-    return out
+        pieces += [text[last:at], QUOTED]
+        last = at
+    return "".join(pieces) + text[last:] if pieces else text
 
 
 # ---------- model ----------
