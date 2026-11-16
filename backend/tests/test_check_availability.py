@@ -49,27 +49,32 @@ def test_every_preset_is_vetted_and_nothing_else_is():
     assert {vetted_audio.vetted_hash(t) for t in presets} == set(vetted_audio.VETTED)
 
 
-@pytest.mark.parametrize("text", _presets())
-def test_each_preset_passes_the_vetting(text):
+# The presets are read inside each test, never at collection: importing
+# services.ambient at collection would import storage and db before any
+# test's DATA_DIR is set, leaving them on the default ./data for the run.
+
+
+def test_each_preset_passes_the_vetting():
     """What vetting a preset means: no minor, nothing sexual or marked, and
     the checks (word filter, mock judge, mock content check) pass it."""
     from app.services import story_script
 
-    safety.check_prompt(text)
-    assert not safety.mentions_minor(text) and not safety.mentions_minor_wide(text)
-    assert not safety.is_sexual(text) and not safety.is_hard_sexual(text)
-    assert not minor_check.minor_hint(text) and not minor_check.sexual_any(text)
-    assert story_script.safety_text(text, prose=True) == story_script.normalize(text)
-    assert mock_chat.mock_minor_verdict(text)["minor_sexual"] is False
+    for text in _presets():
+        safety.check_prompt(text)
+        assert not safety.mentions_minor(text) and not safety.mentions_minor_wide(text), text
+        assert not safety.is_sexual(text) and not safety.is_hard_sexual(text), text
+        assert not minor_check.minor_hint(text) and not minor_check.sexual_any(text), text
+        assert story_script.safety_text(text, prose=True) == story_script.normalize(text), text
+        assert mock_chat.mock_minor_verdict(text)["minor_sexual"] is False, text
 
 
-@pytest.mark.parametrize("text", _presets())
-def test_a_preset_needs_no_live_call(text):
+def test_a_preset_needs_no_live_call():
     from app.providers.registry import audio_guard
 
     mock_chat.MINOR_REPLY = TimeoutError("the check is down")
-    audio_guard(text)
-    assert mock_chat.MINOR_CALLS == []
+    for text in _presets():
+        audio_guard(text)
+        assert mock_chat.MINOR_CALLS == [], text
 
 
 @pytest.mark.parametrize("variant", [
