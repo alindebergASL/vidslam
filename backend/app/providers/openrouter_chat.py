@@ -563,11 +563,25 @@ def _clean_reply(reply: str) -> str:
     return _INVISIBLE_LEAD_RE.sub("", str(reply or "")).strip()
 
 
-def strict_json(reply: str) -> dict:
+class _Pairs(dict):
+    """A JSON object as json.loads reads it (the last value of a key twice
+    over), with `pairs`: every key and value as written, duplicates kept."""
+
+    pairs: list = []
+
+
+def _keep_pairs(pairs: list) -> dict:
+    out = _Pairs(pairs)
+    out.pairs = pairs
+    return out
+
+
+def strict_json(reply: str, *, pairs: bool = False) -> dict:
     """The one JSON object a story safety reply must be: the whole reply, or
     the whole inside of one code fence (```json ... ```). Prose around it,
     a second object, or anything else raises ValueError: on the story path
-    the check never guesses which part of a reply is the answer."""
+    the check never guesses which part of a reply is the answer. `pairs`:
+    every object keeps a key's every value (_Pairs)."""
     text = _clean_reply(reply)
     if text.startswith("```"):
         if not text.endswith("```") or len(text) < 6 or text.count("```") != 2:
@@ -577,7 +591,7 @@ def strict_json(reply: str) -> dict:
             text = text[4:].strip()
     if not text.startswith("{") or not text.endswith("}"):
         raise ValueError(f"not a single JSON object: {text[:120]!r}")
-    data = json.loads(text)
+    data = json.loads(text, object_pairs_hook=_keep_pairs if pairs else None)
     if not isinstance(data, dict):
         raise ValueError("not a JSON object")
     return data
@@ -765,53 +779,80 @@ class ModelDeclined(ValueError):
     """The safety check model answered with a refusal instead of a verdict."""
 
 
-# The first word of a string verdict, past any spaces and punctuation in
-# front ("True.", "yes - a child", '"yes"'); and an exact no, with only
-# punctuation after it ("No.", "false!").
+# The first word of a string verdict ("True.", "yes - a child", '"yes"',
+# "1"); and an exact no ("No.", "false!"). Punctuation and spaces around a
+# string verdict are taken off first.
 _FIRST_WORD_RE = re.compile(r"[\W_]*([a-z0-9]+)")
-_EXACT_NO_RE = re.compile(r"(?:false|no)[.!?]*")
+_EXACT_NO_RE = re.compile(r"(?:false|no)")
+_YES_WORDS = frozenset(("true", "yes", "1", "y", "t"))
+_VERDICT_KEY = "minor_sexual"
 
 
 def _lenient_verdict(value) -> Optional[bool]:  # noqa: ANN001
     """A "minor_sexual" value as the lenient reading takes it: a bool as it
-    is; the number 1 as True; a list as True when any item reads True; a
-    string (zero-width characters and spaces taken off, any case) as True
-    when its first word is "true" or "yes" ("True.", "TRUE!", "yes - a
-    child"), as False only when it is exactly "false" or "no", with at most
-    trailing punctuation ("No.", "false!"); anything else None (unreadable),
-    so a string can't hide a "true" behind a no."""
+    is; the number 1 (or 1.0) as True; a list as True when any item reads
+    True; a string (NFKC, zero-width characters, spaces and punctuation
+    around it taken off, any case) as True when its first word is "true",
+    "yes", "1", "y" or "t" ("True.", "TRUE!", "yes - a child", "ｙｅｓ"),
+    as False only when it is exactly "false" or "no" ("No.", "false!");
+    anything else None (unreadable), so a string can't hide a "true"
+    behind a no."""
     if isinstance(value, bool):
         return value
-    if isinstance(value, int):
+    if isinstance(value, (int, float)):
         return True if value == 1 else None
     if isinstance(value, list):
         return True if any(_lenient_verdict(v) is True for v in value) else None
     if isinstance(value, str):
-        text = "".join(c for c in value if unicodedata.category(c) != "Cf").strip().lower()
+        text = unicodedata.normalize("NFKC", value)
+        text = "".join(c for c in text if unicodedata.category(c) not in ("Cf", "Cc", "Zl", "Zp"))
+        text = text.strip(" \t\n" + "".join(chr(c) for c in range(33, 127) if not chr(c).isalnum()))
+        text = text.strip().casefold()
         first = _FIRST_WORD_RE.match(text)
-        if first and first.group(1) in ("true", "yes"):
+        if first and first.group(1) in _YES_WORDS:
             return True
         if _EXACT_NO_RE.fullmatch(text):
             return False
     return None
 
 
+def _verdict_values(data) -> list:  # noqa: ANN001
+    """Every value of a "minor_sexual" key (any case) anywhere in `data`, a
+    parsed reply: in nested objects and lists, every value of a key written
+    twice (_Pairs) included."""
+    out: list = []
+    stack = [data]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            pairs = item.pairs if isinstance(item, _Pairs) else list(item.items())
+            for key, value in pairs:
+                if isinstance(key, str) and key.casefold() == _VERDICT_KEY:
+                    out.append(value)
+                stack.append(value)
+        elif isinstance(item, list):
+            stack.extend(item)
+    return out
+
+
 def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
     """{"minor_sexual": bool, "reason": str} from a classifier reply; raises
     ModelDeclined on a refusal, ValueError on anything else. Read leniently
     (a fenced block, or the JSON amid prose), as every picture, clip and
-    lip-sync check always was: when any JSON object in the reply has
-    "minor_sexual" true, the verdict is true (a reply that says yes
-    anywhere is never read as no, nor as unreadable: an unreadable reply
-    lets a picture or clip prompt go ahead outside adult mode); otherwise
-    one or more objects that all have "minor_sexual" false are a no. A
-    string starting with "true"/"yes", the number 1 or a list holding a
-    true reads as true, and only an exact "false"/"no" as false
-    (_lenient_verdict); none, or any object whose "minor_sexual" is
-    anything else (a null, "maybe"), is unreadable (json_objects). `strict` (a story part,
-    judged with the story's context) takes one JSON object only
-    (strict_json). A byte order mark or zero-width characters in front are
-    taken off either way."""
+    lip-sync check always was. Every "minor_sexual" value counts, in any
+    case, at any depth, and a key written twice with each of its values
+    (_verdict_values): when any of them reads true, the verdict is true (a
+    reply that says yes anywhere is never read as no, nor as unreadable: an
+    unreadable reply lets a picture or clip prompt go ahead outside adult
+    mode); otherwise one or more values that all read false are a no, and
+    any value that reads neither (a null, "maybe") makes the reply
+    unreadable, never a no. A string whose first word is "true"/"yes"/"1"/
+    "y"/"t", the number 1 or a list holding a true reads as true, and only
+    an exact "false"/"no" as false (_lenient_verdict). `strict` (a story
+    part, judged with the story's context) takes one JSON object only
+    (strict_json) and only JSON true and false: any true value is a yes,
+    all false a no, anything else unreadable. A byte order mark or
+    zero-width characters in front are taken off either way."""
     from ..services.prompting import refusal
 
     reply = _clean_reply(reply)
@@ -820,27 +861,29 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
     if refusal(reply):
         raise ModelDeclined("the safety check model declined to answer")
     if strict:
-        data = strict_json(reply)
-    else:
-        found = [d for d in json_objects(reply) if "minor_sexual" in d]
-        said = [_lenient_verdict(d["minor_sexual"]) for d in found]
-        yes = [d for d, v in zip(found, said, strict=True) if v is True]
-        if yes:
-            # Any true (or a string starting "true"/"yes") is the answer, however
-            # many objects there are.
-            data = {**yes[0], "minor_sexual": True}
-        elif not found or any(v is not False for v in said):
-            # No verdict, or one that isn't a plain false or exactly the
-            # string "false"/"no" (a null, "maybe", "not true", 0): never read
-            # as a no (unreadable).
-            raise ValueError(f"unreadable safety check reply ({len(found)} verdicts): {reply[:120]!r}")
+        data = strict_json(reply, pairs=True)
+        values = _verdict_values(data)
+        if any(v is True for v in values):
+            verdict = True
+        elif values and all(v is False for v in values):
+            verdict = False
         else:
-            # Every verdict says false, however many there are.
-            data = {**found[0], "minor_sexual": False}
-    verdict = data.get("minor_sexual") if isinstance(data, dict) else None
-    if not isinstance(verdict, bool):
-        raise ValueError(f"unreadable safety check reply: {reply[:120]!r}")
-    return {"minor_sexual": verdict, "reason": str(data.get("reason") or "")[:500]}
+            raise ValueError(f"unreadable safety check reply: {reply[:120]!r}")
+        return {"minor_sexual": verdict, "reason": str(data.get("reason") or "")[:500]}
+    found = [(d, _verdict_values(d)) for d in json_objects(reply, pairs=True)]
+    found = [(d, [_lenient_verdict(v) for v in values]) for d, values in found if values]
+    yes = [d for d, said in found if True in said]
+    if yes:
+        # Any true (or a string starting "true"/"yes"), however many values
+        # there are and wherever they are.
+        return {"minor_sexual": True, "reason": str(yes[0].get("reason") or "")[:500]}
+    if not found or any(v is not False for _, said in found for v in said):
+        # No verdict, or one that isn't a plain false or exactly the string
+        # "false"/"no" (a null, "maybe", "not true", 0): never read as a no
+        # (unreadable), even beside a false.
+        raise ValueError(f"unreadable safety check reply ({len(found)} verdicts): {reply[:120]!r}")
+    # Every verdict says false, however many there are.
+    return {"minor_sexual": False, "reason": str(found[0][0].get("reason") or "")[:500]}
 
 
 def parse_explicit_verdict(reply: str) -> dict:
@@ -952,14 +995,16 @@ def _body_error(r: httpx.Response) -> Optional[dict]:
     return None
 
 
-def json_objects(text: str) -> list[dict]:
+def json_objects(text: str, *, pairs: bool = False) -> list[dict]:
     """Every JSON object in a reply, in order: the whole reply when it is
     one, else each balanced {...} span that parses (fenced or amid prose;
     the scan goes on after each one found, so nested objects aren't
-    counted twice)."""
+    counted twice). `pairs`: every object keeps a key's every value
+    (_Pairs)."""
+    hook = _keep_pairs if pairs else None
     text = (text or "").strip()
     try:
-        whole = json.loads(text)
+        whole = json.loads(text, object_pairs_hook=hook)
     except ValueError:
         whole = None
     if isinstance(whole, dict):
@@ -990,7 +1035,7 @@ def json_objects(text: str) -> list[dict]:
         found = None
         if end >= 0:
             try:
-                found = json.loads(text[start:end + 1])
+                found = json.loads(text[start:end + 1], object_pairs_hook=hook)
             except ValueError:
                 found = None
         if isinstance(found, dict):
