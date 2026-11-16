@@ -219,10 +219,10 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
     direction, "(ghosts moaning)", gets a marker after it); the word filter
     of each window reads it without those markers, so a marked direction
     near a child is the model's to judge, not a refusal by the words alone
-    when all it says is an everyday sound ("(ghosts moaning)", "(panting
-    dog)"); an adult voice tag in brackets ("[moans]"), a word that is never
-    an everyday sound ("(orgasmic moans)"), or moaning with a bed or no
-    other source in view still is (minor_check.unmarked). The one exception is
+    when all it says may be an everyday sound ("(ghosts moaning)", "(panting
+    dog)", "(moaning softly)"); an adult voice tag in brackets ("[moans]")
+    or a word that is never an everyday sound ("(orgasmic moans)") still is
+    (minor_check.unmarked). The one exception is
     an app-written preset, word for word (services/vetted_audio.py): vetted
     at test time, so it needs no live call, unless `force` (lyrics or a
     composition plan are joined to it)."""
