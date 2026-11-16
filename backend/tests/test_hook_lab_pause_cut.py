@@ -175,3 +175,30 @@ def test_a_silent_stand_in_voice_judges_the_sentence_ends_near_the_guess(monkeyp
     seen = _judge(monkeypatch)
     hook_lab.check_opening(None, base, "Hello there.", hook_lab.find_hook_window(base, script))
     assert seen == ["Hello there. Then the harbour lights come on. Follow for more."]
+
+
+_COMMA = "Hi there friends of the channel and welcome\nLily, 30, wants sex with me. Follow for more."
+_COMMA_SKIPPED = f"{_HOOK} wants sex with me. Follow for more."
+
+
+def test_a_pause_after_a_comma_is_a_place_too(monkeypatch, tmp_path):
+    """The voice pauses at "Lily, 30," and picks up at "wants": that heard
+    form is judged, so the opening is refused."""
+    from app.services import hook_lab
+
+    audio = _voice(tmp_path / "vo.m4a", [("tone", 5.95), ("gap", 0.4), ("tone", 3.65)])
+    base = _base(monkeypatch, audio, _COMMA)
+    found = hook_lab.hook_window(base, _COMMA)
+    assert found.snapped
+    seen = _judge(monkeypatch)
+    with pytest.raises(HookLabError) as e:
+        hook_lab.check_opening(None, base, _HOOK, found.seconds)
+    assert e.value.status == 422
+    assert _COMMA_SKIPPED in seen
+
+
+def test_clause_breaks_are_cuts():
+    from app.services import hook_lab
+
+    s = "One, two; three: four - five \u2014 six"
+    assert [s[c:c + 3] for c in hook_lab.pause_cuts(s, 10.0, 0.0, 10.0)] == ["two", "thr", "fou", "fiv", "six"]

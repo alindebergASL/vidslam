@@ -14,6 +14,8 @@ import re
 # decimal point ("3.5") or a dot inside a URL is not followed by whitespace,
 # so it is not an end. A line break ends the opening line too.
 _END = re.compile(r"""[.!?…]+["'”’»)\]]*(?=\s|$)|\n""")
+# A clause break a voice may pause at: , ; : or a dash, before a space.
+_CLAUSE = re.compile(r"""(?:[,;:]+["'”’»)\]]*|\s[-–—]+)(?=\s)""")
 
 
 def split_first_sentence(text: str) -> tuple[str, str]:
@@ -346,7 +348,8 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
 def pause_cuts(script: str, total: float, lo: float, hi: float) -> list[int]:
     """The places the voiceover may pick up after a pause found between
     `lo` and `hi` seconds of `total`: the first word after each sentence or
-    line end (.!?…, a line break) whose even-pace time is in that stretch,
+    line end (.!?…, a line break), or clause break (, ; : and dashes, where a
+    voice pauses too), whose even-pace time is in that stretch,
     as character offsets in the stripped script. Ends with nothing after
     them aren't places (nothing of the original is heard)."""
     script = (script or "").strip()
@@ -354,7 +357,7 @@ def pause_cuts(script: str, total: float, lo: float, hi: float) -> list[int]:
     if not n or total <= 0:
         return []
     cuts: list[int] = []
-    for m in _END.finditer(script):
+    for m in sorted([*_END.finditer(script), *_CLAUSE.finditer(script)], key=lambda m: m.end()):
         if not lo <= total * m.end() / n <= hi:
             continue
         after = script[m.end():]
