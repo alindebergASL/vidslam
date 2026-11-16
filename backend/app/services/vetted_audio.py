@@ -5,7 +5,7 @@ leaves and ground...", the spa music) are fixed text in the code. Asking
 the safety check model about them on every scene made an ordinary rain
 bed wait whenever OpenRouter was out of credit or slow, though the words
 can never change. So each preset is vetted at test time instead
-(tests/test_vetted_audio.py reads every one: no minor, nothing sexual, and
+(tests/test_check_availability.py reads every one: no minor, nothing sexual, and
 the checks pass it), and its verdict kept here as a hash of the policy
 version and the EXACT text.
 
