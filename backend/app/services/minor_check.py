@@ -739,20 +739,23 @@ _UNAMBIGUOUS_ADULT_RE = re.compile(
     r"\b(?:orgasm\w*|seduc\w*|erotic\w*|arous\w*|lust(?:ful\w*|ily|ing|ed|s|y)?)\b", re.I)
 # "pleasure" and "climax" are everyday words ("squeals of pleasure", "the
 # music builds to a climax"): they count only in a group that also has a
-# sound word (_SOUND_RE): "moans of pleasure", "climaxing moans", "sighs of
-# pleasure", "(pleasures herself, moaning)".
+# moan or groan (_SOUND_RE): "moans of pleasure", "climaxing moans",
+# "(pleasures herself, moaning)".
 _WITH_SOUND_RE = re.compile(r"\b(?:pleasur\w*|climax\w*|climactic\w*)", re.I)
-_SOUND_RE = re.compile(
-    r"\b(?:moan\w*|groan\w*|pant(?:s|ed|ing)?|sigh(?:s|ed|ing)?|gasp\w*|whimper\w*|breathless\w*|"
-    r"heavy\s+breathing)\b", re.I)
+# Only moans and groans: "gasps of pleasure", "sighs of pleasure" and "the
+# audience gasps at the climax" are everyday sounds, left to the model.
+_SOUND_RE = re.compile(r"\b(?:moan\w*|groan\w*)\b", re.I)
 # The same stems on the group's letters alone (_letters: "o r g a s m i c",
 # "o.r.g.a.s.m.i.c"), where words run together: only stems that start no
 # everyday word and no ordinary pair of words, read across at least three
 # runs of letters, the first one from its start ("carousel", "use duct" and
 # "a rousing" are not them). "lust" is never read there ("cluster").
-_JOINED_ADULT_RE = re.compile(r"orgasm|seduc|erotic|arous")
+# "orgasm", "seduc" and "erotic" are read across two runs or more ("orgas
+# mic", "ero.tic"); "arous" needs three ("a rousing" is two).
+_JOINED_ADULT_RE = re.compile(r"orgasm|seduc|erotic")
+_JOINED_AROUS_RE = re.compile(r"arous")
 _JOINED_WITH_SOUND_RE = re.compile(r"pleasur|climax|climactic")
-_JOINED_SOUND_RE = re.compile(r"moan|groan|gasp|whimper|breathless|heavybreathing")
+_JOINED_SOUND_RE = re.compile(r"moan|groan")
 _LETTER_RUN_RE = re.compile(r"[a-z]+")
 # A bracket group's words that share a stem with an adult voice tag
 # ("[moaning]" for the tag "[moans]", "[flirting]" for "[flirtatious]").
@@ -771,14 +774,14 @@ def _letters(form: str) -> tuple[str, list[int]]:
     return "".join(out), runs
 
 
-def _joined_hit(rx: "re.Pattern", forms: list[str]) -> bool:
+def _joined_hit(rx: "re.Pattern", forms: list[str], span: int = 2) -> bool:
     """Whether `rx` matches the letters of one of `forms` (_letters) across
-    three runs or more, starting at the start of a run."""
+    `span` runs or more, starting at the start of a run."""
     for f in forms:
         letters, runs = _letters(f)
         for m in rx.finditer(letters):
             first, last = runs[m.start()], runs[m.end() - 1]
-            if last - first >= 2 and (m.start() == 0 or runs[m.start() - 1] != first):
+            if last - first >= span - 1 and (m.start() == 0 or runs[m.start() - 1] != first):
                 return True
     return False
 
@@ -789,7 +792,8 @@ def _unambiguous(group: str) -> bool:
     reads (look-alike letters, digits, hidden characters and separators
     folded) and on its letters alone."""
     forms = safety._forms(group)
-    if safety._any(_UNAMBIGUOUS_ADULT_RE, forms) or _joined_hit(_JOINED_ADULT_RE, forms):
+    if (safety._any(_UNAMBIGUOUS_ADULT_RE, forms) or _joined_hit(_JOINED_ADULT_RE, forms)
+            or _joined_hit(_JOINED_AROUS_RE, forms, span=3)):
         return True
     sound = safety._any(_SOUND_RE, forms) or _joined_hit(_JOINED_SOUND_RE, forms)
     return sound and (safety._any(_WITH_SOUND_RE, forms) or _joined_hit(_JOINED_WITH_SOUND_RE, forms))
