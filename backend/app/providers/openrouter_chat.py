@@ -772,8 +772,9 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
     "minor_sexual" true, the verdict is true (a reply that says yes
     anywhere is never read as no, nor as unreadable: an unreadable reply
     lets a picture or clip prompt go ahead outside adult mode); otherwise
-    exactly one object with "minor_sexual" false is a no, and none, or two
-    or more, is unreadable (json_objects). `strict` (a story part,
+    one or more objects that all have "minor_sexual" false are a no; none,
+    or any object whose "minor_sexual" isn't a true/false (a string "true",
+    say), is unreadable (json_objects). `strict` (a story part,
     judged with the story's context) takes one JSON object only
     (strict_json). A byte order mark or zero-width characters in front are
     taken off either way."""
@@ -787,16 +788,17 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
     if strict:
         data = strict_json(reply)
     else:
-        found = [d for d in json_objects(reply) if isinstance(d.get("minor_sexual"), bool)]
+        found = [d for d in json_objects(reply) if "minor_sexual" in d]
         yes = [d for d in found if d["minor_sexual"] is True]
         if yes:
             # Any "true" is the answer, however many objects there are.
             data = yes[0]
-        elif len(found) != 1:
-            # None, or several "false": never a guess at which one is the
-            # answer (unreadable).
+        elif not found or any(d["minor_sexual"] is not False for d in found):
+            # No verdict, or one that isn't a plain false (a string "true",
+            # a null): never read as a no (unreadable).
             raise ValueError(f"unreadable safety check reply ({len(found)} verdicts): {reply[:120]!r}")
         else:
+            # Every verdict says false, however many there are.
             data = found[0]
     verdict = data.get("minor_sexual") if isinstance(data, dict) else None
     if not isinstance(verdict, bool):

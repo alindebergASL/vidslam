@@ -5,8 +5,9 @@ A picture or clip reply is read leniently. With two or more verdict
 objects in it, the reply was unreadable, and an unreadable reply is "the
 check couldn't run": outside adult mode a picture or clip prompt with no
 plainly sexual word then goes ahead with no verdict at all. Now any
-"minor_sexual": true in the reply is the answer (refused); only several
-"false" objects (and none) stay unreadable.
+"minor_sexual": true in the reply is the answer (refused); a reply whose
+verdicts all say false is a no (test_minor_verdict_all_false.py), and one
+with none stays unreadable.
 """
 from __future__ import annotations
 
@@ -37,9 +38,8 @@ def test_any_true_verdict_is_read_as_true(reply):
     assert parse_minor_verdict(reply)["minor_sexual"] is True
 
 
-@pytest.mark.parametrize("reply", ['{"minor_sexual": false, "reason": "a"}\n{"minor_sexual": false, "reason": "b"}',
-                                   "no verdict here"])
-def test_several_false_or_none_stay_unreadable(reply):
+@pytest.mark.parametrize("reply", ["no verdict here"])
+def test_no_verdict_stays_unreadable(reply):
     from app.providers.openrouter_chat import parse_minor_verdict
 
     with pytest.raises(ValueError):
