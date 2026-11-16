@@ -683,34 +683,89 @@ def story_word_filter(text: str) -> None:
 # marker safety_text added.
 _GROUP_BEFORE_MARKER_RE = re.compile(r"(?:\[([^\]]*)\]|\(([^()\n]*)\)|\*([^*\n]+)\*)\s*$")
 # The words of an adult direction that also name everyday sounds ("panting
-# dog", "ghosts moaning", "breathless excitement", "sighs of relief").
-_AMBIGUOUS_ADULT_RE = re.compile(r"\b(?:moan\w*|pant(?:s|ed|ing)?|breathless\w*|sigh\w*)\b", re.I)
+# dog", "ghosts moaning", "breathless excitement", "sighs of relief"), each
+# with its stem: a group with two or more different stems ("moaning and
+# panting", "breathless moans", "heavy breathing, moaning") is never an
+# everyday sound.
+_AMBIGUOUS_STEMS = {
+    "moan": r"moan\w*",
+    "pant": r"pant(?:s|ed|ing)?",
+    "breathless": r"breathless\w*",
+    "sigh": r"sigh\w*",
+    "heavy breathing": r"heav(?:y|ily)\W+breath\w*|breath\w*\W+heav(?:y|ily)",
+}
+_STEM_RES = {k: re.compile(rf"\b(?:{v})\b", re.I) for k, v in _AMBIGUOUS_STEMS.items()}
+_AMBIGUOUS_ADULT_RE = re.compile(r"\b(?:" + "|".join(_AMBIGUOUS_STEMS.values()) + r")\b", re.I)
 # ... and those that never do: a group with one of these (or any word the
 # filter knows as sexual) keeps its marker, so it is refused next to a
 # minor by the words ("little boy (orgasmic moans)", "kid voice (lustful
-# sighs)", "young teen girl (sultry whispers)").
+# sighs)", "young teen girl (sultry whispers)", "little girl (moans of
+# pleasure)", "little girl (climaxing moans)").
 _PLAIN_ADULT_RE = re.compile(
-    r"\b(?:orgasm\w*|seduct\w*|sultr\w*|flirt\w*|"
-    r"lust(?:s|ed|ing|ful|fully|fulness|y|ier|iest|ily|iness)?)\b", re.I)
-# A bed in the prompt: moaning, panting or breathlessness there, next to a
-# minor, is refused by the words ("kids playing (moaning and panting
-# intensely, bed creaking)", "girl aged 9, (moaning softly), bedroom").
+    r"\b(?:pleasur\w*|climax\w*|arous\w*|erotic\w*|ecsta\w*|orgasm\w*|seduct\w*|sultr\w*|flirt\w*|"
+    r"sensual\w*|lust(?:s|ed|ing|ful|fully|fulness|y|ier|iest|ily|iness)?)\b", re.I)
+# A bed in the prompt: moaning there, next to a minor, is refused by the
+# words ("girl aged 9, (moaning softly), bedroom"). Only for moaning:
+# panting, a sigh or breathlessness alone is the model's to judge ("Kids'
+# bedroom ambience at night (panting dog)").
 _BED_RE = re.compile(r"\b(?:beds?|bedrooms?|bed ?sheets?|mattress(?:es)?|under the covers)\b", re.I)
 _MOAN_RE = re.compile(r"\bmoan\w*", re.I)
-# What may moan in a sound prompt without a person doing it: ghosts and a
-# haunted house, the wind, a ship, old timbers, cattle, whales. Moaning
-# with none of these named ("a 10 year old *moaning*") keeps its marker.
+# Why someone moans that has nothing to do with sex (pain, illness, a
+# hospital or the dentist), or a spooky setting where the moaning is a
+# ghost's: these count in the group or in the same clause as it (between
+# the commas, full stops or line ends around it): "Kid with a stomach ache
+# (moaning in pain)", "Toddler with a fever, (moaning softly) in the
+# hospital", "Little boy at the dentist (moaning)", "Haunted house for kids
+# (moaning)".
+_MOAN_CAUSE_RE = re.compile(
+    r"\b(?:pain\w*|aches?|aching|achy|(?:stomach|tummy|head|tooth|ear)aches?|hurt\w*|sore|fevers?|feverish|"
+    r"sick\w*|ill|illness\w*|injur\w*|wound\w*|patients?|hospital\w*|dentists?|dental|"
+    r"ghosts?|ghostly|ghouls?|spirits?|phantoms?|spectres?|specters?|zombies?|undead|mumm(?:y|ies)|"
+    r"haunted|haunting|halloween|spooky)\b", re.I)
+# Things that moan by themselves (the wind, a ship, old timbers, cattle,
+# whales): only when they are what moans, named in the group ("(wind
+# moaning through the trees)") or right before it ("the old ship
+# (moaning)"); elsewhere they are just more sounds in the scene ("little
+# girl (moaning) creaky floorboards", "girl aged 9 (moaning softly), wind
+# outside" keep the marker).
 _MOAN_SOURCE_RE = re.compile(
-    r"\b(?:ghosts?|ghostly|ghouls?|spirits?|phantoms?|spectres?|specters?|spooky|zombies?|undead|"
-    r"mumm(?:y|ies)|monsters?|creatures?|haunted|haunting|halloween|wind|winds|gales?|storms?|"
-    r"ships?|hulls?|timbers?|floorboards?|doors?|hinges?|trees?|branches|pipes?|foghorns?|engines?|"
-    r"cattle|cows?|whales?|wol(?:f|ves))\b", re.I)
+    r"\b(?:wind|winds|gales?|storms?|ships?|hulls?|timbers?|floorboards?|doors?|hinges?|trees?|branches|"
+    r"pipes?|foghorns?|engines?|cattle|cows?|whales?|wol(?:f|ves)|monsters?|creatures?)\b", re.I)
+_CLAUSE_END_RE = re.compile(r"[,.;:!?\n]")
+_LAST_WORD_RE = re.compile(r"(\w+)(?:'s|')?\W*$")
 
 
-def _keeps_marker(group: str, square: bool, text: str) -> bool:
+def _moan_explained(group: str, text: str, start: int, end: int) -> bool:
+    """Whether moaning in `group` (at text[start:end], brackets included)
+    has a named everyday cause or source (_MOAN_CAUSE_RE, _MOAN_SOURCE_RE)."""
+    if _MOAN_CAUSE_RE.search(group) or _MOAN_SOURCE_RE.search(group):
+        return True
+    ends = [m.start() for m in _CLAUSE_END_RE.finditer(text, 0, start)]
+    after = _CLAUSE_END_RE.search(text, end)
+    clause = text[(ends[-1] + 1 if ends else 0):start] + " " + text[end:after.start() if after else len(text)]
+    if _MOAN_CAUSE_RE.search(clause):
+        return True
+    word = _LAST_WORD_RE.search(text[(ends[-1] + 1 if ends else 0):start])
+    return bool(word and _MOAN_SOURCE_RE.fullmatch(word.group(1)))
+
+
+def _keeps_marker(group: str, square: bool, text: str, start: int = 0, end: int = 0) -> bool:
     """Whether a "(seductive)" marker safety_text put after `group` (a
-    direction group of `text`; `square`: in [brackets]) stays for the word
-    filter, so the group is refused next to a minor by the words alone."""
+    direction group of `text` at text[start:end]; `square`: in [brackets])
+    stays for the word filter, so the group is refused next to a minor by
+    the words alone. It stays for:
+    - an adult voice tag in [brackets] ("[moans]", "[panting]");
+    - a word that is never an everyday sound (_PLAIN_ADULT_RE: "orgasmic",
+      "pleasure", "climaxing"; any other adult stem; any word the filter
+      knows as sexual);
+    - two or more different everyday adult words in one group (_AMBIGUOUS_STEMS:
+      "breathless moans", "heavy breathing, moaning");
+    - moaning by itself, with a bed anywhere in the text, or with no named
+      cause or source (_moan_explained): "a 10 year old *moaning*", "little
+      girl (moaning) creaky floorboards"; not "(ghosts moaning)", "Kid with
+      a stomach ache (moaning in pain)".
+    Panting, a sigh, breathlessness or heavy breathing by itself goes to the
+    model, whatever else the text says ("(panting dog)" in a kids' bedroom)."""
     from . import story_script
 
     if square and any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
@@ -721,9 +776,13 @@ def _keeps_marker(group: str, square: bool, text: str) -> bool:
     if story_script._ADULT_STEM_RE.search(_AMBIGUOUS_ADULT_RE.sub(" ", group)):
         # An adult word that isn't one of the everyday ones.
         return True
+    if sum(1 for rx in _STEM_RES.values() if rx.search(group)) >= 2:
+        return True
+    if not _MOAN_RE.search(group):
+        return False
     if _BED_RE.search(text):
         return True
-    return bool(_MOAN_RE.search(group)) and not _MOAN_SOURCE_RE.search(text)
+    return not _moan_explained(group, text, start, end or start + len(group))
 
 
 def unmarked(text: str) -> str:
@@ -735,9 +794,10 @@ def unmarked(text: str) -> str:
     stays (_keeps_marker), refused next to a minor by the words, after an
     adult voice tag in [brackets] ("[moans]", "[lustful]"), a group with a
     word that is never an everyday sound ("(orgasmic moans)", "(lustful
-    sighs)", "(sultry whispers)"), moaning, panting or breathlessness in a
-    prompt with a bed in it, and moaning that nothing but a person could
-    be doing ("a 10 year old *moaning*"; not "(ghosts moaning)")."""
+    sighs)", "(sultry whispers)"), two everyday adult words in one group
+    ("(breathless moans)"), and moaning in a prompt with a bed in it or
+    with no named cause or source ("a 10 year old *moaning*"; not "(ghosts
+    moaning)" or "(moaning in pain)")."""
     from . import story_script
 
     seductive = f"({story_script._ADULT_TAG_WORD})"
@@ -749,7 +809,9 @@ def unmarked(text: str) -> str:
         if not before:
             return " "
         group = next((g for g in before.groups() if g is not None), "")
-        return m.group(0) if _keeps_marker(group, before.group(1) is not None, m.string) else " "
+        keep = _keeps_marker(group, before.group(1) is not None, m.string, before.start(),
+                             before.start() + len(before.group(0).rstrip()))
+        return m.group(0) if keep else " "
 
     return story_script._MARKER_RE.sub(drop, text or "")
 
