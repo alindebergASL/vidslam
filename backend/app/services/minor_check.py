@@ -700,32 +700,94 @@ def story_word_filter(text: str) -> None:
 # A direction group (brackets, parentheses or asterisks) right before a
 # marker safety_text added.
 _GROUP_BEFORE_MARKER_RE = re.compile(r"(?:\[([^\]]*)\]|\(([^()\n]*)\)|\*([^*\n]+)\*)\s*$")
-# Words that are never an everyday sound, whole words only: a marked group
-# with one of them keeps its marker, so it is refused next to a minor by
-# the words ("little boy (orgasmic moans)", "kid voice (lustful sighs)",
-# "little girl (moans of pleasure)"). Everything else a group may say
-# (moaning, panting, sighs, gasps, breathlessness, heavy breathing) is the
-# model's to judge, with the marker in front of it: "sultan", "lustrous"
-# and "painting" are not these words.
+# Words that are never an everyday word (_UNAMBIGUOUS_ADULT_RE, whole
+# words, any ending): a marked group with one of them keeps its marker, so
+# it is refused next to a minor by the words ("little boy (orgasmic moans)",
+# "kid voice (lustful sighs)", "(seduced, moaning)", "(eroticism, moaning)").
+# "lust" takes only its own endings ("lustrous", "lustre" are not it).
 _UNAMBIGUOUS_ADULT_RE = re.compile(
-    r"\b(?:orgasms?|orgasmic|orgasming|climax|climaxes|climaxing|pleasure|pleasured|pleasuring|"
-    r"aroused|arousal|arousing|erotic|erotically|seductive|seductively|seduce|seducing|sultry|"
-    r"lustful|lusty|lusting|sensual|sensually|flirty|flirting|flirtatious)\b", re.I)
+    r"\b(?:orgasm\w*|seduc\w*|erotic\w*|arous\w*|lust(?:ful\w*|ily|ing|ed|s|y)?)\b", re.I)
+# "pleasure" and "climax" are everyday words ("squeals of pleasure", "the
+# music builds to a climax"): they count only in a group that also has a
+# sound word (_SOUND_RE): "moans of pleasure", "climaxing moans", "sighs of
+# pleasure", "(pleasures herself, moaning)".
+_WITH_SOUND_RE = re.compile(r"\b(?:pleasur\w*|climax\w*|climactic\w*)", re.I)
+_SOUND_RE = re.compile(
+    r"\b(?:moan\w*|groan\w*|pant(?:s|ed|ing)?|sigh(?:s|ed|ing)?|gasp\w*|whimper\w*|breathless\w*|"
+    r"heavy\s+breathing)\b", re.I)
+# The same stems on the group's letters alone (_letters: "o r g a s m i c",
+# "o.r.g.a.s.m.i.c"), where words run together: only stems that start no
+# everyday word and no ordinary pair of words, read across at least three
+# runs of letters, the first one from its start ("carousel", "use duct" and
+# "a rousing" are not them). "lust" is never read there ("cluster").
+_JOINED_ADULT_RE = re.compile(r"orgasm|seduc|erotic|arous")
+_JOINED_WITH_SOUND_RE = re.compile(r"pleasur|climax|climactic")
+_JOINED_SOUND_RE = re.compile(r"moan|groan|gasp|whimper|breathless|heavybreathing")
+_LETTER_RUN_RE = re.compile(r"[a-z]+")
+# A bracket group's words that share a stem with an adult voice tag
+# ("[moaning]" for the tag "[moans]", "[flirting]" for "[flirtatious]").
+_TAG_STEM_RE = re.compile(r"\b(?:flirt\w*|seduc\w*)", re.I)
+
+
+def _letters(form: str) -> tuple[str, list[int]]:
+    """(letters, runs): `form` (lower case) with everything but a-z taken
+    out, digits that look like letters read as them; runs[i] is the number
+    of the run of letters in `form` that letter i came from."""
+    out: list[str] = []
+    runs: list[int] = []
+    for n, m in enumerate(_LETTER_RUN_RE.finditer(form.lower().translate(safety._LEET))):
+        out.append(m.group(0))
+        runs += [n] * len(m.group(0))
+    return "".join(out), runs
+
+
+def _joined_hit(rx: "re.Pattern", forms: list[str]) -> bool:
+    """Whether `rx` matches the letters of one of `forms` (_letters) across
+    three runs or more, starting at the start of a run."""
+    for f in forms:
+        letters, runs = _letters(f)
+        for m in rx.finditer(letters):
+            first, last = runs[m.start()], runs[m.end() - 1]
+            if last - first >= 2 and (m.start() == 0 or runs[m.start() - 1] != first):
+                return True
+    return False
+
+
+def _unambiguous(group: str) -> bool:
+    """Whether a direction group says something that is never an everyday
+    sound (see _UNAMBIGUOUS_ADULT_RE), read on every form safety's filter
+    reads (look-alike letters, digits, hidden characters and separators
+    folded) and on its letters alone."""
+    forms = safety._forms(group)
+    if safety._any(_UNAMBIGUOUS_ADULT_RE, forms) or _joined_hit(_JOINED_ADULT_RE, forms):
+        return True
+    sound = safety._any(_SOUND_RE, forms) or _joined_hit(_JOINED_SOUND_RE, forms)
+    return sound and (safety._any(_WITH_SOUND_RE, forms) or _joined_hit(_JOINED_WITH_SOUND_RE, forms))
+
+
+def _adult_tag_group(group: str) -> bool:
+    """Whether a [bracket] group names an adult voice tag, or a word that
+    shares its stem ("[moaning]" like "[moans]")."""
+    from . import story_script
+
+    if any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
+        return True
+    forms = safety._forms(group)
+    return safety._any(story_script._ADULT_STEM_RE, forms) or safety._any(_TAG_STEM_RE, forms)
 
 
 def _keeps_marker(group: str, square: bool) -> bool:
     """Whether a "(seductive)" marker safety_text put after `group` (a
     direction group; `square`: in [brackets]) stays for the word filter, so
     the group is refused next to a minor by the words alone: an adult voice
-    tag in [brackets] ("[moans]", "[lustful]"), a word the filter knows as
-    sexual, or a word that is never an everyday sound (_UNAMBIGUOUS_ADULT_RE).
-    Any other group ("(moaning softly)", "(panting dog)") loses it for the
+    tag in [brackets], or a word sharing its stem ("[moans]", "[moaning]",
+    "[lustful]"), a word the filter knows as sexual, or a word that is
+    never an everyday sound (_unambiguous). Any other group ("(moaning
+    softly)", "(panting dog)", "(squeals of pleasure)") loses it for the
     word filter; the model still reads it marked."""
-    from . import story_script
-
-    if square and any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
+    if square and _adult_tag_group(group):
         return True
-    return bool(_UNAMBIGUOUS_ADULT_RE.search(group)) or safety.is_hard_sexual(group)
+    return _unambiguous(group) or safety.is_hard_sexual(group)
 
 
 def unmarked(text: str) -> str:
@@ -737,7 +799,7 @@ def unmarked(text: str) -> str:
     always asked, judges them). A "(seductive)" marker stays, refused next
     to a minor by the words, only after a group _keeps_marker names: an
     adult voice tag in [brackets] or a word that is never an everyday sound
-    ("(orgasmic moans)", "(lustful sighs)", "(sultry whispers)")."""
+    ("(orgasmic moans)", "(lustful sighs)", "(moans of pleasure)")."""
     from . import story_script
 
     seductive = f"({story_script._ADULT_TAG_WORD})"
