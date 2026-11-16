@@ -799,18 +799,22 @@ def _unambiguous(group: str) -> bool:
     return sound and (safety._any(_WITH_SOUND_RE, forms) or _joined_hit(_JOINED_WITH_SOUND_RE, forms))
 
 
-def _adult_tag_group(group: str) -> bool:
-    """Whether a [bracket] group names an adult voice tag, or a word that
-    shares its stem ("[moaning]" like "[moans]")."""
+def _adult_tag_group(group: str, exact: bool = False) -> bool:
+    """Whether a [bracket] group names an adult voice tag, or (unless
+    `exact`, as for a sound or music prompt, where "[moaning wind]" or
+    "[dog panting]" describe a sound) a word that shares its stem
+    ("[moaning]" like "[moans]")."""
     from . import story_script
 
     if any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
         return True
+    if exact:
+        return False
     forms = safety._forms(group)
     return safety._any(story_script._ADULT_STEM_RE, forms) or safety._any(_TAG_STEM_RE, forms)
 
 
-def _keeps_marker(group: str, square: bool) -> bool:
+def _keeps_marker(group: str, square: bool, audio: bool = False) -> bool:
     """Whether a "(seductive)" marker safety_text put after `group` (a
     direction group; `square`: in [brackets]) stays for the word filter, so
     the group is refused next to a minor by the words alone: an adult voice
@@ -818,13 +822,14 @@ def _keeps_marker(group: str, square: bool) -> bool:
     "[lustful]"), a word the filter knows as sexual, or a word that is
     never an everyday sound (_unambiguous). Any other group ("(moaning
     softly)", "(panting dog)", "(squeals of pleasure)") loses it for the
-    word filter; the model still reads it marked."""
-    if square and _adult_tag_group(group):
+    word filter. `audio`: a sound or music prompt, where only an exact adult
+    voice tag in [brackets] counts as one."""
+    if square and _adult_tag_group(group, exact=audio):
         return True
     return _unambiguous(group) or safety.is_hard_sexual(group)
 
 
-def unmarked(text: str) -> str:
+def unmarked(text: str, audio: bool = False) -> str:
     """`text` without the markers story_script.safety_text adds ("(seductive)",
     "(sensual)"): what a word filter reads of a text that was marked for the
     model (`marked` below). The app's marks are for the model to weigh,
@@ -846,7 +851,7 @@ def unmarked(text: str) -> str:
         if not before:
             return " "
         group = next((g for g in before.groups() if g is not None), "")
-        return seductive if _keeps_marker(group, before.group(1) is not None) else " "
+        return seductive if _keeps_marker(group, before.group(1) is not None, audio) else " "
 
     return story_script._MARKER_RE.sub(drop, text or "")
 
@@ -857,7 +862,7 @@ def _word_filter(prompt: str, negative: str, kind: str, marked: bool = False) ->
     filter on the text as written first, so a marker the user typed is still
     read there; here its markers are taken out (unmarked)."""
     if marked:
-        prompt = unmarked(prompt)
+        prompt = unmarked(prompt, audio=kind == "audio")
     if kind == "story":
         story_word_filter(prompt)
     elif kind in ("script", "lipsync"):

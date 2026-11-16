@@ -52,6 +52,14 @@ def _explicit(text: str) -> None:
     explicit_check.check(text or "")
 
 
+# A negated "explicit" or "sexual" in a sound or music prompt ("nothing
+# explicit", "no sexual content", "non-explicit", "without explicit
+# lyrics"), right before a break or the end: not the word itself.
+_NEGATED_ADULT_RE = re.compile(
+    r"\b(?:no|nothing|not|non-?|without)\s*(?:explicit|sexual)"
+    r"(?:\s+(?:content|material|lyrics|themes|language|words))?(?=\s*(?:[,.;:!?)\]]|$))", re.I)
+
+
 def _explicit_prompt(prompt: str) -> None:
     """A clean deployment: a prompt sent to a lip-sync model (its motion)
     gets the explicit-content check (services/explicit_check.py)."""
@@ -228,7 +236,7 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
     composition plan are joined to it)."""
     from ..services import story_pass as passes
     from ..services import vetted_audio
-    from ..services.minor_check import check_long
+    from ..services.minor_check import _word_filter, check_long
     from ..services.safety import UnsafePromptError, check_prompt
     from ..services.story_script import safety_text
 
@@ -236,6 +244,11 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
     text = (prompt or "").strip()
     if not text:
         return
+    if not (context or "").strip():
+        # "family friendly, nothing explicit", "no sexual content": a
+        # negated "explicit" or "sexual" isn't the word itself (the safety
+        # model, always asked below, reads the rest).
+        text = _NEGATED_ADULT_RE.sub(" ", text).strip() or text
     check_prompt(text)
     context = (context or "").strip()
     if context:
@@ -251,10 +264,15 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
             # (services/vetted_audio.py): no live call, so a rain bed
             # doesn't wait on OpenRouter. Anything else is asked.
             return
-        # The word filter read `text` as written (check_prompt above); the
-        # windows' word filter reads it without the markers safety_text adds,
-        # the model with them (minor_check._word_filter).
-        check_long(safety_text(text, "", prose=True), kind="audio", force=force, marked=True)
+        # The word filter read `text` as written (check_prompt above), then
+        # once more with the markers safety_text adds after a direction
+        # group near a minor, of which it keeps only those after an
+        # unmistakable sexual word or an exact adult voice tag
+        # (minor_check.unmarked). The model reads the prompt as the user
+        # wrote it: the markers are the app's notes, which it would read as
+        # the user's ("(waves crashing, seagulls) (sensual)").
+        _word_filter(safety_text(text, "", prose=True), "", "audio", marked=True)
+        check_long(text, kind="audio", force=force)
     _explicit_prompt(text)
 
 
