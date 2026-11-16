@@ -189,17 +189,17 @@ def classifier_text(prompt: str, negative: str = "", context: str = "") -> str:
 # "context", "facts" or "notes"; "context" then "from the app"; "from the
 # app" by itself; "user" then "text"; "app" or "system" then "note",
 # "message", "context" or "facts"; and "first-person narrator" ("1st
-# person narrator", "narrator (first person)"). A few non-letters, newlines
-# included, may come between the letters of a word (up to 6) and between
-# the words (up to 12): "Story\ncontext", "Story_context", "S t o r y
-# context", "STORY  con​text"; with or without a colon. A digit that looks like
-# a letter counts as it (_DIGIT_LOOKALIKES: "St0ry c0ntext (fr0m the app)").
-# The gaps are bounded and every branch starts with a letter or "(", so a
-# long run of digits, brackets or text with no Latin letters is read in
-# linear time.
+# person narrator", "narrator (first person)"). The skeleton has every run
+# of non-letters (spaces, newlines, punctuation, symbols, other scripts) as
+# one space, so a label is found however many come between its letters or
+# words: "Story\ncontext", "Story_____context", "S t o r y   context",
+# "STORY ····· FACTS:", "STORY  con​text"; with or without a colon. A
+# digit that looks like a letter counts as it (_DIGIT_LOOKALIKES: "St0ry
+# c0ntext (fr0m the app)"). The gaps are at most two characters and every
+# branch starts with a letter, so any text is read in linear time.
 _DIGIT_LOOKALIKES = {"o": "0", "l": "1", "i": "1", "e": "3", "a": "4", "s": "5", "t": "7"}
-_LETTER_GAP = "[^a-z]{0,6}"
-_WORD_GAP = "[^a-z]{0,12}"
+_LETTER_GAP = "[^a-z]{0,2}"
+_WORD_GAP = "[^a-z]{0,2}"
 
 
 def _letter(c: str) -> str:
@@ -222,7 +222,7 @@ _LOOKALIKE_RE = re.compile(
     r"(?<![a-z])(?:"
     rf"{_spaced('story|storys|stories', 'context|contexts|fact|facts|note|notes')}(?:{_WORD_GAP}{_APP})?|"
     rf"{_spaced('context|contexts')}{_WORD_GAP}{_APP}|"
-    rf"\({_WORD_GAP}{_APP}|{_APP}|"
+    rf"{_APP}|"
     rf"{_spaced('user', 'text|texts')}|"
     rf"{_spaced('app|system', 'note|notes|message|messages|context|contexts|fact|facts')}|"
     rf"{_spaced('first|1st', 'person', 'narrator|narrators|narration')}|"
@@ -250,11 +250,17 @@ _MORE_CONFUSABLE = str.maketrans({
 QUOTED = "quoted: "
 
 
+_SKELETON_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyz" + "".join(set(_DIGIT_LOOKALIKES.values())))
+_APP_RE = re.compile(_APP)
+
+
 def _skeleton(text: str) -> tuple[str, list[int]]:
     """(skeleton, where): `text` read as the model may read it, NFKC, lower
     case, Cyrillic, Greek, Cherokee and other look-alikes as Latin letters
     (safety's table and _MORE_CONFUSABLE), accents and hidden characters
-    gone; where[i] is the index in `text` of the skeleton's character i."""
+    gone, and every run of other characters (a digit that looks like a
+    letter is a letter) as one space; where[i] is the index in `text` of
+    the skeleton's character i (for a space, the run's first character)."""
     out: list[str] = []
     where: list[int] = []
     for i, c in enumerate(text):
@@ -265,26 +271,50 @@ def _skeleton(text: str) -> tuple[str, list[int]]:
             if unicodedata.combining(d):
                 continue
             for e in d.translate(safety._CONFUSABLE).translate(_MORE_CONFUSABLE):
-                out.append(e)
-                where.append(i)
+                if e in _SKELETON_LETTERS:
+                    out.append(e)
+                    where.append(i)
+                elif not out or out[-1] != " ":
+                    out.append(" ")
+                    where.append(i)
     return "".join(out), where
+
+
+def _already_quoted(text: str, at: int) -> bool:
+    """Whether the label at `text[at]` has "quoted:" right before it."""
+    before = "".join(c for c in text[max(0, at - 64):at] if unicodedata.category(c) not in ("Cf", "Co"))
+    return before.rstrip().lower().endswith(QUOTED.strip())
+
+
+def lookalike_starts(text: str) -> list[int]:
+    """Where each look-alike of the app's labels (_LOOKALIKE_RE) starts in
+    `text`: at its first character, or at the bracket of "(from the app)"."""
+    skel, where = _skeleton(text or "")
+    out: list[int] = []
+    for m in _LOOKALIKE_RE.finditer(skel):
+        at = where[m.start()]
+        if m.start() > 0 and _APP_RE.match(skel, m.start()):
+            run = text[where[m.start() - 1]:at]
+            if "(" in run:
+                at = where[m.start() - 1] + run.rindex("(")
+        out.append(at)
+    return out
 
 
 def quote_marks(text: str) -> str:
     """`text` with "quoted: " put in front of every look-alike of the app's
-    labels (_LOOKALIKE_RE): "Stоry context (from the app):" (a Cyrillic о),
-    "Story_context", "User text:", "Story facts: the Titanic sank in 1912."
-    The text is never refused for one; the model is told a label after
-    "quoted:" is the user's. One already quoted is left as it is."""
+    labels (lookalike_starts): "Stоry context (from the app):" (a Cyrillic
+    о), "Story_context", "User text:", "Story facts: the Titanic sank in
+    1912.", "(from the app)" from its bracket. The text is never refused for
+    one; the model is told a label after "quoted:" is the user's. One
+    already quoted is left as it is."""
     if not text:
         return text
-    skel, where = _skeleton(text)
     pieces: list[str] = []
     last = 0
-    for m in _LOOKALIKE_RE.finditer(skel):
-        if skel[max(0, m.start() - 64):m.start()].rstrip().endswith(QUOTED.strip()):
+    for at in lookalike_starts(text):
+        if at < last or _already_quoted(text, at):
             continue
-        at = where[m.start()]
         pieces += [text[last:at], QUOTED]
         last = at
     return "".join(pieces) + text[last:] if pieces else text

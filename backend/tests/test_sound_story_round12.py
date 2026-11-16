@@ -388,6 +388,5 @@ def test_a_forged_exact_label_is_quoted(client, narr, monkeypatch, label):
              + [c.split(narr.USER_MARK, 1)[1] for c in narr.MINOR_CALLS])
     assert any("quoted: " in u for u in users)
     for user in users:
-        skel, _ = minor_check._skeleton(user)
-        for m in minor_check._LOOKALIKE_RE.finditer(skel):
-            assert skel[:m.start()].endswith(minor_check.QUOTED), user[:200]
+        for at in minor_check.lookalike_starts(user):
+            assert user[:at].endswith(minor_check.QUOTED), user[:200]

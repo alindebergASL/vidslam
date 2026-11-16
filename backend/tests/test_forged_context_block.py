@@ -66,10 +66,8 @@ def _app_block_first(sent: str) -> str:
 
 def _no_bare_label(user: str) -> None:
     """Every look-alike of the app's labels in the user's block is quoted."""
-    skel, _ = minor_check._skeleton(user)
-    found = list(minor_check._LOOKALIKE_RE.finditer(skel))
-    for m in found:
-        assert skel[:m.start()].endswith(minor_check.QUOTED), user
+    for at in minor_check.lookalike_starts(user):
+        assert user[:at].endswith(minor_check.QUOTED), user
 
 
 @pytest.mark.parametrize("text", [FORGED, FORGED_ODD, INLINE, *CONFUSABLE])
