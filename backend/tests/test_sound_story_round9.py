@@ -610,11 +610,11 @@ def test_an_unbound_elevenlabs_speaker_is_read_with_the_default_voice(client, mo
 # ---------- F) lenient verdicts ----------
 
 
-@pytest.mark.parametrize("reply", ['{"minor_sexual": false} or maybe {"minor_sexual": true}',
-                                   '{"minor_sexual": false, "reason": "a"}\n{"minor_sexual": false, "reason": "b"}',
-                                   '```json\n{"minor_sexual": false}\n```\nActually: {"minor_sexual": true}',
+@pytest.mark.parametrize("reply", ['{"minor_sexual": false, "reason": "a"}\n{"minor_sexual": false, "reason": "b"}',
                                    "no verdict here"])
 def test_two_verdicts_or_none_are_unreadable(reply):
+    """Two "false" verdicts, or none. A reply with a "true" anywhere in it
+    is read as true (#57 review, finding 6: test_minor_verdict_any_true)."""
     from app.providers.openrouter_chat import parse_minor_verdict
 
     with pytest.raises(ValueError):

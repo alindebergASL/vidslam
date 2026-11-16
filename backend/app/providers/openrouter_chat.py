@@ -684,9 +684,12 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
     """{"minor_sexual": bool, "reason": str} from a classifier reply; raises
     ModelDeclined on a refusal, ValueError on anything else. Read leniently
     (a fenced block, or the JSON amid prose), as every picture, clip and
-    lip-sync check always was, but only when exactly one JSON object in
-    the reply has a true/false "minor_sexual" (json_objects: two or more,
-    agreeing or not, are unreadable); `strict` (a story part,
+    lip-sync check always was: when any JSON object in the reply has
+    "minor_sexual" true, the verdict is true (a reply that says yes
+    anywhere is never read as no, nor as unreadable: an unreadable reply
+    lets a picture or clip prompt go ahead outside adult mode); otherwise
+    exactly one object with "minor_sexual" false is a no, and none, or two
+    or more, is unreadable (json_objects). `strict` (a story part,
     judged with the story's context) takes one JSON object only
     (strict_json). A byte order mark or zero-width characters in front are
     taken off either way."""
@@ -701,11 +704,16 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
         data = strict_json(reply)
     else:
         found = [d for d in json_objects(reply) if isinstance(d.get("minor_sexual"), bool)]
-        if len(found) != 1:
-            # None, or more than one (agreeing or not): never a guess at
-            # which one is the answer.
+        yes = [d for d in found if d["minor_sexual"] is True]
+        if yes:
+            # Any "true" is the answer, however many objects there are.
+            data = yes[0]
+        elif len(found) != 1:
+            # None, or several "false": never a guess at which one is the
+            # answer (unreadable).
             raise ValueError(f"unreadable safety check reply ({len(found)} verdicts): {reply[:120]!r}")
-        data = found[0]
+        else:
+            data = found[0]
     verdict = data.get("minor_sexual") if isinstance(data, dict) else None
     if not isinstance(verdict, bool):
         raise ValueError(f"unreadable safety check reply: {reply[:120]!r}")
