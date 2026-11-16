@@ -319,15 +319,19 @@ class OpenRouterChatProvider(ChatProvider):
         return content if isinstance(content, str) else ""
 
 
-    def _post_check(self, body: dict) -> dict:
+    def _post_check(self, body: dict, budget: Optional[list[int]] = None) -> dict:
         """POST one safety or content check and return the reply's JSON.
         A 429, a 5xx, a timeout or a dropped connection is tried once more
         after a short wait (SAFETY_RETRY_DELAY, or a short Retry-After):
         a check that can't run pauses voice scripts, sounds and lip-syncs,
         so one blip shouldn't. Anything else (a 402 or 403 for credit or a
-        key limit, a 400) is raised at once."""
+        key limit, a 400) is raised at once. `budget` ([retries left]) is
+        shared by calls that make up one ask (a story facts ask and its
+        re-ask with more room): one retry in all, not one per call."""
         url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
-        for attempt in range(2):
+        if budget is None:
+            budget = [1]
+        while True:
             try:
                 with httpx.Client(timeout=30.0) as client:
                     r = client.post(url, headers=self._headers(), json=body)
@@ -335,17 +339,17 @@ class OpenRouterChatProvider(ChatProvider):
                     return r.json()
             except httpx.HTTPStatusError as e:
                 code = e.response.status_code
-                if attempt or not (code == 429 or code >= 500):
+                if budget[0] <= 0 or not (code == 429 or code >= 500):
                     raise
                 wait = _retry_after(e.response)
                 log.info("safety check: HTTP %s, trying once more in %.1fs", code, wait)
             except httpx.TransportError as e:  # a timeout or a dropped connection
-                if attempt:
+                if budget[0] <= 0:
                     raise
                 wait = SAFETY_RETRY_DELAY
                 log.info("safety check: %s, trying once more in %.1fs", type(e).__name__, wait)
+            budget[0] -= 1
             _sleep(wait)
-        raise AssertionError("unreachable")
 
     def classify_minor(self, text: str) -> dict:
         """One short call: {"minor_sexual": bool, "reason": str}. Raises on
@@ -396,9 +400,12 @@ class OpenRouterChatProvider(ChatProvider):
         so the reply gets plenty of room (STORY_FACTS_TOKENS), and a reply
         the model ran out of room for (finish_reason "length", or JSON cut
         off before its end) is asked for once more with more room, never
-        read as "the check couldn't run" at once."""
+        read as "the check couldn't run" at once. The whole ask (both
+        calls) shares one retry for a blip (_post_check), so it makes at
+        most three requests."""
+        budget = [1]
         for attempt, room in enumerate(STORY_FACTS_TOKENS):
-            content, finish = self._story_facts_call(text, room)
+            content, finish = self._story_facts_call(text, room, budget)
             last = attempt == len(STORY_FACTS_TOKENS) - 1
             try:
                 return parse_story_characters(content)
@@ -410,8 +417,10 @@ class OpenRouterChatProvider(ChatProvider):
                 log.info("story facts: the reply ran out of room (%s tokens), asking with more", room)
         raise AssertionError("unreachable")
 
-    def _story_facts_call(self, text: str, max_tokens: int) -> tuple[str, str]:
-        """(reply text, finish_reason) of one story facts call."""
+    def _story_facts_call(self, text: str, max_tokens: int,
+                          budget: Optional[list[int]] = None) -> tuple[str, str]:
+        """(reply text, finish_reason) of one story facts call (`budget`:
+        the retries left for the whole ask, see _post_check)."""
         body: dict = {
             "model": self.model,
             "temperature": 0.0,
@@ -422,7 +431,7 @@ class OpenRouterChatProvider(ChatProvider):
                 {"role": "user", "content": text[:6000]},  # minor_check.JUDGE_WINDOW
             ],
         }
-        data = self._post_check(body)
+        data = self._post_check(body, budget)
         if "choices" not in data:
             err = data.get("error") or {}
             raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
