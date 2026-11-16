@@ -536,7 +536,37 @@ def story_word_filter(text: str) -> None:
                 _story_clause(clause)
 
 
-def _word_filter(prompt: str, negative: str, kind: str) -> None:
+# A direction group (brackets, parentheses or asterisks) right before a
+# marker safety_text added.
+_GROUP_BEFORE_MARKER_RE = re.compile(r"(?:\[([^\]]*)\]|\(([^()\n]*)\)|\*([^*\n]+)\*)\s*$")
+
+
+def unmarked(text: str) -> str:
+    """`text` without the markers story_script.safety_text adds ("(seductive)",
+    "(sensual)"): what a word filter reads of a text that was marked for the
+    model (`marked` below). The app's own marks are for the model to weigh,
+    never a refusal by the words alone ("(ghosts moaning)" near "kids").
+    Kept after a group that is an adult voice tag itself ("[moans]",
+    "[lustful]"): a sexual direction, refused next to a minor by the words."""
+    from . import story_script
+
+    def drop(m: "re.Match") -> str:
+        before = _GROUP_BEFORE_MARKER_RE.search(m.string, max(0, m.start() - 400), m.start())
+        group = next((g for g in before.groups() if g is not None), "") if before else ""
+        if any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
+            return m.group(0)
+        return " "
+
+    return story_script._MARKER_RE.sub(drop, text or "")
+
+
+def _word_filter(prompt: str, negative: str, kind: str, marked: bool = False) -> None:
+    """The word filter. `marked`: `prompt` is a text safety_text marked (a
+    sound or music prompt, registry._audio_guard), whose caller ran the word
+    filter on the text as written first, so a marker the user typed is still
+    read there; here its markers are taken out (unmarked)."""
+    if marked:
+        prompt = unmarked(prompt)
     if kind == "story":
         story_word_filter(prompt)
     elif kind in ("script", "lipsync"):
@@ -770,13 +800,14 @@ def check_generation(prompt: str, negative: str = "", *, kind: str) -> None:
 
 
 def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = "",
-                  force: bool = False) -> None:
+                  force: bool = False, marked: bool = False) -> None:
     """The word filter on `prompt` alone, then the model on `context` (the
     story note, facts and cast: the app's block, for the model only) and
-    `prompt` (the user's block), when needs_ai says so or `force`."""
+    `prompt` (the user's block), when needs_ai says so or `force`.
+    `marked`: see _word_filter (the model reads the marked text)."""
     prompt = prompt or ""
     negative = negative or ""
-    _word_filter(prompt, negative, kind)
+    _word_filter(prompt, negative, kind, marked)
     context = (context or "").strip() if prompt.strip() else ""
     seen = f"{context}\n\n{prompt}" if context else prompt
     if not (prompt.strip() and force) and not needs_ai(seen, negative, kind=kind):
@@ -787,7 +818,7 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
         # A long voice script, lip-sync or sound: read in overlapping
         # windows (check_long), every window asked about (the whole was)
         # and every one failing closed.
-        check_long(prompt, kind=kind, force=True)
+        check_long(prompt, kind=kind, force=True, marked=marked)
         return
     if len(shown) > JUDGE_WINDOW:
         # Longer than the model reads: never judged on a part of it (nor
@@ -880,7 +911,8 @@ def check_cast_length(context: str) -> None:
         raise UnsafePromptError(FACTS_TOO_MANY)
 
 
-def check_long(text: str, *, kind: str = "story", context: str = "", force: bool = False) -> None:
+def check_long(text: str, *, kind: str = "story", context: str = "", force: bool = False,
+               marked: bool = False) -> None:
     """Raise UnsafePromptError when any part of a long `text` (read with
     `context`, the story note, facts and cast, in front of it) puts a minor
     in a sexual context, or when a part the model must judge can't be
@@ -891,7 +923,9 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
     block and the window as the user's. A story line or cast description
     that starts like the app's block ("Story facts:") is refused. The
     context is capped (check_cast_length), so all of it is in view of every
-    window."""
+    window. `marked`: `text` was marked by safety_text and its caller ran
+    the word filter on it as written (see _word_filter): each window's word
+    filter reads it without the markers, the model with them."""
     from ..providers.mock_chat import CONTEXT_MARK, USER_MARK
     from .explicit_check import parts
 
@@ -945,10 +979,10 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         for window in parts(text, size=size, lines=True):
             line = facts.window_line(window) if facts.fp_adult else ""
             ctx = "\n".join(x for x in (context, line) if x)
-            _check_minors(window, "", kind=kind, context=ctx, force=force)
+            _check_minors(window, "", kind=kind, context=ctx, force=force, marked=marked)
         return
     for window in parts(text, size=size, lines=True):
-        _check_minors(window, "", kind=kind, context=context, force=force)
+        _check_minors(window, "", kind=kind, context=context, force=force, marked=marked)
 
 
 # Room kept in a long text's window for its own line (StoryFacts.window_line).

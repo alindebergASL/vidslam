@@ -415,10 +415,14 @@ def disallowed_tags(clean: Optional[bool] = None) -> frozenset[str]:
 # and the model read it as one ("[lustful]" next to "little girl" is refused
 # by the words alone). Romance and intimacy tags are for adults only, and so
 # is any direction written like one ("[moaning]", "[softly moans]",
-# "[pants.]"): tag-reading models accept any words in brackets.
+# "[pants.]"): tag-reading models accept any words in brackets. "sultry"
+# and "lust" have their forms listed, not a bare stem: "sultan",
+# "lustrous" and "lustre" are not directions. (The other stems start no
+# everyday word but "pants", which is only ever marked for the model.)
 _ADULT_TAG_WORD = "seductive"
 _ADULT_STEM_RE = re.compile(
-    r"\b(?:moan\w*|pant(?:s|ed|ing)?|breathless\w*|seduct\w*|sult\w*|lust\w*|orgasm\w*|"
+    r"\b(?:moan\w*|pant(?:s|ed|ing)?|breathless\w*|seduct\w*|sultr(?:y|ier|iest|ily|iness)|"
+    r"lust(?:s|ed|ing|ful|fully|fulness|y|ier|iest|ily|iness)?|orgasm\w*|"
     + "|".join(re.escape(t) for t in sorted(ADULT_TAGS)) + r")\b", re.I)
 # Any other direction a model would perform (not a known general tag), in
 # a text that mentions a minor or with a minor in the cast: asked about

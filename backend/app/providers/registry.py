@@ -233,7 +233,10 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
         if passes.clean_checked(token):
             return
     else:
-        check_long(safety_text(text, "", prose=True), kind="audio", force=force)
+        # The word filter read `text` as written (check_prompt above); the
+        # windows' word filter reads it without the markers safety_text adds,
+        # the model with them (minor_check._word_filter).
+        check_long(safety_text(text, "", prose=True), kind="audio", force=force, marked=True)
     _explicit_prompt(text)
 
 
