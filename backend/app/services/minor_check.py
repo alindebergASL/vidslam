@@ -1108,7 +1108,7 @@ def _long_facts(text: str) -> str:
 # character who is a minor only in some parts. Fails closed; each part's
 # answer is cached in this process by a hash of what was asked.
 
-FACTS_POLICY = "facts-6"
+FACTS_POLICY = "facts-7"
 _facts: "OrderedDict[str, list]" = OrderedDict()
 _RANK = {"adult": 0, "unknown": 1, "minor": 2}
 FACTS_INCOMPLETE = ("The safety check couldn't say who every character in this story is, so the story is paused. "
@@ -1158,13 +1158,13 @@ def _read_entries(out: object) -> list[tuple]:
     smallest number under 18 in it, or not given; an adult's with a number
     under 18 in it is shown as a minor at another time, `past_age`). A
     nameless character that isn't a minor is left out."""
-    from ..providers.openrouter_chat import read_ages, read_part, read_status, read_when
+    from ..providers.openrouter_chat import no_narrator, read_ages, read_part, read_status, read_when
 
     chars = out.get("characters") if isinstance(out, dict) else None
     if not isinstance(chars, list):
         raise CheckUnavailable("unreadable story facts")
     nar = out.get("narrator")
-    if nar is not None and nar is not False:
+    if nar is not None and nar is not False and not no_narrator(nar):
         if not isinstance(nar, dict):
             raise CheckUnavailable("unreadable story facts (narrator)")
         given = nar.get("name")
