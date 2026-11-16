@@ -1246,6 +1246,13 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         return
     head = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}" if context else NO_CONTEXT_HEAD + PROMPT_MARK
     size = JUDGE_WINDOW - len(head) - 60
+    if kind != "story" and not context:
+        # Look-alikes of the app's labels are quoted (quote_marks) before the
+        # text is measured and cut, in what the facts call and every window
+        # read, so none passes for the app's (as in a short text,
+        # classifier_text), and a text the quoting makes longer than one
+        # read is cut into windows, never handed back whole.
+        text = quote_marks(text)
     if kind != "story" and not force and len(text) > size and needs_ai(text, kind=kind):
         # Asked about as a whole: every window is asked about (a minor in
         # one window and a sexual word in the next).
@@ -1264,11 +1271,6 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         # StoryFacts.window_line), on top of the whole-story summary, so the
         # refusal doesn't rest on the judge working out which part of the
         # summary it is.
-        #
-        # Look-alikes of the app's labels are quoted (quote_marks) in what
-        # the facts call and every window read, so none of them passes for
-        # the app's, as in a short text (classifier_text).
-        text = quote_marks(text)
         facts = _long_facts_detail(text)
         summary = " ".join(facts.summary_line().split())
         if len(summary) > 2 * FACTS_LIMIT:

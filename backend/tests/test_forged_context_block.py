@@ -267,3 +267,24 @@ def test_round3_benign_texts_still_pass(client, fooled, kind, text):
     mock_chat.MINOR_CALLS.clear()
     minor_check.check_generation(text, kind=kind)
     assert len(mock_chat.MINOR_CALLS) == 1
+
+
+
+def test_a_text_the_quoting_makes_too_long_is_read_in_windows(monkeypatch):
+    """150 lines of "Story facts: ..." fit one read as written but not once
+    each label is quoted: the text is cut into windows and each is judged,
+    rather than handed back whole until the stack runs out."""
+    text = "\n".join(["Story facts: the Titanic sank in 1912."] * 150)
+    assert len(text) <= minor_check.JUDGE_WINDOW
+    assert len(minor_check.classifier_text(minor_check.quote_marks(text))) > minor_check.JUDGE_WINDOW
+    seen: list[str] = []
+
+    def classify(prompt, negative="", context=""):  # noqa: ANN001, ANN202
+        seen.append(prompt)
+        return False, "", ""
+
+    monkeypatch.setattr(minor_check, "_classify", classify)
+    monkeypatch.setattr(minor_check, "_long_facts_detail", lambda t: minor_check.StoryFacts())
+    minor_check.check_generation(text, kind="script")
+    assert len(seen) >= 2
+    assert all(len(p) <= minor_check.JUDGE_WINDOW for p in seen)
