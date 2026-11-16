@@ -77,7 +77,8 @@ def test_the_lily_opening_is_judged_without_the_sentence_it_replaces(auth_client
 
 def test_each_heard_form_is_its_own_call(auth_client, monkeypatch):
     """One call per text the model reads: the script the opening makes, and
-    each form heard with the window inside the original first sentence."""
+    each form that may be heard with the window inside the original first
+    sentence (every word near the guess)."""
     from app.providers import mock_chat
     from app.services import minor_check
 
@@ -99,7 +100,8 @@ def test_each_heard_form_is_its_own_call(auth_client, monkeypatch):
     assert all("\n" not in t and t.count(hook) == 1 for t in seen)
     assert f"{hook}. Follow for more." in seen  # the script it makes
     assert f"{hook} tonight she dances for you! Follow for more." in seen  # heard at the window
-    assert f"{hook} {script}" in seen  # heard when the voiceover picks up at the first word
+    # heard when the voiceover picks up a word or two early
+    assert f"{hook} thirty and tonight she dances for you! Follow for more." in seen
     assert len(seen) == len(set(seen))
 
 

@@ -247,13 +247,18 @@ def judged_texts(opening: str, heard: list[str]) -> list[str]:
     return out
 
 
-# The most places inside the original first sentence the voiceover may pick
-# up at that are each judged: a window inside a longer first sentence is
-# refused (move it to where that sentence ends). Each join is short
-# (heard_joins), so this is about the number of calls, not their length.
-MAX_JOINS = 150
-JOINS_TOO_MANY = ("The original first sentence is too long to check every place the voiceover could pick up "
-                  "inside it. Move where the opening ends to the end of that sentence.")
+# The most heard forms judged for one opening when the window isn't at the
+# end of the original first sentence (heard_checks, 2.): one call each.
+# More are refused: move the window to that sentence's end.
+MAX_JOINS = 12
+JOINS_TOO_MANY = ("There are too many places where the original voiceover could pick up after this opening to "
+                  "check them all. Move where the opening ends to the end of the original first sentence.")
+# The most of those forms that may be longer than the model reads at once:
+# each of them is read in several parts (minor_check.check_long).
+MAX_LONG_JOINS = 4
+LONG_JOINS_TOO_MANY = ("The script is too long to check every place where the original voiceover could pick up "
+                       "after this opening. Move where the opening ends to the end of the original first "
+                       "sentence, or shorten the script.")
 
 
 def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> list[str]:
@@ -263,26 +268,29 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     makes (or the window isn't known yet: it is checked again with the
     window before anything is made).
 
-    1. The opening, then the whole original script: the word filter only.
-       Every word of the original that can be heard after the opening is
-       in it, wherever the window is. The model never reads it: the
-       replaced first sentence is in it, and it isn't heard.
-    2. With the window known: the opening joined to the original where the
-       voiceover picks up (heard_cuts). The model reads that best guess as
-       it is heard, without the replaced words around it (they could make
-       it read as being about someone else). The word filter also sees the
-       joins near the guess, since the words aren't timed: a phrase can
-       form only across the join ("she is" + "sixteen tips"). Each join is
-       also read without the punctuation at the end of the opening, which
-       a listener doesn't hear ("Her age?" + "fifteen, and").
-    3. The model reads every join inside the original first sentence on
-       its own: those near the guess (they reach back into that sentence
-       even when the window is at its end), and, when the voiceover may
-       pick up inside it, every word of it, since speech is too uneven to
-       trust the guess. One text each (at most MAX_JOINS), each cut short
-       to what the join can change (heard_joins): the rest of the script
-       is read with the opening already (the script it makes).
-    4. When the opening fills the whole voiceover, the opening alone is
+    The word filter always reads the opening then the whole original
+    script: every word of the original that can be heard after the opening
+    is in it, wherever the window is. The model never reads it: the
+    replaced first sentence is in it, and it isn't heard.
+
+    1. The window at the end of the original first sentence (where the
+       lab finds it, find_hook_window): the cut is exact. What is heard is
+       the script the opening makes, which check_opening judges anyway:
+       nothing more.
+    2. Anywhere else (inside the first sentence, past its end, or its end
+       not known): the words aren't timed, so the voiceover may pick up at
+       any word near the guess, on either side of where the first sentence
+       ends (heard_cuts). Each of those joins is heard as the opening then
+       the original from there to the end of the script (heard_joins): a
+       minor named in the heard part of the first sentence is read beside
+       whatever comes later. One text each, never beside another join's
+       words; a text the same as the script the opening makes isn't
+       repeated. The word filter also reads each join without the
+       punctuation at the end of the opening, which a listener doesn't
+       hear ("Her age?" + "fifteen, and"). At most MAX_JOINS texts, and at
+       most MAX_LONG_JOINS longer than the model reads at once (else
+       refused: too many calls).
+    3. When the opening fills the whole voiceover, the opening alone is
        what is heard.
     Raises UnsafeScriptError (refused) or HookLabError (too many joins)."""
     from .renderer import _probe_duration
@@ -303,31 +311,35 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
         end_of_first: Optional[float] = find_hook_window(base, script)
     except HookLabError:
         end_of_first = None
-    best, near = heard_cuts(script, float(window), total, end_of_first)
     rest = rest_of_script(script)
     rest_at = len(script) - len(rest) if rest else len(script)
-    inside = (window < end_of_first - 0.05) if end_of_first else best < rest_at
-    cuts = sorted(set(near) | (set(word_starts(script, rest_at)) if inside else set()))
     bare = _HOOK_END.sub("", hook) or hook
+    if rest and end_of_first and abs(window - end_of_first) <= 0.05:
+        check_script(f"{bare} {script[rest_at:].lstrip(_PUNCT)}")
+        return []  # exact: the script the opening makes
+    _best, cuts = heard_cuts(script, float(window), total, end_of_first)
     for cut in cuts:
         check_script(f"{hook} {script[cut:]}")
         check_script(f"{bare} {script[cut:].lstrip(_PUNCT)}")
-    texts: list[str] = []
-    if not (rest and best == rest_at):  # else the usual join: the script the opening makes
-        heard = f"{hook} {script[best:]}"
-        check_script(heard)
-        texts.append(heard)
-    joins = [c for c in cuts if c < rest_at]
-    if len(joins) > MAX_JOINS:
+    made = judged_texts(replace_first_sentence(script, hook), [])
+    texts = [t for t in judged_texts("", heard_joins(hook, script, cuts)) if t not in made]
+    if sum(not fits_one_call(t) for t in texts) > MAX_LONG_JOINS:
+        raise HookLabError(LONG_JOINS_TOO_MANY, 422)
+    if len(texts) > MAX_JOINS:
         raise HookLabError(JOINS_TOO_MANY, 422)
-    texts += heard_joins(hook, script, joins, rest_at)
     return texts
+
+
+def fits_one_call(text: str) -> bool:
+    """`text` is short enough for the model to read at once (else
+    minor_check reads it in parts, check_long, which costs several calls)."""
+    from . import minor_check
+
+    return len(minor_check.classifier_text(minor_check.quote_marks(text))) <= minor_check.JUDGE_WINDOW
 
 
 _PUNCT = " \t.,;:!?…-–—\"'“”‘’()"
 _HOOK_END = re.compile(r"[\s.,;:!?…\-–—\"'“”‘’()]+$")
-# How much of the script after the first sentence each join shows.
-_JOIN_TAIL = 160
 
 
 def word_starts(script: str, upto: int) -> list[int]:
@@ -335,58 +347,51 @@ def word_starts(script: str, upto: int) -> list[int]:
     return [m.start() for m in re.finditer(r"\S+", script) if m.start() < upto]
 
 
-def heard_joins(hook: str, script: str, cuts: list[int], rest_at: int) -> list[str]:
-    """The opening joined to the original at each cut inside the first
-    sentence (which starts the rest at `rest_at`), as heard: the opening,
-    the original from the cut to the end of that sentence, then about
-    _JOIN_TAIL characters of what follows, cut at a word. That is all a
-    join can change: the whole rest of the script is read with the opening
-    already (the script it makes). One text per cut, each judged alone
-    (never beside the words of another cut, which aren't heard with it)."""
-    return [f"{hook} {script[c:rest_at]}{join_tail(script, rest_at)}".strip() for c in cuts]
+def heard_joins(hook: str, script: str, cuts: list[int]) -> list[str]:
+    """The opening joined to the original at each cut, as heard: the
+    opening, then the original from the cut to the end of the script.
+    Never cut short: a minor named in the heard part of the first sentence
+    must be read beside what comes later, however far on. One text per
+    cut, each judged alone (never beside the words of another cut, which
+    aren't heard with it)."""
+    return [f"{hook} {script[c:]}".strip() for c in cuts]
 
 
-def join_tail(script: str, rest_at: int) -> str:
-    """About _JOIN_TAIL characters of `script` from `rest_at`, ending at a
-    word (all of it when it is that short)."""
-    tail = script[rest_at:rest_at + _JOIN_TAIL + 1]
-    if rest_at + len(tail) >= len(script):
-        return tail
-    cut = tail.rfind(" ")
-    return tail[:cut] if cut > 0 else tail[:_JOIN_TAIL]
+# How uneven speech may be around the guess: about this much of it.
+_PACE_SECONDS = 0.75
+_MIN_BAND_CHARS = 12.0
 
 
 def heard_cuts(script: str, window: float, total: float,
                end_of_first: Optional[float] = None) -> tuple[int, list[int]]:
     """Where the base voiceover picks up in its script when the opening ends
-    at `window` seconds of `total`: (the best guess, every place near it),
-    as character offsets of word starts in the stripped script.
+    at `window` seconds of `total`: (the best guess, every place it may
+    really be), as character offsets of word starts in the stripped script.
 
     The guess spreads the characters evenly over the voiceover, as
     estimate_window does. When `end_of_first` (where the first sentence
     ends, find_hook_window) is known, it is spread over the first sentence
     and the rest separately, so a window inside the first sentence lands
-    inside it. The places near it allow for an uneven pace: about a quarter
-    of the way more or less, and about 0.75 s of speech either side."""
+    inside it. The places it may really be allow for an uneven pace: every
+    word start within about _PACE_SECONDS of speech of the guess (at least
+    _MIN_BAND_CHARS characters), either side, wherever the first sentence
+    ends."""
     script = (script or "").strip()
     starts = [m.start() for m in re.finditer(r"\S+", script)]
     if not starts or total <= 0 or window <= 0 or window >= total:
         return 0, []
     n = len(script)
-    guesses = [n * window / total]
+    guess = n * window / total
     rest = rest_of_script(script)
     rest_at = n - len(rest) if rest else n
     if end_of_first and 0 < end_of_first < total:
         if window <= end_of_first:
-            guesses.append(rest_at * window / end_of_first)
+            guess = rest_at * window / end_of_first
         else:
-            guesses.append(rest_at + (n - rest_at) * (window - end_of_first) / (total - end_of_first))
-    best = min(starts, key=lambda s: abs(s - guesses[-1]))
-    margin = max(0.25 * max(guesses) + 0.75 * n / total, 12.0)
-    lo, hi = min(guesses) - margin, max(guesses) + margin
-    near = sorted(s for s in starts if lo <= s <= hi)
-    if len(near) > 40:  # a very late window: the 40 nearest
-        near = sorted(sorted(near, key=lambda s: abs(s - best))[:40])
+            guess = rest_at + (n - rest_at) * (window - end_of_first) / (total - end_of_first)
+    best = min(starts, key=lambda s: abs(s - guess))
+    margin = max(_PACE_SECONDS * n / total, _MIN_BAND_CHARS)
+    near = sorted({s for s in starts if guess - margin <= s <= guess + margin} | {best})
     return best, near
 
 

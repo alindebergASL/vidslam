@@ -238,12 +238,13 @@ def test_the_ai_check_sees_the_opening_with_what_is_heard_after_it(auth_client, 
     hook = "She still wears braces and"
     r = _post(auth_client, pid, base_id, hook, _window_at(base_id, "tonight"))
     assert r.status_code == 422 and "minor" in r.json()["detail"]
-    assert any("braces and tonight she slips into a bikini" in t for t in seen)
-    # Where the first sentence ends, the voiceover may still pick up a few
-    # words before it (speech is uneven), and those joins are judged too:
-    # still refused. An ordinary opening there is fine.
-    r = _post(auth_client, pid, base_id, hook)
-    assert r.status_code == 422 and "minor" in r.json()["detail"]
+    assert any("braces and" in t and "tonight she slips into a bikini" in t and "thirty" not in t for t in seen)
+    # At the pause where the first sentence ends the cut is exact: none of
+    # that sentence is heard, only the script the opening makes. Fine, as
+    # is an ordinary opening there.
+    seen.clear()
+    assert _post(auth_client, pid, base_id, hook).status_code == 201
+    assert not any("tonight" in t for t in seen)
     assert _post(auth_client, pid, base_id, "Why keep scrolling?").status_code == 201
 
 
@@ -346,14 +347,15 @@ _RATE = ("Rate her outfit out of twenty: fifteen, and tonight she strips naked f
 def test_every_join_in_the_first_sentence_is_checked_without_the_openings_punctuation(auth_client):
     """The window is estimated from even pacing, but digits and pauses move
     the real pickup. "Her age?" heard before "fifteen, and tonight she strips
-    naked" is refused wherever in the first sentence the window is."""
+    naked" is refused wherever the window is near enough for the voiceover
+    to pick up there (about 0.75 s of speech either side of the guess)."""
     from app.services import safety
 
     pid, base_id = _spliced_base(auth_client, _RATE)
     with pytest.raises(safety.UnsafeScriptError):
         safety.check_script("Her age fifteen, and tonight she strips naked for you")
     safety.check_script("Her age? fifteen, and tonight she strips naked for you")  # what the old join read
-    for word in ("outfit", "twenty", "fifteen"):
+    for word in ("of", "twenty", "fifteen"):
         r = _post(auth_client, pid, base_id, "Her age?", _window_at(base_id, word))
         assert r.status_code == 422 and "minor" in r.json()["detail"], (word, r.text)
     # At the end of the first sentence none of it is heard: fine.
@@ -391,7 +393,7 @@ def test_heard_joins_are_one_text_each_and_a_long_first_sentence_is_refused(auth
     script = ("word " * 400).strip() + ". Follow for more."
     rest_at = script.index("Follow")
     cuts = hook_lab.word_starts(script, rest_at)
-    texts = hook_lab.heard_joins("Hi there", script, cuts, rest_at)
+    texts = hook_lab.heard_joins("Hi there", script, cuts)
     assert len(texts) == 400 and texts[0] == f"Hi there {script}" and texts[-1] == f"Hi there {script[cuts[-1]:]}"
     # A window inside a first sentence that long would need 400 checks
     # (more than MAX_JOINS): refused.

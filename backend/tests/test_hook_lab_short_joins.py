@@ -1,16 +1,20 @@
-"""Hook lab: every join into the original first sentence is judged, each
-one short (#57 fixes, round 2).
+"""Hook lab: every join into the original first sentence is judged
+(#57 fixes, round 2; round 3: each join is read as heard, to the end of
+the script, see test_hook_lab_joins_as_heard).
 
 1. heard_cuts' places near the guess can reach back into the original
-   first sentence even when the window is at its end; those joins were
-   only word-filtered. Each is now read by the model as its own text.
-2. Each join was the opening plus the whole rest of the script: a long
-   base made every join a long read (check_long, a facts call and several
-   windows each). A join is now cut to what it can change: the opening,
-   the rest of the first sentence and a short tail. The whole rest of the
-   script is read once, with the opening (the script it makes).
-3. With short joins, a window inside an ordinary long first sentence (more
-   than 40 words) is no longer refused.
+   first sentence; those joins were only word-filtered. Each is now read
+   by the model as its own text. Round 3: a window exactly where the lab
+   found the first sentence's end is an exact cut (one text, the script
+   the opening makes); anywhere else, every place near the guess is read.
+2. Each join is the opening plus the whole rest of the script, so on a
+   long base every join is a long read (check_long, a facts call and
+   several windows each). Round 2 cut joins short, which split a minor in
+   the first sentence from an act later on; round 3 reads them whole and
+   instead caps the long ones (MAX_LONG_JOINS), failing closed beyond it.
+3. On an ordinary-length script, a window inside a long first sentence
+   (more than 40 words) is checked, not refused: only the places near the
+   guess are read (at most MAX_JOINS).
 """
 from __future__ import annotations
 
@@ -42,9 +46,10 @@ def _judged(monkeypatch, *, judge: bool = True) -> list[str]:
     return seen
 
 
-def test_joins_near_the_window_inside_the_first_sentence_are_judged(monkeypatch, tmp_path):
-    """The window at the end of the first sentence: the best guess is the
-    script the opening makes, but the voiceover may pick up a few words
+def test_the_window_at_the_end_of_the_first_sentence_is_exact(monkeypatch, tmp_path):
+    """Round 3: the window where the lab found the first sentence's end is
+    an exact cut, and the only text heard is the script the opening makes:
+    one call. Just before that pause, the voiceover may pick up a few words
     earlier ("Emma who is nine."), and the model reads that join too."""
     from app.services import hook_lab, renderer
 
@@ -54,16 +59,17 @@ def test_joins_near_the_window_inside_the_first_sentence_are_judged(monkeypatch,
     monkeypatch.setattr(hook_lab, "find_hook_window", lambda base, script=None: 4.0)
     monkeypatch.setattr(renderer, "_probe_duration", lambda p: 7.0)
     base = types.SimpleNamespace(audio_path=str(audio))
-    rest_at = _EMMA.index("Tonight")
-    best, near = hook_lab.heard_cuts(_EMMA, 4.0, 7.0, 4.0)
-    assert best == rest_at and [c for c in near if c < rest_at]  # near reaches into the first sentence
 
     seen = _judged(monkeypatch, judge=False)
     hook_lab.check_opening(None, base, _UNDRESS, 4.0)
-    assert f"{_UNDRESS} Tonight we have a party at home." in seen  # the script it makes
+    assert seen == [f"{_UNDRESS} Tonight we have a party at home."]  # the script it makes
+
+    seen.clear()
+    hook_lab.check_opening(None, base, _UNDRESS, 3.5)
+    assert seen[0] == f"{_UNDRESS} Tonight we have a party at home."
     assert f"{_UNDRESS} Emma who is nine. Tonight we have a party at home." in seen
-    assert f"{_UNDRESS} daughter Emma who is nine. Tonight we have a party at home." in seen
     assert all(t.count(_UNDRESS) == 1 and "Meet my wife" not in t for t in seen)
+    assert len(seen) == len(set(seen))
 
 
 def _long_base(first_words: int) -> tuple[str, str]:
@@ -73,75 +79,65 @@ def _long_base(first_words: int) -> tuple[str, str]:
     return f"{first} {rest}", first
 
 
-def test_each_join_is_short_and_a_long_base_makes_few_long_reads(auth_client, monkeypatch):
-    from app.providers import mock_chat
-    from app.services import hook_lab, minor_check
+def test_a_window_inside_the_first_sentence_of_a_long_script_fails_closed(auth_client, monkeypatch):
+    """Every join runs to the end of the script, so on a long script each
+    is a long read (check_long, several calls). More than MAX_LONG_JOINS of
+    them: refused before anything is judged, with a plain message."""
+    from app import models
+    from app.services import hook_lab, minor_check, renderer
 
     script, first = _long_base(30)
     assert 7700 < len(script) <= 7850 and len(script) > minor_check.JUDGE_WINDOW
-    from app import models
-    from app.services import renderer
-
     pid, base_id = _spliced_base(auth_client, script)
     # About eight minutes of speech, the first sentence about 15 s of it,
     # the window a third of the way into that sentence.
     monkeypatch.setattr(renderer, "_probe_duration", lambda p: 480.0)
     monkeypatch.setattr(hook_lab, "find_hook_window", lambda base, s=None: 15.0)
-
-    seen = _judged(monkeypatch)
-    longs: list[str] = []
-    real_long = minor_check.check_long
-
-    def count_long(text, **kw):  # noqa: ANN001, ANN202
-        longs.append(text)
-        return real_long(text, **kw)
-
-    monkeypatch.setattr(minor_check, "check_long", count_long)
-    facts: list[str] = []
-    real_facts = mock_chat.MockChatProvider.story_characters
-
-    def count_facts(self, text):  # noqa: ANN001, ANN202
-        facts.append(text)
-        return real_facts(self, text)
-
-    monkeypatch.setattr(mock_chat.MockChatProvider, "story_characters", count_facts)
-    minor_check.reset_cache()
+    monkeypatch.setattr(hook_lab, "MAX_LONG_JOINS", 1)
+    seen = _judged(monkeypatch, judge=False)
     db = _db()
     try:
-        hook_lab.check_opening(db, db.get(models.Render, base_id), "Here is a calm opening", 5.0)
+        with pytest.raises(hook_lab.HookLabError) as e:
+            hook_lab.check_opening(db, db.get(models.Render, base_id), "Here is a calm opening", 5.0)
     finally:
         db.close()
-
-    joins = [t for t in seen if t.startswith("Here is a calm opening word")]
-    assert len(joins) >= 25  # every word of the first sentence (inside)
-    limit = len("Here is a calm opening") + 1 + len(first) + 1 + hook_lab._JOIN_TAIL
-    # Each join is short; only the best guess is read as heard to the end.
-    assert len([t for t in joins if len(t) > limit]) <= 1
-    # Only the long forms (the script the opening makes, the best guess as
-    # heard) are read whole: never one per join.
-    assert len(longs) <= 2 and len(facts) <= 2 * len(longs), (len(longs), len(facts))
-    assert len(seen) <= len(joins) + 4
+    assert e.value.status == 422 and str(e.value) == hook_lab.LONG_JOINS_TOO_MANY
+    assert "shorten the script" in str(e.value)
+    assert seen == []
 
 
-def test_join_tail_ends_at_a_word():
-    from app.services import hook_lab
+def test_a_few_long_joins_are_each_read_whole(monkeypatch, tmp_path):
+    """Under MAX_LONG_JOINS, each long join is judged as heard, to the end
+    of the script, one text each."""
+    from app.services import hook_lab, minor_check, renderer
 
-    script = "Short first. " + "alpha beta gamma " * 40
-    rest_at = script.index("alpha")
-    tail = hook_lab.join_tail(script, rest_at)
-    assert len(tail) <= hook_lab._JOIN_TAIL and script[rest_at:].startswith(tail)
-    assert tail.split()[-1] in ("alpha", "beta", "gamma")
-    assert script[rest_at + len(tail)] == " "
-    assert hook_lab.join_tail("One. Two three.", 5) == "Two three."
+    first = "My calm first sentence is short."
+    body = "We walk to the market and buy some bread and fresh fruit for the week. "
+    script = first + " " + (body * 100).strip()
+    assert len(script) > minor_check.JUDGE_WINDOW
+    audio = tmp_path / "vo.m4a"
+    audio.write_bytes(b"x")
+    monkeypatch.setattr(hook_lab, "base_script", lambda db, base: script)
+    monkeypatch.setattr(hook_lab, "find_hook_window", lambda base, s=None: 3.0)
+    monkeypatch.setattr(renderer, "_probe_duration", lambda p: 480.0)
+    base = types.SimpleNamespace(audio_path=str(audio))
+    seen = _judged(monkeypatch, judge=False)
+    hook_lab.check_opening(None, base, "Here is a calm opening", 1.5)
+    joins = [t for t in seen if t != f"Here is a calm opening. {script[len(first) + 1:]}"]
+    assert 1 <= len(joins) <= hook_lab.MAX_LONG_JOINS
+    assert all(t.endswith("fresh fruit for the week.") and len(t) > minor_check.JUDGE_WINDOW for t in joins)
+    assert len(set(seen)) == len(seen)
 
 
-def test_a_window_inside_a_45_word_first_sentence_is_checked_not_refused(auth_client):
-    from app.services import hook_lab
+def test_a_window_inside_a_45_word_first_sentence_is_checked_not_refused(auth_client, monkeypatch):
+    from app.services import hook_lab, renderer
 
     script, _first = _long_base(45)
     script = script[:1200].rsplit(" ", 1)[0] + "."
-    assert hook_lab.MAX_JOINS >= 45
     pid, base_id = _spliced_base(auth_client, script)
+    # Spoken at an ordinary pace (about 15 characters a second).
+    monkeypatch.setattr(renderer, "_probe_duration", lambda p: 80.0)
+    hook_lab._window_cache.clear()
     r = _post(auth_client, pid, base_id, "Here is a calm opening", _window_at(base_id, "word20"))
     assert r.status_code == 201, r.text
 

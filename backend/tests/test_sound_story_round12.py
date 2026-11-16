@@ -335,11 +335,15 @@ def test_a_hook_costs_one_call_per_text_from_create_to_its_voice(auth_client, mo
     minor_check.reset_cache()
     mock_chat.MINOR_CALLS.clear()
     made = _create(auth_client, pid, base_id, [{"hook_text": hook, "style": "question"}])
-    # The script it makes, and what is heard at the window (2.5 s): one each.
+    # The script it makes, then each place the voiceover may pick up near
+    # the window (2.5 s, not where the first sentence ends), heard to the
+    # end of the script: one call each, none twice.
     drafted = list(mock_chat.MINOR_CALLS)
     head = mock_chat.NO_CONTEXT_HEAD
-    assert drafted == [f"{head}Prompt: {hook} Here is the rest of it. And one more line.",
-                       f"{head}Prompt: {hook} rest of it. And one more line."]
+    assert drafted == [f"{head}Prompt: {hook} {tail}" for tail in (
+        "Here is the rest of it. And one more line.", "is the rest of it. And one more line.",
+        "the rest of it. And one more line.", "rest of it. And one more line.", "of it. And one more line.",
+        "it. And one more line.")]
     vid = made["variants"][0]["id"]
     r = auth_client.post(f"/api/hook-variants/{vid}/preview-audio")
     assert r.status_code == 200, r.text
