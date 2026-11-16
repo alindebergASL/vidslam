@@ -194,12 +194,22 @@ def _warn_adult_leftovers() -> None:
         log.warning("adult content leftover check skipped: %s", e)
 
 
+def _masked_url(url: str) -> str:
+    """A database URL fit for a log: its password replaced by ***."""
+    try:
+        from sqlalchemy.engine import make_url
+
+        return make_url(url).render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001
+        return "(unreadable database URL)"
+
+
 def create_app() -> FastAPI:
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        log.info("initializing database at %s", settings.database_url)
+        log.info("initializing database at %s", _masked_url(settings.database_url))
         init_db()
         _repair_image_types()
         _warn_adult_leftovers()
