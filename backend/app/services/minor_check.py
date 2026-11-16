@@ -8,7 +8,9 @@ model) is asked whether the text puts a minor in a sexual context:
 - every non-empty voice script, lip-sync script and sound, music or ambient
   prompt, and every window of an audio story, in every mode (adult, default
   and clean): a word list can't tell an adult text from one about a child.
-  The word lists only refuse obvious cases before the call (needs_ai);
+  The word lists only refuse obvious cases before the call (needs_ai).
+  The app's own sound and music presets, word for word, were vetted at
+  test time instead and are not asked about (services/vetted_audio.py);
 - adult mode on: every image and video prompt (provider filters are off);
 - adult mode off: picture and clip prompts that are sexual, mention a minor,
   or have an avoid list that removes signs of adulthood (provider filters
@@ -22,7 +24,10 @@ keeps recent "ok" verdicts in memory; refusals are always read from the
 table, so a cleared one is gone for every process. Verdicts from the mock
 classifier are used only in mock mode.
 
-When the check can't run, every story part, voice script, lip-sync and
+A check call that hits a 429, a 5xx or a timeout is tried once more after
+a short wait (openrouter_chat._post_check); a 402 or 403 (OpenRouter
+credit or a key's limit) is said so in the message (CREDIT). When the
+check can't run, every story part, voice script, lip-sync and
 sound the model would have been asked about waits (no word rule stands in
 for the model). Picture and clip prompts with a plainly sexual word (or an
 avoid list that steers young) wait; in adult mode, where the provider
@@ -66,6 +71,12 @@ UNAVAILABLE_CLEAN = ("The safety check couldn't run, so this prompt is paused un
                      "planner model in Settings → Models).")
 UNAVAILABLE = (UNAVAILABLE_CLEAN + " Every voice script, lip-sync and sound waits for it; in Adult mode every "
                "picture and clip does too (turn Adult mode off to keep making those with the provider filters on).")
+# A 402 or 403 from OpenRouter (out of credit, a key's spending limit or
+# an in-flight budget): not the planner model's fault, so not that hint.
+CREDIT_CLEAN = ("OpenRouter credit or key limit reached, so the safety check couldn't run; this prompt is paused "
+                "until it can (add credit or raise the key's limit on OpenRouter).")
+CREDIT = (CREDIT_CLEAN + " Every voice script, lip-sync and sound waits for it; in Adult mode every picture and "
+          "clip does too.")
 DECLINED = ("This prompt was refused: the safety check model declined to judge it, which counts as a no. "
             "A different planner model (Settings → Models) may answer.")
 TOO_LONG = ("This prompt was refused: with its avoid list it is longer than the safety check can read "
@@ -82,6 +93,29 @@ _lock = threading.Lock()
 class CheckUnavailable(RuntimeError):
     """The safety check model gave no verdict (no key, switched off, error,
     timeout, unreadable reply)."""
+
+
+class CheckCreditLimit(CheckUnavailable):
+    """The check couldn't run because OpenRouter refused the call for credit
+    or a key limit (HTTP 402 or 403)."""
+
+
+CREDIT_STATUSES = (402, 403)
+
+
+def credit_limited(exc: BaseException) -> bool:
+    """`exc` (or what it was raised from) is OpenRouter's 402 or 403."""
+    import httpx
+
+    seen = 0
+    while exc is not None and seen < 5:
+        if isinstance(exc, CheckCreditLimit):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in CREDIT_STATUSES:
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
 
 
 class CheckDeclined(CheckUnavailable):
@@ -164,11 +198,14 @@ def availability() -> dict:
                 pictures == "mock" and bool(get_settings().mock_providers))}
 
 
-def _unavailable() -> str:
+def _unavailable(e: Optional[BaseException] = None) -> str:
     """The paused-prompt message; a clean deployment (ADULT_FEATURES=false)
-    has no adult mode to mention."""
+    has no adult mode to mention. `e`: why the check couldn't run (a credit
+    or key limit says so)."""
     from .content_mode import features
 
+    if e is not None and credit_limited(e):
+        return CREDIT if features() else CREDIT_CLEAN
     return UNAVAILABLE if features() else UNAVAILABLE_CLEAN
 
 
@@ -256,7 +293,8 @@ def _classify(prompt: str, negative: str, context: str = "") -> tuple[bool, str,
     except ModelDeclined as e:
         raise CheckDeclined(str(e)[:200]) from None
     except Exception as e:  # noqa: BLE001 — HTTP error, timeout, garbage
-        raise CheckUnavailable(f"{type(e).__name__}: {str(e)[:200]}") from None
+        kind = CheckCreditLimit if credit_limited(e) else CheckUnavailable
+        raise kind(f"{type(e).__name__}: {str(e)[:200]}") from None
     verdict = out.get("minor_sexual") if isinstance(out, dict) else None
     if not isinstance(verdict, bool):
         raise CheckUnavailable("unreadable verdict")
@@ -843,7 +881,7 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
     except CheckUnavailable as e:
         if _fails_closed(seen, negative, kind, force):
             log.warning("safety check unavailable (%s): sexual %s prompt paused", e, kind)
-            raise UnsafePromptError(_unavailable()) from None
+            raise UnsafePromptError(_unavailable(e)) from None
         log.info("safety check unavailable (%s): non-sexual %s prompt allowed", e, kind)
         return
     _store(key, "minor_sexual" if minor_sexual else "ok", model, reason)
@@ -876,6 +914,8 @@ FACTS_TOO_MANY = ("This story has too many characters for the safety check to ke
                   "split it into shorter stories.")
 STORY_UNAVAILABLE = ("The safety check couldn't run, so this story is paused until it's available (check the "
                      "planner model in Settings → Models).")
+STORY_CREDIT = ("OpenRouter credit or key limit reached, so the safety check couldn't run; this story is paused "
+                "until it can (add credit or raise the key's limit on OpenRouter).")
 
 
 # The same, for a long voiceover, lip-sync or sound with no story around it
@@ -999,6 +1039,8 @@ def _long_facts_detail(text: str) -> "StoryFacts":
     except UnsafePromptError as e:
         if str(e) == STORY_UNAVAILABLE:
             raise UnsafePromptError(_unavailable()) from None
+        if str(e) == STORY_CREDIT:
+            raise UnsafePromptError(_unavailable(CheckCreditLimit())) from None
         raise
 
 
@@ -1461,7 +1503,7 @@ def _facts_window(fn, judge: str, cast: str, so_far: str, window: str, required:
             raise UnsafePromptError(DECLINED) from None
         except Exception as e:  # noqa: BLE001 — error, timeout, unreadable reply
             log.warning("story facts unavailable (%s: %s): story refused", type(e).__name__, str(e)[:200])
-            raise UnsafePromptError(STORY_UNAVAILABLE) from None
+            raise UnsafePromptError(STORY_CREDIT if credit_limited(e) else STORY_UNAVAILABLE) from None
         got = {story_name_key(e[0]) for e in entries}
         missing = sorted(n for n in required if story_name_key(n) not in got)
         no_narrator = narrator and not _names_narrator(entries, cast, window, called)

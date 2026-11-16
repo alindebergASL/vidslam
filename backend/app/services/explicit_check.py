@@ -40,6 +40,8 @@ REFUSED = ("This text was refused: this app is for a general audience, and the c
            "sexually explicit. Reword it without sexual content.")
 UNAVAILABLE = ("The content check couldn't run, so this text is paused until it's available (check the "
                "planner model in Settings → Models).")
+CREDIT = ("OpenRouter credit or key limit reached, so the content check couldn't run; this text is paused until "
+          "it can (add credit or raise the key's limit on OpenRouter).")
 DECLINED = ("This text was refused: the content check model declined to judge it, which counts as a no. "
             "A different planner model (Settings → Models) may answer.")
 
@@ -156,7 +158,8 @@ def _judge(text: str) -> tuple[bool, str, str]:
     except ModelDeclined as e:
         raise minor_check.CheckDeclined(str(e)[:200]) from None
     except Exception as e:  # noqa: BLE001 — HTTP error, timeout, garbage
-        raise minor_check.CheckUnavailable(f"{type(e).__name__}: {str(e)[:200]}") from None
+        kind = minor_check.CheckCreditLimit if minor_check.credit_limited(e) else minor_check.CheckUnavailable
+        raise kind(f"{type(e).__name__}: {str(e)[:200]}") from None
     verdict = out.get("explicit") if isinstance(out, dict) else None
     if not isinstance(verdict, bool):
         raise minor_check.CheckUnavailable("unreadable verdict")
@@ -174,7 +177,7 @@ def _check_part(text: str) -> None:
         raise ExplicitContentError(DECLINED) from None
     except minor_check.CheckUnavailable as e:
         log.warning("content check unavailable (%s): script paused", e)
-        raise ExplicitContentError(UNAVAILABLE) from None
+        raise ExplicitContentError(CREDIT if minor_check.credit_limited(e) else UNAVAILABLE) from None
     if explicit:
         # Not remembered: asked again next time (a clean deployment has no
         # place to clear a remembered answer).
@@ -232,9 +235,12 @@ PROMPT_REFUSED = ("This prompt was refused: this app is for a general audience, 
                   "sexually explicit. Reword it without sexual content.")
 PROMPT_UNAVAILABLE = ("The content check couldn't run, so this prompt is paused until it's available (check the "
                       "planner model in Settings → Models).")
+PROMPT_CREDIT = ("OpenRouter credit or key limit reached, so the content check couldn't run; this prompt is paused "
+                 "until it can (add credit or raise the key's limit on OpenRouter).")
 PROMPT_DECLINED = ("This prompt was refused: the content check model declined to judge it, which counts as a "
                    "no. A different planner model (Settings → Models) may answer.")
-_PROMPT_MESSAGES = {REFUSED: PROMPT_REFUSED, UNAVAILABLE: PROMPT_UNAVAILABLE, DECLINED: PROMPT_DECLINED}
+_PROMPT_MESSAGES = {REFUSED: PROMPT_REFUSED, UNAVAILABLE: PROMPT_UNAVAILABLE, DECLINED: PROMPT_DECLINED,
+                    CREDIT: PROMPT_CREDIT}
 
 
 class ExplicitPromptError(ExplicitContentError, UnsafePromptError):

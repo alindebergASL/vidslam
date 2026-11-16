@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -318,6 +319,34 @@ class OpenRouterChatProvider(ChatProvider):
         return content if isinstance(content, str) else ""
 
 
+    def _post_check(self, body: dict) -> dict:
+        """POST one safety or content check and return the reply's JSON.
+        A 429, a 5xx, a timeout or a dropped connection is tried once more
+        after a short wait (SAFETY_RETRY_DELAY, or a short Retry-After):
+        a check that can't run pauses voice scripts, sounds and lip-syncs,
+        so one blip shouldn't. Anything else (a 402 or 403 for credit or a
+        key limit, a 400) is raised at once."""
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
+        for attempt in range(2):
+            try:
+                with httpx.Client(timeout=30.0) as client:
+                    r = client.post(url, headers=self._headers(), json=body)
+                    r.raise_for_status()
+                    return r.json()
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code
+                if attempt or not (code == 429 or code >= 500):
+                    raise
+                wait = _retry_after(e.response)
+                log.info("safety check: HTTP %s, trying once more in %.1fs", code, wait)
+            except httpx.TransportError as e:  # a timeout or a dropped connection
+                if attempt:
+                    raise
+                wait = SAFETY_RETRY_DELAY
+                log.info("safety check: %s, trying once more in %.1fs", type(e).__name__, wait)
+            _sleep(wait)
+        raise AssertionError("unreachable")
+
     def classify_minor(self, text: str) -> dict:
         """One short call: {"minor_sexual": bool, "reason": str}. Raises on
         an error body, a refusal or a reply that isn't that JSON (the caller
@@ -337,11 +366,7 @@ class OpenRouterChatProvider(ChatProvider):
         # prompt's reply is read leniently (the JSON in a fence or amid
         # prose); a story part's (sent with the story's context block) must
         # be one JSON object (parse_minor_verdict strict).
-        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(url, headers=self._headers(), json=body)
-            r.raise_for_status()
-            data = r.json()
+        data = self._post_check(body)
         if "choices" not in data:
             err = data.get("error") or {}
             raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
@@ -374,11 +399,7 @@ class OpenRouterChatProvider(ChatProvider):
                 {"role": "user", "content": text[:6000]},  # minor_check.JUDGE_WINDOW
             ],
         }
-        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(url, headers=self._headers(), json=body)
-            r.raise_for_status()
-            data = r.json()
+        data = self._post_check(body)
         if "choices" not in data:
             err = data.get("error") or {}
             raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
@@ -409,11 +430,7 @@ class OpenRouterChatProvider(ChatProvider):
                 {"role": "user", "content": text[:6000]},  # minor_check.JUDGE_WINDOW
             ],
         }
-        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(url, headers=self._headers(), json=body)
-            r.raise_for_status()
-            data = r.json()
+        data = self._post_check(body)
         if "choices" not in data:
             err = data.get("error") or {}
             raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
@@ -642,6 +659,21 @@ def _story_entry(c: object, reply: str, *, nameless: bool = False) -> dict:
     if when:
         entry["minor_when"] = when
     return entry
+
+
+# The wait before a safety check's one retry (OpenRouterChatProvider._post_check).
+SAFETY_RETRY_DELAY = 1.5
+SAFETY_RETRY_MAX = 5.0
+_sleep = time.sleep
+
+
+def _retry_after(response: httpx.Response) -> float:
+    """A short Retry-After (seconds, at most SAFETY_RETRY_MAX), else SAFETY_RETRY_DELAY."""
+    try:
+        wait = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return SAFETY_RETRY_DELAY
+    return min(max(wait, 0.0), SAFETY_RETRY_MAX)
 
 
 class ModelDeclined(ValueError):

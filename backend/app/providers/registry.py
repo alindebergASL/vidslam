@@ -203,18 +203,28 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
     """A sound or music prompt: the word filter, the minors check and, on a
     clean deployment, the explicit-content check. Every caller of
     get_sound() and get_music() comes through here, whatever screen the
-    prompt came from. An adult word ("moaning", "panting", [moans]) is
-    marked (story_script.safety_text), so with a child in view the model
-    is asked, never refused by the words alone.
+    prompt came from.
 
     `context`: a story's context (story_script.check_story): with one, the
     prompt is a story part, sent only when `story_pass` (by default the one
     the context carries) covers this prompt with this context (check_story
     judged it, with the story's facts and cast in front); anything else is
-    refused (story_pass.STALE: check the story again). Without one, kind
-    "audio": asked when it's sexual or mentions a minor, or `force`
-    (lyrics or a composition plan)."""
+    refused (story_pass.STALE: check the story again).
+
+    Without one: the word filter reads the prompt as written, then the
+    minors check (kind "audio") asks the model about every prompt, in every
+    mode, and fails closed: when the check can't run (no key, out of
+    credit, an error or timeout after one retry) the prompt waits. The
+    model reads the prompt marked by story_script.safety_text (an adult
+    direction, "(ghosts moaning)", gets a marker after it); the word filter
+    of each window reads it without those markers, so a marked direction
+    near a child is the model's to judge, not a refusal by the words alone
+    (an adult voice tag itself, "[moans]", still is). The one exception is
+    an app-written preset, word for word (services/vetted_audio.py): vetted
+    at test time, so it needs no live call, unless `force` (lyrics or a
+    composition plan are joined to it)."""
     from ..services import story_pass as passes
+    from ..services import vetted_audio
     from ..services.minor_check import check_long
     from ..services.safety import UnsafePromptError, check_prompt
     from ..services.story_script import safety_text
@@ -233,6 +243,11 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
         if passes.clean_checked(token):
             return
     else:
+        if not force and vetted_audio.is_vetted(text):
+            # Exactly an app-written preset, vetted at test time
+            # (services/vetted_audio.py): no live call, so a rain bed
+            # doesn't wait on OpenRouter. Anything else is asked.
+            return
         # The word filter read `text` as written (check_prompt above); the
         # windows' word filter reads it without the markers safety_text adds,
         # the model with them (minor_check._word_filter).

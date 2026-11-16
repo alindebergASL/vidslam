@@ -115,11 +115,16 @@ music at its own volume, or on its own with music set to "No music".
 The clip is crossfaded into a seamless loop at render, like the music bed.
 
 Sound and music prompts are safety-checked in every mode, not only on a
-clean deployment: the word filter, then the minors check (the model is asked
-when a prompt is sexual or mentions a minor, so "children laughing on a
-playground" costs one check call). A loop runs these checks on its music and
-sound prompts before its first paid step, so a refused prompt stops the loop
-before any still or clip is bought.
+clean deployment: the word filter, then the minors check, which asks the
+model about every custom sound or music prompt (one check call per new
+prompt, cached). When the check can't run (no key, OpenRouter out of credit
+or at a key's limit, an error or a timeout after one retry) a custom prompt
+waits, with a message that says why. The app's own presets (the sound and
+music choices above, word for word) were vetted at test time
+(`services/vetted_audio.py`), so they need no check call and never wait on
+OpenRouter; the same words with anything added are a custom prompt. A loop
+runs these checks on its music and sound prompts before its first paid step,
+so a refused prompt stops the loop before any still or clip is bought.
 
 Music `settings` are passed to the provider's request as they are (ElevenLabs
 merges them into the request body), so the music guard allow-lists them
