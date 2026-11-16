@@ -238,8 +238,12 @@ def test_the_ai_check_sees_the_opening_with_what_is_heard_after_it(auth_client, 
     r = _post(auth_client, pid, base_id, hook, _window_at(base_id, "tonight"))
     assert r.status_code == 422 and "minor" in r.json()["detail"]
     assert any("braces and tonight she slips into a bikini" in t for t in seen)
-    # Where the first sentence ends, none of it is heard: fine.
-    assert _post(auth_client, pid, base_id, hook).status_code == 201
+    # Where the first sentence ends, the voiceover may still pick up a few
+    # words before it (speech is uneven), and those joins are judged too:
+    # still refused. An ordinary opening there is fine.
+    r = _post(auth_client, pid, base_id, hook)
+    assert r.status_code == 422 and "minor" in r.json()["detail"]
+    assert _post(auth_client, pid, base_id, "Why keep scrolling?").status_code == 201
 
 
 def test_ordinary_openings_at_any_window_are_still_made(auth_client):
@@ -386,9 +390,11 @@ def test_heard_joins_are_one_text_each_and_a_long_first_sentence_is_refused(auth
     script = ("word " * 400).strip() + ". Follow for more."
     rest_at = script.index("Follow")
     cuts = hook_lab.word_starts(script, rest_at)
-    texts = hook_lab.heard_joins("Hi there", script, cuts)
+    texts = hook_lab.heard_joins("Hi there", script, cuts, rest_at)
     assert len(texts) == 400 and texts[0] == f"Hi there {script}" and texts[-1] == f"Hi there {script[cuts[-1]:]}"
-    # A window inside a first sentence that long would need 400 checks: refused.
+    # A window inside a first sentence that long would need 400 checks
+    # (more than MAX_JOINS): refused.
+    assert len(texts) > hook_lab.MAX_JOINS
     pid, base_id = _spliced_base(auth_client, script)
     db = _db()
     try:

@@ -249,8 +249,9 @@ def judged_texts(opening: str, heard: list[str]) -> list[str]:
 
 # The most places inside the original first sentence the voiceover may pick
 # up at that are each judged: a window inside a longer first sentence is
-# refused (move it to where that sentence ends).
-MAX_JOINS = 40
+# refused (move it to where that sentence ends). Each join is short
+# (heard_joins), so this is about the number of calls, not their length.
+MAX_JOINS = 150
 JOINS_TOO_MANY = ("The original first sentence is too long to check every place the voiceover could pick up "
                   "inside it. Move where the opening ends to the end of that sentence.")
 
@@ -274,10 +275,13 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
        form only across the join ("she is" + "sixteen tips"). Each join is
        also read without the punctuation at the end of the opening, which
        a listener doesn't hear ("Her age?" + "fifteen, and").
-    3. When the voiceover may pick up inside the original first sentence,
-       speech is too uneven to trust the guess: the model reads the
-       opening joined at every word of that sentence, each join as heard
-       to the end, one text each (at most MAX_JOINS).
+    3. The model reads every join inside the original first sentence on
+       its own: those near the guess (they reach back into that sentence
+       even when the window is at its end), and, when the voiceover may
+       pick up inside it, every word of it, since speech is too uneven to
+       trust the guess. One text each (at most MAX_JOINS), each cut short
+       to what the join can change (heard_joins): the rest of the script
+       is read with the opening already (the script it makes).
     4. When the opening fills the whole voiceover, the opening alone is
        what is heard.
     Raises UnsafeScriptError (refused) or HookLabError (too many joins)."""
@@ -313,27 +317,43 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
         heard = f"{hook} {script[best:]}"
         check_script(heard)
         texts.append(heard)
-    if inside:
-        joins = [c for c in cuts if c < rest_at]
-        if len(joins) > MAX_JOINS:
-            raise HookLabError(JOINS_TOO_MANY, 422)
-        texts += heard_joins(hook, script, joins)
+    joins = [c for c in cuts if c < rest_at]
+    if len(joins) > MAX_JOINS:
+        raise HookLabError(JOINS_TOO_MANY, 422)
+    texts += heard_joins(hook, script, joins, rest_at)
     return texts
 
 
 _PUNCT = " \t.,;:!?…-–—\"'“”‘’()"
 _HOOK_END = re.compile(r"[\s.,;:!?…\-–—\"'“”‘’()]+$")
+# How much of the script after the first sentence each join shows.
+_JOIN_TAIL = 160
+
+
 def word_starts(script: str, upto: int) -> list[int]:
     """The offsets of the words that start before `upto`."""
     return [m.start() for m in re.finditer(r"\S+", script) if m.start() < upto]
 
 
-def heard_joins(hook: str, script: str, cuts: list[int]) -> list[str]:
-    """The opening joined to the original at each cut, as heard: the
-    opening, then the original from the cut to its end. One text per cut,
-    each judged alone (never beside the words of another cut, which aren't
-    heard with it)."""
-    return [f"{hook} {script[c:]}".strip() for c in cuts]
+def heard_joins(hook: str, script: str, cuts: list[int], rest_at: int) -> list[str]:
+    """The opening joined to the original at each cut inside the first
+    sentence (which starts the rest at `rest_at`), as heard: the opening,
+    the original from the cut to the end of that sentence, then about
+    _JOIN_TAIL characters of what follows, cut at a word. That is all a
+    join can change: the whole rest of the script is read with the opening
+    already (the script it makes). One text per cut, each judged alone
+    (never beside the words of another cut, which aren't heard with it)."""
+    return [f"{hook} {script[c:rest_at]}{join_tail(script, rest_at)}".strip() for c in cuts]
+
+
+def join_tail(script: str, rest_at: int) -> str:
+    """About _JOIN_TAIL characters of `script` from `rest_at`, ending at a
+    word (all of it when it is that short)."""
+    tail = script[rest_at:rest_at + _JOIN_TAIL + 1]
+    if rest_at + len(tail) >= len(script):
+        return tail
+    cut = tail.rfind(" ")
+    return tail[:cut] if cut > 0 else tail[:_JOIN_TAIL]
 
 
 def heard_cuts(script: str, window: float, total: float,
