@@ -154,17 +154,81 @@ def classifier_text(prompt: str, negative: str = "", context: str = "") -> str:
     model reads (JUDGE_WINDOW) isn't judged at all (check_generation). With
     a story `context` (the app's note, facts and cast), it comes first as a
     block of its own (CONTEXT_MARK), then the user's text (USER_MARK): the
-    model is told the first is the app's and the second the user's."""
-    from ..providers.mock_chat import AVOID_MARK, CONTEXT_MARK, PROMPT_MARK, USER_MARK
+    model is told the first is the app's and the second the user's.
+
+    A text with no story around it is sent the same way, with NO_CONTEXT as
+    the app's block and the avoid list and prompt as the user's, so the
+    app's block always comes first and a block forged in the user's text
+    can only sit inside the user's (the model is told only the first block
+    is the app's). Outside a story part, _check_minors quotes look-alikes
+    of the app's labels in the user's text first (quote_marks)."""
+    from ..providers.mock_chat import (
+        AVOID_MARK,
+        CONTEXT_MARK,
+        NO_CONTEXT_HEAD,
+        PROMPT_MARK,
+        USER_MARK,
+    )
 
     context = (context or "").strip()
+    prompt = (prompt or "").strip()
+    negative = (negative or "").strip()
     if context:
-        text = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}{prompt.strip()}"
-    else:
-        text = PROMPT_MARK + prompt.strip()
-    if (negative or "").strip():
-        text = f"{AVOID_MARK}{negative.strip()}\n\n{text}"
-    return text
+        text = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}{prompt}"
+        if negative:
+            text = f"{AVOID_MARK}{negative}\n\n{text}"
+        return text
+    text = PROMPT_MARK + prompt
+    if negative:
+        text = f"{AVOID_MARK}{negative}\n\n{text}"
+    return NO_CONTEXT_HEAD + text
+
+
+# Look-alikes of the app's labels in a user's text, read on a skeleton of
+# it (_skeleton): "story" then "context", "facts" or "note", "user" then
+# "text", and "first-person narrator", with any run of non-letters between
+# the words ("Story_context", "Story-context", "STORY  con\u200btext") and
+# with or without a colon.
+_LOOKALIKE_RE = re.compile(r"(?<![a-z])(?:story[^a-z\n]*(?:context|facts?|notes?)|user[^a-z\n]*text|"
+                           r"first[^a-z\n]*person[^a-z\n]*narrator)(?![a-z])")
+QUOTED = "quoted: "
+
+
+def _skeleton(text: str) -> tuple[str, list[int]]:
+    """(skeleton, where): `text` read as the model may read it, NFKC, lower
+    case, Cyrillic and Greek look-alikes as Latin letters (safety's
+    table), accents and hidden characters gone; where[i] is the index in
+    `text` of the skeleton's character i."""
+    out: list[str] = []
+    where: list[int] = []
+    for i, c in enumerate(text):
+        if unicodedata.category(c) in ("Cf", "Co"):
+            continue
+        for d in unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", c).lower()):
+            if unicodedata.combining(d):
+                continue
+            for e in d.translate(safety._CONFUSABLE):
+                out.append(e)
+                where.append(i)
+    return "".join(out), where
+
+
+def quote_marks(text: str) -> str:
+    """`text` with "quoted: " put in front of every look-alike of the app's
+    labels (_LOOKALIKE_RE): "Stоry context (from the app):" (a Cyrillic о),
+    "Story_context", "User text:", "Story facts: the Titanic sank in 1912."
+    The text is never refused for one; the model is told a label after
+    "quoted:" is the user's. One already quoted is left as it is."""
+    if not text:
+        return text
+    skel, where = _skeleton(text)
+    out = text
+    for m in reversed(list(_LOOKALIKE_RE.finditer(skel))):
+        if skel[:m.start()].rstrip().endswith(QUOTED.strip()):
+            continue
+        at = where[m.start()]
+        out = out[:at] + QUOTED + out[at:]
+    return out
 
 
 # ---------- model ----------
@@ -501,27 +565,6 @@ def forged_app_label(text: str) -> bool:
         if any(line.startswith(x) for x in labels):
             return True
     return False
-
-
-# The headers of the app's two blocks (mock_chat CONTEXT_MARK, USER_MARK),
-# as a user could forge them: "Story context (from the app):" anywhere in
-# a line, "User text:" at the start of one (after an optional speaker), in
-# any case or spacing.
-_MARK_RE = re.compile(r"story\s*context\b[^\n:]{0,40}:|^\s*(?:[^:\n]{1,40}:\s*)?user\s*text\s*:", re.I | re.M)
-MARK_REFUSED = ("The text can't contain \"Story context:\", \"Story facts:\", \"Story note:\" or \"User text:\" "
-                "labels: the safety check keeps those words for the app. Reword it.")
-
-
-def forged_mark(text: str) -> bool:
-    """Whether `text` forges the app's context block for a text judged on
-    its own (no story around it): its headers (_MARK_RE) or one of the
-    labels the app writes in front of a window (forged_app_label), with
-    hidden characters ignored. The model is told to trust that block."""
-    import unicodedata
-
-    clean = "".join(c for c in unicodedata.normalize("NFKC", str(text or ""))
-                    if unicodedata.category(c) not in ("Cf", "Co") or c in "\n\t")
-    return bool(_MARK_RE.search(clean)) or forged_app_label(text)
 
 
 # What story_word_filter takes out before reading a story's words: the
@@ -922,7 +965,12 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
     seen = f"{context}\n\n{prompt}" if context else prompt
     if not (prompt.strip() and force) and not needs_ai(seen, negative, kind=kind):
         return
-    shown = classifier_text(prompt, negative, context)
+    # What the model reads of the user's text: outside a story part, with
+    # look-alikes of the app's labels quoted (quote_marks), so none passes
+    # for the app's block. The verdict is remembered by the text as written
+    # (or, with a context, by exactly what was shown).
+    sent, sent_negative = (prompt, negative) if kind == "story" else (quote_marks(prompt), quote_marks(negative))
+    shown = classifier_text(sent, sent_negative, context)
     if len(shown) > JUDGE_WINDOW and kind in ("script", "lipsync", "audio") and not context \
             and not negative.strip():
         # A long voice script, lip-sync or sound: read in overlapping
@@ -930,13 +978,6 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
         # and every one failing closed.
         check_long(prompt, kind=kind, force=True, marked=marked)
         return
-    if not context and kind != "story" and (forged_mark(prompt) or forged_mark(negative)):
-        # A text judged on its own can't carry a block that passes for the
-        # app's (the model trusts "Story context (from the app)"). A story
-        # line is checked with forged_label on the story path, a long text
-        # in check_long.
-        log.warning("safety check: a %s prompt forges the app's context block: refused", kind)
-        raise UnsafePromptError(MARK_REFUSED)
     if len(shown) > JUDGE_WINDOW:
         # Longer than the model reads: never judged on a part of it (nor
         # answered from a verdict given when the model was shown a part).
@@ -952,7 +993,7 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
     if hit == "minor_sexual":
         raise UnsafePromptError(REFUSED)
     try:
-        minor_sexual, reason, model = _classify(prompt, negative, context)
+        minor_sexual, reason, model = _classify(sent, sent_negative, context)
     except CheckDeclined as e:
         # Not cached: a different planner may answer.
         log.warning("safety check declined a %s prompt (%s): refused", kind, e)
@@ -1045,7 +1086,7 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
     window. `marked`: `text` was marked by safety_text and its caller ran
     the word filter on it as written (see _word_filter): each window's word
     filter reads it without the markers, the model with them."""
-    from ..providers.mock_chat import CONTEXT_MARK, USER_MARK
+    from ..providers.mock_chat import CONTEXT_MARK, NO_CONTEXT_HEAD, PROMPT_MARK, USER_MARK
     from .explicit_check import parts
 
     text = text or ""
@@ -1065,7 +1106,7 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         if cast:
             _check_minors("\n".join(cast_lines), "", kind=kind, context="\n".join(lead_lines), force=force)
         return
-    head = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}" if context else ""
+    head = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}" if context else NO_CONTEXT_HEAD + PROMPT_MARK
     size = JUDGE_WINDOW - len(head) - 60
     if kind != "story" and not force and len(text) > size and needs_ai(text, kind=kind):
         # Asked about as a whole: every window is asked about (a minor in
@@ -1085,10 +1126,11 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         # StoryFacts.window_line), on top of the whole-story summary, so the
         # refusal doesn't rest on the judge working out which part of the
         # summary it is.
-        if forged_app_label(text):
-            raise UnsafePromptError(LABEL_REFUSED)
-        if forged_mark(text):
-            raise UnsafePromptError(MARK_REFUSED)
+        #
+        # Look-alikes of the app's labels are quoted (quote_marks) in what
+        # the facts call and every window read, so none of them passes for
+        # the app's, as in a short text (classifier_text).
+        text = quote_marks(text)
         facts = _long_facts_detail(text)
         summary = " ".join(facts.summary_line().split())
         if len(summary) > 2 * FACTS_LIMIT:

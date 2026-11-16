@@ -366,7 +366,7 @@ def test_the_ai_check_sees_every_join_in_the_first_sentence(auth_client, monkeyp
     seen: list[str] = []
 
     def judge(self, text):
-        seen.append(text.removeprefix("Prompt: "))
+        seen.append(text.removeprefix(mock_chat.NO_CONTEXT_HEAD).removeprefix("Prompt: "))
         bad = "braces and tonight she slips into a bikini" in text
         return {"minor_sexual": bad, "reason": "probe"}
 

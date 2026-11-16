@@ -34,7 +34,7 @@ def _recording(monkeypatch) -> list[str]:
     seen: list[str] = []
 
     def judge(self, text):  # noqa: ANN001, ANN202
-        seen.append(text.removeprefix("Prompt: "))
+        seen.append(text.removeprefix(mock_chat.NO_CONTEXT_HEAD).removeprefix("Prompt: "))
         bad = "pigtails" in text and "sex" in text and REPLACED not in text
         return {"minor_sexual": bad, "reason": "recording"}
 
@@ -86,7 +86,7 @@ def test_each_heard_form_is_its_own_call(auth_client, monkeypatch):
     seen: list[str] = []
 
     def judge(self, text):  # noqa: ANN001, ANN202
-        seen.append(text.removeprefix("Prompt: "))
+        seen.append(text.removeprefix(mock_chat.NO_CONTEXT_HEAD).removeprefix("Prompt: "))
         return {"minor_sexual": False, "reason": "ok"}
 
     monkeypatch.setattr(mock_chat.MockChatProvider, "classify_minor", judge)
@@ -134,7 +134,7 @@ def test_a_drafted_hook_still_costs_a_call_elsewhere(auth_client, monkeypatch, m
         registry.GuardedTTSProvider(_Inner()).synthesize(text=hook, voice_id="v")  # pipeline / TTS guard
     else:
         registry.GuardedAvatarProvider(_Inner()).submit_avatar(script=hook)  # a lip-sync script
-    assert mock_chat.MINOR_CALLS == [f"Prompt: {hook}"]
+    assert mock_chat.MINOR_CALLS == [f"{mock_chat.NO_CONTEXT_HEAD}Prompt: {hook}"]
 
 
 def test_the_hook_alone_is_judged_before_its_voice_is_made(auth_client, monkeypatch):
@@ -149,8 +149,8 @@ def test_the_hook_alone_is_judged_before_its_voice_is_made(auth_client, monkeypa
     seen: list[str] = []
 
     def judge(self, text):  # noqa: ANN001, ANN202
-        seen.append(text.removeprefix("Prompt: "))
-        return {"minor_sexual": text.removeprefix("Prompt: ") == "Alone it is refused.", "reason": "probe"}
+        seen.append(text.removeprefix(mock_chat.NO_CONTEXT_HEAD).removeprefix("Prompt: "))
+        return {"minor_sexual": text.removeprefix(mock_chat.NO_CONTEXT_HEAD).removeprefix("Prompt: ") == "Alone it is refused.", "reason": "probe"}
 
     monkeypatch.setattr(mock_chat.MockChatProvider, "classify_minor", judge)
     pid, base_id = _spliced_base(auth_client, "Stop scrolling now! Here is the rest of it. And one more line.")
