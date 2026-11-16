@@ -384,26 +384,6 @@ def _store_row(key: str, verdict: str, model: str, reason: str, at: datetime) ->
         db.close()
 
 
-def vouch_ok(judged: str, parts) -> None:  # noqa: ANN001
-    """Record "ok" for each of `parts` (texts inside `judged` that the app
-    later sends alone, such as a hook lab opening) when `judged`, a text
-    check_generation has just passed with no avoid list or story context,
-    holds an "ok" from the judge set now: the model read every part in it,
-    so asking about a part again would only pay twice. A part not inside
-    `judged`, or with a verdict of its own, is left alone."""
-    whole = _key_text(judged)
-    if not whole or cached(text_hash(judged)) != "ok":
-        return
-    judge = _identity() or ""
-    for part in parts:
-        text = _key_text(part)
-        if not text or text not in whole:
-            continue
-        key = text_hash(part)
-        if cached(key) is None:
-            _store(key, "ok", judge, "judged ok inside a longer text")
-
-
 def memory() -> dict:
     """{"refusals", "oks"}: verdicts the check remembers (Settings → Adult
     content). "oks" counts only the ones still in date."""

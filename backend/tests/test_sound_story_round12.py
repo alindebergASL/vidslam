@@ -10,7 +10,9 @@
    facts cap (56 presidents and first ladies pass); a cap that trips says
    so in voiceover words.
 3. The hook lab: an opening judged ok inside its combined text isn't asked
-   about again when its voice is made.
+   about again when its voice is made. (Undone after the #57 review: an
+   "ok" for a text inside another is never recorded for the part, so its
+   voice asks about the opening alone, once.)
 4. The non-story path refuses only the exact labels the app writes
    ("Story notes: keep a small notebook" is fine).
 
@@ -341,22 +343,6 @@ def test_a_hook_costs_one_call_per_text_from_create_to_its_voice(auth_client, mo
     r = auth_client.post(f"/api/hook-variants/{vid}/preview-audio")
     assert r.status_code == 200, r.text
     assert mock_chat.MINOR_CALLS == [*drafted, f"Prompt: {hook}"]
-
-
-def test_vouching_needs_an_ok_and_a_part_inside(client):
-    from app.providers import mock_chat
-    from app.services import minor_check
-
-    minor_check.reset_cache()
-    minor_check.vouch_ok("Never judged at all. Hello there.", ["Hello there."])
-    assert minor_check.cached(minor_check.text_hash("Hello there.")) is None
-    minor_check.check_generation("A calm opening. And the rest of it.", kind="script")
-    minor_check.vouch_ok("A calm opening. And the rest of it.", ["A calm opening.", "Something else."])
-    assert minor_check.cached(minor_check.text_hash("A calm opening.")) == "ok"
-    assert minor_check.cached(minor_check.text_hash("Something else.")) is None
-    mock_chat.MINOR_CALLS.clear()
-    minor_check.check_generation("A calm opening.", kind="script")
-    assert mock_chat.MINOR_CALLS == []
 
 
 # ---------- 4) the non-story path's labels ----------

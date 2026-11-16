@@ -1307,7 +1307,8 @@ def precheck(db: Session, project: models.VideoProject, variant: models.HookVari
              clips: list["ComposeClip"], needed: Optional[list[int]] = None) -> None:
     """The safety checks the variant's paid steps will meet, before any of
     them is paid for (cached: the checks at the providers are then hits):
-    the opening, a new shot 1's prompt, and the words and motion of every
+    the opening (check_opening, and alone, as its voice speaks it:
+    synth_hook), a new shot 1's prompt, and the words and motion of every
     shot (`needed`) that is lip-synced again, so a refused lip-sync never
     comes after other clips were paid for."""
     from .minor_check import check_generation
@@ -1315,8 +1316,10 @@ def precheck(db: Session, project: models.VideoProject, variant: models.HookVari
     from .prompting import effective_negative
     from .safety import check_prompt
 
-    check_opening(db, db.get(models.Render, variant.base_render_id), variant.hook_text or "",
-                  variant.window_seconds)
+    base = db.get(models.Render, variant.base_render_id)
+    check_opening(db, base, variant.hook_text or "", variant.window_seconds)
+    if not is_original(db, variant, base):
+        check_generation((variant.hook_text or "").strip(), kind="script")
     if variant.shot1_source == "new":
         check_generation(variant.shot1_prompt or "", effective_negative("video", _negative(db, clips[0])),
                          kind="video")
