@@ -23,7 +23,7 @@ import types
 import pytest
 
 from .test_hook_lab import _db
-from .test_hook_lab_heard import _post, _spliced_base, _window_at
+from .test_hook_lab_heard import _found_at, _post, _spliced_base, _window_at
 
 _EMMA = "Meet my wife Lily, and her daughter Emma who is nine. Tonight we have a party at home."
 _UNDRESS = "Watch me undress her slowly."
@@ -56,7 +56,7 @@ def test_the_window_at_the_end_of_the_first_sentence_is_exact(monkeypatch, tmp_p
     audio = tmp_path / "vo.m4a"
     audio.write_bytes(b"x")
     monkeypatch.setattr(hook_lab, "base_script", lambda db, base: _EMMA)
-    monkeypatch.setattr(hook_lab, "find_hook_window", lambda base, script=None: 4.0)
+    monkeypatch.setattr(hook_lab, "hook_window", lambda base, script=None: _found_at(4.0, _EMMA, 7.0))
     monkeypatch.setattr(renderer, "_probe_duration", lambda p: 7.0)
     base = types.SimpleNamespace(audio_path=str(audio))
 
@@ -92,7 +92,7 @@ def test_a_window_inside_the_first_sentence_of_a_long_script_fails_closed(auth_c
     # About eight minutes of speech, the first sentence about 15 s of it,
     # the window a third of the way into that sentence.
     monkeypatch.setattr(renderer, "_probe_duration", lambda p: 480.0)
-    monkeypatch.setattr(hook_lab, "find_hook_window", lambda base, s=None: 15.0)
+    monkeypatch.setattr(hook_lab, "hook_window", lambda base, s=None: _found_at(15.0, script, 480.0))
     monkeypatch.setattr(hook_lab, "MAX_LONG_JOINS", 1)
     seen = _judged(monkeypatch, judge=False)
     db = _db()
@@ -118,7 +118,7 @@ def test_a_few_long_joins_are_each_read_whole(monkeypatch, tmp_path):
     audio = tmp_path / "vo.m4a"
     audio.write_bytes(b"x")
     monkeypatch.setattr(hook_lab, "base_script", lambda db, base: script)
-    monkeypatch.setattr(hook_lab, "find_hook_window", lambda base, s=None: 3.0)
+    monkeypatch.setattr(hook_lab, "hook_window", lambda base, s=None: _found_at(3.0, script, 480.0))
     monkeypatch.setattr(renderer, "_probe_duration", lambda p: 480.0)
     base = types.SimpleNamespace(audio_path=str(audio))
     seen = _judged(monkeypatch, judge=False)
@@ -148,7 +148,7 @@ def test_too_many_joins_still_fail_closed(monkeypatch):
     script = "one two three four five six seven eight nine ten. Follow for more."
     monkeypatch.setattr(hook_lab, "MAX_JOINS", 3)
     monkeypatch.setattr(hook_lab, "base_script", lambda db, base: script)
-    monkeypatch.setattr(hook_lab, "find_hook_window", lambda base, s=None: 4.0)
+    monkeypatch.setattr(hook_lab, "hook_window", lambda base, s=None: _found_at(4.0, script, 8.0))
     monkeypatch.setattr(renderer, "_probe_duration", lambda p: 8.0)
     monkeypatch.setattr(hook_lab.Path, "is_file", lambda self: True)
     base = types.SimpleNamespace(audio_path="/vo.m4a")

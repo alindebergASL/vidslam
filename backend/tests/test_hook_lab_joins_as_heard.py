@@ -26,6 +26,8 @@ import pytest
 
 from app.services.hook_lab import HookLabError
 
+from .test_hook_lab_heard import _found_at
+
 _FILLER = ("We walk along the old harbour wall while the fishing boats come in, the gulls circle over the "
            "nets, and the lamps along the quay flicker on one by one as the evening tide rolls slowly in. ")
 _ANNA = ("This is my wife Anna, not the girl of nine next door. " + _FILLER
@@ -48,10 +50,10 @@ def _setup(monkeypatch, tmp_path, script: str, total: float = 20.0, end_of_first
     def found(base, s=None):  # noqa: ANN001, ANN202
         if end_of_first is None:
             raise HookLabError("no pause found")
-        return end_of_first
+        return _found_at(end_of_first, script, total)
 
     monkeypatch.setattr(hook_lab, "base_script", lambda db, base: script)
-    monkeypatch.setattr(hook_lab, "find_hook_window", found)
+    monkeypatch.setattr(hook_lab, "hook_window", found)
     monkeypatch.setattr(renderer, "_probe_duration", lambda p: total)
     return types.SimpleNamespace(audio_path=str(audio))
 

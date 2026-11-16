@@ -60,6 +60,16 @@ def _window_at(base_id: int, word: str) -> float:
     return round(end * script.index(word) / rest_at, 2)
 
 
+def _found_at(seconds: float, script: str, total: float):
+    """What the lab reports (hook_window) when it finds the pause after the
+    first sentence at `seconds` of a `total`-second voiceover of `script`."""
+    from app.services import hook_lab
+
+    est = hook_lab.estimate_window(script, total)
+    lo, hi = hook_lab.pause_range(est, total)
+    return hook_lab.HookWindow(seconds, True, lo, hi, est, total)
+
+
 def _post(auth_client, pid, base_id, hook, window=None):
     body = {"base_render_id": base_id, "variants": [{"hook_text": hook, "style": "custom"}]}
     if window is not None:

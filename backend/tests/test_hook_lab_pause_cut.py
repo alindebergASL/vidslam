@@ -1,0 +1,177 @@
+"""Hook lab: the window at the pause the lab found is a cut at a sentence
+end, but not necessarily the first sentence's (#57 fixes, round 4).
+
+find_hook_window snaps the even-pace guess to the nearest pause in a
+stretch around it, or keeps the guess when it finds none. The pause shows
+only that the speaker stopped: "Hi there friends of the channel" ends at a
+line break on the page, but the voice reads straight on and first stops
+after "Lily is 30.". There, "Lily wears her pigtails and braces. Tonight
+she wants sex with me." is heard, though only the script the opening makes
+("... Lily is 30. Tonight ...") was judged.
+
+Now:
+- Snapped to a pause: every sentence or line end whose even-pace time is
+  in the stretch searched is a cut, heard to the end of the script and
+  judged alone (usually only the first sentence's: one call).
+- Not snapped: the window is a guess, so the places near it are judged
+  (the pace band), as anywhere else.
+"""
+from __future__ import annotations
+
+import types
+
+import pytest
+
+from app.services.hook_lab import HookLabError
+
+from .test_hook_lab import _tone, _voice
+
+_LINE = "Hi there friends of the channel\nLily is 30. Tonight she wants sex with me. Follow for more."
+_HOOK = "Lily wears her pigtails and braces."
+_SKIPPED = f"{_HOOK} Tonight she wants sex with me. Follow for more."
+
+
+def _refuses(text: str) -> bool:
+    """A minor marker and the act in one text, unless it says the person is
+    30 (as the model would read "Lily is 30.")."""
+    return "pigtails" in text and "sex" in text and "30" not in text
+
+
+def _judge(monkeypatch, *, judge: bool = True) -> list[str]:
+    from app.services import minor_check
+    from app.services.safety import UnsafePromptError
+
+    seen: list[str] = []
+
+    def record(prompt, negative="", *, kind):  # noqa: ANN001, ANN202
+        seen.append(prompt)
+        if judge and _refuses(prompt):
+            raise UnsafePromptError("refused")
+
+    monkeypatch.setattr(minor_check, "check_generation", record)
+    return seen
+
+
+def _base(monkeypatch, audio, script: str = _LINE):
+    from app.services import hook_lab
+
+    hook_lab._window_cache.clear()
+    monkeypatch.setattr(hook_lab, "base_script", lambda db, base: script)
+    return types.SimpleNamespace(audio_path=str(audio), composition_json={"script": script})
+
+
+def test_a_pause_after_a_sentence_past_a_line_break_is_judged(monkeypatch, tmp_path):
+    """The red-team case, with real audio and real pause detection: the
+    voice runs through the line break and pauses after "Lily is 30."."""
+    from app.services import hook_lab
+
+    audio = _voice(tmp_path / "vo.m4a", [("tone", 4.0), ("gap", 0.4), ("tone", 5.6)])
+    base = _base(monkeypatch, audio)
+    found = hook_lab.hook_window(base, _LINE)
+    assert found.snapped and found.seconds == pytest.approx(4.2, abs=0.1)
+    assert hook_lab.find_hook_window(base, _LINE) == found.seconds
+    assert not _refuses(hook_lab.opening_script(None, base, _HOOK))  # "... Lily is 30. ..." passes
+
+    seen = _judge(monkeypatch)
+    with pytest.raises(HookLabError) as e:
+        hook_lab.check_opening(None, base, _HOOK, found.seconds)
+    assert e.value.status == 422 and hook_lab.HEARD_NOTE in str(e.value)
+    assert _SKIPPED in seen
+
+    # Every text is judged alone, once each, never with the replaced words.
+    seen = _judge(monkeypatch, judge=False)
+    hook_lab.check_opening(None, base, _HOOK, found.seconds)
+    assert seen == [" ".join(hook_lab.opening_script(None, base, _HOOK).split()), _SKIPPED]
+
+
+def test_a_guess_not_snapped_to_a_pause_reads_the_places_near_it(monkeypatch, tmp_path):
+    """No pause near the guess: the window is the even-pace guess, not a
+    sentence end the lab heard, so it is not an exact cut."""
+    from app.services import hook_lab
+
+    audio = _tone(tmp_path / "flat.m4a", 10.0)
+    base = _base(monkeypatch, audio)
+    found = hook_lab.hook_window(base, _LINE)
+    assert not found.snapped
+    seen = _judge(monkeypatch, judge=False)
+    hook_lab.check_opening(None, base, _HOOK, found.seconds)
+    made = " ".join(hook_lab.opening_script(None, base, _HOOK).split())
+    assert seen[0] == made and len(seen) > 1 and len(seen) == len(set(seen))
+    assert all(t.startswith(_HOOK) and t.endswith("Follow for more.") for t in seen)
+
+
+def test_an_ordinary_hook_at_a_found_pause_is_still_one_call(monkeypatch, tmp_path):
+    from app.services import hook_lab
+
+    script = "Calm words about the sea and the boats today. Then the harbour lights come on. Follow for more."
+    audio = _voice(tmp_path / "vo.m4a", [("tone", 3.6), ("gap", 0.4), ("tone", 2.4), ("gap", 0.3), ("tone", 1.6)])
+    base = _base(monkeypatch, audio, script)
+    found = hook_lab.hook_window(base, script)
+    assert found.snapped and found.seconds == pytest.approx(3.8, abs=0.1)
+    seen = _judge(monkeypatch)
+    hook_lab.check_opening(None, base, "Hello there.", found.seconds)
+    assert seen == ["Hello there. Then the harbour lights come on. Follow for more."]
+    seen.clear()
+    hook_lab.check_opening(None, base, "Hello there", found.seconds)  # no end punctuation
+    assert len(seen) == 1
+
+
+def test_the_sentence_ends_in_the_stretch_searched_are_the_cuts():
+    from app.services import hook_lab
+
+    script = _LINE
+    n, total = len(script), 10.0
+    est = hook_lab.estimate_window(script, total)
+    lo, hi = hook_lab.pause_range(est, total)
+    cuts = hook_lab.pause_cuts(script, total, lo, hi)
+    assert [script[c:c + 7] for c in cuts] == ["Lily is", "Tonight"]
+    assert all(lo <= total * (c - 1) / n <= hi for c in cuts)
+    # The last sentence's end has nothing after it: not a place.
+    assert hook_lab.pause_cuts(script, total, 0.0, total)[-1] == script.index("Follow")
+    # The first ellipsis, "?!" and closing quotes end a sentence too.
+    s = 'One… Two?! "Three." Four'
+    assert [s[c] for c in hook_lab.pause_cuts(s, 10.0, 0.0, 10.0)] == ["T", '"', "F"]
+
+
+def test_too_many_cuts_at_a_found_pause_fail_closed(monkeypatch, tmp_path):
+    from app.services import hook_lab
+
+    audio = _voice(tmp_path / "vo.m4a", [("tone", 4.0), ("gap", 0.4), ("tone", 5.6)])
+    base = _base(monkeypatch, audio)
+    window = hook_lab.find_hook_window(base, _LINE)
+    monkeypatch.setattr(hook_lab, "MAX_JOINS", 0)
+    seen = _judge(monkeypatch)
+    with pytest.raises(HookLabError) as e:
+        hook_lab.check_opening(None, base, _HOOK, window)
+    assert e.value.status == 422 and str(e.value) == hook_lab.JOINS_TOO_MANY and seen == []
+    monkeypatch.setattr(hook_lab, "MAX_JOINS", 12)
+    monkeypatch.setattr(hook_lab, "MAX_LONG_JOINS", -1)
+    with pytest.raises(HookLabError) as e:
+        hook_lab.check_opening(None, base, _HOOK, window)
+    assert e.value.status == 422 and str(e.value) == hook_lab.LONG_JOINS_TOO_MANY and seen == []
+
+
+def test_a_silent_stand_in_voice_judges_the_sentence_ends_near_the_guess(monkeypatch, tmp_path):
+    """The mock voice is silence throughout: no pause to snap to, and
+    nothing of it is heard. The sentence ends near the guess are judged as
+    at a pause (an ordinary hook stays one call)."""
+    import subprocess
+
+    from app.services import hook_lab
+
+    audio = tmp_path / "silent.m4a"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono:d=10",
+                    "-ac", "2", "-c:a", "aac", str(audio)], check=True)
+    base = _base(monkeypatch, audio)
+    found = hook_lab.hook_window(base, _LINE)
+    assert found.silent and not found.snapped
+    seen = _judge(monkeypatch)
+    with pytest.raises(HookLabError):
+        hook_lab.check_opening(None, base, _HOOK, found.seconds)
+    assert _SKIPPED in seen
+
+    script = "Calm words about the sea and the boats today. Then the harbour lights come on. Follow for more."
+    base = _base(monkeypatch, audio, script)
+    seen = _judge(monkeypatch)
+    hook_lab.check_opening(None, base, "Hello there.", hook_lab.find_hook_window(base, script))
+    assert seen == ["Hello there. Then the harbour lights come on. Follow for more."]

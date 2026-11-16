@@ -89,7 +89,7 @@ import subprocess  # noqa: E402
 import threading  # noqa: E402
 from datetime import datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import TYPE_CHECKING, Optional  # noqa: E402
+from typing import TYPE_CHECKING, NamedTuple, Optional  # noqa: E402
 
 from sqlalchemy import or_, select  # noqa: E402
 from sqlalchemy import update as sa_update  # noqa: E402
@@ -273,12 +273,18 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     is in it, wherever the window is. The model never reads it: the
     replaced first sentence is in it, and it isn't heard.
 
-    1. The window at the end of the original first sentence (where the
-       lab finds it, find_hook_window): the cut is exact. What is heard is
-       the script the opening makes, which check_opening judges anyway:
-       nothing more.
-    2. Anywhere else (inside the first sentence, past its end, or its end
-       not known): the words aren't timed, so the voiceover may pick up at
+    1. The window at the pause the lab found after the first sentence
+       (hook_window, snapped to a pause in the audio): the cut is at a
+       sentence end, but the pause shows only that the speaker stopped,
+       not which sentence end it was (a line break is read straight on).
+       So each sentence or line end whose even-pace time is in the
+       stretch searched for that pause is a cut (pause_cuts), heard to
+       the end of the script. Usually the only one is the first
+       sentence's, which is the script the opening makes, judged anyway:
+       nothing more. The same at the even-pace guess when the voiceover
+       is silent throughout (nothing of it is heard).
+    2. Anywhere else (inside the first sentence, past its end, its end
+       not known, or a guess not snapped to a pause): the words aren't timed, so the voiceover may pick up at
        any word near the guess, on either side of where the first sentence
        ends (heard_cuts). Each of those joins is heard as the opening then
        the original from there to the end of the script (heard_joins): a
@@ -308,16 +314,23 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     if window >= total - 0.05:
         return [hook]  # nothing of the original is heard after the opening
     try:
-        end_of_first: Optional[float] = find_hook_window(base, script)
+        found: Optional[HookWindow] = hook_window(base, script)
     except HookLabError:
-        end_of_first = None
+        found = None
+    end_of_first = found.seconds if found else None
     rest = rest_of_script(script)
     rest_at = len(script) - len(rest) if rest else len(script)
     bare = _HOOK_END.sub("", hook) or hook
-    if rest and end_of_first and abs(window - end_of_first) <= 0.05:
+    if rest and found and (found.snapped or found.silent) and abs(window - found.seconds) <= 0.05:
+        # At the pause the lab found: the cut is at a sentence end spoken
+        # there, the first sentence's or another one's. (A silent
+        # voiceover has no pause to find, and none of it is heard: the
+        # same sentence ends are judged.)
         check_script(f"{bare} {script[rest_at:].lstrip(_PUNCT)}")
-        return []  # exact: the script the opening makes
-    _best, cuts = heard_cuts(script, float(window), total, end_of_first)
+        # The first sentence's own end is the script the opening makes.
+        cuts = [c for c in pause_cuts(script, total, found.lo, found.hi) if c != rest_at]
+    else:
+        _best, cuts = heard_cuts(script, float(window), total, end_of_first)
     for cut in cuts:
         check_script(f"{hook} {script[cut:]}")
         check_script(f"{bare} {script[cut:].lstrip(_PUNCT)}")
@@ -328,6 +341,27 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     if len(texts) > MAX_JOINS:
         raise HookLabError(JOINS_TOO_MANY, 422)
     return texts
+
+
+def pause_cuts(script: str, total: float, lo: float, hi: float) -> list[int]:
+    """The places the voiceover may pick up after a pause found between
+    `lo` and `hi` seconds of `total`: the first word after each sentence or
+    line end (.!?…, a line break) whose even-pace time is in that stretch,
+    as character offsets in the stripped script. Ends with nothing after
+    them aren't places (nothing of the original is heard)."""
+    script = (script or "").strip()
+    n = len(script)
+    if not n or total <= 0:
+        return []
+    cuts: list[int] = []
+    for m in _END.finditer(script):
+        if not lo <= total * m.end() / n <= hi:
+            continue
+        after = script[m.end():]
+        cut = m.end() + len(after) - len(after.lstrip())
+        if cut < n and cut not in cuts:
+            cuts.append(cut)
+    return cuts
 
 
 def fits_one_call(text: str) -> bool:
@@ -633,7 +667,26 @@ def detect_silences(path: Path, *, noise_db: float = -35.0, min_seconds: float =
     return out
 
 
-_window_cache: dict[tuple, float] = {}
+class HookWindow(NamedTuple):
+    """Where the lab finds the opening line's end in the base voiceover
+    (hook_window). `seconds` is that place; `snapped` whether it is a pause
+    found in the audio (else the even-pace guess, `estimate`); `lo`..`hi`
+    the stretch searched for that pause (pause_range). A pause there is
+    where the speaker breathed, not necessarily after the first sentence
+    (a line break the voice reads straight past is a sentence end only on
+    the page), so any sentence end spoken in that stretch may be the cut.
+    `silent`: nothing in the voiceover is louder than a pause (a stand-in
+    voice), so none of the original is heard, wherever the cut is."""
+    seconds: float
+    snapped: bool
+    lo: float
+    hi: float
+    estimate: float
+    total: float
+    silent: bool = False
+
+
+_window_cache: dict[tuple, HookWindow] = {}
 _window_lock = threading.Lock()
 
 
@@ -646,10 +699,27 @@ def estimate_window(script: str, audio_seconds: float) -> float:
     return audio_seconds * len(first) / len(script)
 
 
+def pause_range(est: float, total: float) -> tuple[float, float]:
+    """The stretch of the voiceover searched for the pause after the first
+    sentence, around its even-pace end `est`: never past half of what
+    follows it, and closer in when the first sentence is most of the script
+    (a breath before its last clause is not its end)."""
+    share = est / total if total > 0 else 0.0
+    lo = est * (0.6 if share < 0.6 else 0.85)
+    hi = min(est * 1.4, est + (total - est) * 0.5)
+    return lo, hi
+
+
 def find_hook_window(base_render: models.Render, script: Optional[str] = None) -> float:
     """Seconds into the base voiceover where its opening line ends: the
     even-pace estimate (first sentence's share of the script's characters),
-    snapped to the middle of the nearest pause within ±40% of it."""
+    snapped to the middle of the nearest pause near it (hook_window)."""
+    return hook_window(base_render, script).seconds
+
+
+def hook_window(base_render: models.Render, script: Optional[str] = None) -> HookWindow:
+    """find_hook_window, and how it was found: whether it snapped to a
+    pause, and the stretch searched for one (HookWindow)."""
     from .renderer import _probe_duration
 
     path = Path(base_render.audio_path or "")
@@ -672,27 +742,25 @@ def find_hook_window(base_render: models.Render, script: Optional[str] = None) -
     if not rest_of_script(script):
         # One sentence: the opening is the whole voiceover (nothing is
         # joined after it), never a pause inside the line.
-        window = round(total, 2)
+        found = HookWindow(round(total, 2), False, total, total, est, total)
         with _window_lock:
-            _window_cache[key] = window
-        return window
-    # Snap to a pause near the estimate, but never past half of what follows
-    # the first sentence, and closer in when the first sentence is most of
-    # the script (a breath before its last clause is not its end).
-    share = est / total if total > 0 else 0.0
-    lo = est * (0.6 if share < 0.6 else 0.85)
-    hi = min(est * 1.4, est + (total - est) * 0.5)
+            _window_cache[key] = found
+        return found
+    lo, hi = pause_range(est, total)
     best: Optional[float] = None
-    for start, end in detect_silences(path):
+    silences = detect_silences(path)
+    silent = any(start <= 0.05 and end >= total - 0.05 for start, end in silences)
+    for start, end in silences:
         if start <= 0.05 or end >= total - 0.05:
             continue  # leading / trailing silence is not a pause between lines
         mid = (start + end) / 2
         if lo <= mid <= hi and (best is None or abs(mid - est) < abs(best - est)):
             best = mid
     window = round(min(max(best if best is not None else est, 0.3), max(total - 0.3, 0.3)), 2)
+    found = HookWindow(window, best is not None, lo, hi, est, total, silent)
     with _window_lock:
-        _window_cache[key] = window
-    return window
+        _window_cache[key] = found
+    return found
 
 
 def estimate_seconds(text: str, original: str, window: float) -> float:
