@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -764,18 +765,33 @@ class ModelDeclined(ValueError):
     """The safety check model answered with a refusal instead of a verdict."""
 
 
+# The first word of a string verdict, past any spaces and punctuation in
+# front ("True.", "yes - a child", '"yes"'); and an exact no, with only
+# punctuation after it ("No.", "false!").
+_FIRST_WORD_RE = re.compile(r"[\W_]*([a-z0-9]+)")
+_EXACT_NO_RE = re.compile(r"(?:false|no)[.!?]*")
+
+
 def _lenient_verdict(value) -> Optional[bool]:  # noqa: ANN001
     """A "minor_sexual" value as the lenient reading takes it: a bool as it
-    is; a string that is exactly "true"/"yes" or "false"/"no" (any case,
-    spaces around it) as that; anything else None (unreadable). Only those
-    exact words count, so a string can't hide a "true" behind a no."""
+    is; the number 1 as True; a list as True when any item reads True; a
+    string (zero-width characters and spaces taken off, any case) as True
+    when its first word is "true" or "yes" ("True.", "TRUE!", "yes - a
+    child"), as False only when it is exactly "false" or "no", with at most
+    trailing punctuation ("No.", "false!"); anything else None (unreadable),
+    so a string can't hide a "true" behind a no."""
     if isinstance(value, bool):
         return value
+    if isinstance(value, int):
+        return True if value == 1 else None
+    if isinstance(value, list):
+        return True if any(_lenient_verdict(v) is True for v in value) else None
     if isinstance(value, str):
-        word = value.strip().lower()
-        if word in ("true", "yes"):
+        text = "".join(c for c in value if unicodedata.category(c) != "Cf").strip().lower()
+        first = _FIRST_WORD_RE.match(text)
+        if first and first.group(1) in ("true", "yes"):
             return True
-        if word in ("false", "no"):
+        if _EXACT_NO_RE.fullmatch(text):
             return False
     return None
 
@@ -789,8 +805,9 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
     anywhere is never read as no, nor as unreadable: an unreadable reply
     lets a picture or clip prompt go ahead outside adult mode); otherwise
     one or more objects that all have "minor_sexual" false are a no. A
-    string "true"/"yes" or "false"/"no" (any case, trimmed) reads as that
-    bool (_lenient_verdict); none, or any object whose "minor_sexual" is
+    string starting with "true"/"yes", the number 1 or a list holding a
+    true reads as true, and only an exact "false"/"no" as false
+    (_lenient_verdict); none, or any object whose "minor_sexual" is
     anything else (a null, "maybe"), is unreadable (json_objects). `strict` (a story part,
     judged with the story's context) takes one JSON object only
     (strict_json). A byte order mark or zero-width characters in front are
@@ -809,12 +826,12 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
         said = [_lenient_verdict(d["minor_sexual"]) for d in found]
         yes = [d for d, v in zip(found, said, strict=True) if v is True]
         if yes:
-            # Any "true" (or a string "true"/"yes") is the answer, however
+            # Any true (or a string starting "true"/"yes") is the answer, however
             # many objects there are.
             data = {**yes[0], "minor_sexual": True}
         elif not found or any(v is not False for v in said):
             # No verdict, or one that isn't a plain false or exactly the
-            # string "false"/"no" (a null, "maybe", "not true"): never read
+            # string "false"/"no" (a null, "maybe", "not true", 0): never read
             # as a no (unreadable).
             raise ValueError(f"unreadable safety check reply ({len(found)} verdicts): {reply[:120]!r}")
         else:

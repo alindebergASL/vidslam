@@ -43,12 +43,53 @@ UNREADABLE = [
     '{"minor_sexual": "maybe"}',
     '{"minor_sexual": "not true"}',
     '{"minor_sexual": "false, but a child"}',
-    '{"minor_sexual": "true-ish"}',
     '{"minor_sexual": false} {"minor_sexual": "unsure"}',
     '{"minor_sexual": "false"} {"minor_sexual": null}',
-    '{"minor_sexual": 1}',
     '{"minor_sexual": ""}',
 ]
+
+
+# #57 round 4: the first word decides a yes ("True.", "yes - a child"),
+# with punctuation and zero-width characters around it; the number 1 and a
+# list holding a true are a yes too. Only an exact "false"/"no" (trailing
+# punctuation allowed) is a no; any yes still wins.
+STRING_TRUE += [
+    '{"minor_sexual": "True."}',
+    '{"minor_sexual": "TRUE!"}',
+    '{"minor_sexual": "yes - a child"}',
+    '{"minor_sexual": "Yes."}',
+    '{"minor_sexual": 1}',
+    '{"minor_sexual": [true]}',
+    '{"minor_sexual": "true\\u200b"}',
+    '{"minor_sexual": "\u200btrue\u200b"}',
+    '{"minor_sexual": "true-ish"}',
+    '{"minor_sexual": "no"} {"minor_sexual": "yes."}',
+    '{"minor_sexual": "No."} {"minor_sexual": [false, "yes"]}',
+]
+STRING_FALSE += [
+    '{"minor_sexual": "No."}',
+    '{"minor_sexual": "false!"}',
+    '{"minor_sexual": "\u200bfalse "}',
+]
+UNREADABLE += [
+    '{"minor_sexual": 0}',
+    '{"minor_sexual": 2}',
+    '{"minor_sexual": [false]}',
+    '{"minor_sexual": []}',
+    '{"minor_sexual": "no, but"}',
+    '{"minor_sexual": "nope"}',
+]
+
+
+@pytest.mark.parametrize("value,verdict", [
+    ("True.", True), ("TRUE!", True), ("yes - a child", True), ("Yes.", True), (1, True), ([True], True),
+    ("true\u200b", True), (False, False), ("no", False), (" FALSE. ", False), (0, None), (1.5, None),
+    ("not true", None), ("false, but a child", None), ([False], None),
+])
+def test_lenient_verdict_values(value, verdict):
+    from app.providers.openrouter_chat import _lenient_verdict
+
+    assert _lenient_verdict(value) is verdict
 
 
 @pytest.mark.parametrize("reply", STRING_TRUE)
