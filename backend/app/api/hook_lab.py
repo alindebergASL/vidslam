@@ -133,8 +133,9 @@ def _check_shot1(*prompts: Optional[str]) -> None:
 
 
 def _check_opening(db: Session, base: models.Render, hook: str, window: Optional[float]) -> None:
-    """The minors check, on the opening alone, inside the script it joins
-    and with the original voiceover heard after it from `window` on."""
+    """The minors check, on the opening alone, then on the script it makes
+    and each heard form (the opening with the original voiceover heard
+    after it from `window` on), one call each."""
     try:
         hook_lab.check_opening(db, base, hook, window)
     except hook_lab.HookLabError as e:

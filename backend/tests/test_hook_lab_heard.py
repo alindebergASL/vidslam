@@ -219,8 +219,9 @@ def test_a_phrase_formed_across_the_join_is_refused_only_where_it_is_heard(auth_
 def test_the_ai_check_sees_the_opening_with_what_is_heard_after_it(auth_client, monkeypatch):
     """The replaced words ("my wife is thirty") can make the joined text read
     as being about an adult. The AI check also sees the opening with only the
-    words heard after it, on a line of its own in the one text it is asked
-    about (hook_lab.opening_text)."""
+    words heard after it, as a text of its own: the script the opening makes
+    and each heard form are each asked about in their own call
+    (hook_lab.judged_texts)."""
     from app.providers import mock_chat
 
     seen: list[str] = []
