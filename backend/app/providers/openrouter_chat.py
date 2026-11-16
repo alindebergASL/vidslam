@@ -764,6 +764,22 @@ class ModelDeclined(ValueError):
     """The safety check model answered with a refusal instead of a verdict."""
 
 
+def _lenient_verdict(value) -> Optional[bool]:  # noqa: ANN001
+    """A "minor_sexual" value as the lenient reading takes it: a bool as it
+    is; a string that is exactly "true"/"yes" or "false"/"no" (any case,
+    spaces around it) as that; anything else None (unreadable). Only those
+    exact words count, so a string can't hide a "true" behind a no."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in ("true", "yes"):
+            return True
+        if word in ("false", "no"):
+            return False
+    return None
+
+
 def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
     """{"minor_sexual": bool, "reason": str} from a classifier reply; raises
     ModelDeclined on a refusal, ValueError on anything else. Read leniently
@@ -772,9 +788,10 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
     "minor_sexual" true, the verdict is true (a reply that says yes
     anywhere is never read as no, nor as unreadable: an unreadable reply
     lets a picture or clip prompt go ahead outside adult mode); otherwise
-    one or more objects that all have "minor_sexual" false are a no; none,
-    or any object whose "minor_sexual" isn't a true/false (a string "true",
-    say), is unreadable (json_objects). `strict` (a story part,
+    one or more objects that all have "minor_sexual" false are a no. A
+    string "true"/"yes" or "false"/"no" (any case, trimmed) reads as that
+    bool (_lenient_verdict); none, or any object whose "minor_sexual" is
+    anything else (a null, "maybe"), is unreadable (json_objects). `strict` (a story part,
     judged with the story's context) takes one JSON object only
     (strict_json). A byte order mark or zero-width characters in front are
     taken off either way."""
@@ -789,17 +806,20 @@ def parse_minor_verdict(reply: str, *, strict: bool = False) -> dict:
         data = strict_json(reply)
     else:
         found = [d for d in json_objects(reply) if "minor_sexual" in d]
-        yes = [d for d in found if d["minor_sexual"] is True]
+        said = [_lenient_verdict(d["minor_sexual"]) for d in found]
+        yes = [d for d, v in zip(found, said, strict=True) if v is True]
         if yes:
-            # Any "true" is the answer, however many objects there are.
-            data = yes[0]
-        elif not found or any(d["minor_sexual"] is not False for d in found):
-            # No verdict, or one that isn't a plain false (a string "true",
-            # a null): never read as a no (unreadable).
+            # Any "true" (or a string "true"/"yes") is the answer, however
+            # many objects there are.
+            data = {**yes[0], "minor_sexual": True}
+        elif not found or any(v is not False for v in said):
+            # No verdict, or one that isn't a plain false or exactly the
+            # string "false"/"no" (a null, "maybe", "not true"): never read
+            # as a no (unreadable).
             raise ValueError(f"unreadable safety check reply ({len(found)} verdicts): {reply[:120]!r}")
         else:
             # Every verdict says false, however many there are.
-            data = found[0]
+            data = {**found[0], "minor_sexual": False}
     verdict = data.get("minor_sexual") if isinstance(data, dict) else None
     if not isinstance(verdict, bool):
         raise ValueError(f"unreadable safety check reply: {reply[:120]!r}")

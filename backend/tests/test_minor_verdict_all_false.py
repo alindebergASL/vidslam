@@ -4,7 +4,7 @@ A picture or clip reply is read leniently. One with two or more verdict
 objects that all said "minor_sexual": false was unreadable ("the check
 couldn't run"), though no object in it said yes. Now every verdict
 agreeing on false is a no. Any true still wins, and a verdict that isn't
-a plain true/false (a string "true", a null) never reads as a no.
+a true/false (a null, "maybe") never reads as a no.
 """
 from __future__ import annotations
 
@@ -39,14 +39,13 @@ def test_any_true_still_wins(reply):
 
 
 @pytest.mark.parametrize("reply", [
-    '{"minor_sexual": "true", "reason": "a child"}',
-    '{"minor_sexual": false} {"minor_sexual": "true", "reason": "a child"}',
-    '{"minor_sexual": "true"} {"minor_sexual": false}',
     '{"minor_sexual": false} {"minor_sexual": null}',
-    '{"minor_sexual": "false"}',
+    '{"minor_sexual": "maybe"}',
     "no verdict here",
 ])
 def test_a_verdict_that_is_not_a_plain_bool_stays_unreadable(reply):
+    # A string "true"/"yes" or "false"/"no" reads as that bool since round 3
+    # (test_minor_verdict_strings.py).
     with pytest.raises(ValueError):
         parse_minor_verdict(reply)
 
