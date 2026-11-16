@@ -598,23 +598,74 @@ def story_word_filter(text: str) -> None:
 # A direction group (brackets, parentheses or asterisks) right before a
 # marker safety_text added.
 _GROUP_BEFORE_MARKER_RE = re.compile(r"(?:\[([^\]]*)\]|\(([^()\n]*)\)|\*([^*\n]+)\*)\s*$")
+# The words of an adult direction that also name everyday sounds ("panting
+# dog", "ghosts moaning", "breathless excitement", "sighs of relief").
+_AMBIGUOUS_ADULT_RE = re.compile(r"\b(?:moan\w*|pant(?:s|ed|ing)?|breathless\w*|sigh\w*)\b", re.I)
+# ... and those that never do: a group with one of these (or any word the
+# filter knows as sexual) keeps its marker, so it is refused next to a
+# minor by the words ("little boy (orgasmic moans)", "kid voice (lustful
+# sighs)", "young teen girl (sultry whispers)").
+_PLAIN_ADULT_RE = re.compile(
+    r"\b(?:orgasm\w*|seduct\w*|sultr\w*|flirt\w*|"
+    r"lust(?:s|ed|ing|ful|fully|fulness|y|ier|iest|ily|iness)?)\b", re.I)
+# A bed in the prompt: moaning, panting or breathlessness there, next to a
+# minor, is refused by the words ("kids playing (moaning and panting
+# intensely, bed creaking)", "girl aged 9, (moaning softly), bedroom").
+_BED_RE = re.compile(r"\b(?:beds?|bedrooms?|bed ?sheets?|mattress(?:es)?|under the covers)\b", re.I)
+_MOAN_RE = re.compile(r"\bmoan\w*", re.I)
+# What may moan in a sound prompt without a person doing it: ghosts and a
+# haunted house, the wind, a ship, old timbers, cattle, whales. Moaning
+# with none of these named ("a 10 year old *moaning*") keeps its marker.
+_MOAN_SOURCE_RE = re.compile(
+    r"\b(?:ghosts?|ghostly|ghouls?|spirits?|phantoms?|spectres?|specters?|spooky|zombies?|undead|"
+    r"mumm(?:y|ies)|monsters?|creatures?|haunted|haunting|halloween|wind|winds|gales?|storms?|"
+    r"ships?|hulls?|timbers?|floorboards?|doors?|hinges?|trees?|branches|pipes?|foghorns?|engines?|"
+    r"cattle|cows?|whales?|wol(?:f|ves))\b", re.I)
+
+
+def _keeps_marker(group: str, square: bool, text: str) -> bool:
+    """Whether a "(seductive)" marker safety_text put after `group` (a
+    direction group of `text`; `square`: in [brackets]) stays for the word
+    filter, so the group is refused next to a minor by the words alone."""
+    from . import story_script
+
+    if square and any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
+        # A voice tag ("[moans]", "[panting]", "[lustful]"): a sexual direction.
+        return True
+    if _PLAIN_ADULT_RE.search(group) or safety.is_hard_sexual(group):
+        return True
+    if story_script._ADULT_STEM_RE.search(_AMBIGUOUS_ADULT_RE.sub(" ", group)):
+        # An adult word that isn't one of the everyday ones.
+        return True
+    if _BED_RE.search(text):
+        return True
+    return bool(_MOAN_RE.search(group)) and not _MOAN_SOURCE_RE.search(text)
 
 
 def unmarked(text: str) -> str:
     """`text` without the markers story_script.safety_text adds ("(seductive)",
     "(sensual)"): what a word filter reads of a text that was marked for the
-    model (`marked` below). The app's own marks are for the model to weigh,
-    never a refusal by the words alone ("(ghosts moaning)" near "kids").
-    Kept after a group that is an adult voice tag itself ("[moans]",
-    "[lustful]"): a sexual direction, refused next to a minor by the words."""
+    model (`marked` below). The app's marks on everyday sounds are for the
+    model to weigh, never a refusal by the words alone ("(ghosts moaning)",
+    "(panting dog)" or "*breathless*" near "kids"). A "(seductive)" marker
+    stays (_keeps_marker), refused next to a minor by the words, after an
+    adult voice tag in [brackets] ("[moans]", "[lustful]"), a group with a
+    word that is never an everyday sound ("(orgasmic moans)", "(lustful
+    sighs)", "(sultry whispers)"), moaning, panting or breathlessness in a
+    prompt with a bed in it, and moaning that nothing but a person could
+    be doing ("a 10 year old *moaning*"; not "(ghosts moaning)")."""
     from . import story_script
 
+    seductive = f"({story_script._ADULT_TAG_WORD})"
+
     def drop(m: "re.Match") -> str:
+        if m.group(0).lower() != seductive:
+            return " "
         before = _GROUP_BEFORE_MARKER_RE.search(m.string, max(0, m.start() - 400), m.start())
-        group = next((g for g in before.groups() if g is not None), "") if before else ""
-        if any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
-            return m.group(0)
-        return " "
+        if not before:
+            return " "
+        group = next((g for g in before.groups() if g is not None), "")
+        return m.group(0) if _keeps_marker(group, before.group(1) is not None, m.string) else " "
 
     return story_script._MARKER_RE.sub(drop, text or "")
 
