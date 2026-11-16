@@ -464,9 +464,10 @@ def picture_file(scene_id: int, db: Session = Depends(get_db)) -> FileResponse:
     return FileResponse(svc.picture_path(project), media_type="image/png")
 
 
-# The request waits on the inline measurement: each FFmpeg read gets this
-# long (the worker's own measurement keeps loop_health's longer default).
-INLINE_MEASURE_TIMEOUT = 30.0
+# The request waits on the inline measurement of the loop clip: all of it
+# gets this long (the worker's own measurement keeps loop_health's longer
+# per-read default and measures the variations).
+INLINE_MEASURE_SECONDS = 45.0
 
 
 @router.post("/{scene_id}/render", status_code=202,
@@ -475,9 +476,10 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
     """Queue the full-length render. A loop whose join jumps visibly (the
     blend won't hide it) answers 409 {code: "seam_jump"}, and a loop clip
     whose join couldn't be measured answers 409 {code: "seam_unmeasured"},
-    unless `accept_seam` or the scene's seam_mode is "blend". The worker
-    gets `accept_seam` too: a jump it finds that nobody accepted stops the
-    render."""
+    unless `accept_seam` or the scene's seam_mode is "blend". Only the loop
+    clip is measured here (within INLINE_MEASURE_SECONDS); a variation
+    without a reading is measured by the worker, which gets `accept_seam`
+    too: a visible jump it finds that nobody accepted stops the render."""
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is already generating")
@@ -487,10 +489,11 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
     from ..services import loop_health
 
     cfg = svc._config_of(project)
-    if cfg.source == "video" and loop_health.unmeasured(project):
-        # A clip (the loop or a variation) has no current reading: measure
-        # now (local, a few seconds; current readings are kept).
-        loop_health.measure_scene(db, project, timeout=INLINE_MEASURE_TIMEOUT)
+    if cfg.source == "video" and loop_health.current_entry(project, shot) is None:
+        # The loop clip has no current reading: measure it now (local, a few
+        # seconds). Its reading alone decides whether the request can tell
+        # if the loop jumps; variations are left to the worker.
+        loop_health.measure_loop(db, project, within=INLINE_MEASURE_SECONDS)
         db.refresh(project)
     treatment = svc.seam_treatment(project)
     if (not accept_seam and cfg.source == "video" and cfg.seam_mode == "auto"

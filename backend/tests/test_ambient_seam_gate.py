@@ -212,15 +212,25 @@ def test_the_music_bed_loops_on_its_own_long_crossfade(auth_client, monkeypatch,
     assert xfades and xfades[0] == 6.0
 
 
-def test_a_jumping_variation_with_no_reading_is_measured_and_gated(auth_client):
+def test_a_variation_with_no_reading_is_left_to_the_worker_which_stops_on_a_jump(auth_client):
     """The loop clip's reading is current but a variation's clip changed
-    since: POST /render measures the variation too, and its visible jump
-    asks first (the scene's treatment is the worst join)."""
+    since: the request measures only the loop clip (its basis decides the
+    gate) and queues; the worker measures the variation, finds a visible
+    jump nobody accepted, and stops. Its reading then gates the next
+    request (the scene's treatment is the worst join)."""
+    from app.services import ambient
+
     scene = _scene(auth_client, variety="takes", variations=2)
     sid = scene["id"]
     assert len(scene["variant_shots"]) == 1
     assert scene["seam_treatment"]["verdict"] == "seamless"
     _replace(Path(scene["variant_shots"][0]["clip_path"]), hard_cut)
+    r = auth_client.post(f"/api/ambient/{sid}/render")
+    assert r.status_code == 202, r.text
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["status"] == "failed"
+    assert out["latest_render"]["status"] == "failed"
+    assert out["latest_render"]["error"] == ambient.SEAM_STOP_MESSAGE
     r = auth_client.post(f"/api/ambient/{sid}/render")
     assert r.status_code == 409, r.text
     detail = r.json()["detail"]
@@ -292,25 +302,72 @@ def test_blend_mode_renders_an_unmeasured_loop_without_asking(auth_client, monke
     assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
 
 
-def test_the_inline_measurement_uses_a_short_timeout(auth_client, monkeypatch):
+def test_the_inline_measurement_reads_only_the_loop_clip_within_a_deadline(auth_client, monkeypatch):
+    from app.api import ambient as ambient_api
+    from app.services import loop_health
+
+    scene = _scene(auth_client, variety="takes", variations=2)
+    sid = scene["id"]
+    loop_clip = Path(scene["loop_shot"]["clip_path"])
+    var_clip = Path(scene["variant_shots"][0]["clip_path"])
+    _replace(loop_clip, seamless)
+    _replace(var_clip, seamless)
+    seen = []
+    real_measure = loop_health.measure
+
+    def spy(clip, still=False, **kw):
+        seen.append((Path(clip), kw.get("timeout"), kw.get("deadline") is not None))
+        return real_measure(clip, still=still, **kw)
+
+    monkeypatch.setattr(loop_health, "measure", spy)
+    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
+    # The request reads the loop clip under one overall deadline; the
+    # worker reads the variation with its own (longer, per-read) timeout.
+    assert ambient_api.INLINE_MEASURE_SECONDS == 45
+    assert seen == [(loop_clip, ambient_api.INLINE_MEASURE_SECONDS, True),
+                    (var_clip, loop_health.MEASURE_TIMEOUT_SECONDS, False)]
+    assert loop_health.MEASURE_TIMEOUT_SECONDS == 120  # the worker's is unchanged
+    assert auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["status"] == "completed"
+
+
+def test_the_inline_deadline_bounds_the_whole_measurement(auth_client, monkeypatch):
+    """Each FFmpeg read gets only what is left of the overall deadline; once
+    it's gone the measurement stops and the request asks."""
+    import time
+
     from app.api import ambient as ambient_api
     from app.services import loop_health
 
     scene = _scene(auth_client)
     sid = scene["id"]
-    _replace(Path(scene["loop_shot"]["clip_path"]), seamless)
-    seen = []
-    real_measure = loop_health.measure
+    _replace(Path(scene["loop_shot"]["clip_path"]), hard_cut)
+    monkeypatch.setattr(ambient_api, "INLINE_MEASURE_SECONDS", 0.6)
+    timeouts = []
+    real_read = loop_health._read_frames
 
-    def spy(clip, still=False, **kw):
-        seen.append(kw.get("timeout"))
-        return real_measure(clip, still=still, **kw)
+    def slow_read(cmd_in, vf_pre, size, *, timeout):
+        timeouts.append(timeout)
+        time.sleep(0.35)
+        return real_read(cmd_in, vf_pre, size, timeout=60)
 
-    monkeypatch.setattr(loop_health, "measure", spy)
-    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
-    # The request's own reading is short; the worker had a current one.
-    assert seen == [ambient_api.INLINE_MEASURE_TIMEOUT] and ambient_api.INLINE_MEASURE_TIMEOUT <= 30
-    assert loop_health.MEASURE_TIMEOUT_SECONDS == 120  # the worker's is unchanged
+    monkeypatch.setattr(loop_health, "_read_frames", slow_read)
+    r = auth_client.post(f"/api/ambient/{sid}/render")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "seam_unmeasured"
+    assert len(timeouts) < 3  # the third read never started
+    assert all(t <= 0.6 for t in timeouts)
+    assert all(b < a for a, b in zip(timeouts, timeouts[1:], strict=False))
+
+
+def test_a_spent_deadline_raises_before_reading(tmp_path, monkeypatch):
+    import time
+
+    from app.services import loop_health
+
+    clip = seamless(tmp_path / "s.mp4")
+    monkeypatch.setattr(loop_health, "_read_frames", _boom)
+    with pytest.raises(TimeoutError):
+        loop_health.measure(clip, deadline=time.monotonic() - 1)
 
 
 def test_accept_seam_reaches_the_worker(auth_client, monkeypatch):
@@ -370,7 +427,7 @@ def test_the_worker_stops_an_unasked_jumping_render(auth_client):
         db.commit()
     finally:
         db.close()
-    jobs.render_ambient_job(sid, claim_token="tok")
+    jobs.render_ambient_job(sid, claim_token="tok", accept_seam=False)
     out = auth_client.get(f"/api/ambient/{sid}").json()
     assert out["status"] == "failed"  # not left "generating"
     latest = out["latest_render"]
@@ -391,6 +448,174 @@ def test_the_worker_stops_an_unasked_jumping_render(auth_client):
     r = auth_client.post(f"/api/ambient/{sid}/render?accept_seam=true")
     assert r.status_code == 202, r.text
     assert auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["status"] == "completed"
+
+
+def _claim(sid: int, token: str = "tok") -> None:
+    from app import models
+    from app.db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        # As POST /render claims the scene before queueing.
+        db.query(models.VideoProject).filter(models.VideoProject.id == sid).update(
+            {"status": "generating", "claim_token": token}, synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_a_render_queued_before_accept_seam_travelled_is_honoured(auth_client):
+    """A job POST /render queued before the job carried accept_seam (an
+    earlier "Render anyway") has a claim token and no accept_seam: its
+    request already passed the gate, so the worker's jump doesn't stop it."""
+    from app.workers import jobs
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), hard_cut)
+    _claim(sid)
+    jobs.render_ambient_job(sid, claim_token="tok")
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["status"] == "completed"
+    assert out["latest_render"]["status"] == "completed"
+    assert "seam=visible_jump blend=2s" in out["latest_render"]["render_log"]
+
+
+def test_the_api_always_queues_an_explicit_accept_seam(auth_client, monkeypatch):
+    from app.workers import jobs, queue
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    kwargs = []
+    real_enqueue = queue.enqueue
+
+    def spy(fn, *a, **kw):
+        if fn is jobs.render_ambient_job:
+            kwargs.append(kw)
+        return real_enqueue(fn, *a, **kw)
+
+    monkeypatch.setattr("app.api.ambient.enqueue", spy)
+    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
+    assert kwargs[-1]["accept_seam"] is False and kwargs[-1]["claim_token"]
+
+
+def _no_alerts(monkeypatch) -> list:
+    from app.services import alerts
+
+    sent = []
+    monkeypatch.setattr(alerts, "render_failed", lambda *a, **kw: sent.append(a))
+    return sent
+
+
+def _assert_batch_asked(auth_client, sid: int) -> None:
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["status"] == "planned"
+    latest = out["latest_render"]
+    assert latest["status"] == "cancelled" and latest["error"] == ambient.SEAM_STOP_MESSAGE
+    db = SessionLocal()
+    try:
+        ev = (db.query(models.Event).filter(models.Event.project_id == sid,
+                                            models.Event.status == "needs_look").one())
+        assert ev.kind == "ambient_loop" and ev.severity == "warning" and "needs a look" in ev.title
+        assert not db.query(models.Event).filter(models.Event.project_id == sid,
+                                                 models.Event.status == "failed").count()
+    finally:
+        db.close()
+
+
+def test_a_batch_render_that_finds_a_jump_asks_instead_of_failing(auth_client, monkeypatch, tmp_path):
+    """A batch queued the render without a reading (the generate-time
+    measurement failed); the worker's own reading finds a visible jump. As
+    when the batch finds it at generate time: the scene goes back to
+    planned with a needs_look event; no failed event, no alert."""
+    from app.services import loop_health
+    from app.workers import jobs, queue
+
+    sent = _no_alerts(monkeypatch)
+    jump = hard_cut(tmp_path / "jump.mp4")
+    real_measure = loop_health.measure
+    calls = {"n": 0}
+
+    def first_fails(clip, still=False, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("ffmpeg took too long")
+        return real_measure(jump, still=still, **kw)
+
+    monkeypatch.setattr(loop_health, "measure", first_fails)
+    queued = []
+    real_enqueue = queue.enqueue
+
+    def spy(fn, *a, **kw):
+        if fn is jobs.render_ambient_job:
+            queued.append(kw)
+        return real_enqueue(fn, *a, **kw)
+
+    monkeypatch.setattr(queue, "enqueue", spy)
+    r = auth_client.post("/api/ambient/batch", json={
+        "presets": ["fireplace"], "config": {**SHORT, "music_mood": "none"}, "render": True})
+    assert r.status_code == 201, r.text
+    sid = r.json()["scene_ids"][0]
+    assert calls["n"] == 2  # generate time (failed), then the worker
+    assert queued == [{}]  # the batch's job: no claim token, no accept_seam
+    _assert_batch_asked(auth_client, sid)
+    assert sent == []
+
+
+def test_a_batch_queued_render_stops_and_asks(auth_client, monkeypatch):
+    """The batch's job (no claim token, no accept_seam) on a scene whose
+    clip now jumps: no failure, the scene asks."""
+    from app.workers import jobs
+
+    sent = _no_alerts(monkeypatch)
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), hard_cut)
+    jobs.render_ambient_job(sid)
+    _assert_batch_asked(auth_client, sid)
+    assert sent == []
+
+
+def test_a_cancel_during_the_measurement_wins_over_the_seam_stop(auth_client, monkeypatch):
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient, loop_health
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), hard_cut)
+    real_measure = loop_health.measure
+
+    def cancel_meanwhile(clip, still=False, **kw):
+        db = SessionLocal()
+        try:
+            db.query(models.Render).filter(models.Render.project_id == sid,
+                                           models.Render.status == "rendering").update(
+                {"status": "cancelled"}, synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+        return real_measure(clip, still=still, **kw)
+
+    monkeypatch.setattr(loop_health, "measure", cancel_meanwhile)
+    db = SessionLocal()
+    try:
+        render = ambient.render_scene(db, sid, accept_seam=False)
+        assert render.status == "cancelled" and render.error == ""
+    finally:
+        db.close()
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["status"] == "cancelled"
+    db = SessionLocal()
+    try:
+        assert not db.query(models.Event).filter(models.Event.project_id == sid,
+                                                 models.Event.status.in_(("failed", "needs_look"))).count()
+    finally:
+        db.close()
 
 
 # ---------- a seamless join and an explicit short setting ----------

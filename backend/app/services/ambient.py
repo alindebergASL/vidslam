@@ -2237,6 +2237,7 @@ def _finalize_generation(
         from ..workers.jobs import render_ambient_job
         from ..workers.queue import enqueue
 
+        # No claim token: the job knows a batch queued it (nobody was asked).
         enqueue(render_ambient_job, project.id)
 
 
@@ -2548,18 +2549,28 @@ def render_seam_blend_seconds(project: models.VideoProject) -> float:
 class SeamJumpStop(RuntimeError):
     """The render found a visibly jumping join that nobody accepted."""
 
+    def __init__(self, message: str, treatment: dict):
+        super().__init__(message)
+        self.treatment = treatment
+
 
 SEAM_STOP_MESSAGE = ("Not rendered: the loop clip jumps visibly at the join and the blend won't hide it. "
                      "Open the scene to choose a longer blend or render anyway.")
 
 
-def render_scene(db: Session, project_id: int, *, accept_seam: bool = False) -> models.Render:
+def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
+                 batch: bool = False) -> models.Render:
     """Tile the loop clip to the full target duration under the music bed.
 
     `accept_seam`: the person said a visibly jumping join is OK (POST
     /render?accept_seam=true). Without it, a reading taken here that finds
-    a visible jump (seam_mode "auto") stops the render before composing:
-    the render fails with SEAM_STOP_MESSAGE and the scene is released."""
+    a visible jump (seam_mode "auto") stops the render before composing.
+    Asked from the page (`batch` False), the render fails with
+    SEAM_STOP_MESSAGE and the scene is released. Queued by a batch after
+    its loop was made (`batch`), nobody was asked: as when the batch finds
+    the jump at generate time, the scene goes back to "planned" with a
+    needs_look event, and the render row ends "cancelled" (no failure
+    event, no alert)."""
     from .pipeline import RenderCancelled, _check_cancel, _music_path_if_any
 
     project = db.get(models.VideoProject, project_id)
@@ -2603,11 +2614,14 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False) -> 
         if cfg.source == "video" and loop_health.unmeasured(project):
             loop_health.measure_quietly(db, project.id)  # local, a few seconds
             db.refresh(project)
+        # Cancelled while measuring: that wins over anything the reading says.
+        _check_cancel(db, render)
         treatment = seam_treatment(project)
         if not accept_seam and seam_needs_a_look(project, treatment):
-            # A reading taken just now (the request's own may have failed):
-            # don't render an hour of a jumping loop nobody agreed to.
-            raise SeamJumpStop(SEAM_STOP_MESSAGE)
+            # A reading taken just now (the request's own may have failed,
+            # or skipped a variation): don't render an hour of a jumping
+            # loop nobody agreed to.
+            raise SeamJumpStop(SEAM_STOP_MESSAGE, treatment)
         seam = float(treatment["blend_seconds"])
         outputs = compose_ambient(
             AmbientRenderInputs(
@@ -2673,6 +2687,15 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False) -> 
         # Not a fault (no alert, no retry): the render stops and says why;
         # the scene is free to render again from the page.
         log.info("ambient render of scene %s stopped: visible jump at the join", project.id)
+        if batch:
+            # Nobody was asked: ask now, as the batch does when it finds
+            # the jump at generate time.
+            render.status = "cancelled"
+            render.error = str(e)
+            project.status = "planned"
+            events.ambient_seam_event(db, project, e.treatment)
+            db.commit()
+            return render
         render.status = "failed"
         render.error = str(e)
         project.status = "failed"

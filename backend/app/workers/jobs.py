@@ -6,6 +6,7 @@ process and cannot share a FastAPI request's session.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from sqlalchemy import update
 
@@ -127,7 +128,13 @@ def generate_ambient_loop_job(project_id: int, regenerate_music: bool = True, cl
         db.close()
 
 
-def render_ambient_job(project_id: int, claim_token: str = "", accept_seam: bool = False) -> None:
+def render_ambient_job(project_id: int, claim_token: str = "", accept_seam: Optional[bool] = None) -> None:
+    """Render an Ambient scene. With `claim_token`: queued by POST /render,
+    which always passes an explicit `accept_seam`; None there is a job
+    queued before accept_seam travelled with it, whose request already
+    passed the seam gate, so a jump doesn't stop it. Without a token:
+    queued by a batch after its loop was made (nobody was asked), so a
+    visible jump stops the render and asks (needs_look)."""
     from ..services import ambient
 
     db = SessionLocal()
@@ -138,7 +145,10 @@ def render_ambient_job(project_id: int, claim_token: str = "", accept_seam: bool
                 db.rollback()
                 return
             db.commit()
-        ambient.render_scene(db, project_id, accept_seam=accept_seam)
+        if claim_token:
+            ambient.render_scene(db, project_id, accept_seam=True if accept_seam is None else accept_seam)
+        else:
+            ambient.render_scene(db, project_id, accept_seam=bool(accept_seam), batch=True)
     finally:
         db.close()
 

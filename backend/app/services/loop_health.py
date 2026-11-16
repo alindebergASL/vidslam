@@ -97,7 +97,7 @@ def _read_frames(cmd_in: list[str], vf_pre: str, size: tuple[int, int], *,
     w, h = size
     vf = ",".join(x for x in (vf_pre, f"scale={w}:{h}:flags=area", "format=rgb24") if x)
     cmd = ["ffmpeg", "-v", "error", *cmd_in, "-vf", vf, "-an", "-f", "rawvideo", "-"]
-    proc = subprocess.run(cmd, capture_output=True, timeout=max(1.0, timeout))
+    proc = subprocess.run(cmd, capture_output=True, timeout=max(0.1, timeout))
     if proc.returncode != 0:
         raise RuntimeError(f"could not read the clip: {proc.stderr.decode(errors='replace')[-300:]}")
     n = w * h * 3
@@ -223,20 +223,31 @@ def _drift(frames: list[Image.Image], fps: float) -> dict:
     return {"verdict": verdict, "level": level, "text": text, "distance": round(dist, 4)}
 
 
-def measure(clip: Path, *, still: bool = False, timeout: float = MEASURE_TIMEOUT_SECONDS) -> dict:
+def measure(clip: Path, *, still: bool = False, timeout: float = MEASURE_TIMEOUT_SECONDS,
+            deadline: Optional[float] = None) -> dict:
     """The four readings for `clip`. `still`: an image-drift loop (a still
     picture with slow camera motion), where freezing isn't meaningful.
     `timeout`: seconds each FFmpeg read may take (subprocess.TimeoutExpired
-    past it)."""
+    past it). `deadline`: a time.monotonic() by which the whole measurement
+    must be done (each read gets what is left; TimeoutError once it's gone)."""
+
+    def budget() -> float:
+        if deadline is None:
+            return timeout
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the measurement ran out of time")
+        return min(timeout, left)
+
     duration, size = _probe(clip)
     if duration <= 0:
         raise RuntimeError("could not read the clip")
     asize = _analysis_size(size)
     fps = min(SAMPLE_FPS, MAX_SAMPLES / duration)
-    frames = _read_frames(["-i", str(clip)], f"fps={fps:.4f}", asize, timeout=timeout)
+    frames = _read_frames(["-i", str(clip)], f"fps={fps:.4f}", asize, timeout=budget())
     win = min(WINDOW_SECONDS, duration / 2.0)
-    first = _read_frames(["-t", f"{win:.3f}", "-i", str(clip)], "", asize, timeout=timeout)
-    last = _read_frames(["-sseof", f"-{win:.3f}", "-i", str(clip)], "", asize, timeout=timeout)
+    first = _read_frames(["-t", f"{win:.3f}", "-i", str(clip)], "", asize, timeout=budget())
+    last = _read_frames(["-sseof", f"-{win:.3f}", "-i", str(clip)], "", asize, timeout=budget())
     if len(frames) < 2 or not first or not last:
         raise RuntimeError("the clip is too short to measure")
     luma = [ImageStat.Stat(f.convert("L")).mean[0] / 255.0 for f in frames]
@@ -343,7 +354,8 @@ def out(project: models.VideoProject, shot: models.VideoShot, entry: dict) -> di
 
 
 def measure_shot(db: Session, project: models.VideoProject, shot: models.VideoShot, *,
-                 force: bool = False, timeout: float = MEASURE_TIMEOUT_SECONDS) -> Optional[dict]:
+                 force: bool = False, timeout: float = MEASURE_TIMEOUT_SECONDS,
+                 deadline: Optional[float] = None) -> Optional[dict]:
     """Measure the shot's clip (unless a current reading exists and not
     `force`), keep it in the scene's state, and return it."""
     if not force:
@@ -353,7 +365,7 @@ def measure_shot(db: Session, project: models.VideoProject, shot: models.VideoSh
     if not shot.clip_path or shot.status != "completed" or not Path(shot.clip_path).is_file():
         return None
     stamp = _clip_stamp(shot.clip_path)
-    entry = measure(Path(shot.clip_path), still=_is_still(project), timeout=timeout)
+    entry = measure(Path(shot.clip_path), still=_is_still(project), timeout=timeout, deadline=deadline)
     entry.update({"measured_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
                   "clip_path": shot.clip_path, "clip_mtime_ns": stamp})
     db.refresh(project)  # the state may have moved on while we measured
@@ -384,6 +396,24 @@ def measure_scene(db: Session, project: models.VideoProject, *, force: bool = Fa
         if got is not None:
             results.append(got)
     return results
+
+
+def measure_loop(db: Session, project: models.VideoProject, *, within: float) -> Optional[dict]:
+    """Measure just the loop clip (unless its reading is current), all of it
+    within `within` seconds: a request waits on this, and only the loop
+    clip's reading decides whether it can tell if the loop jumps. Never
+    raises (None: no reading)."""
+    from .ambient import _loop_shot
+
+    shot = _loop_shot(project)
+    if shot is None:
+        return None
+    try:
+        return measure_shot(db, project, shot, timeout=within, deadline=time.monotonic() + within)
+    except Exception as e:  # noqa: BLE001 — no reading: the caller asks
+        db.rollback()
+        log.warning("loop health of shot %s failed: %s", shot.id, e)
+        return None
 
 
 def measure_quietly(db: Session, project_id: int) -> None:
