@@ -56,8 +56,21 @@ def _explicit(text: str) -> None:
 # explicit", "no sexual content", "non-explicit", "without explicit
 # lyrics"), right before a break or the end: not the word itself.
 _NEGATED_ADULT_RE = re.compile(
-    r"\b(?:no|nothing|not|non-?|without)\s*(?:explicit|sexual)"
-    r"(?:\s+(?:content|material|lyrics|themes|language|words))?(?=\s*(?:[,.;:!?)\]]|$))", re.I)
+    r"(?<![\w-])(?:no|nothing|not|non-?|without)\s*(?:explicit|sexual)"
+    r"(?:\s+(?:content|material|lyrics|themes|language|words))?(?=\s*(?:[,.;:!)\]]|$))", re.I)
+# A word that turns the negation round or makes it a question ("never not
+# sexual", "not non-explicit", "why not explicit", "if not explicit").
+_UNNEGATING_RE = re.compile(r"\b(?:never|not|no|non|nothing|without|why|if|hardly|barely)[\s-]*$", re.I)
+
+
+def _negations_out(text: str) -> str:
+    """A copy of `text` for the word filter only: a plain negated
+    "explicit" or "sexual" ("nothing explicit", "no sexual content") taken
+    out. Never what the safety model or the explicit-content check reads."""
+    def drop(m: "re.Match") -> str:
+        return m.group(0) if _UNNEGATING_RE.search(m.string[:m.start()]) else " "
+
+    return _NEGATED_ADULT_RE.sub(drop, text).strip() or text
 
 
 def _explicit_prompt(prompt: str) -> None:
@@ -244,12 +257,12 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
     text = (prompt or "").strip()
     if not text:
         return
-    if not (context or "").strip():
-        # "family friendly, nothing explicit", "no sexual content": a
-        # negated "explicit" or "sexual" isn't the word itself (the safety
-        # model, always asked below, reads the rest).
-        text = _NEGATED_ADULT_RE.sub(" ", text).strip() or text
-    check_prompt(text)
+    # "family friendly, nothing explicit", "no sexual content": the word
+    # filter reads a copy without a plain negated "explicit" or "sexual";
+    # the safety model, the explicit-content check and the vetted-preset
+    # lookup read the text as written.
+    words = _negations_out(text) if not (context or "").strip() else text
+    check_prompt(words)
     context = (context or "").strip()
     if context:
         if not passes.covers(token, context, passes.prompt_item(text)):
@@ -271,8 +284,11 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
         # (minor_check.unmarked). The model reads the prompt as the user
         # wrote it: the markers are the app's notes, which it would read as
         # the user's ("(waves crashing, seagulls) (sensual)").
-        _word_filter(safety_text(text, "", prose=True), "", "audio", marked=True)
-        check_long(text, kind="audio", force=force)
+        _word_filter(safety_text(words, "", prose=True), "", "audio", marked=True)
+        # The whole text's word filter has run (above), so the windows'
+        # word filter would only read less of it: the model reads each
+        # window as written.
+        check_long(text, kind="audio", force=force, words=False)
     _explicit_prompt(text)
 
 

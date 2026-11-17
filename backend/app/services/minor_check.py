@@ -799,6 +799,9 @@ def _unambiguous(group: str) -> bool:
     return sound and (safety._any(_WITH_SOUND_RE, forms) or _joined_hit(_JOINED_WITH_SOUND_RE, forms))
 
 
+_TAG_PUNCT_RE = re.compile(r"[^\w\s]+")
+
+
 def _adult_tag_group(group: str, exact: bool = False) -> bool:
     """Whether a [bracket] group names an adult voice tag, or (unless
     `exact`, as for a sound or music prompt, where "[moaning wind]" or
@@ -809,7 +812,11 @@ def _adult_tag_group(group: str, exact: bool = False) -> bool:
     if any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
         return True
     if exact:
-        return False
+        # Read as safety's word filter reads it: look-alike letters and
+        # digits, hidden characters and stray punctuation folded ("[m0ans]",
+        # "[mоans]", "[moans!]").
+        return any(story_script.norm_tag(_TAG_PUNCT_RE.sub("", f)) in story_script.ADULT_TAGS
+                   for t in group.split(",") for f in safety._forms(t))
     forms = safety._forms(group)
     return safety._any(story_script._ADULT_STEM_RE, forms) or safety._any(_TAG_STEM_RE, forms)
 
@@ -1096,14 +1103,15 @@ def check_generation(prompt: str, negative: str = "", *, kind: str) -> None:
 
 
 def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = "",
-                  force: bool = False, marked: bool = False) -> None:
+                  force: bool = False, marked: bool = False, words: bool = True) -> None:
     """The word filter on `prompt` alone, then the model on `context` (the
     story note, facts and cast: the app's block, for the model only) and
     `prompt` (the user's block), when needs_ai says so or `force`.
     `marked`: see _word_filter (the model reads the marked text)."""
     prompt = prompt or ""
     negative = negative or ""
-    _word_filter(prompt, negative, kind, marked)
+    if words:
+        _word_filter(prompt, negative, kind, marked)
     context = (context or "").strip() if prompt.strip() else ""
     seen = f"{context}\n\n{prompt}" if context else prompt
     if not (prompt.strip() and force) and not needs_ai(seen, negative, kind=kind):
@@ -1119,7 +1127,7 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
         # A long voice script, lip-sync or sound: read in overlapping
         # windows (check_long), every window asked about (the whole was)
         # and every one failing closed.
-        check_long(prompt, kind=kind, force=True, marked=marked)
+        check_long(prompt, kind=kind, force=True, marked=marked, words=words)
         return
     if len(shown) > JUDGE_WINDOW:
         # Longer than the model reads: never judged on a part of it (nor
@@ -1215,7 +1223,7 @@ def check_cast_length(context: str) -> None:
 
 
 def check_long(text: str, *, kind: str = "story", context: str = "", force: bool = False,
-               marked: bool = False) -> None:
+               marked: bool = False, words: bool = True) -> None:
     """Raise UnsafePromptError when any part of a long `text` (read with
     `context`, the story note, facts and cast, in front of it) puts a minor
     in a sexual context, or when a part the model must judge can't be
@@ -1287,10 +1295,10 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         for window in parts(text, size=size, lines=True):
             line = facts.window_line(window) if facts.fp_adult else ""
             ctx = "\n".join(x for x in (context, line) if x)
-            _check_minors(window, "", kind=kind, context=ctx, force=force, marked=marked)
+            _check_minors(window, "", kind=kind, context=ctx, force=force, marked=marked, words=words)
         return
     for window in parts(text, size=size, lines=True):
-        _check_minors(window, "", kind=kind, context=context, force=force, marked=marked)
+        _check_minors(window, "", kind=kind, context=context, force=force, marked=marked, words=words)
 
 
 # Room kept in a long text's window for its own line (StoryFacts.window_line).
