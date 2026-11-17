@@ -113,3 +113,17 @@ def test_only_a_single_word_mixing_scripts_is_disguised(group, disguised):
     from app.services import minor_check
 
     assert minor_check._disguised(group) is disguised
+
+
+def test_changing_the_judges_instruction_needs_a_policy_bump():
+    """Verdicts are cached by POLICY_VERSION and the text, not by the
+    judge's instruction: when the instruction changes, bump POLICY_VERSION
+    (minor_check, and story_pass's) so cached approvals are judged again,
+    then record the new instruction's digest here."""
+    import hashlib
+
+    from app.services import minor_check, story_pass
+
+    digest = hashlib.sha256(MINOR_CHECK_SYSTEM.encode()).hexdigest()[:16]
+    assert (digest, minor_check.POLICY_VERSION, story_pass.POLICY_VERSION) == (
+        "33e49b985ee5c755", "minors-2", "story-pass-5"), "bump POLICY_VERSION with the judge's instruction"

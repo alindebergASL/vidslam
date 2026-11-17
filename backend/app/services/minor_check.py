@@ -62,7 +62,7 @@ from .safety import UnsafePromptError
 log = logging.getLogger("avs.minor_check")
 
 # Bump to invalidate every cached verdict when the check's rules change.
-POLICY_VERSION = "minors-1"
+POLICY_VERSION = "minors-2"
 OK_TTL = timedelta(days=30)
 LRU_SIZE = 2000
 

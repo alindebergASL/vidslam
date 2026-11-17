@@ -44,7 +44,7 @@ TTL_SECONDS = 6 * 3600
 VERSION = 3
 # Bump when what check_story judges, or how, changes: older passes stop
 # covering anything.
-POLICY_VERSION = "story-pass-4"
+POLICY_VERSION = "story-pass-5"
 _DIGEST = 16  # bytes of each item's hash kept in the pass
 
 STALE = "This part changed since the story was checked. Check the story again."
