@@ -822,17 +822,45 @@ def _script(c: str) -> str:
     return unicodedata.name(c, "?").split(" ")[0]
 
 
+# Scripts written together in one word by everyday writing: Japanese mixes
+# kanji, hiragana and katakana (halfwidth too) within a word.
+_SCRIPT_FAMILY = {"CJK": "JAPANESE", "HIRAGANA": "JAPANESE", "KATAKANA": "JAPANESE", "HALFWIDTH": "JAPANESE"}
+
+
+def _words(text: str) -> list[str]:
+    """`text`'s words: runs of letters, combining marks and hidden or
+    filler characters (which hide inside a word: "mo\u3164ans")."""
+    out: list[str] = []
+    cur: list[str] = []
+    for c in text:
+        if c.isalpha() or unicodedata.category(c).startswith("M") or _hidden(c):
+            cur.append(c)
+        elif cur:
+            out.append("".join(cur))
+            cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
 def _disguised(group: str) -> bool:
-    """A direction group written in a way no everyday sound description is:
-    letters from more than one script (Latin with Cyrillic, Greek,
-    Armenian, Hangul, Cherokee, ...), a hidden or filler character, or a
-    look-alike letter (_MORE_CONFUSABLE: "ɑ", "ı", Cherokee, Lisu). Near a
-    minor it keeps its marker, so the whole look-alike family is refused by
-    the words rather than one table entry at a time."""
-    letters = [c for c in unicodedata.normalize("NFKC", group) if c.isalpha() and c not in _FILLERS]
-    if len({_script(c) for c in letters}) > 1:
+    """A direction group with a word written in a way no everyday word is:
+    one word whose letters mix scripts (Latin with Cyrillic, Greek,
+    Armenian, Hangul, Cherokee, ...; Japanese kanji and kana count as one),
+    a hidden or filler character, or a Latin word with a look-alike letter
+    (_MORE_CONFUSABLE: "ɑ", "ı"). Near a minor it keeps its marker, so the
+    look-alike family is refused by the words. A group that only uses more
+    than one script across words ("子供たちの笑い声 (波の音)", "niños, waves")
+    is not disguised; the model reads misspellings and look-alikes too."""
+    if any(_hidden(c) for c in group):
         return True
-    return any(_hidden(c) or c in _MORE_CONFUSABLE_CHARS for c in group)
+    for word in _words(unicodedata.normalize("NFKC", group)):
+        scripts = {_SCRIPT_FAMILY.get(_script(c), _script(c)) for c in word if c.isalpha()}
+        if len(scripts) > 1:
+            return True
+        if scripts == {"LATIN"} and any(c in _MORE_CONFUSABLE_CHARS for c in word):
+            return True
+    return False
 
 
 def _adult_tag_group(group: str, exact: bool = False) -> bool:
