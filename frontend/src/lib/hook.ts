@@ -4,8 +4,9 @@
 
 // A sentence ends at . ! ? … (or a run of them), optionally followed by
 // closing quotes or brackets, then whitespace or the end. A line break ends
-// the opening line too.
-const END = /[.!?…]+["'”’»)\]]*(?=\s|$)|\n/;
+// the opening line too: \n, \r, VT, FF, FS/GS/RS, NEL, U+2028 and U+2029, as
+// the backend's _END does.
+const END = /[.!?…]+["'”’»)\]]*(?=\s|$)|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]/;
 
 export function splitFirstSentence(text: string): [string, string] {
   const t = (text || "").trim();
