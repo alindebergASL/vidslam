@@ -800,6 +800,39 @@ def _unambiguous(group: str) -> bool:
 
 
 _TAG_PUNCT_RE = re.compile(r"[^\w\s]+")
+# Filler code points that render as nothing or a blank yet count as letters
+# (Hangul fillers, halfwidth Hangul filler) or are default-ignorable.
+_FILLERS = frozenset("\u115f\u1160\u3164\uffa0\u034f\u17b4\u17b5\u180b\u180c\u180d\u180e")
+_MORE_CONFUSABLE_CHARS = frozenset(
+    {*_MORE_CONFUSABLE_PAIRS, *(k.lower() for k in _MORE_CONFUSABLE_PAIRS if len(k.lower()) == 1)})
+
+
+def _hidden(c: str) -> bool:
+    return c in _FILLERS or unicodedata.category(c) in ("Cf", "Co", "Cn")
+
+
+def _tag_fold(text: str) -> str:
+    """`text` with hidden and filler characters taken out and the
+    look-alikes _MORE_CONFUSABLE knows folded (safety._forms folds the rest)."""
+    t = "".join(c for c in unicodedata.normalize("NFKC", text) if not _hidden(c))
+    return t.translate(_MORE_CONFUSABLE)
+
+
+def _script(c: str) -> str:
+    return unicodedata.name(c, "?").split(" ")[0]
+
+
+def _disguised(group: str) -> bool:
+    """A direction group written in a way no everyday sound description is:
+    letters from more than one script (Latin with Cyrillic, Greek,
+    Armenian, Hangul, Cherokee, ...), a hidden or filler character, or a
+    look-alike letter (_MORE_CONFUSABLE: "ɑ", "ı", Cherokee, Lisu). Near a
+    minor it keeps its marker, so the whole look-alike family is refused by
+    the words rather than one table entry at a time."""
+    letters = [c for c in unicodedata.normalize("NFKC", group) if c.isalpha() and c not in _FILLERS]
+    if len({_script(c) for c in letters}) > 1:
+        return True
+    return any(_hidden(c) or c in _MORE_CONFUSABLE_CHARS for c in group)
 
 
 def _adult_tag_group(group: str, exact: bool = False) -> bool:
@@ -812,11 +845,12 @@ def _adult_tag_group(group: str, exact: bool = False) -> bool:
     if any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
         return True
     if exact:
-        # Read as safety's word filter reads it: look-alike letters and
-        # digits, hidden characters and stray punctuation folded ("[m0ans]",
-        # "[mоans]", "[moans!]").
+        # Read as safety's word filter reads it, and then some: look-alike
+        # letters and digits (safety's table and _MORE_CONFUSABLE), hidden
+        # and filler characters and stray punctuation folded ("[m0ans]",
+        # "[mоans]", "[moɑns]", "[moㅤans]", "[moans!]").
         return any(story_script.norm_tag(_TAG_PUNCT_RE.sub("", f)) in story_script.ADULT_TAGS
-                   for t in group.split(",") for f in safety._forms(t))
+                   for t in group.split(",") for f in safety._forms(_tag_fold(t)))
     forms = safety._forms(group)
     return safety._any(story_script._ADULT_STEM_RE, forms) or safety._any(_TAG_STEM_RE, forms)
 
@@ -832,6 +866,8 @@ def _keeps_marker(group: str, square: bool, audio: bool = False) -> bool:
     word filter. `audio`: a sound or music prompt, where only an exact adult
     voice tag in [brackets] counts as one."""
     if square and _adult_tag_group(group, exact=audio):
+        return True
+    if audio and _disguised(group):
         return True
     return _unambiguous(group) or safety.is_hard_sexual(group)
 

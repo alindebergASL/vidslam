@@ -57,10 +57,10 @@ def _explicit(text: str) -> None:
 # lyrics"), right before a break or the end: not the word itself.
 _NEGATED_ADULT_RE = re.compile(
     r"(?<![\w-])(?:no|nothing|not|non-?|without)\s*(?:explicit|sexual)"
-    r"(?:\s+(?:content|material|lyrics|themes|language|words))?(?=\s*(?:[,.;:!)\]]|$))", re.I)
+    r"(?:\s+(?:content|material|lyrics|themes|language|words))?(?=\s*(?:[,.;:!)\]]|$))(?![^\n]*\?)", re.I)
 # A word that turns the negation round or makes it a question ("never not
 # sexual", "not non-explicit", "why not explicit", "if not explicit").
-_UNNEGATING_RE = re.compile(r"\b(?:never|not|no|non|nothing|without|why|if|hardly|barely)[\s-]*$", re.I)
+_UNNEGATING_RE = re.compile(r"\b(?:never|not|no|non|nothing|without|why|if|hardly|barely)[\W_]*$", re.I)
 
 
 def _negations_out(text: str) -> str:
