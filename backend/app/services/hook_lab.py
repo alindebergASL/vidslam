@@ -341,8 +341,9 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
         if found.snapped and not any(abs(total * c / n - found.seconds) <= _PACE_SECONDS
                                      for c in [*places, rest_at]):
             # No break near the pause the lab found (a breath, say): the
-            # places near it at an even pace, as for any other window.
-            _best, cuts = heard_cuts(script, float(window), total, end_of_first)
+            # places near the pause itself at an even pace (not near the
+            # first sentence's end, which is far from it).
+            _best, cuts = heard_cuts(script, float(window), total, None)
             cuts = [c for c in cuts if c != rest_at]
         else:
             # The first sentence's own end is the script the opening makes.
@@ -361,6 +362,25 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     return texts
 
 
+# Any run of characters that are neither letters, digits nor spaces (any
+# punctuation, quotes, fullwidth marks, hidden characters such as U+200B,
+# U+2060 or a soft hyphen) can be a place the voice pauses: "30;tonight",
+# "\"30.\"Tonight", "«30»tonight", "30。tonight", "30.\u200btonight",
+# "30— tonight". Not one inside a word or number (_in_word).
+_SEP = re.compile(r"[^\w\s]+")
+
+
+def _in_word(script: str, m: "re.Match") -> bool:
+    """A single ' ’ or - between letters or digits ("it's", "well-known"),
+    or a single . , or : between digits ("3.5", "30,000", "10:30")."""
+    if len(m.group(0)) != 1 or m.start() == 0 or m.end() >= len(script):
+        return False
+    a, b, c = script[m.start() - 1], m.group(0), script[m.end()]
+    if b in "'’-" and a.isalnum() and c.isalnum():
+        return True
+    return b in ".,:" and a.isdigit() and c.isdigit()
+
+
 def pause_cuts(script: str, total: float, lo: float, hi: float) -> list[int]:
     """The places the voiceover may pick up after a pause found between
     `lo` and `hi` seconds of `total`: the first word after each sentence or
@@ -374,13 +394,14 @@ def pause_cuts(script: str, total: float, lo: float, hi: float) -> list[int]:
     if not n or total <= 0:
         return []
     cuts: list[int] = []
-    marks = [*_END.finditer(script), *_CLAUSE.finditer(script), *_TIGHT.finditer(script)]
+    marks = [*_END.finditer(script), *_CLAUSE.finditer(script), *_TIGHT.finditer(script),
+             *(m for m in _SEP.finditer(script) if not _in_word(script, m))]
     for m in sorted(marks, key=lambda m: m.end()):
         if not lo <= total * m.end() / n <= hi:
             continue
         after = script[m.end():]
         cut = m.end() + len(after) - len(after.lstrip())
-        if cut < n and cut not in cuts:
+        if cut < n and (script[cut].isalnum() or m.re is not _SEP) and cut not in cuts:
             cuts.append(cut)
     return cuts
 

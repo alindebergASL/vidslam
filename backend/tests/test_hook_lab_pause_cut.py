@@ -130,7 +130,8 @@ def test_the_sentence_ends_in_the_stretch_searched_are_the_cuts():
     assert hook_lab.pause_cuts(script, total, 0.0, total)[-1] == script.index("Follow")
     # The first ellipsis, "?!" and closing quotes end a sentence too.
     s = 'One… Two?! "Three." Four'
-    assert [s[c] for c in hook_lab.pause_cuts(s, 10.0, 0.0, 10.0)] == ["T", '"', "F"]
+    # An opening quote before a word is a place too (any separator run).
+    assert [s[c] for c in hook_lab.pause_cuts(s, 10.0, 0.0, 10.0)] == ["T", '"', "T", "F"]
 
 
 def test_too_many_cuts_at_a_found_pause_fail_closed(monkeypatch, tmp_path):
@@ -262,3 +263,62 @@ def test_no_break_near_a_found_pause_reads_the_pace_band(monkeypatch, tmp_path):
     with pytest.raises(HookLabError):
         hook_lab.check_opening(None, base, _HOOK, found.seconds)
     assert any(t.startswith(f"{_HOOK} tonight") for t in seen)
+
+
+# Host delta review of #58: every separator between "30" and "tonight" the
+# voice may pause at, with real audio.
+_SEPARATED = [
+    "30;tonight", "30,tonight", "30:tonight", '"30."Tonight', '"30…"tonight', "“30…”tonight",
+    '"30!"Tonight', "«30»tonight", "«30.»Tonight", "30。tonight", "30！tonight",
+    "30；tonight", "30.​tonight", "30.⁠tonight",
+]
+
+
+def _separated_script(sep: str) -> str:
+    return f"Hi there friends of the channel and welcome\nLily is {sep} she wants sex with me. Follow for more."
+
+
+def _assert_heard_form_refused(monkeypatch, tmp_path, script: str, total: float, word: str) -> None:
+    from app.services import hook_lab
+
+    at = total * (script.index(word) + 0.0) / len(script)
+    audio = _voice(tmp_path / "vo.m4a", [("tone", at - 0.2), ("gap", 0.4), ("tone", total - at - 0.2)])
+    base = _base(monkeypatch, audio, script)
+    found = hook_lab.hook_window(base, script)
+    assert found.snapped
+    seen = _judge(monkeypatch)
+    with pytest.raises(HookLabError) as e:
+        hook_lab.check_opening(None, base, _HOOK, found.seconds)
+    assert e.value.status == 422
+    assert any(t.startswith(_HOOK) and "she wants sex" in t and "30" not in t for t in seen)
+
+
+@pytest.mark.parametrize("sep", _SEPARATED)
+def test_any_separator_at_a_found_pause_is_a_place(monkeypatch, tmp_path, sep):
+    script = _separated_script(sep)
+    word = "Tonight" if "Tonight" in script else "tonight"
+    _assert_heard_form_refused(monkeypatch, tmp_path, script, 10.0, word)
+
+
+@pytest.mark.parametrize("sep", ["30— tonight", "30- tonight"])
+def test_a_dash_with_a_space_on_one_side_at_15_chars_a_second(monkeypatch, tmp_path, sep):
+    script = _separated_script(sep)
+    _assert_heard_form_refused(monkeypatch, tmp_path, script, len(script) / 15.0, "tonight")
+
+
+def test_a_breath_far_from_the_first_sentence_reads_the_band_around_the_pause(monkeypatch, tmp_path):
+    """At 16+ characters a second, a breath before "tonight" a second after
+    the first sentence's end: the band is centred on the pause, not on the
+    sentence end, so the heard form is judged."""
+    script = "Hi there friends of the channel and welcome to my page. Lily is 30 and tonight she wants sex with me so follow for more"
+    total = len(script) / 17.0
+    end_of_first = total * script.index(" Lily") / len(script)
+    assert total * script.index("tonight") / len(script) - end_of_first > 0.75
+    _assert_heard_form_refused(monkeypatch, tmp_path, script, total, "tonight")
+
+
+def test_separators_inside_words_and_numbers_are_not_places():
+    from app.services import hook_lab
+
+    s = "It costs 3.5 or 30,000 at 10:30 it's well-known"
+    assert hook_lab.pause_cuts(s, 10.0, 0.0, 10.0) == []
