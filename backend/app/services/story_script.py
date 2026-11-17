@@ -415,10 +415,14 @@ def disallowed_tags(clean: Optional[bool] = None) -> frozenset[str]:
 # and the model read it as one ("[lustful]" next to "little girl" is refused
 # by the words alone). Romance and intimacy tags are for adults only, and so
 # is any direction written like one ("[moaning]", "[softly moans]",
-# "[pants.]"): tag-reading models accept any words in brackets.
+# "[pants.]"): tag-reading models accept any words in brackets. "sultry"
+# and "lust" have their forms listed, not a bare stem: "sultan",
+# "lustrous" and "lustre" are not directions. (The other stems start no
+# everyday word but "pants", which is only ever marked for the model.)
 _ADULT_TAG_WORD = "seductive"
 _ADULT_STEM_RE = re.compile(
-    r"\b(?:moan\w*|pant(?:s|ed|ing)?|breathless\w*|seduct\w*|sult\w*|lust\w*|orgasm\w*|"
+    r"\b(?:moan\w*|pant(?:s|ed|ing)?|breathless\w*|seduct\w*|sultr(?:y|ier|iest|ily|iness)|"
+    r"lust(?:s|ed|ing|ful|fully|fulness|y|ier|iest|ily|iness)?|orgasm\w*|"
     + "|".join(re.escape(t) for t in sorted(ADULT_TAGS)) + r")\b", re.I)
 # Any other direction a model would perform (not a known general tag), in
 # a text that mentions a minor or with a minor in the cast: asked about
@@ -1358,9 +1362,17 @@ def check_story(doc: StoryDoc, *, music_prompts: tuple[str, ...] = (), title: st
                                     summary=facts.summary_line())
     clean = explicit_check.active()
     if clean:
-        lines = "\n".join(f"{i.speaker}: {i.voice_text}" + (f"\n{i.instructions}" if i.instructions.strip() else "")
+        # Judged as the guards send it (normalize: NFKC, bracket look-alikes
+        # as [ ]), the same string the voice gets: the guards skip their own
+        # explicit-content check under this pass, so "𝒻𝓊𝒸𝓀" or fullwidth
+        # letters are judged as the plain words they are sent as.
+        def sent(x: str) -> str:
+            return normalize(x, dashes=False)
+
+        lines = "\n".join(f"{i.speaker}: {sent(i.voice_text)}"
+                          + (f"\n{sent(i.instructions)}" if i.instructions.strip() else "")
                           for i in doc.speech())
-        explicit_check.check(header, lines, _prompt_lines(doc, music_prompts, marked=False))
+        explicit_check.check(sent(header), lines, sent(_prompt_lines(doc, music_prompts, marked=False)))
     items = [story_pass.line_item(i.speaker, i.voice_text, i.instructions) for i in doc.speech()]
     items += [story_pass.prompt_item(p) for p in (*prompts_text(doc), *music_prompts)]
     digest = story_hash(doc, music_prompts, title, premise)

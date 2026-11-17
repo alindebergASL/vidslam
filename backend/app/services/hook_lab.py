@@ -8,12 +8,22 @@ machinery builds on them.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # A sentence ends at ., !, ?, … (or a run of them, "?!", "..."), optionally
 # followed by closing quotes or brackets, then whitespace or the end. A
 # decimal point ("3.5") or a dot inside a URL is not followed by whitespace,
 # so it is not an end. A line break ends the opening line too.
-_END = re.compile(r"""[.!?…]+["'”’»)\]]*(?=\s|$)|\n""")
+_END = re.compile(r"""[.!?…]+["'”’»)\]]*(?=\s|$)|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]""")
+# A clause break a voice may pause at: , ; : or a dash, before a space.
+_CLAUSE = re.compile(r"""(?:[,;:]+["'”’»)\]]*|\s[-–—]+)(?=\s)""")
+# A pause can also follow punctuation with no space after it ("30...tonight",
+# "30—tonight", "30…tonight", "(30) tonight"): a run of sentence ends, an
+# em/en dash or "--", or a closing bracket, right before a letter or digit;
+# a closing bracket before a space; and an opening bracket. A single dot
+# between digits ("3.5"), a hyphen or an apostrophe inside a word is not one.
+_TIGHT = re.compile(
+    r"""(?:[!?…]+|\.{2,}|\.(?=[^\W\d_])|[–—]+|-{2,}|[)\]])(?=\w)|[)\]](?=\s)|[(\[](?=\w)""")
 
 
 def split_first_sentence(text: str) -> tuple[str, str]:
@@ -89,7 +99,7 @@ import subprocess  # noqa: E402
 import threading  # noqa: E402
 from datetime import datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
-from typing import TYPE_CHECKING, Optional  # noqa: E402
+from typing import TYPE_CHECKING, NamedTuple, Optional  # noqa: E402
 
 from sqlalchemy import or_, select  # noqa: E402
 from sqlalchemy import update as sa_update  # noqa: E402
@@ -188,21 +198,23 @@ HEARD_NOTE = "It was checked together with the original voiceover heard after it
 
 
 def check_opening(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> None:
-    """The minors check an opening meets: on its own, and inside the script
-    it joins. The script check only refuses a minor and a sexual word in
-    the same text, so "She just turned 15." passes alone but not in front
-    of an adult script.
+    """The minors check an opening meets: inside the script it makes, and
+    with what of the original is heard after it. The script check only
+    refuses a minor and a sexual word in the same text, so "She just turned
+    15." passes alone but not in front of an adult script.
 
     What is heard is the new opening, then the base voiceover from `window`
     on, and the window can be moved anywhere, even inside the original first
     sentence. So the opening is also checked with what of the original may
     be heard after it (heard_checks).
 
-    Every form goes through the word filter; the model is asked once, on
-    the longest combined text (opening_text: the opening with the whole
-    original script, the script it makes, what is heard and the joins), so
-    an opening costs one call whatever the window. Raises HookLabError
-    (422) when refused."""
+    Every form goes through the word filter. The model is asked about each
+    text that can really be heard (judged_texts: the script the opening
+    makes, then each heard form), one call each, so no text it judges has
+    the replaced words, which are never heard, beside it: those words can
+    make an opening read as being about someone else ("Lily is my
+    30-year-old wife." in front of "Lily wears her pigtails and braces.").
+    Raises HookLabError (422) when refused."""
     from . import minor_check
     from .safety import UnsafeScriptError, check_script
 
@@ -216,15 +228,12 @@ def check_opening(db: Session, base: models.Render, hook: str, window: Optional[
         heard = heard_checks(db, base, hook, window)
     except UnsafeScriptError as e:
         raise HookLabError(f"This opening can't be used: {e} {HEARD_NOTE}", 422) from None
-    judged = opening_text(hook, opening, heard)
-    try:
-        minor_check.check_generation(judged, kind="script")
-    except UnsafeScriptError as e:
-        note = f" {HEARD_NOTE}" if heard else ""
-        raise HookLabError(f"This opening can't be used: {e}{note}", 422) from None
-    # The model read the opening inside that text: its own voice (synth_hook
-    # speaks the opening alone) isn't asked about again.
-    minor_check.vouch_ok(judged, [" ".join((hook or "").split()), (hook or "").strip()])
+    for i, text in enumerate(judged_texts(opening, heard)):
+        try:
+            minor_check.check_generation(text, kind="script")
+        except UnsafeScriptError as e:
+            note = f" {HEARD_NOTE}" if i else ""
+            raise HookLabError(f"This opening can't be used: {e}{note}", 422) from None
     from . import explicit_check
 
     if explicit_check.active():
@@ -236,45 +245,70 @@ def check_opening(db: Session, base: models.Render, hook: str, window: Optional[
             raise HookLabError(f"This opening can't be used: {e}", 422) from None
 
 
-def opening_text(hook: str, opening: str, heard: list[str]) -> str:
-    """What the model reads of an opening, once: the opening alone when
-    nothing of an original is heard, else each form on lines of its own
-    (the opening with the whole original script, the script it makes,
-    what is heard and the joins). A form already in the text isn't
-    repeated."""
-    hook = " ".join((hook or "").split())
-    forms: list[str] = []
-    for text in (*heard[:1], " ".join((opening or "").split()), *heard[1:]):
-        text = (text or "").strip()
-        if text and text not in forms:
-            forms.append(text)
-    if not heard:
-        return forms[0] if forms else hook
-    return "\n".join(forms)
+def judged_texts(opening: str, heard: list[str]) -> list[str]:
+    """The texts the model is asked about for an opening, each on its own:
+    the script the opening makes, then each form of it that can be heard
+    (heard_checks). A form the same as one before it isn't repeated."""
+    out: list[str] = []
+    for text in (opening, *heard):
+        text = " ".join((text or "").split())
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+# The most heard forms judged for one opening when the window isn't at the
+# end of the original first sentence (heard_checks, 2.): one call each.
+# More are refused: move the window to that sentence's end.
+MAX_JOINS = 12
+JOINS_TOO_MANY = ("There are too many places where the original voiceover could pick up after this opening to "
+                  "check them all. Move where the opening ends to the end of the original first sentence.")
+# The most of those forms that may be longer than the model reads at once:
+# each of them is read in several parts (minor_check.check_long).
+MAX_LONG_JOINS = 4
+LONG_JOINS_TOO_MANY = ("The script is too long to check every place where the original voiceover could pick up "
+                       "after this opening. Move where the opening ends to the end of the original first "
+                       "sentence, or shorten the script.")
 
 
 def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[float] = None) -> list[str]:
     """The opening with the original words that may be heard after it:
-    the word filter on each form, and the forms the model reads
-    (check_opening joins them into one text). [] when no original script
-    is heard.
+    the word filter on each form, and the forms the model reads, each
+    alone (check_opening). [] when what is heard is the script the opening
+    makes (or the window isn't known yet: it is checked again with the
+    window before anything is made).
 
-    1. The opening, then the whole original script: every word of the
-       original that can be heard after the opening is in it, wherever the
-       window is.
-    2. With the window known: the opening joined to the original where the
-       voiceover picks up (heard_cuts). The safety check sees that best
-       guess as it is heard, without the replaced words around it (they
-       could make it read as being about someone else). The word filter
-       also sees the joins near the guess, since the words aren't timed: a
-       phrase can form only across the join ("she is" + "sixteen tips").
-       Each join is also read without the punctuation at the end of the
-       opening, which a listener doesn't hear ("Her age?" + "fifteen, and").
-    3. When the voiceover may pick up inside the original first sentence,
-       speech is too uneven to trust the guess: the safety check sees the
-       opening joined at every word of that sentence (heard_joins), a few
-       at a time.
-    Raises UnsafeScriptError."""
+    The word filter always reads the opening then the whole original
+    script: every word of the original that can be heard after the opening
+    is in it, wherever the window is. The model never reads it: the
+    replaced first sentence is in it, and it isn't heard.
+
+    1. The window at the pause the lab found after the first sentence
+       (hook_window, snapped to a pause in the audio): the cut is at a
+       sentence end, but the pause shows only that the speaker stopped,
+       not which sentence end it was (a line break is read straight on).
+       So each sentence or line end whose even-pace time is in the
+       stretch searched for that pause is a cut (pause_cuts), heard to
+       the end of the script. Usually the only one is the first
+       sentence's, which is the script the opening makes, judged anyway:
+       nothing more. The same at the even-pace guess when the voiceover
+       is silent throughout (nothing of it is heard).
+    2. Anywhere else (inside the first sentence, past its end, its end
+       not known, or a guess not snapped to a pause): the words aren't timed, so the voiceover may pick up at
+       any word near the guess, on either side of where the first sentence
+       ends (heard_cuts). Each of those joins is heard as the opening then
+       the original from there to the end of the script (heard_joins): a
+       minor named in the heard part of the first sentence is read beside
+       whatever comes later. One text each, never beside another join's
+       words; a text the same as the script the opening makes isn't
+       repeated. The word filter also reads each join without the
+       punctuation at the end of the opening, which a listener doesn't
+       hear ("Her age?" + "fifteen, and"). At most MAX_JOINS texts, and at
+       most MAX_LONG_JOINS longer than the model reads at once (else
+       refused: too many calls).
+    3. When the opening fills the whole voiceover, the opening alone is
+       what is heard.
+    Raises UnsafeScriptError (refused) or HookLabError (too many joins)."""
     from .renderer import _probe_duration
     from .safety import check_script
 
@@ -282,43 +316,117 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
     script = base_script(db, base).strip()
     if not hook or not script:
         return []
-    whole = f"{hook} {script}"
-    check_script(whole)
-    texts = [whole]
+    check_script(f"{hook} {script}")
     path = Path(base.audio_path or "")
     if not window or window <= 0 or not path.is_file():
-        return texts
+        return []
     total = _probe_duration(path)
     if window >= total - 0.05:
-        return texts  # nothing of the original is heard after the opening
+        return [hook]  # nothing of the original is heard after the opening
     try:
-        end_of_first: Optional[float] = find_hook_window(base, script)
+        found: Optional[HookWindow] = hook_window(base, script)
     except HookLabError:
-        end_of_first = None
-    best, near = heard_cuts(script, float(window), total, end_of_first)
+        found = None
+    end_of_first = found.seconds if found else None
     rest = rest_of_script(script)
     rest_at = len(script) - len(rest) if rest else len(script)
-    inside = (window < end_of_first - 0.05) if end_of_first else best < rest_at
-    cuts = sorted(set(near) | (set(word_starts(script, rest_at)) if inside else set()))
     bare = _HOOK_END.sub("", hook) or hook
+    if rest and found and (found.snapped or found.silent) and abs(window - found.seconds) <= 0.05:
+        # At the pause the lab found: the cut is at a sentence end spoken
+        # there, the first sentence's or another one's. (A silent
+        # voiceover has no pause to find, and none of it is heard: the
+        # same sentence ends are judged.)
+        check_script(f"{bare} {script[rest_at:].lstrip(_PUNCT)}")
+        places = pause_cuts(script, total, found.lo, found.hi)
+        n = len(script)
+        if found.snapped and not any(abs(total * c / n - found.seconds) <= _PACE_SECONDS
+                                     for c in [*places, rest_at]):
+            # No break near the pause the lab found (a breath, say): the
+            # places near the pause itself at an even pace (not near the
+            # first sentence's end, which is far from it).
+            _best, cuts = heard_cuts(script, float(window), total, None)
+            cuts = [c for c in cuts if c != rest_at]
+        else:
+            # The first sentence's own end is the script the opening makes.
+            cuts = [c for c in places if c != rest_at]
+    else:
+        _best, cuts = heard_cuts(script, float(window), total, end_of_first)
     for cut in cuts:
         check_script(f"{hook} {script[cut:]}")
         check_script(f"{bare} {script[cut:].lstrip(_PUNCT)}")
-    if not (rest and best == rest_at):  # else the usual join: the script the opening makes
-        heard = f"{hook} {script[best:]}"
-        check_script(heard)
-        texts.append(heard)
-    if inside:
-        for text in heard_joins(hook, script, [c for c in cuts if c < rest_at], rest_at):
-            check_script(text)
-            texts.append(text)
+    made = judged_texts(replace_first_sentence(script, hook), [])
+    texts = [t for t in judged_texts("", heard_joins(hook, script, cuts)) if t not in made]
+    if sum(not fits_one_call(t) for t in texts) > MAX_LONG_JOINS:
+        raise HookLabError(LONG_JOINS_TOO_MANY, 422)
+    if len(texts) > MAX_JOINS:
+        raise HookLabError(JOINS_TOO_MANY, 422)
     return texts
+
+
+# Any run of characters that are neither letters, digits nor spaces (any
+# punctuation, quotes, fullwidth marks, hidden characters such as U+200B,
+# U+2060 or a soft hyphen) can be a place the voice pauses: "30;tonight",
+# "\"30.\"Tonight", "«30»tonight", "30。tonight", "30.\u200btonight",
+# "30— tonight". Not one inside a word or number (_in_word).
+_SEP = re.compile(r"(?:[^\w\s]|_)+")
+# Inside a word in scripts that write vowels and other signs as combining
+# marks (Hindi, Tamil, Bengali, Thai, decomposed Vietnamese), or join
+# letters with a zero-width (non-)joiner: not a separator.
+_WORD_JOINERS = frozenset("\u200c\u200d")
+
+
+def _in_word(script: str, m: "re.Match") -> bool:
+    """A single ' ’ or - between letters or digits ("it's", "well-known"),
+    a single . , or : between digits ("3.5", "30,000", "10:30"), or a run
+    of combining marks and zero-width joiners after a letter (Hindi, Thai)."""
+    run = m.group(0)
+    if m.start() > 0 and all(unicodedata.category(c).startswith("M") or c in _WORD_JOINERS for c in run):
+        before = script[m.start() - 1]
+        if before.isalnum() or unicodedata.category(before).startswith("M"):
+            return True
+    if len(run) != 1 or m.start() == 0 or m.end() >= len(script):
+        return False
+    a, b, c = script[m.start() - 1], m.group(0), script[m.end()]
+    if b in "'’-" and a.isalnum() and c.isalnum():
+        return True
+    return b in ".,:" and a.isdigit() and c.isdigit()
+
+
+def pause_cuts(script: str, total: float, lo: float, hi: float) -> list[int]:
+    """The places the voiceover may pick up after a pause found between
+    `lo` and `hi` seconds of `total`: the first word after each sentence or
+    line end (.!?…, a line break), or clause break (, ; : and dashes, where a
+    voice pauses too), with or without a space after it (_TIGHT), whose
+    even-pace time is in that stretch,
+    as character offsets in the stripped script. Ends with nothing after
+    them aren't places (nothing of the original is heard)."""
+    script = (script or "").strip()
+    n = len(script)
+    if not n or total <= 0:
+        return []
+    cuts: list[int] = []
+    marks = [*_END.finditer(script), *_CLAUSE.finditer(script), *_TIGHT.finditer(script),
+             *(m for m in _SEP.finditer(script) if not _in_word(script, m))]
+    for m in sorted(marks, key=lambda m: m.end()):
+        if not lo <= total * m.end() / n <= hi:
+            continue
+        after = script[m.end():]
+        cut = m.end() + len(after) - len(after.lstrip())
+        if cut < n and (script[cut].isalnum() or m.re is not _SEP) and cut not in cuts:
+            cuts.append(cut)
+    return cuts
+
+
+def fits_one_call(text: str) -> bool:
+    """`text` is short enough for the model to read at once (else
+    minor_check reads it in parts, check_long, which costs several calls)."""
+    from . import minor_check
+
+    return len(minor_check.classifier_text(minor_check.quote_marks(text))) <= minor_check.JUDGE_WINDOW
 
 
 _PUNCT = " \t.,;:!?…-–—\"'“”‘’()"
 _HOOK_END = re.compile(r"[\s.,;:!?…\-–—\"'“”‘’()]+$")
-# How much of the script after the first sentence each join shows.
-_JOIN_TAIL = 160
 
 
 def word_starts(script: str, upto: int) -> list[int]:
@@ -326,62 +434,51 @@ def word_starts(script: str, upto: int) -> list[int]:
     return [m.start() for m in re.finditer(r"\S+", script) if m.start() < upto]
 
 
-def heard_joins(hook: str, script: str, cuts: list[int], rest_at: int) -> list[str]:
-    """The opening joined to the original at each cut inside the first
-    sentence, as numbered lines, packed into texts the safety check reads
-    whole (minor_check.JUDGE_WINDOW). Each line runs to a little past the
-    first sentence; the rest of the script was checked with the opening
-    already (heard_checks, step 1)."""
-    from .minor_check import JUDGE_WINDOW
+def heard_joins(hook: str, script: str, cuts: list[int]) -> list[str]:
+    """The opening joined to the original at each cut, as heard: the
+    opening, then the original from the cut to the end of the script.
+    Never cut short: a minor named in the heard part of the first sentence
+    must be read beside what comes later, however far on. One text per
+    cut, each judged alone (never beside the words of another cut, which
+    aren't heard with it)."""
+    return [f"{hook} {script[c:]}".strip() for c in cuts]
 
-    head = "The opening may be heard joined to the original voiceover at any of these points:"
-    tail = script[rest_at:rest_at + _JOIN_TAIL]
-    lines = [f"{i}. {hook} {script[c:rest_at]}{tail}".strip() for i, c in enumerate(cuts, 1)]
-    texts: list[str] = []
-    room = JUDGE_WINDOW - 200
-    cur = head
-    for line in lines:
-        line = line[:room - len(head) - 1]
-        if len(cur) + 1 + len(line) > room and cur != head:
-            texts.append(cur)
-            cur = head
-        cur += "\n" + line
-    if cur != head:
-        texts.append(cur)
-    return texts
+
+# How uneven speech may be around the guess: about this much of it.
+_PACE_SECONDS = 0.75
+_MIN_BAND_CHARS = 12.0
 
 
 def heard_cuts(script: str, window: float, total: float,
                end_of_first: Optional[float] = None) -> tuple[int, list[int]]:
     """Where the base voiceover picks up in its script when the opening ends
-    at `window` seconds of `total`: (the best guess, every place near it),
-    as character offsets of word starts in the stripped script.
+    at `window` seconds of `total`: (the best guess, every place it may
+    really be), as character offsets of word starts in the stripped script.
 
     The guess spreads the characters evenly over the voiceover, as
     estimate_window does. When `end_of_first` (where the first sentence
     ends, find_hook_window) is known, it is spread over the first sentence
     and the rest separately, so a window inside the first sentence lands
-    inside it. The places near it allow for an uneven pace: about a quarter
-    of the way more or less, and about 0.75 s of speech either side."""
+    inside it. The places it may really be allow for an uneven pace: every
+    word start within about _PACE_SECONDS of speech of the guess (at least
+    _MIN_BAND_CHARS characters), either side, wherever the first sentence
+    ends."""
     script = (script or "").strip()
     starts = [m.start() for m in re.finditer(r"\S+", script)]
     if not starts or total <= 0 or window <= 0 or window >= total:
         return 0, []
     n = len(script)
-    guesses = [n * window / total]
+    guess = n * window / total
     rest = rest_of_script(script)
     rest_at = n - len(rest) if rest else n
     if end_of_first and 0 < end_of_first < total:
         if window <= end_of_first:
-            guesses.append(rest_at * window / end_of_first)
+            guess = rest_at * window / end_of_first
         else:
-            guesses.append(rest_at + (n - rest_at) * (window - end_of_first) / (total - end_of_first))
-    best = min(starts, key=lambda s: abs(s - guesses[-1]))
-    margin = max(0.25 * max(guesses) + 0.75 * n / total, 12.0)
-    lo, hi = min(guesses) - margin, max(guesses) + margin
-    near = sorted(s for s in starts if lo <= s <= hi)
-    if len(near) > 40:  # a very late window: the 40 nearest
-        near = sorted(sorted(near, key=lambda s: abs(s - best))[:40])
+            guess = rest_at + (n - rest_at) * (window - end_of_first) / (total - end_of_first)
+    best = min(starts, key=lambda s: abs(s - guess))
+    margin = max(_PACE_SECONDS * n / total, _MIN_BAND_CHARS)
+    near = sorted({s for s in starts if guess - margin <= s <= guess + margin} | {best})
     return best, near
 
 
@@ -623,7 +720,26 @@ def detect_silences(path: Path, *, noise_db: float = -35.0, min_seconds: float =
     return out
 
 
-_window_cache: dict[tuple, float] = {}
+class HookWindow(NamedTuple):
+    """Where the lab finds the opening line's end in the base voiceover
+    (hook_window). `seconds` is that place; `snapped` whether it is a pause
+    found in the audio (else the even-pace guess, `estimate`); `lo`..`hi`
+    the stretch searched for that pause (pause_range). A pause there is
+    where the speaker breathed, not necessarily after the first sentence
+    (a line break the voice reads straight past is a sentence end only on
+    the page), so any sentence end spoken in that stretch may be the cut.
+    `silent`: nothing in the voiceover is louder than a pause (a stand-in
+    voice), so none of the original is heard, wherever the cut is."""
+    seconds: float
+    snapped: bool
+    lo: float
+    hi: float
+    estimate: float
+    total: float
+    silent: bool = False
+
+
+_window_cache: dict[tuple, HookWindow] = {}
 _window_lock = threading.Lock()
 
 
@@ -636,10 +752,27 @@ def estimate_window(script: str, audio_seconds: float) -> float:
     return audio_seconds * len(first) / len(script)
 
 
+def pause_range(est: float, total: float) -> tuple[float, float]:
+    """The stretch of the voiceover searched for the pause after the first
+    sentence, around its even-pace end `est`: never past half of what
+    follows it, and closer in when the first sentence is most of the script
+    (a breath before its last clause is not its end)."""
+    share = est / total if total > 0 else 0.0
+    lo = est * (0.6 if share < 0.6 else 0.85)
+    hi = min(est * 1.4, est + (total - est) * 0.5)
+    return lo, hi
+
+
 def find_hook_window(base_render: models.Render, script: Optional[str] = None) -> float:
     """Seconds into the base voiceover where its opening line ends: the
     even-pace estimate (first sentence's share of the script's characters),
-    snapped to the middle of the nearest pause within ±40% of it."""
+    snapped to the middle of the nearest pause near it (hook_window)."""
+    return hook_window(base_render, script).seconds
+
+
+def hook_window(base_render: models.Render, script: Optional[str] = None) -> HookWindow:
+    """find_hook_window, and how it was found: whether it snapped to a
+    pause, and the stretch searched for one (HookWindow)."""
     from .renderer import _probe_duration
 
     path = Path(base_render.audio_path or "")
@@ -662,27 +795,25 @@ def find_hook_window(base_render: models.Render, script: Optional[str] = None) -
     if not rest_of_script(script):
         # One sentence: the opening is the whole voiceover (nothing is
         # joined after it), never a pause inside the line.
-        window = round(total, 2)
+        found = HookWindow(round(total, 2), False, total, total, est, total)
         with _window_lock:
-            _window_cache[key] = window
-        return window
-    # Snap to a pause near the estimate, but never past half of what follows
-    # the first sentence, and closer in when the first sentence is most of
-    # the script (a breath before its last clause is not its end).
-    share = est / total if total > 0 else 0.0
-    lo = est * (0.6 if share < 0.6 else 0.85)
-    hi = min(est * 1.4, est + (total - est) * 0.5)
+            _window_cache[key] = found
+        return found
+    lo, hi = pause_range(est, total)
     best: Optional[float] = None
-    for start, end in detect_silences(path):
+    silences = detect_silences(path)
+    silent = any(start <= 0.05 and end >= total - 0.05 for start, end in silences)
+    for start, end in silences:
         if start <= 0.05 or end >= total - 0.05:
             continue  # leading / trailing silence is not a pause between lines
         mid = (start + end) / 2
         if lo <= mid <= hi and (best is None or abs(mid - est) < abs(best - est)):
             best = mid
     window = round(min(max(best if best is not None else est, 0.3), max(total - 0.3, 0.3)), 2)
+    found = HookWindow(window, best is not None, lo, hi, est, total, silent)
     with _window_lock:
-        _window_cache[key] = window
-    return window
+        _window_cache[key] = found
+    return found
 
 
 def estimate_seconds(text: str, original: str, window: float) -> float:
@@ -1322,7 +1453,8 @@ def precheck(db: Session, project: models.VideoProject, variant: models.HookVari
              clips: list["ComposeClip"], needed: Optional[list[int]] = None) -> None:
     """The safety checks the variant's paid steps will meet, before any of
     them is paid for (cached: the checks at the providers are then hits):
-    the opening, a new shot 1's prompt, and the words and motion of every
+    the opening (check_opening, and alone, as its voice speaks it:
+    synth_hook), a new shot 1's prompt, and the words and motion of every
     shot (`needed`) that is lip-synced again, so a refused lip-sync never
     comes after other clips were paid for."""
     from .minor_check import check_generation
@@ -1330,8 +1462,10 @@ def precheck(db: Session, project: models.VideoProject, variant: models.HookVari
     from .prompting import effective_negative
     from .safety import check_prompt
 
-    check_opening(db, db.get(models.Render, variant.base_render_id), variant.hook_text or "",
-                  variant.window_seconds)
+    base = db.get(models.Render, variant.base_render_id)
+    check_opening(db, base, variant.hook_text or "", variant.window_seconds)
+    if not is_original(db, variant, base):
+        check_generation((variant.hook_text or "").strip(), kind="script")
     if variant.shot1_source == "new":
         check_generation(variant.shot1_prompt or "", effective_negative("video", _negative(db, clips[0])),
                          kind="video")

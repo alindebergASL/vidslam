@@ -1964,11 +1964,13 @@ def check_audio_prompt(prompt: str) -> None:
     check before the provider is paid (a music model may sing what the
     prompt asks for, and the bed is mixed into the video). Raises
     explicit_check.ExplicitPromptError (a ValueError). Nothing with adult
-    features."""
-    from . import explicit_check
+    features, nor for an app-written preset vetted at test time
+    (services/vetted_audio.py)."""
+    from . import explicit_check, vetted_audio
 
-    if explicit_check.active() and (prompt or "").strip():
-        explicit_check.check_prompt(prompt.strip())
+    text = (prompt or "").strip()
+    if explicit_check.active() and text and not vetted_audio.is_vetted(text):
+        explicit_check.check_prompt(text)
 
 
 def generate_music_for_project(

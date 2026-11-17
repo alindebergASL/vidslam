@@ -45,9 +45,10 @@ CALLS: dict = {"judge": 0, "judged": []}
 
 
 def _oracle(text: str) -> dict:
-    from app.providers.mock_chat import CONTEXT_MARK, PROMPT_MARK, USER_MARK
+    from app.providers.mock_chat import CONTEXT_MARK, NO_CONTEXT_HEAD, PROMPT_MARK, USER_MARK
 
     CALLS["judge"] += 1
+    text = text.removeprefix(NO_CONTEXT_HEAD)  # a text with no story around it
     ctx, user = "", text.removeprefix(PROMPT_MARK)
     if text.startswith(CONTEXT_MARK):
         ctx, _, user = text[len(CONTEXT_MARK):].partition("\n\n" + USER_MARK)
@@ -610,11 +611,11 @@ def test_an_unbound_elevenlabs_speaker_is_read_with_the_default_voice(client, mo
 # ---------- F) lenient verdicts ----------
 
 
-@pytest.mark.parametrize("reply", ['{"minor_sexual": false} or maybe {"minor_sexual": true}',
-                                   '{"minor_sexual": false, "reason": "a"}\n{"minor_sexual": false, "reason": "b"}',
-                                   '```json\n{"minor_sexual": false}\n```\nActually: {"minor_sexual": true}',
-                                   "no verdict here"])
-def test_two_verdicts_or_none_are_unreadable(reply):
+@pytest.mark.parametrize("reply", ["no verdict here"])
+def test_no_verdict_is_unreadable(reply):
+    """No verdict. A reply with a "true" anywhere in it is read as true
+    (#57 review, finding 6: test_minor_verdict_any_true), and one whose
+    verdicts all say false is a no (test_minor_verdict_all_false)."""
     from app.providers.openrouter_chat import parse_minor_verdict
 
     with pytest.raises(ValueError):

@@ -277,10 +277,13 @@ def test_adult_mode_refuses_every_picture_when_the_check_cant_run(client, prompt
 
 
 def test_the_avoid_list_comes_first_and_a_long_prompt_is_never_cut(client):
+    from app.providers.mock_chat import NO_CONTEXT_HEAD
+
     long = "nude woman, petite, flat chest, " + "a sunlit meadow with wildflowers, " * 200
     assert len(long) > minor_check.JUDGE_WINDOW
     text = minor_check.classifier_text("nude woman", "older looking skin, 21 year old")
-    assert text.startswith("Avoid list (negative prompt): older looking skin") and text.endswith("Prompt: nude woman")
+    assert text.startswith(NO_CONTEXT_HEAD + "Avoid list (negative prompt): older looking skin")
+    assert text.endswith("Prompt: nude woman")
     # An "ok" given when the model was shown only a part of it doesn't count.
     minor_check._store(minor_check.text_hash(long, "curvy, voluptuous"), "ok", minor_check._identity(), "part")
     with pytest.raises(safety.UnsafePromptError) as e:

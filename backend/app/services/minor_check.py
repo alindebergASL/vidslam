@@ -8,7 +8,9 @@ model) is asked whether the text puts a minor in a sexual context:
 - every non-empty voice script, lip-sync script and sound, music or ambient
   prompt, and every window of an audio story, in every mode (adult, default
   and clean): a word list can't tell an adult text from one about a child.
-  The word lists only refuse obvious cases before the call (needs_ai);
+  The word lists only refuse obvious cases before the call (needs_ai).
+  The app's own sound and music presets, word for word, were vetted at
+  test time instead and are not asked about (services/vetted_audio.py);
 - adult mode on: every image and video prompt (provider filters are off);
 - adult mode off: picture and clip prompts that are sexual, mention a minor,
   or have an avoid list that removes signs of adulthood (provider filters
@@ -22,7 +24,10 @@ keeps recent "ok" verdicts in memory; refusals are always read from the
 table, so a cleared one is gone for every process. Verdicts from the mock
 classifier are used only in mock mode.
 
-When the check can't run, every story part, voice script, lip-sync and
+A check call that hits a 429, a 5xx or a timeout is tried once more after
+a short wait (openrouter_chat._post_check); a 402 or 403 (OpenRouter
+credit or a key's limit) is said so in the message (CREDIT). When the
+check can't run, every story part, voice script, lip-sync and
 sound the model would have been asked about waits (no word rule stands in
 for the model). Picture and clip prompts with a plainly sexual word (or an
 avoid list that steers young) wait; in adult mode, where the provider
@@ -66,6 +71,12 @@ UNAVAILABLE_CLEAN = ("The safety check couldn't run, so this prompt is paused un
                      "planner model in Settings → Models).")
 UNAVAILABLE = (UNAVAILABLE_CLEAN + " Every voice script, lip-sync and sound waits for it; in Adult mode every "
                "picture and clip does too (turn Adult mode off to keep making those with the provider filters on).")
+# A 402 or 403 from OpenRouter (out of credit, a key's spending limit or
+# an in-flight budget): not the planner model's fault, so not that hint.
+CREDIT_CLEAN = ("OpenRouter credit or key limit reached, so the safety check couldn't run; this prompt is paused "
+                "until it can (add credit or raise the key's limit on OpenRouter).")
+CREDIT = (CREDIT_CLEAN + " Every voice script, lip-sync and sound waits for it; in Adult mode every picture and "
+          "clip does too.")
 DECLINED = ("This prompt was refused: the safety check model declined to judge it, which counts as a no. "
             "A different planner model (Settings → Models) may answer.")
 TOO_LONG = ("This prompt was refused: with its avoid list it is longer than the safety check can read "
@@ -82,6 +93,29 @@ _lock = threading.Lock()
 class CheckUnavailable(RuntimeError):
     """The safety check model gave no verdict (no key, switched off, error,
     timeout, unreadable reply)."""
+
+
+class CheckCreditLimit(CheckUnavailable):
+    """The check couldn't run because OpenRouter refused the call for credit
+    or a key limit (HTTP 402 or 403)."""
+
+
+CREDIT_STATUSES = (402, 403)
+
+
+def credit_limited(exc: BaseException) -> bool:
+    """`exc` (or what it was raised from) is OpenRouter's 402 or 403."""
+    import httpx
+
+    seen = 0
+    while exc is not None and seen < 5:
+        if isinstance(exc, CheckCreditLimit):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in CREDIT_STATUSES:
+            return True
+        exc = exc.__cause__ or exc.__context__
+        seen += 1
+    return False
 
 
 class CheckDeclined(CheckUnavailable):
@@ -120,17 +154,170 @@ def classifier_text(prompt: str, negative: str = "", context: str = "") -> str:
     model reads (JUDGE_WINDOW) isn't judged at all (check_generation). With
     a story `context` (the app's note, facts and cast), it comes first as a
     block of its own (CONTEXT_MARK), then the user's text (USER_MARK): the
-    model is told the first is the app's and the second the user's."""
-    from ..providers.mock_chat import AVOID_MARK, CONTEXT_MARK, PROMPT_MARK, USER_MARK
+    model is told the first is the app's and the second the user's.
+
+    A text with no story around it is sent the same way, with NO_CONTEXT as
+    the app's block and the avoid list and prompt as the user's, so the
+    app's block always comes first and a block forged in the user's text
+    can only sit inside the user's (the model is told only the first block
+    is the app's). Outside a story part, _check_minors quotes look-alikes
+    of the app's labels in the user's text first (quote_marks)."""
+    from ..providers.mock_chat import (
+        AVOID_MARK,
+        CONTEXT_MARK,
+        NO_CONTEXT_HEAD,
+        PROMPT_MARK,
+        USER_MARK,
+    )
 
     context = (context or "").strip()
+    prompt = (prompt or "").strip()
+    negative = (negative or "").strip()
     if context:
-        text = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}{prompt.strip()}"
-    else:
-        text = PROMPT_MARK + prompt.strip()
-    if (negative or "").strip():
-        text = f"{AVOID_MARK}{negative.strip()}\n\n{text}"
-    return text
+        text = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}{prompt}"
+        if negative:
+            text = f"{AVOID_MARK}{negative}\n\n{text}"
+        return text
+    text = PROMPT_MARK + prompt
+    if negative:
+        text = f"{AVOID_MARK}{negative}\n\n{text}"
+    return NO_CONTEXT_HEAD + text
+
+
+# Look-alikes of the app's labels in a user's text, read on a skeleton of
+# it (_skeleton): "story" (or "story's", "storys", "stories") then
+# "context", "facts" or "notes"; "context" then "from the app"; "from the
+# app" by itself; "user" then "text"; "app" or "system" then "note",
+# "message", "context" or "facts"; and "first-person narrator" ("1st
+# person narrator", "narrator (first person)"). The skeleton has every run
+# of non-letters (spaces, newlines, punctuation, symbols, other scripts) as
+# one space, so a label is found however many come between its letters or
+# words: "Story\ncontext", "Story_____context", "S t o r y   context",
+# "STORY ····· FACTS:", "STORY  con​text"; with or without a colon. A
+# digit that looks like a letter counts as it (_DIGIT_LOOKALIKES: "St0ry
+# c0ntext (fr0m the app)"). The gaps are at most two characters and every
+# branch starts with a letter, so any text is read in linear time.
+_DIGIT_LOOKALIKES = {"o": "0", "l": "1", "i": "1", "e": "3", "a": "4", "s": "5", "t": "7"}
+_LETTER_GAP = "[^a-z]{0,2}"
+_WORD_GAP = "[^a-z]{0,2}"
+
+
+def _letter(c: str) -> str:
+    d = _DIGIT_LOOKALIKES.get(c)
+    return f"[{c}{d}]" if d else re.escape(c)
+
+
+def _spaced(*words: str) -> str:
+    """`words` in order, a few non-letters between them and between their
+    letters (a letter may be a digit that looks like it); a word may be a
+    regex alternation of plain words."""
+    def one(word: str) -> str:
+        return "(?:" + "|".join(_LETTER_GAP.join(_letter(c) for c in w) for w in word.split("|")) + ")"
+
+    return _WORD_GAP.join(one(w) for w in words)
+
+
+_APP = _spaced("from", "the", "app")
+_LOOKALIKE_RE = re.compile(
+    r"(?<![a-z])(?:"
+    rf"{_spaced('story|storys|stories', 'context|contexts|fact|facts|note|notes')}(?:{_WORD_GAP}{_APP})?|"
+    rf"{_spaced('context|contexts')}{_WORD_GAP}{_APP}|"
+    rf"{_APP}|"
+    rf"{_spaced('user', 'text|texts')}|"
+    rf"{_spaced('app|system', 'note|notes|message|messages|context|contexts|fact|facts')}|"
+    rf"{_spaced('first|1st', 'person', 'narrator|narrators|narration')}|"
+    rf"{_spaced('narrator|narration', 'first|1st', 'person')}"
+    r")(?![a-z])")
+# Look-alike letters safety's table (_CONFUSABLE) doesn't fold: Cherokee
+# ("Ꮪtory"), Lisu, Armenian and a few Latin and Cyrillic ones. Cherokee
+# has lower case forms too (str.lower turns "Ꮪ" into "ꮪ"): both are folded.
+_MORE_CONFUSABLE_PAIRS = {
+    "Ꭰ": "d", "Ꭱ": "r", "Ꭲ": "t", "Ꭵ": "i", "Ꭹ": "y", "Ꭺ": "a", "Ꭻ": "j", "Ꭼ": "e", "Ꮃ": "w",
+    "Ꮇ": "m", "Ꮋ": "h", "Ꮍ": "y", "Ꮐ": "g", "Ꮒ": "h", "Ꮓ": "z", "Ꮟ": "b", "Ꮢ": "r", "Ꮤ": "w",
+    "Ꮥ": "s", "Ꮪ": "s", "Ꮩ": "v", "Ꮮ": "l", "Ꮯ": "c", "Ꮲ": "p", "Ꮶ": "k", "Ꮷ": "d", "Ᏼ": "b",
+    "Ꮻ": "o", "Ꮎ": "o", "Ꮜ": "u", "Ꭴ": "u", "Ꮖ": "t", "Ꮏ": "h",
+    "ꓮ": "a", "ꓐ": "b", "ꓚ": "c", "ꓓ": "d", "ꓰ": "e", "ꓝ": "f", "ꓖ": "g", "ꓧ": "h", "ꓲ": "i",
+    "ꓙ": "j", "ꓗ": "k", "ꓡ": "l", "ꓟ": "m", "ꓠ": "n", "ꓳ": "o", "ꓑ": "p", "ꓣ": "r", "ꓢ": "s",
+    "ꓔ": "t", "ꓴ": "u", "ꓦ": "v", "ꓪ": "w", "ꓫ": "x", "ꓬ": "y", "ꓜ": "z",
+    "օ": "o", "Օ": "o", "ս": "u", "Ս": "u", "հ": "h", "ո": "n", "ց": "g", "զ": "q", "ա": "w",
+    "Տ": "s", "ք": "p", "ռ": "n", "ɑ": "a", "ɡ": "g", "ı": "i", "ȷ": "j", "ɩ": "i", "ʋ": "u",
+    "ԛ": "q", "ԝ": "w", "ү": "y", "һ": "h", "ԍ": "g", "ꭓ": "x", "ꮪ": "s",
+}
+_MORE_CONFUSABLE = str.maketrans({
+    **_MORE_CONFUSABLE_PAIRS,
+    **{k.lower(): v for k, v in _MORE_CONFUSABLE_PAIRS.items() if k.lower() != k and len(k.lower()) == 1},
+})
+QUOTED = "quoted: "
+
+
+_SKELETON_LETTERS = frozenset("abcdefghijklmnopqrstuvwxyz" + "".join(set(_DIGIT_LOOKALIKES.values())))
+_APP_RE = re.compile(_APP)
+
+
+def _skeleton(text: str) -> tuple[str, list[int]]:
+    """(skeleton, where): `text` read as the model may read it, NFKC, lower
+    case, Cyrillic, Greek, Cherokee and other look-alikes as Latin letters
+    (safety's table and _MORE_CONFUSABLE), accents and hidden characters
+    gone, and every run of other characters (a digit that looks like a
+    letter is a letter) as one space; where[i] is the index in `text` of
+    the skeleton's character i (for a space, the run's first character)."""
+    out: list[str] = []
+    where: list[int] = []
+    for i, c in enumerate(text):
+        if unicodedata.category(c) in ("Cf", "Co"):
+            continue
+        folded = unicodedata.normalize("NFKC", c).translate(_MORE_CONFUSABLE).lower()
+        for d in unicodedata.normalize("NFKD", folded):
+            if unicodedata.combining(d):
+                continue
+            for e in d.translate(safety._CONFUSABLE).translate(_MORE_CONFUSABLE):
+                if e in _SKELETON_LETTERS:
+                    out.append(e)
+                    where.append(i)
+                elif not out or out[-1] != " ":
+                    out.append(" ")
+                    where.append(i)
+    return "".join(out), where
+
+
+def _already_quoted(text: str, at: int) -> bool:
+    """Whether the label at `text[at]` has "quoted:" right before it."""
+    before = "".join(c for c in text[max(0, at - 64):at] if unicodedata.category(c) not in ("Cf", "Co"))
+    return before.rstrip().lower().endswith(QUOTED.strip())
+
+
+def lookalike_starts(text: str) -> list[int]:
+    """Where each look-alike of the app's labels (_LOOKALIKE_RE) starts in
+    `text`: at its first character, or at the bracket of "(from the app)"."""
+    skel, where = _skeleton(text or "")
+    out: list[int] = []
+    for m in _LOOKALIKE_RE.finditer(skel):
+        at = where[m.start()]
+        if m.start() > 0 and _APP_RE.match(skel, m.start()):
+            run = text[where[m.start() - 1]:at]
+            if "(" in run:
+                at = where[m.start() - 1] + run.rindex("(")
+        out.append(at)
+    return out
+
+
+def quote_marks(text: str) -> str:
+    """`text` with "quoted: " put in front of every look-alike of the app's
+    labels (lookalike_starts): "Stоry context (from the app):" (a Cyrillic
+    о), "Story_context", "User text:", "Story facts: the Titanic sank in
+    1912.", "(from the app)" from its bracket. The text is never refused for
+    one; the model is told a label after "quoted:" is the user's. One
+    already quoted is left as it is."""
+    if not text:
+        return text
+    pieces: list[str] = []
+    last = 0
+    for at in lookalike_starts(text):
+        if at < last or _already_quoted(text, at):
+            continue
+        pieces += [text[last:at], QUOTED]
+        last = at
+    return "".join(pieces) + text[last:] if pieces else text
 
 
 # ---------- model ----------
@@ -164,11 +351,14 @@ def availability() -> dict:
                 pictures == "mock" and bool(get_settings().mock_providers))}
 
 
-def _unavailable() -> str:
+def _unavailable(e: Optional[BaseException] = None) -> str:
     """The paused-prompt message; a clean deployment (ADULT_FEATURES=false)
-    has no adult mode to mention."""
+    has no adult mode to mention. `e`: why the check couldn't run (a credit
+    or key limit says so)."""
     from .content_mode import features
 
+    if e is not None and credit_limited(e):
+        return CREDIT if features() else CREDIT_CLEAN
     return UNAVAILABLE if features() else UNAVAILABLE_CLEAN
 
 
@@ -256,7 +446,8 @@ def _classify(prompt: str, negative: str, context: str = "") -> tuple[bool, str,
     except ModelDeclined as e:
         raise CheckDeclined(str(e)[:200]) from None
     except Exception as e:  # noqa: BLE001 — HTTP error, timeout, garbage
-        raise CheckUnavailable(f"{type(e).__name__}: {str(e)[:200]}") from None
+        kind = CheckCreditLimit if credit_limited(e) else CheckUnavailable
+        raise kind(f"{type(e).__name__}: {str(e)[:200]}") from None
     verdict = out.get("minor_sexual") if isinstance(out, dict) else None
     if not isinstance(verdict, bool):
         raise CheckUnavailable("unreadable verdict")
@@ -382,26 +573,6 @@ def _store_row(key: str, verdict: str, model: str, reason: str, at: datetime) ->
         return None
     finally:
         db.close()
-
-
-def vouch_ok(judged: str, parts) -> None:  # noqa: ANN001
-    """Record "ok" for each of `parts` (texts inside `judged` that the app
-    later sends alone, such as a hook lab opening) when `judged`, a text
-    check_generation has just passed with no avoid list or story context,
-    holds an "ok" from the judge set now: the model read every part in it,
-    so asking about a part again would only pay twice. A part not inside
-    `judged`, or with a verdict of its own, is left alone."""
-    whole = _key_text(judged)
-    if not whole or cached(text_hash(judged)) != "ok":
-        return
-    judge = _identity() or ""
-    for part in parts:
-        text = _key_text(part)
-        if not text or text not in whole:
-            continue
-        key = text_hash(part)
-        if cached(key) is None:
-            _store(key, "ok", judge, "judged ok inside a longer text")
 
 
 def memory() -> dict:
@@ -556,7 +727,185 @@ def story_word_filter(text: str) -> None:
                 _story_clause(clause)
 
 
-def _word_filter(prompt: str, negative: str, kind: str) -> None:
+# A direction group (brackets, parentheses or asterisks) right before a
+# marker safety_text added.
+_GROUP_BEFORE_MARKER_RE = re.compile(r"(?:\[([^\]]*)\]|\(([^()\n]*)\)|\*([^*\n]+)\*)\s*$")
+# Words that are never an everyday word (_UNAMBIGUOUS_ADULT_RE, whole
+# words, any ending): a marked group with one of them keeps its marker, so
+# it is refused next to a minor by the words ("little boy (orgasmic moans)",
+# "kid voice (lustful sighs)", "(seduced, moaning)", "(eroticism, moaning)").
+# "lust" takes only its own endings ("lustrous", "lustre" are not it).
+_UNAMBIGUOUS_ADULT_RE = re.compile(
+    r"\b(?:orgasm\w*|seduc\w*|erotic\w*|arous\w*|lust(?:ful\w*|ily|ing|ed|s|y)?)\b", re.I)
+# "pleasure" and "climax" are everyday words ("squeals of pleasure", "the
+# music builds to a climax"): they count only in a group that also has a
+# moan or groan (_SOUND_RE): "moans of pleasure", "climaxing moans",
+# "(pleasures herself, moaning)".
+_WITH_SOUND_RE = re.compile(r"\b(?:pleasur\w*|climax\w*|climactic\w*)", re.I)
+# Only moans and groans: "gasps of pleasure", "sighs of pleasure" and "the
+# audience gasps at the climax" are everyday sounds, left to the model.
+_SOUND_RE = re.compile(r"\b(?:moan\w*|groan\w*)\b", re.I)
+# The same stems on the group's letters alone (_letters: "o r g a s m i c",
+# "o.r.g.a.s.m.i.c"), where words run together: only stems that start no
+# everyday word and no ordinary pair of words, read across at least three
+# runs of letters, the first one from its start ("carousel", "use duct" and
+# "a rousing" are not them). "lust" is never read there ("cluster").
+# "orgasm", "seduc" and "erotic" are read across two runs or more ("orgas
+# mic", "ero.tic"); "arous" needs three ("a rousing" is two).
+_JOINED_ADULT_RE = re.compile(r"orgasm|seduc|erotic")
+_JOINED_AROUS_RE = re.compile(r"arous")
+_JOINED_WITH_SOUND_RE = re.compile(r"pleasur|climax|climactic")
+_JOINED_SOUND_RE = re.compile(r"moan|groan")
+_LETTER_RUN_RE = re.compile(r"[a-z]+")
+# A bracket group's words that share a stem with an adult voice tag
+# ("[moaning]" for the tag "[moans]", "[flirting]" for "[flirtatious]").
+_TAG_STEM_RE = re.compile(r"\b(?:flirt\w*|seduc\w*)", re.I)
+
+
+def _letters(form: str) -> tuple[str, list[int]]:
+    """(letters, runs): `form` (lower case) with everything but a-z taken
+    out, digits that look like letters read as them; runs[i] is the number
+    of the run of letters in `form` that letter i came from."""
+    out: list[str] = []
+    runs: list[int] = []
+    for n, m in enumerate(_LETTER_RUN_RE.finditer(form.lower().translate(safety._LEET))):
+        out.append(m.group(0))
+        runs += [n] * len(m.group(0))
+    return "".join(out), runs
+
+
+def _joined_hit(rx: "re.Pattern", forms: list[str], span: int = 2) -> bool:
+    """Whether `rx` matches the letters of one of `forms` (_letters) across
+    `span` runs or more, starting at the start of a run."""
+    for f in forms:
+        letters, runs = _letters(f)
+        for m in rx.finditer(letters):
+            first, last = runs[m.start()], runs[m.end() - 1]
+            if last - first >= span - 1 and (m.start() == 0 or runs[m.start() - 1] != first):
+                return True
+    return False
+
+
+def _unambiguous(group: str) -> bool:
+    """Whether a direction group says something that is never an everyday
+    sound (see _UNAMBIGUOUS_ADULT_RE), read on every form safety's filter
+    reads (look-alike letters, digits, hidden characters and separators
+    folded) and on its letters alone."""
+    forms = safety._forms(group)
+    if (safety._any(_UNAMBIGUOUS_ADULT_RE, forms) or _joined_hit(_JOINED_ADULT_RE, forms)
+            or _joined_hit(_JOINED_AROUS_RE, forms, span=3)):
+        return True
+    sound = safety._any(_SOUND_RE, forms) or _joined_hit(_JOINED_SOUND_RE, forms)
+    return sound and (safety._any(_WITH_SOUND_RE, forms) or _joined_hit(_JOINED_WITH_SOUND_RE, forms))
+
+
+_TAG_PUNCT_RE = re.compile(r"[^\w\s]+")
+# Filler code points that render as nothing or a blank yet count as letters
+# (Hangul fillers, halfwidth Hangul filler) or are default-ignorable.
+_FILLERS = frozenset("\u115f\u1160\u3164\uffa0\u034f\u17b4\u17b5\u180b\u180c\u180d\u180e")
+_MORE_CONFUSABLE_CHARS = frozenset(
+    {*_MORE_CONFUSABLE_PAIRS, *(k.lower() for k in _MORE_CONFUSABLE_PAIRS if len(k.lower()) == 1)})
+
+
+def _hidden(c: str) -> bool:
+    return c in _FILLERS or unicodedata.category(c) in ("Cf", "Co", "Cn")
+
+
+def _tag_fold(text: str) -> str:
+    """`text` with hidden and filler characters taken out and the
+    look-alikes _MORE_CONFUSABLE knows folded (safety._forms folds the rest)."""
+    t = "".join(c for c in unicodedata.normalize("NFKC", text) if not _hidden(c))
+    return t.translate(_MORE_CONFUSABLE)
+
+
+def _script(c: str) -> str:
+    return unicodedata.name(c, "?").split(" ")[0]
+
+
+def _disguised(group: str) -> bool:
+    """A direction group written in a way no everyday sound description is:
+    letters from more than one script (Latin with Cyrillic, Greek,
+    Armenian, Hangul, Cherokee, ...), a hidden or filler character, or a
+    look-alike letter (_MORE_CONFUSABLE: "ɑ", "ı", Cherokee, Lisu). Near a
+    minor it keeps its marker, so the whole look-alike family is refused by
+    the words rather than one table entry at a time."""
+    letters = [c for c in unicodedata.normalize("NFKC", group) if c.isalpha() and c not in _FILLERS]
+    if len({_script(c) for c in letters}) > 1:
+        return True
+    return any(_hidden(c) or c in _MORE_CONFUSABLE_CHARS for c in group)
+
+
+def _adult_tag_group(group: str, exact: bool = False) -> bool:
+    """Whether a [bracket] group names an adult voice tag, or (unless
+    `exact`, as for a sound or music prompt, where "[moaning wind]" or
+    "[dog panting]" describe a sound) a word that shares its stem
+    ("[moaning]" like "[moans]")."""
+    from . import story_script
+
+    if any(story_script.norm_tag(t) in story_script.ADULT_TAGS for t in group.split(",")):
+        return True
+    if exact:
+        # Read as safety's word filter reads it, and then some: look-alike
+        # letters and digits (safety's table and _MORE_CONFUSABLE), hidden
+        # and filler characters and stray punctuation folded ("[m0ans]",
+        # "[mоans]", "[moɑns]", "[moㅤans]", "[moans!]").
+        return any(story_script.norm_tag(_TAG_PUNCT_RE.sub("", f)) in story_script.ADULT_TAGS
+                   for t in group.split(",") for f in safety._forms(_tag_fold(t)))
+    forms = safety._forms(group)
+    return safety._any(story_script._ADULT_STEM_RE, forms) or safety._any(_TAG_STEM_RE, forms)
+
+
+def _keeps_marker(group: str, square: bool, audio: bool = False) -> bool:
+    """Whether a "(seductive)" marker safety_text put after `group` (a
+    direction group; `square`: in [brackets]) stays for the word filter, so
+    the group is refused next to a minor by the words alone: an adult voice
+    tag in [brackets], or a word sharing its stem ("[moans]", "[moaning]",
+    "[lustful]"), a word the filter knows as sexual, or a word that is
+    never an everyday sound (_unambiguous). Any other group ("(moaning
+    softly)", "(panting dog)", "(squeals of pleasure)") loses it for the
+    word filter. `audio`: a sound or music prompt, where only an exact adult
+    voice tag in [brackets] counts as one."""
+    if square and _adult_tag_group(group, exact=audio):
+        return True
+    if audio and _disguised(group):
+        return True
+    return _unambiguous(group) or safety.is_hard_sexual(group)
+
+
+def unmarked(text: str, audio: bool = False) -> str:
+    """`text` without the markers story_script.safety_text adds ("(seductive)",
+    "(sensual)"): what a word filter reads of a text that was marked for the
+    model (`marked` below). The app's marks are for the model to weigh,
+    never a refusal by the words alone ("(ghosts moaning)", "(panting dog)",
+    "*breathless*" or "(moaning softly)" near "kids": the model, which is
+    always asked, judges them). A "(seductive)" marker stays, refused next
+    to a minor by the words, only after a group _keeps_marker names: an
+    adult voice tag in [brackets] or a word that is never an everyday sound
+    ("(orgasmic moans)", "(lustful sighs)", "(moans of pleasure)")."""
+    from . import story_script
+
+    seductive = f"({story_script._ADULT_TAG_WORD})"
+
+    def drop(m: "re.Match") -> str:
+        # Either marker: a group with no adult stem ("(flirty giggles)")
+        # is marked "(sensual)" near a minor; one that keeps its marker is
+        # read by the word filter as an adult direction, "(seductive)".
+        before = _GROUP_BEFORE_MARKER_RE.search(m.string, max(0, m.start() - 400), m.start())
+        if not before:
+            return " "
+        group = next((g for g in before.groups() if g is not None), "")
+        return seductive if _keeps_marker(group, before.group(1) is not None, audio) else " "
+
+    return story_script._MARKER_RE.sub(drop, text or "")
+
+
+def _word_filter(prompt: str, negative: str, kind: str, marked: bool = False) -> None:
+    """The word filter. `marked`: `prompt` is a text safety_text marked (a
+    sound or music prompt, registry._audio_guard), whose caller ran the word
+    filter on the text as written first, so a marker the user typed is still
+    read there; here its markers are taken out (unmarked)."""
+    if marked:
+        prompt = unmarked(prompt, audio=kind == "audio")
     if kind == "story":
         story_word_filter(prompt)
     elif kind in ("script", "lipsync"):
@@ -790,24 +1139,31 @@ def check_generation(prompt: str, negative: str = "", *, kind: str) -> None:
 
 
 def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = "",
-                  force: bool = False) -> None:
+                  force: bool = False, marked: bool = False, words: bool = True) -> None:
     """The word filter on `prompt` alone, then the model on `context` (the
     story note, facts and cast: the app's block, for the model only) and
-    `prompt` (the user's block), when needs_ai says so or `force`."""
+    `prompt` (the user's block), when needs_ai says so or `force`.
+    `marked`: see _word_filter (the model reads the marked text)."""
     prompt = prompt or ""
     negative = negative or ""
-    _word_filter(prompt, negative, kind)
+    if words:
+        _word_filter(prompt, negative, kind, marked)
     context = (context or "").strip() if prompt.strip() else ""
     seen = f"{context}\n\n{prompt}" if context else prompt
     if not (prompt.strip() and force) and not needs_ai(seen, negative, kind=kind):
         return
-    shown = classifier_text(prompt, negative, context)
+    # What the model reads of the user's text: outside a story part, with
+    # look-alikes of the app's labels quoted (quote_marks), so none passes
+    # for the app's block. The verdict is remembered by the text as written
+    # (or, with a context, by exactly what was shown).
+    sent, sent_negative = (prompt, negative) if kind == "story" else (quote_marks(prompt), quote_marks(negative))
+    shown = classifier_text(sent, sent_negative, context)
     if len(shown) > JUDGE_WINDOW and kind in ("script", "lipsync", "audio") and not context \
             and not negative.strip():
         # A long voice script, lip-sync or sound: read in overlapping
         # windows (check_long), every window asked about (the whole was)
         # and every one failing closed.
-        check_long(prompt, kind=kind, force=True)
+        check_long(prompt, kind=kind, force=True, marked=marked, words=words)
         return
     if len(shown) > JUDGE_WINDOW:
         # Longer than the model reads: never judged on a part of it (nor
@@ -824,7 +1180,7 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
     if hit == "minor_sexual":
         raise UnsafePromptError(REFUSED)
     try:
-        minor_sexual, reason, model = _classify(prompt, negative, context)
+        minor_sexual, reason, model = _classify(sent, sent_negative, context)
     except CheckDeclined as e:
         # Not cached: a different planner may answer.
         log.warning("safety check declined a %s prompt (%s): refused", kind, e)
@@ -832,7 +1188,7 @@ def _check_minors(prompt: str, negative: str = "", *, kind: str, context: str = 
     except CheckUnavailable as e:
         if _fails_closed(seen, negative, kind, force):
             log.warning("safety check unavailable (%s): sexual %s prompt paused", e, kind)
-            raise UnsafePromptError(_unavailable()) from None
+            raise UnsafePromptError(_unavailable(e)) from None
         log.info("safety check unavailable (%s): non-sexual %s prompt allowed", e, kind)
         return
     _store(key, "minor_sexual" if minor_sexual else "ok", model, reason)
@@ -865,6 +1221,8 @@ FACTS_TOO_MANY = ("This story has too many characters for the safety check to ke
                   "split it into shorter stories.")
 STORY_UNAVAILABLE = ("The safety check couldn't run, so this story is paused until it's available (check the "
                      "planner model in Settings → Models).")
+STORY_CREDIT = ("OpenRouter credit or key limit reached, so the safety check couldn't run; this story is paused "
+                "until it can (add credit or raise the key's limit on OpenRouter).")
 
 
 # The same, for a long voiceover, lip-sync or sound with no story around it
@@ -900,7 +1258,8 @@ def check_cast_length(context: str) -> None:
         raise UnsafePromptError(FACTS_TOO_MANY)
 
 
-def check_long(text: str, *, kind: str = "story", context: str = "", force: bool = False) -> None:
+def check_long(text: str, *, kind: str = "story", context: str = "", force: bool = False,
+               marked: bool = False, words: bool = True) -> None:
     """Raise UnsafePromptError when any part of a long `text` (read with
     `context`, the story note, facts and cast, in front of it) puts a minor
     in a sexual context, or when a part the model must judge can't be
@@ -911,8 +1270,10 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
     block and the window as the user's. A story line or cast description
     that starts like the app's block ("Story facts:") is refused. The
     context is capped (check_cast_length), so all of it is in view of every
-    window."""
-    from ..providers.mock_chat import CONTEXT_MARK, USER_MARK
+    window. `marked`: `text` was marked by safety_text and its caller ran
+    the word filter on it as written (see _word_filter): each window's word
+    filter reads it without the markers, the model with them."""
+    from ..providers.mock_chat import CONTEXT_MARK, NO_CONTEXT_HEAD, PROMPT_MARK, USER_MARK
     from .explicit_check import parts
 
     text = text or ""
@@ -932,8 +1293,15 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         if cast:
             _check_minors("\n".join(cast_lines), "", kind=kind, context="\n".join(lead_lines), force=force)
         return
-    head = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}" if context else ""
+    head = f"{CONTEXT_MARK}{context}\n\n{USER_MARK}" if context else NO_CONTEXT_HEAD + PROMPT_MARK
     size = JUDGE_WINDOW - len(head) - 60
+    if kind != "story" and not context:
+        # Look-alikes of the app's labels are quoted (quote_marks) before the
+        # text is measured and cut, in what the facts call and every window
+        # read, so none passes for the app's (as in a short text,
+        # classifier_text), and a text the quoting makes longer than one
+        # read is cut into windows, never handed back whole.
+        text = quote_marks(text)
     if kind != "story" and not force and len(text) > size and needs_ai(text, kind=kind):
         # Asked about as a whole: every window is asked about (a minor in
         # one window and a sexual word in the next).
@@ -952,8 +1320,6 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         # StoryFacts.window_line), on top of the whole-story summary, so the
         # refusal doesn't rest on the judge working out which part of the
         # summary it is.
-        if forged_app_label(text):
-            raise UnsafePromptError(LABEL_REFUSED)
         facts = _long_facts_detail(text)
         summary = " ".join(facts.summary_line().split())
         if len(summary) > 2 * FACTS_LIMIT:
@@ -965,10 +1331,10 @@ def check_long(text: str, *, kind: str = "story", context: str = "", force: bool
         for window in parts(text, size=size, lines=True):
             line = facts.window_line(window) if facts.fp_adult else ""
             ctx = "\n".join(x for x in (context, line) if x)
-            _check_minors(window, "", kind=kind, context=ctx, force=force)
+            _check_minors(window, "", kind=kind, context=ctx, force=force, marked=marked, words=words)
         return
     for window in parts(text, size=size, lines=True):
-        _check_minors(window, "", kind=kind, context=context, force=force)
+        _check_minors(window, "", kind=kind, context=context, force=force, marked=marked, words=words)
 
 
 # Room kept in a long text's window for its own line (StoryFacts.window_line).
@@ -985,6 +1351,8 @@ def _long_facts_detail(text: str) -> "StoryFacts":
     except UnsafePromptError as e:
         if str(e) == STORY_UNAVAILABLE:
             raise UnsafePromptError(_unavailable()) from None
+        if str(e) == STORY_CREDIT:
+            raise UnsafePromptError(_unavailable(CheckCreditLimit())) from None
         raise
 
 
@@ -1022,7 +1390,7 @@ def _long_facts(text: str) -> str:
 # character who is a minor only in some parts. Fails closed; each part's
 # answer is cached in this process by a hash of what was asked.
 
-FACTS_POLICY = "facts-6"
+FACTS_POLICY = "facts-7"
 _facts: "OrderedDict[str, list]" = OrderedDict()
 _RANK = {"adult": 0, "unknown": 1, "minor": 2}
 FACTS_INCOMPLETE = ("The safety check couldn't say who every character in this story is, so the story is paused. "
@@ -1072,13 +1440,19 @@ def _read_entries(out: object) -> list[tuple]:
     smallest number under 18 in it, or not given; an adult's with a number
     under 18 in it is shown as a minor at another time, `past_age`). A
     nameless character that isn't a minor is left out."""
-    from ..providers.openrouter_chat import read_ages, read_part, read_status, read_when
+    from ..providers.openrouter_chat import (
+        no_narrator,
+        read_ages,
+        read_part,
+        read_status,
+        read_when,
+    )
 
     chars = out.get("characters") if isinstance(out, dict) else None
     if not isinstance(chars, list):
         raise CheckUnavailable("unreadable story facts")
     nar = out.get("narrator")
-    if nar is not None and nar is not False:
+    if nar is not None and nar is not False and not no_narrator(nar):
         if not isinstance(nar, dict):
             raise CheckUnavailable("unreadable story facts (narrator)")
         given = nar.get("name")
@@ -1447,7 +1821,7 @@ def _facts_window(fn, judge: str, cast: str, so_far: str, window: str, required:
             raise UnsafePromptError(DECLINED) from None
         except Exception as e:  # noqa: BLE001 — error, timeout, unreadable reply
             log.warning("story facts unavailable (%s: %s): story refused", type(e).__name__, str(e)[:200])
-            raise UnsafePromptError(STORY_UNAVAILABLE) from None
+            raise UnsafePromptError(STORY_CREDIT if credit_limited(e) else STORY_UNAVAILABLE) from None
         got = {story_name_key(e[0]) for e in entries}
         missing = sorted(n for n in required if story_name_key(n) not in got)
         no_narrator = narrator and not _names_narrator(entries, cast, window, called)

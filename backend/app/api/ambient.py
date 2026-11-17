@@ -30,8 +30,8 @@ from ..schemas.ambient import (
 )
 from ..services import ambient as svc
 from ..services import provider_gate, storage
-from ..services.explicit_check import ExplicitContentError
 from ..services.ratelimit import rate_limit
+from ..services.safety import UnsafeScriptError
 from ..services.spend import budget_guard
 from ..workers.jobs import (
     ambient_batch_job,
@@ -213,7 +213,6 @@ def _check_scene_prompts(project: models.VideoProject, *, loop: bool = False,
     clip and still prompts, the music and sound prompts), so the worker's
     own precheck and the provider checks are cache hits."""
     from ..services import explicit_check
-    from ..services.safety import UnsafeScriptError
 
     if not explicit_check.active():
         return
@@ -340,8 +339,8 @@ def regenerate_music(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut
         raise HTTPException(409, "music mood is 'none'")
     try:
         svc.generate_music_bed(db, project, cfg, prompt)
-    except ExplicitContentError as e:  # a clean deployment: before the provider is paid
-        raise HTTPException(422, str(e)) from None
+    except UnsafeScriptError as e:  # refused by the checks (minors, word filter, clean mode) or the check
+        raise HTTPException(422, str(e)) from None  # couldn't run: before the provider is paid
     db.refresh(project)
     return svc.to_out(db, project)
 
@@ -356,8 +355,8 @@ def regenerate_sound(scene_id: int, db: Session = Depends(get_db)) -> AmbientOut
         raise HTTPException(409, "nature sound is off for this scene")
     try:
         svc.generate_sound_bed(db, project, cfg)
-    except ExplicitContentError as e:  # a clean deployment: before the provider is paid
-        raise HTTPException(422, str(e)) from None
+    except UnsafeScriptError as e:  # refused by the checks (minors, word filter, clean mode) or the check
+        raise HTTPException(422, str(e)) from None  # couldn't run: before the provider is paid
     db.refresh(project)
     return svc.to_out(db, project)
 
@@ -422,7 +421,7 @@ def generate_picture(scene_id: int, discard_loop: bool = False, db: Session = De
         raise HTTPException(409, str(e)) from e
     except svc.PictureError as e:
         raise HTTPException(422, str(e)) from e
-    except ExplicitContentError as e:  # a clean deployment only: e.g. a rewrite made just now
+    except UnsafeScriptError as e:  # the checks: e.g. a clean deployment's rewrite made just now
         raise HTTPException(422, str(e)) from None
     return svc.to_out(db, project)
 

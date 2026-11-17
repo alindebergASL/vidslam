@@ -78,6 +78,12 @@ PROMPT_MARK = "Prompt: "
 # user's text (minor_check.classifier_text).
 CONTEXT_MARK = "Story context (from the app):\n"
 USER_MARK = "User text:\n"
+# A text with no story around it is sent the same way, with this as the
+# app's block (minor_check.classifier_text): the app's block always comes
+# first, so a look-alike block in the user's text can only ever sit inside
+# the user's block, after the real one.
+NO_CONTEXT = "(none)"
+NO_CONTEXT_HEAD = f"{CONTEXT_MARK}{NO_CONTEXT}\n\n{USER_MARK}"
 
 
 # How services/minor_check.py lays out a story facts request: the cast
@@ -339,6 +345,8 @@ def mock_minor_verdict(text: str) -> dict:
     from ..services.safety import is_sexual, mentions_minor, mentions_minor_wide, steers_young
 
     negative = ""
+    # A text with no story around it: the user's block is read as before.
+    text = text.removeprefix(NO_CONTEXT_HEAD)
     if text.startswith(AVOID_MARK):
         negative, _, text = text[len(AVOID_MARK):].partition("\n\n" + PROMPT_MARK)
     if text.startswith(CONTEXT_MARK):

@@ -194,12 +194,22 @@ def _warn_adult_leftovers() -> None:
         log.warning("adult content leftover check skipped: %s", e)
 
 
+def _masked_url(url: str) -> str:
+    """A database URL fit for a log: its password replaced by ***."""
+    try:
+        from sqlalchemy.engine import make_url
+
+        return make_url(url).render_as_string(hide_password=True)
+    except Exception:  # noqa: BLE001
+        return "(unreadable database URL)"
+
+
 def create_app() -> FastAPI:
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        log.info("initializing database at %s", settings.database_url)
+        log.info("initializing database at %s", _masked_url(settings.database_url))
         init_db()
         _repair_image_types()
         _warn_adult_leftovers()
@@ -315,6 +325,16 @@ def create_app() -> FastAPI:
         # any provider call, so nothing was spent.
         return JSONResponse({"detail": str(exc), "code": "provider_unavailable",
                              "provider": exc.provider}, status_code=409)
+
+    from .services.safety import UnsafeScriptError
+
+    @app.exception_handler(UnsafeScriptError)
+    async def _refused(request, exc):  # noqa: ANN001
+        # A backstop: a safety refusal (or a check that couldn't run, which
+        # waits) that a route didn't turn into its own reply is a 422 with
+        # the check's message, never a bare 500. Raised before the provider
+        # is paid.
+        return JSONResponse({"detail": str(exc)}, status_code=422)
 
     app.include_router(api_router)
     return app

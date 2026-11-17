@@ -461,7 +461,18 @@ def resolve_sound_prompt(cfg: AmbientConfig) -> str:
     if sid == "auto":
         sid = _AUTO_SOUND_BY_WEATHER.get(cfg.weather) or _AUTO_SOUND_BY_SCENE.get(cfg.scene_preset, "")
     preset = _SOUND_BY_ID.get(sid)
-    return (preset.prompt + ", seamless loop, no music, no voices") if preset else ""
+    return (preset.prompt + SOUND_PRESET_SUFFIX) if preset else ""
+
+
+SOUND_PRESET_SUFFIX = ", seamless loop, no music, no voices"
+
+
+def preset_audio_prompts() -> list[str]:
+    """Every sound and music prompt the app itself writes (the presets, as
+    resolve_sound_prompt and resolve_music_prompt send them): fixed text,
+    vetted once (services/vetted_audio.py), never a user's."""
+    return [*(p.prompt + SOUND_PRESET_SUFFIX for p in SOUND_PRESETS if p.prompt),
+            *(m.prompt for m in MUSIC_MOODS if m.prompt)]
 
 
 def sound_path(project: models.VideoProject) -> Path:
@@ -1976,9 +1987,12 @@ def precheck(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPlanOut
 
     - Every mode: the music and sound prompts get the checks get_music()
       and get_sound() run on them (registry.audio_guard: the word filter,
-      the minors check, asked when a prompt is sexual or mentions a minor,
-      and on a clean deployment the explicit-content check). Sound and
-      music prompts are guarded in every mode, so their refusal comes here.
+      the minors check, which asks the model about every such prompt and
+      waits when it can't run, and on a clean deployment the
+      explicit-content check). The app's own presets, word for word, were
+      vetted at test time and need no live call (services/vetted_audio.py);
+      a custom prompt is always asked. Sound and music prompts are guarded
+      in every mode, so their refusal, or their wait, comes here.
     - A clean deployment: also the picture and clip prompts
       (checked_prompts).
 

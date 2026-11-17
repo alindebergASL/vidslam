@@ -60,6 +60,16 @@ def _window_at(base_id: int, word: str) -> float:
     return round(end * script.index(word) / rest_at, 2)
 
 
+def _found_at(seconds: float, script: str, total: float):
+    """What the lab reports (hook_window) when it finds the pause after the
+    first sentence at `seconds` of a `total`-second voiceover of `script`."""
+    from app.services import hook_lab
+
+    est = hook_lab.estimate_window(script, total)
+    lo, hi = hook_lab.pause_range(est, total)
+    return hook_lab.HookWindow(seconds, True, lo, hi, est, total)
+
+
 def _post(auth_client, pid, base_id, hook, window=None):
     body = {"base_render_id": base_id, "variants": [{"hook_text": hook, "style": "custom"}]}
     if window is not None:
@@ -219,8 +229,9 @@ def test_a_phrase_formed_across_the_join_is_refused_only_where_it_is_heard(auth_
 def test_the_ai_check_sees_the_opening_with_what_is_heard_after_it(auth_client, monkeypatch):
     """The replaced words ("my wife is thirty") can make the joined text read
     as being about an adult. The AI check also sees the opening with only the
-    words heard after it, on a line of its own in the one text it is asked
-    about (hook_lab.opening_text)."""
+    words heard after it, as a text of its own: the script the opening makes
+    and each heard form are each asked about in their own call
+    (hook_lab.judged_texts)."""
     from app.providers import mock_chat
 
     seen: list[str] = []
@@ -237,9 +248,14 @@ def test_the_ai_check_sees_the_opening_with_what_is_heard_after_it(auth_client, 
     hook = "She still wears braces and"
     r = _post(auth_client, pid, base_id, hook, _window_at(base_id, "tonight"))
     assert r.status_code == 422 and "minor" in r.json()["detail"]
-    assert any("braces and tonight she slips into a bikini" in t for t in seen)
-    # Where the first sentence ends, none of it is heard: fine.
+    assert any("braces and" in t and "tonight she slips into a bikini" in t and "thirty" not in t for t in seen)
+    # At the pause where the first sentence ends the cut is exact: none of
+    # that sentence is heard, only the script the opening makes. Fine, as
+    # is an ordinary opening there.
+    seen.clear()
     assert _post(auth_client, pid, base_id, hook).status_code == 201
+    assert not any("tonight" in t for t in seen)
+    assert _post(auth_client, pid, base_id, "Why keep scrolling?").status_code == 201
 
 
 def test_ordinary_openings_at_any_window_are_still_made(auth_client):
@@ -341,14 +357,15 @@ _RATE = ("Rate her outfit out of twenty: fifteen, and tonight she strips naked f
 def test_every_join_in_the_first_sentence_is_checked_without_the_openings_punctuation(auth_client):
     """The window is estimated from even pacing, but digits and pauses move
     the real pickup. "Her age?" heard before "fifteen, and tonight she strips
-    naked" is refused wherever in the first sentence the window is."""
+    naked" is refused wherever the window is near enough for the voiceover
+    to pick up there (about 0.75 s of speech either side of the guess)."""
     from app.services import safety
 
     pid, base_id = _spliced_base(auth_client, _RATE)
     with pytest.raises(safety.UnsafeScriptError):
         safety.check_script("Her age fifteen, and tonight she strips naked for you")
     safety.check_script("Her age? fifteen, and tonight she strips naked for you")  # what the old join read
-    for word in ("outfit", "twenty", "fifteen"):
+    for word in ("of", "twenty", "fifteen"):
         r = _post(auth_client, pid, base_id, "Her age?", _window_at(base_id, word))
         assert r.status_code == 422 and "minor" in r.json()["detail"], (word, r.text)
     # At the end of the first sentence none of it is heard: fine.
@@ -361,7 +378,7 @@ def test_the_ai_check_sees_every_join_in_the_first_sentence(auth_client, monkeyp
     seen: list[str] = []
 
     def judge(self, text):
-        seen.append(text)
+        seen.append(text.removeprefix(mock_chat.NO_CONTEXT_HEAD).removeprefix("Prompt: "))
         bad = "braces and tonight she slips into a bikini" in text
         return {"minor_sexual": bad, "reason": "probe"}
 
@@ -371,15 +388,33 @@ def test_the_ai_check_sees_every_join_in_the_first_sentence(auth_client, monkeyp
     # The window says "thirty"; the voiceover may really pick up at "tonight".
     r = _post(auth_client, pid, base_id, "She still wears braces and", _window_at(base_id, "thirty"))
     assert r.status_code == 422 and "minor" in r.json()["detail"]
-    joins = [t for t in seen if "may be heard joined" in t]
-    assert joins and any("\n1. She still wears braces and My wife" in t for t in joins)
+    # Every join is its own text, as heard to the end: never beside another
+    # join's words, which aren't heard with it.
+    assert "She still wears braces and My wife is thirty and tonight she slips into a bikini for you! " \
+           "Follow for more." in seen
+    assert "She still wears braces and tonight she slips into a bikini for you! Follow for more." in seen
+    assert all(t.count("She still wears braces and") <= 1 for t in seen)
 
 
-def test_heard_joins_fit_what_the_check_reads():
-    from app.services import hook_lab, minor_check
+def test_heard_joins_are_one_text_each_and_a_long_first_sentence_is_refused(auth_client):
+    from app import models
+    from app.services import hook_lab
 
     script = ("word " * 400).strip() + ". Follow for more."
     rest_at = script.index("Follow")
-    texts = hook_lab.heard_joins("Hi there", script, hook_lab.word_starts(script, rest_at), rest_at)
-    assert len(texts) > 1 and all(len(t) <= minor_check.JUDGE_WINDOW for t in texts)
-    assert sum(t.count("\n") for t in texts) == 400  # every join, once
+    cuts = hook_lab.word_starts(script, rest_at)
+    texts = hook_lab.heard_joins("Hi there", script, cuts)
+    assert len(texts) == 400 and texts[0] == f"Hi there {script}" and texts[-1] == f"Hi there {script[cuts[-1]:]}"
+    # A window inside a first sentence that long would need 400 checks
+    # (more than MAX_JOINS): refused.
+    assert len(texts) > hook_lab.MAX_JOINS
+    pid, base_id = _spliced_base(auth_client, script)
+    db = _db()
+    try:
+        base = db.get(models.Render, base_id)
+        end = hook_lab.find_hook_window(base, script)
+        with pytest.raises(hook_lab.HookLabError) as e:
+            hook_lab.check_opening(db, base, "Hi there", round(end / 2, 2))
+        assert e.value.status == 422 and str(e.value) == hook_lab.JOINS_TOO_MANY
+    finally:
+        db.close()

@@ -52,6 +52,27 @@ def _explicit(text: str) -> None:
     explicit_check.check(text or "")
 
 
+# A negated "explicit" or "sexual" in a sound or music prompt ("nothing
+# explicit", "no sexual content", "non-explicit", "without explicit
+# lyrics"), right before a break or the end: not the word itself.
+_NEGATED_ADULT_RE = re.compile(
+    r"(?<![\w-])(?:no|nothing|not|non-?|without)\s*(?:explicit|sexual)"
+    r"(?:\s+(?:content|material|lyrics|themes|language|words))?(?=\s*(?:[,.;:!)\]]|$))(?![^\n]*\?)", re.I)
+# A word that turns the negation round or makes it a question ("never not
+# sexual", "not non-explicit", "why not explicit", "if not explicit").
+_UNNEGATING_RE = re.compile(r"\b(?:never|not|no|non|nothing|without|why|if|hardly|barely)[\W_]*$", re.I)
+
+
+def _negations_out(text: str) -> str:
+    """A copy of `text` for the word filter only: a plain negated
+    "explicit" or "sexual" ("nothing explicit", "no sexual content") taken
+    out. Never what the safety model or the explicit-content check reads."""
+    def drop(m: "re.Match") -> str:
+        return m.group(0) if _UNNEGATING_RE.search(m.string[:m.start()]) else " "
+
+    return _NEGATED_ADULT_RE.sub(drop, text).strip() or text
+
+
 def _explicit_prompt(prompt: str) -> None:
     """A clean deployment: a prompt sent to a lip-sync model (its motion)
     gets the explicit-content check (services/explicit_check.py)."""
@@ -203,19 +224,32 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
     """A sound or music prompt: the word filter, the minors check and, on a
     clean deployment, the explicit-content check. Every caller of
     get_sound() and get_music() comes through here, whatever screen the
-    prompt came from. An adult word ("moaning", "panting", [moans]) is
-    marked (story_script.safety_text), so with a child in view the model
-    is asked, never refused by the words alone.
+    prompt came from.
 
     `context`: a story's context (story_script.check_story): with one, the
     prompt is a story part, sent only when `story_pass` (by default the one
     the context carries) covers this prompt with this context (check_story
     judged it, with the story's facts and cast in front); anything else is
-    refused (story_pass.STALE: check the story again). Without one, kind
-    "audio": asked when it's sexual or mentions a minor, or `force`
-    (lyrics or a composition plan)."""
+    refused (story_pass.STALE: check the story again).
+
+    Without one: the word filter reads the prompt as written, then the
+    minors check (kind "audio") asks the model about every prompt, in every
+    mode, and fails closed: when the check can't run (no key, out of
+    credit, an error or timeout after one retry) the prompt waits. The
+    model reads the prompt marked by story_script.safety_text (an adult
+    direction, "(ghosts moaning)", gets a marker after it); the word filter
+    of each window reads it without those markers, so a marked direction
+    near a child is the model's to judge, not a refusal by the words alone
+    when all it says may be an everyday sound ("(ghosts moaning)", "(panting
+    dog)", "(moaning softly)"); an adult voice tag in brackets ("[moans]")
+    or a word that is never an everyday sound ("(orgasmic moans)") still is
+    (minor_check.unmarked). The one exception is
+    an app-written preset, word for word (services/vetted_audio.py): vetted
+    at test time, so it needs no live call, unless `force` (lyrics or a
+    composition plan are joined to it)."""
     from ..services import story_pass as passes
-    from ..services.minor_check import check_long
+    from ..services import vetted_audio
+    from ..services.minor_check import _word_filter, check_long
     from ..services.safety import UnsafePromptError, check_prompt
     from ..services.story_script import safety_text
 
@@ -223,7 +257,12 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
     text = (prompt or "").strip()
     if not text:
         return
-    check_prompt(text)
+    # "family friendly, nothing explicit", "no sexual content": the word
+    # filter reads a copy without a plain negated "explicit" or "sexual";
+    # the safety model, the explicit-content check and the vetted-preset
+    # lookup read the text as written.
+    words = _negations_out(text) if not (context or "").strip() else text
+    check_prompt(words)
     context = (context or "").strip()
     if context:
         if not passes.covers(token, context, passes.prompt_item(text)):
@@ -233,7 +272,23 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
         if passes.clean_checked(token):
             return
     else:
-        check_long(safety_text(text, "", prose=True), kind="audio", force=force)
+        if not force and vetted_audio.is_vetted(text):
+            # Exactly an app-written preset, vetted at test time
+            # (services/vetted_audio.py): no live call, so a rain bed
+            # doesn't wait on OpenRouter. Anything else is asked.
+            return
+        # The word filter read `text` as written (check_prompt above), then
+        # once more with the markers safety_text adds after a direction
+        # group near a minor, of which it keeps only those after an
+        # unmistakable sexual word or an exact adult voice tag
+        # (minor_check.unmarked). The model reads the prompt as the user
+        # wrote it: the markers are the app's notes, which it would read as
+        # the user's ("(waves crashing, seagulls) (sensual)").
+        _word_filter(safety_text(words, "", prose=True), "", "audio", marked=True)
+        # The whole text's word filter has run (above), so the windows'
+        # word filter would only read less of it: the model reads each
+        # window as written.
+        check_long(text, kind="audio", force=force, words=False)
     _explicit_prompt(text)
 
 

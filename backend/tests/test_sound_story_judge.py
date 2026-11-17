@@ -442,7 +442,7 @@ def test_music_lyrics_are_judged_with_the_prompt(client, monkeypatch):
     mock_chat.MINOR_CALLS.clear()
     registry.GuardedMusicProvider(inner).generate(prompt="calm piano", duration_seconds=10)
     registry.GuardedMusicProvider(inner).generate(prompt="calm piano", duration_seconds=10)
-    assert mock_chat.MINOR_CALLS == ["Prompt: calm piano"]
+    assert mock_chat.MINOR_CALLS == [mock_chat.NO_CONTEXT_HEAD + "Prompt: calm piano"]
 
 
 def test_music_lyrics_with_a_story_context_fail_closed(client):
