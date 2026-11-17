@@ -8,12 +8,13 @@ machinery builds on them.
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # A sentence ends at ., !, ?, … (or a run of them, "?!", "..."), optionally
 # followed by closing quotes or brackets, then whitespace or the end. A
 # decimal point ("3.5") or a dot inside a URL is not followed by whitespace,
 # so it is not an end. A line break ends the opening line too.
-_END = re.compile(r"""[.!?…]+["'”’»)\]]*(?=\s|$)|\n""")
+_END = re.compile(r"""[.!?…]+["'”’»)\]]*(?=\s|$)|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]""")
 # A clause break a voice may pause at: , ; : or a dash, before a space.
 _CLAUSE = re.compile(r"""(?:[,;:]+["'”’»)\]]*|\s[-–—]+)(?=\s)""")
 # A pause can also follow punctuation with no space after it ("30...tonight",
@@ -367,13 +368,23 @@ def heard_checks(db: Session, base: models.Render, hook: str, window: Optional[f
 # U+2060 or a soft hyphen) can be a place the voice pauses: "30;tonight",
 # "\"30.\"Tonight", "«30»tonight", "30。tonight", "30.\u200btonight",
 # "30— tonight". Not one inside a word or number (_in_word).
-_SEP = re.compile(r"[^\w\s]+")
+_SEP = re.compile(r"(?:[^\w\s]|_)+")
+# Inside a word in scripts that write vowels and other signs as combining
+# marks (Hindi, Tamil, Bengali, Thai, decomposed Vietnamese), or join
+# letters with a zero-width (non-)joiner: not a separator.
+_WORD_JOINERS = frozenset("\u200c\u200d")
 
 
 def _in_word(script: str, m: "re.Match") -> bool:
     """A single ' ’ or - between letters or digits ("it's", "well-known"),
-    or a single . , or : between digits ("3.5", "30,000", "10:30")."""
-    if len(m.group(0)) != 1 or m.start() == 0 or m.end() >= len(script):
+    a single . , or : between digits ("3.5", "30,000", "10:30"), or a run
+    of combining marks and zero-width joiners after a letter (Hindi, Thai)."""
+    run = m.group(0)
+    if m.start() > 0 and all(unicodedata.category(c).startswith("M") or c in _WORD_JOINERS for c in run):
+        before = script[m.start() - 1]
+        if before.isalnum() or unicodedata.category(before).startswith("M"):
+            return True
+    if len(run) != 1 or m.start() == 0 or m.end() >= len(script):
         return False
     a, b, c = script[m.start() - 1], m.group(0), script[m.end()]
     if b in "'’-" and a.isalnum() and c.isalnum():

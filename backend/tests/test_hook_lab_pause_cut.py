@@ -300,21 +300,43 @@ def test_any_separator_at_a_found_pause_is_a_place(monkeypatch, tmp_path, sep):
     _assert_heard_form_refused(monkeypatch, tmp_path, script, 10.0, word)
 
 
-@pytest.mark.parametrize("sep", ["30— tonight", "30- tonight"])
-def test_a_dash_with_a_space_on_one_side_at_15_chars_a_second(monkeypatch, tmp_path, sep):
-    script = _separated_script(sep)
+_LONG_HEAD = "Hi there friends of the channel and welcome to my page\n"
+
+
+@pytest.mark.parametrize("tail", ["Lily is aged 30\u2014 tonight", "Lily is aged 30- tonight"])
+def test_a_dash_with_a_space_on_one_side_at_15_chars_a_second(monkeypatch, tmp_path, tail):
+    """The host's cases that c274179 accepted: the long head, 15 chars/s."""
+    script = f"{_LONG_HEAD}{tail} she wants sex with me. Follow for more."
     _assert_heard_form_refused(monkeypatch, tmp_path, script, len(script) / 15.0, "tonight")
 
 
 def test_a_breath_far_from_the_first_sentence_reads_the_band_around_the_pause(monkeypatch, tmp_path):
-    """At 16+ characters a second, a breath before "tonight" a second after
-    the first sentence's end: the band is centred on the pause, not on the
-    sentence end, so the heard form is judged."""
-    script = "Hi there friends of the channel and welcome to my page. Lily is 30 and tonight she wants sex with me so follow for more"
-    total = len(script) / 17.0
-    end_of_first = total * script.index(" Lily") / len(script)
-    assert total * script.index("tonight") / len(script) - end_of_first > 0.75
-    _assert_heard_form_refused(monkeypatch, tmp_path, script, total, "tonight")
+    """The host's case that c274179 accepted: a breath before "tonight", at
+    15 chars/s, with the band centred on the pause."""
+    script = "Hi there friends of the channel and welcome to my page. Lily is now 30 tonight she wants sex with me so follow for more"
+    _assert_heard_form_refused(monkeypatch, tmp_path, script, len(script) / 15.0, "tonight")
+
+
+@pytest.mark.parametrize("sep", [";_", "\u2028", "\u2029", "\r", "\x85", "\x0b", "\x0c"])
+def test_an_underscore_or_any_line_break_at_a_found_pause_is_a_place(monkeypatch, tmp_path, sep):
+    """Host's re-check of #58: "30;_tonight", and line breaks other than
+    "\\n" (CR, NEL, VT, FF, U+2028, U+2029) the voice reads through."""
+    script = f"{_LONG_HEAD}Lily, now 30{sep}tonight she wants sex with me so follow for more"
+    _assert_heard_form_refused(monkeypatch, tmp_path, script, 10.0, "tonight")
+
+
+_HINDI = "\u0928\u092e\u0938\u094d\u0924\u0947 \u0926\u094b\u0938\u094d\u0924\u094b\u0902, \u0906\u091c \u0939\u092e \u090f\u0915 \u0915\u0939\u093e\u0928\u0940"
+_THAI = "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35\u0e04\u0e23\u0e31\u0e1a, \u0e27\u0e31\u0e19\u0e19\u0e35\u0e49\u0e40\u0e23\u0e32\u0e08\u0e30\u0e40\u0e25\u0e48\u0e32\u0e19\u0e34\u0e17\u0e32\u0e19"
+
+
+@pytest.mark.parametrize("script", [_HINDI, _THAI])
+def test_combining_marks_inside_hindi_and_thai_words_are_not_places(script):
+    """Vowel signs are combining marks: only the comma is a place, so an
+    opening on such a script is not refused for "too many places"."""
+    from app.services import hook_lab
+
+    cuts = hook_lab.pause_cuts(script, 10.0, 0.0, 10.0)
+    assert cuts == [script.index(", ") + 2]
 
 
 def test_separators_inside_words_and_numbers_are_not_places():
