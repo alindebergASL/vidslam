@@ -1,4 +1,10 @@
-"""Host review after #58: look-alike Latin letters the fold tables miss
+"""STUB TESTS: the judge here is a stub that says yes whenever the new
+sentence is in its instruction, so these prove the sentence is sent, not
+that the real model refuses (it doesn't reliably: see
+test_wordlayer_disguise.py, where the same attacks are refused by the
+words, with 0 model calls).
+
+Host review after #58: look-alike Latin letters the fold tables miss
 ("[møans]", "[ɱoans]", ...) are a class the safety model reads, told to
 read misspellings and look-alikes as the words they imitate. The
 mixed-script rule fires on one word only, so benign multilingual sound

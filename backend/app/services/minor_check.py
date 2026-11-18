@@ -824,7 +824,14 @@ def _script(c: str) -> str:
 
 # Scripts written together in one word by everyday writing: Japanese mixes
 # kanji, hiragana and katakana (halfwidth too) within a word.
-_SCRIPT_FAMILY = {"CJK": "JAPANESE", "HIRAGANA": "JAPANESE", "KATAKANA": "JAPANESE", "HALFWIDTH": "JAPANESE"}
+_SCRIPT_FAMILY = {"CJK": "JAPANESE", "HIRAGANA": "JAPANESE", "KATAKANA": "JAPANESE", "HALFWIDTH": "JAPANESE",
+                  "KATAKANA-HIRAGANA": "JAPANESE", "IDEOGRAPHIC": "JAPANESE"}
+# Latin letters outside a-z that are ordinary spelling, not look-alikes of
+# another letter (German, Danish/Norwegian, French, Icelandic, Old English).
+_LATIN_EXTRA_OK = frozenset("ßæœþðÆŒÞÐ")
+# Scripts whose look-alikes (_MORE_CONFUSABLE) disguise a word anywhere in a
+# group: nobody writes a sound direction in Cherokee or Lisu capitals.
+_LOOKALIKE_SCRIPTS = frozenset({"CHEROKEE", "LISU"})
 
 
 def _words(text: str) -> list[str]:
@@ -843,24 +850,51 @@ def _words(text: str) -> list[str]:
     return out
 
 
+def _plain_latin(c: str) -> bool:
+    """A Latin letter that is a-z once its accents are taken off ("é", "ñ",
+    "ü", "ë"), or ordinary spelling (_LATIN_EXTRA_OK). Not IPA or other
+    look-alike letters ("ɔ", "ɵ", "ɐ", "ø", "ɱ", "ɑ", "ŋ")."""
+    base = "".join(d for d in unicodedata.normalize("NFKD", c) if not unicodedata.combining(d))
+    return (base.isascii() and base.isalpha()) or c in _LATIN_EXTRA_OK
+
+
+def _lookalike_letters() -> frozenset:
+    return frozenset({chr(k) for k in safety._CONFUSABLE} | _MORE_CONFUSABLE_CHARS)
+
+
 def _disguised(group: str) -> bool:
-    """A direction group with a word written in a way no everyday word is:
-    one word whose letters mix scripts (Latin with Cyrillic, Greek,
-    Armenian, Hangul, Cherokee, ...; Japanese kanji and kana count as one),
-    a hidden or filler character, or a Latin word with a look-alike letter
-    (_MORE_CONFUSABLE: "ɑ", "ı"). Near a minor it keeps its marker, so the
-    look-alike family is refused by the words. A group that only uses more
-    than one script across words ("子供たちの笑い声 (波の音)", "niños, waves")
-    is not disguised; the model reads misspellings and look-alikes too."""
+    """A direction group written in a way no everyday sound description is,
+    so near a minor it keeps its marker and is refused by the words:
+    - a hidden or filler character;
+    - a Cherokee or Lisu look-alike letter anywhere in it;
+    - a word whose letters mix scripts (Japanese kanji and kana, with ー
+      and 々, count as one);
+    - a Latin word with a letter outside a-z once accents are folded
+      ("møans", "mɔans", "moɑns"), save ordinary spelling ("ß", "æ");
+    - Latin letters with a non-Latin word made only of look-alike letters
+      ("m.о.a.n.s", "m о a n s", "m1о1ans").
+    Prompts in one other script, or several scripts word by word ("rain
+    дождь", Hindi, Japanese, Armenian), are not disguised."""
     if any(_hidden(c) for c in group):
         return True
-    for word in _words(unicodedata.normalize("NFKC", group)):
-        scripts = {_SCRIPT_FAMILY.get(_script(c), _script(c)) for c in word if c.isalpha()}
+    text = unicodedata.normalize("NFKC", group)
+    if any(c in _MORE_CONFUSABLE_CHARS and _script(c) in _LOOKALIKE_SCRIPTS for c in text):
+        return True
+    lookalikes = _lookalike_letters()
+    has_latin = False
+    lookalike_word = False
+    for word in _words(text):
+        letters = [c for c in word if c.isalpha()]
+        scripts = {_SCRIPT_FAMILY.get(_script(c), _script(c)) for c in letters}
         if len(scripts) > 1:
             return True
-        if scripts == {"LATIN"} and any(c in _MORE_CONFUSABLE_CHARS for c in word):
-            return True
-    return False
+        if scripts == {"LATIN"}:
+            has_latin = True
+            if not all(_plain_latin(c) for c in letters):
+                return True
+        elif letters and all(c in lookalikes for c in letters):
+            lookalike_word = True
+    return has_latin and lookalike_word
 
 
 def _adult_tag_group(group: str, exact: bool = False) -> bool:
