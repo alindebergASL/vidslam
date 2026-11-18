@@ -62,7 +62,7 @@ from .safety import UnsafePromptError
 log = logging.getLogger("avs.minor_check")
 
 # Bump to invalidate every cached verdict when the check's rules change.
-POLICY_VERSION = "minors-1"
+POLICY_VERSION = "minors-2"
 OK_TTL = timedelta(days=30)
 LRU_SIZE = 2000
 
@@ -822,17 +822,110 @@ def _script(c: str) -> str:
     return unicodedata.name(c, "?").split(" ")[0]
 
 
+# Scripts written together in one word by everyday writing: Japanese mixes
+# kanji, hiragana and katakana (halfwidth too) within a word.
+_SCRIPT_FAMILY = {"CJK": "JAPANESE", "HIRAGANA": "JAPANESE", "KATAKANA": "JAPANESE", "HALFWIDTH": "JAPANESE",
+                  "KATAKANA-HIRAGANA": "JAPANESE", "IDEOGRAPHIC": "JAPANESE"}
+# Latin letters outside a-z that are ordinary spelling, not look-alikes of
+# another letter (German, Danish/Norwegian, French, Icelandic, Old English).
+_LATIN_EXTRA_OK = frozenset("ßæœþðÆŒÞÐ")
+# Letters of real alphabets that keep no a-z base under NFKD but look like
+# one: their Unicode name says which ("O WITH STROKE" ø, "L WITH STROKE" ł,
+# "OPEN E" ɛ, "OPEN O" ɔ, "D WITH HOOK" ɗ, "SMALL CAPITAL C" ᴄ, "SHARP S"
+# ẞ), or _LATIN_FOLD does (Turkish ı, Azerbaijani ə, Ewe and Sami ŋ, Kabyle
+# ɣ, IPA ʃ ʒ). Ordinary spelling in "Søren", "Łukasz", "Rəşad", "Mbɔtɛ",
+# "ɗiyata", "FUẞBALL", but also a look-alike in "møans", "mɔans": a word
+# using them is disguised only when, folded to the letters they resemble,
+# it is an adult word. A look-alike _MORE_CONFUSABLE lists ("ɑ", "ɩ") or a
+# letter no name or table places ("ɒ") always is.
+_LATIN_FOLD = {"ı": "i", "ə": "e", "Ə": "E", "ŋ": "n", "Ŋ": "N", "ɣ": "y", "Ɣ": "Y",
+               "ʃ": "s", "Ʃ": "S", "ʒ": "z", "Ʒ": "Z"}
+_LATIN_NAME_RE = re.compile(r"LATIN (?:SMALL |CAPITAL )?LETTER (?:[A-Z]+ )*?([A-Z])(?: WITH .+)?")
+# Scripts whose look-alikes (_MORE_CONFUSABLE) disguise a word anywhere in a
+# group: nobody writes a sound direction in Cherokee or Lisu capitals.
+_LOOKALIKE_SCRIPTS = frozenset({"CHEROKEE", "LISU"})
+
+
+def _words(text: str) -> list[str]:
+    """`text`'s words: runs of letters, combining marks and hidden or
+    filler characters (which hide inside a word: "mo\u3164ans")."""
+    out: list[str] = []
+    cur: list[str] = []
+    for c in text:
+        if c.isalpha() or unicodedata.category(c).startswith("M") or _hidden(c):
+            cur.append(c)
+        elif cur:
+            out.append("".join(cur))
+            cur = []
+    if cur:
+        out.append("".join(cur))
+    return out
+
+
+def _plain_latin(c: str) -> bool:
+    """A Latin letter that is a-z once its accents are taken off ("é", "ñ",
+    "ü", "ë"), or ordinary spelling (_LATIN_EXTRA_OK). Not IPA or other
+    look-alike letters ("ɔ", "ɵ", "ɐ", "ø", "ɱ", "ɑ", "ŋ")."""
+    base = "".join(d for d in unicodedata.normalize("NFKD", c) if not unicodedata.combining(d))
+    return (base.isascii() and base.isalpha()) or c in _LATIN_EXTRA_OK
+
+
+def _lookalike_letters() -> frozenset:
+    return frozenset({chr(k) for k in safety._CONFUSABLE} | _MORE_CONFUSABLE_CHARS)
+
+
+def _latin_fold(c: str) -> Optional[str]:
+    """The a-z letter a Latin letter outside a-z resembles ("ø" o, "ɔ" o,
+    "ᴄ" c, "ə" e), or None (see _LATIN_FOLD)."""
+    if c in _LATIN_FOLD:
+        return _LATIN_FOLD[c]
+    if c in _MORE_CONFUSABLE_CHARS:
+        return None
+    m = _LATIN_NAME_RE.fullmatch(unicodedata.name(c, ""))
+    return m.group(1).lower() if m else None
+
+
+def _folds_to_adult(word: str) -> bool:
+    """`word` with its letters outside a-z folded ("møans" -> "moans") names
+    an adult voice tag or shares an adult stem."""
+    w = "".join(c if _plain_latin(c) else (_latin_fold(c) or c) for c in word)
+    return _adult_tag_group(w, exact=True) or _adult_tag_group(w)
+
+
 def _disguised(group: str) -> bool:
-    """A direction group written in a way no everyday sound description is:
-    letters from more than one script (Latin with Cyrillic, Greek,
-    Armenian, Hangul, Cherokee, ...), a hidden or filler character, or a
-    look-alike letter (_MORE_CONFUSABLE: "ɑ", "ı", Cherokee, Lisu). Near a
-    minor it keeps its marker, so the whole look-alike family is refused by
-    the words rather than one table entry at a time."""
-    letters = [c for c in unicodedata.normalize("NFKC", group) if c.isalpha() and c not in _FILLERS]
-    if len({_script(c) for c in letters}) > 1:
+    """A direction group written in a way no everyday sound description is,
+    so near a minor it keeps its marker and is refused by the words:
+    - a hidden or filler character;
+    - a Cherokee or Lisu look-alike letter anywhere in it;
+    - a word whose letters mix scripts (Japanese kanji and kana, with ー
+      and 々, count as one);
+    - a Latin word with a letter outside a-z once accents are folded
+      ("møans", "mɔans", "moɑns"), save ordinary spelling ("ß", "æ");
+    - Latin letters with a non-Latin word made only of look-alike letters
+      ("m.о.a.n.s", "m о a n s", "m1о1ans").
+    Prompts in one other script, or several scripts word by word ("rain
+    дождь", Hindi, Japanese, Armenian), are not disguised."""
+    if any(_hidden(c) for c in group):
         return True
-    return any(_hidden(c) or c in _MORE_CONFUSABLE_CHARS for c in group)
+    text = unicodedata.normalize("NFKC", group)
+    if any(c in _MORE_CONFUSABLE_CHARS and _script(c) in _LOOKALIKE_SCRIPTS for c in text):
+        return True
+    lookalikes = _lookalike_letters()
+    has_latin = False
+    lookalike_word = False
+    for word in _words(text):
+        letters = [c for c in word if c.isalpha()]
+        scripts = {_SCRIPT_FAMILY.get(_script(c), _script(c)) for c in letters}
+        if len(scripts) > 1:
+            return True
+        if scripts == {"LATIN"}:
+            has_latin = True
+            odd = [c for c in letters if not _plain_latin(c)]
+            if odd and (not all(_latin_fold(c) for c in odd) or _folds_to_adult(word)):
+                return True
+        elif letters and all(c in lookalikes or _script(c) == "COPTIC" for c in letters):
+            lookalike_word = True
+    return has_latin and lookalike_word
 
 
 def _adult_tag_group(group: str, exact: bool = False) -> bool:

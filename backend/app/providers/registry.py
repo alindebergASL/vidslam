@@ -60,7 +60,29 @@ _NEGATED_ADULT_RE = re.compile(
     r"(?:\s+(?:content|material|lyrics|themes|language|words))?(?=\s*(?:[,.;:!)\]]|$))(?![^\n]*\?)", re.I)
 # A word that turns the negation round or makes it a question ("never not
 # sexual", "not non-explicit", "why not explicit", "if not explicit").
-_UNNEGATING_RE = re.compile(r"\b(?:never|not|no|non|nothing|without|why|if|hardly|barely)[\W_]*$", re.I)
+# Any of these within the four words before the negation, with punctuation
+# or intensifiers between ("never, ever, not sexual", "no, not at all ...").
+_UNNEGATORS = r"(?:never|not|no|non|nothing|without|why|if|hardly|barely)"
+_UNNEGATING_RE = re.compile(
+    r"\b" + _UNNEGATORS + r"\b(?:[\W_]+(?:ever|really|truly|absolutely|totally|completely|even|very|"
+    + _UNNEGATORS[3:-1] + r")\b){0,3}[\W_]*$", re.I)
+
+
+_CLOSERS = {"[": "]", "(": ")"}
+
+
+def _closed_groups(text: str) -> str:
+    """`text` with a direction group left open at its end closed ("a teen
+    girl [moɑns" -> "... [moɑns]"), so the word layer reads it as a group.
+    An open "(" is left as typed: an emoticon (":(", "(:") or a forgotten
+    ")" is not a direction group."""
+    depth: list[str] = []
+    for c in text:
+        if c in _CLOSERS:
+            depth.append(c)
+        elif depth and c == _CLOSERS[depth[-1]]:
+            depth.pop()
+    return text + "".join(_CLOSERS[c] for c in reversed(depth) if c == "[")
 
 
 def _negations_out(text: str) -> str:
@@ -261,7 +283,7 @@ def _audio_guard(prompt: str, context: str = "", story_pass: str = "", *, force:
     # filter reads a copy without a plain negated "explicit" or "sexual";
     # the safety model, the explicit-content check and the vetted-preset
     # lookup read the text as written.
-    words = _negations_out(text) if not (context or "").strip() else text
+    words = _closed_groups(_negations_out(text)) if not (context or "").strip() else text
     check_prompt(words)
     context = (context or "").strip()
     if context:
