@@ -829,6 +829,18 @@ _SCRIPT_FAMILY = {"CJK": "JAPANESE", "HIRAGANA": "JAPANESE", "KATAKANA": "JAPANE
 # Latin letters outside a-z that are ordinary spelling, not look-alikes of
 # another letter (German, Danish/Norwegian, French, Icelandic, Old English).
 _LATIN_EXTRA_OK = frozenset("ßæœþðÆŒÞÐ")
+# Letters of real alphabets that keep no a-z base under NFKD but look like
+# one: their Unicode name says which ("O WITH STROKE" ø, "L WITH STROKE" ł,
+# "OPEN E" ɛ, "OPEN O" ɔ, "D WITH HOOK" ɗ, "SMALL CAPITAL C" ᴄ, "SHARP S"
+# ẞ), or _LATIN_FOLD does (Turkish ı, Azerbaijani ə, Ewe and Sami ŋ, Kabyle
+# ɣ, IPA ʃ ʒ). Ordinary spelling in "Søren", "Łukasz", "Rəşad", "Mbɔtɛ",
+# "ɗiyata", "FUẞBALL", but also a look-alike in "møans", "mɔans": a word
+# using them is disguised only when, folded to the letters they resemble,
+# it is an adult word. A look-alike _MORE_CONFUSABLE lists ("ɑ", "ɩ") or a
+# letter no name or table places ("ɒ") always is.
+_LATIN_FOLD = {"ı": "i", "ə": "e", "Ə": "E", "ŋ": "n", "Ŋ": "N", "ɣ": "y", "Ɣ": "Y",
+               "ʃ": "s", "Ʃ": "S", "ʒ": "z", "Ʒ": "Z"}
+_LATIN_NAME_RE = re.compile(r"LATIN (?:SMALL |CAPITAL )?LETTER (?:[A-Z]+ )*?([A-Z])(?: WITH .+)?")
 # Scripts whose look-alikes (_MORE_CONFUSABLE) disguise a word anywhere in a
 # group: nobody writes a sound direction in Cherokee or Lisu capitals.
 _LOOKALIKE_SCRIPTS = frozenset({"CHEROKEE", "LISU"})
@@ -862,6 +874,24 @@ def _lookalike_letters() -> frozenset:
     return frozenset({chr(k) for k in safety._CONFUSABLE} | _MORE_CONFUSABLE_CHARS)
 
 
+def _latin_fold(c: str) -> Optional[str]:
+    """The a-z letter a Latin letter outside a-z resembles ("ø" o, "ɔ" o,
+    "ᴄ" c, "ə" e), or None (see _LATIN_FOLD)."""
+    if c in _LATIN_FOLD:
+        return _LATIN_FOLD[c]
+    if c in _MORE_CONFUSABLE_CHARS:
+        return None
+    m = _LATIN_NAME_RE.fullmatch(unicodedata.name(c, ""))
+    return m.group(1).lower() if m else None
+
+
+def _folds_to_adult(word: str) -> bool:
+    """`word` with its letters outside a-z folded ("møans" -> "moans") names
+    an adult voice tag or shares an adult stem."""
+    w = "".join(c if _plain_latin(c) else (_latin_fold(c) or c) for c in word)
+    return _adult_tag_group(w, exact=True) or _adult_tag_group(w)
+
+
 def _disguised(group: str) -> bool:
     """A direction group written in a way no everyday sound description is,
     so near a minor it keeps its marker and is refused by the words:
@@ -890,9 +920,10 @@ def _disguised(group: str) -> bool:
             return True
         if scripts == {"LATIN"}:
             has_latin = True
-            if not all(_plain_latin(c) for c in letters):
+            odd = [c for c in letters if not _plain_latin(c)]
+            if odd and (not all(_latin_fold(c) for c in odd) or _folds_to_adult(word)):
                 return True
-        elif letters and all(c in lookalikes for c in letters):
+        elif letters and all(c in lookalikes or _script(c) == "COPTIC" for c in letters):
             lookalike_word = True
     return has_latin and lookalike_word
 

@@ -62,8 +62,10 @@ _NEGATED_ADULT_RE = re.compile(
 # sexual", "not non-explicit", "why not explicit", "if not explicit").
 # Any of these within the four words before the negation, with punctuation
 # or intensifiers between ("never, ever, not sexual", "no, not at all ...").
+_UNNEGATORS = r"(?:never|not|no|non|nothing|without|why|if|hardly|barely)"
 _UNNEGATING_RE = re.compile(
-    r"\b(?:never|not|no|non|nothing|without|why|if|hardly|barely)\b(?:[\W_]+[^\W_]+){0,3}[\W_]*$", re.I)
+    r"\b" + _UNNEGATORS + r"\b(?:[\W_]+(?:ever|really|truly|absolutely|totally|completely|even|very|"
+    + _UNNEGATORS[3:-1] + r")\b){0,3}[\W_]*$", re.I)
 
 
 _CLOSERS = {"[": "]", "(": ")"}
@@ -71,14 +73,16 @@ _CLOSERS = {"[": "]", "(": ")"}
 
 def _closed_groups(text: str) -> str:
     """`text` with a direction group left open at its end closed ("a teen
-    girl [moɑns" -> "... [moɑns]"), so the word layer reads it as a group."""
+    girl [moɑns" -> "... [moɑns]"), so the word layer reads it as a group.
+    An open "(" is left as typed: an emoticon (":(", "(:") or a forgotten
+    ")" is not a direction group."""
     depth: list[str] = []
     for c in text:
         if c in _CLOSERS:
             depth.append(c)
         elif depth and c == _CLOSERS[depth[-1]]:
             depth.pop()
-    return text + "".join(_CLOSERS[c] for c in reversed(depth))
+    return text + "".join(_CLOSERS[c] for c in reversed(depth) if c == "[")
 
 
 def _negations_out(text: str) -> str:
