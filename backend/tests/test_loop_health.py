@@ -399,3 +399,68 @@ def test_a_jump_the_render_blends_says_so(monkeypatch):
     monkeypatch.setattr(ambient, "seam_treatment", treat(0.0, True))
     view = loop_health.out(SimpleNamespace(id=1), SimpleNamespace(id=2), entry)
     assert view["seam"]["level"] == "bad" and "visible jump" in view["seam"]["text"]
+
+
+# ---------- snap: the last frame lands only by jumping to it ----------
+
+# A still, soft pattern wider than the frame: only the crop moves.
+TEXTURE = "nullsrc=s=640x180:d={d}:r=24,geq=lum='128+60*sin(X/9)*cos(Y/7)':cb=128:cr=128,format=yuv420p"
+
+
+def _scroll(path: Path, x: str, seconds: float = 4.0) -> Path:
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", TEXTURE.format(d=seconds),
+                    "-vf", f"crop=320:180:x='{x}':y=0", "-t", str(seconds), *ENC, str(path)], check=True)
+    return path
+
+
+def test_a_take_that_snaps_to_its_last_frame_reads_snap_not_seamless(tmp_path):
+    """The host's long-Wan-take failure: the picture drifts away from the
+    target for the whole take, then jumps back to it in the last two
+    frames. The join alone reads seamless (the last frame lands); the
+    approach does not."""
+    from app.services import loop_health as lh
+
+    n = 96  # 4 s at 24 fps
+    r = lh.measure(_scroll(tmp_path / "snap.mp4", f"if(gte(n,{n - 2}),0,n)"))
+    seam = r["seam"]
+    assert seam["difference"] <= lh.SEAM_TINY or seam["ratio"] <= lh.SEAM_SEAMLESS_RATIO
+    assert seam["verdict"] == "snap" and seam["level"] == "bad"
+    assert seam["approach"]["snaps"] is True
+
+
+def test_a_smooth_loop_does_not_read_snap(tmp_path):
+    from app.services import loop_health as lh
+
+    r = lh.measure(_scroll(tmp_path / "smooth.mp4", "40-40*cos(2*PI*t/4)"))
+    assert r["seam"]["verdict"] == "seamless"
+    assert r["seam"]["approach"]["snaps"] is False
+    assert r["seam"]["approach"]["to_target"] >= lh.SNAP_SSIM
+
+
+def test_the_box_loop_and_the_cut_keep_their_verdicts(tmp_path):
+    from app.services import loop_health as lh
+
+    assert lh.measure(seamless(tmp_path / "s.mp4"))["seam"]["approach"]["snaps"] is False
+    assert lh.measure(hard_cut(tmp_path / "c.mp4"))["seam"]["verdict"] == "visible_jump"
+
+
+def test_blend_mismatch_reads_how_different_the_blended_pictures_are(tmp_path):
+    """The two pictures a loop blend mixes (the last second against the
+    first, frame by frame): alike for a still loop, far apart across a cut.
+    A note for calibration (D5), not a gate."""
+    from app.services import loop_health as lh
+
+    still = lh.measure(static(tmp_path / "still.mp4"))["seam"]
+    snap = lh.measure(_scroll(tmp_path / "snap.mp4", "if(gte(n,94),0,n)"))["seam"]
+    assert still["blend_mismatch"] < 5 and still["blend_mismatch_level"] == "good"
+    assert snap["blend_mismatch"] > lh.MISMATCH_WARN and snap["blend_mismatch_level"] == "warn"
+
+
+def test_ssim_is_one_for_the_same_frame_and_lower_for_a_shift():
+    from PIL import Image, ImageFilter
+
+    from app.services import loop_health as lh
+
+    img = Image.effect_noise((160, 90), 60).filter(ImageFilter.GaussianBlur(2)).convert("RGB")
+    assert lh._ssim(img, img) == pytest.approx(1.0, abs=1e-6)
+    assert lh._ssim(img, img.transform(img.size, Image.AFFINE, (1, 0, 20, 0, 1, 0))) < lh.SNAP_SSIM

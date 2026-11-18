@@ -1378,7 +1378,7 @@ JOIN_CROSSFADE = 0.5
 SEAM_SEAMLESS_BLEND = 0.5  # a hedge against a join that is near-exact
 SEAM_SLIGHT_BLEND = 1.5
 SEAM_VISIBLE_BLEND = 2.0
-_SEAM_RANK = {"seamless": 0, "slight_jump": 1, "visible_jump": 2}
+_SEAM_RANK = {"seamless": 0, "slight_jump": 1, "visible_jump": 2, "snap": 3}
 
 
 def _video_model_for(cfg: AmbientConfig) -> str:
@@ -2515,7 +2515,7 @@ def seam_treatment(project: models.VideoProject) -> dict:
         blend = max(user, SEAM_VISIBLE_BLEND)
     return {"blend_seconds": round(blend, 2), "verdict": verdict,
             "ratio": round(float(seam.get("ratio") or 0.0), 2), "basis": "measured",
-            "covers": verdict != "visible_jump"}
+            "covers": verdict not in ("visible_jump", "snap")}
 
 
 def _plan_with_seam(plan: LoopPlanOut, cfg: AmbientConfig, treatment: dict) -> LoopPlanOut:
@@ -2536,7 +2536,7 @@ def _plan_with_seam(plan: LoopPlanOut, cfg: AmbientConfig, treatment: dict) -> L
 def seam_needs_a_look(project: models.VideoProject, treatment: Optional[dict] = None) -> bool:
     """A render would loop a visibly jumping clip and nobody has said that's OK."""
     treatment = treatment or seam_treatment(project)
-    return treatment["verdict"] == "visible_jump" and _config_of(project).seam_mode == "auto"
+    return treatment["verdict"] in ("visible_jump", "snap") and _config_of(project).seam_mode == "auto"
 
 
 def render_seam_blend_seconds(project: models.VideoProject) -> float:

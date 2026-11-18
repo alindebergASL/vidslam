@@ -205,6 +205,13 @@ export function seamVerdictView(
       title: `The raw clip jumps slightly at the join (${t.ratio ?? "?"}× a normal frame step); the render blends it over ${blend}.`,
     };
   }
+  if (t.verdict === "snap") {
+    return {
+      label: "Loop jumps at the end",
+      tone: "bad",
+      title: "The clip jumps to its last frame in the final frames; a blend over that tail would show two pictures at once.",
+    };
+  }
   return {
     label: t.covers ? `Visible jump · ${blend} blend` : "Loop jumps",
     tone: t.covers ? "warn" : "bad",
@@ -236,7 +243,13 @@ export function seamBlendHint(cfg: AmbientConfig, treatment: SeamTreatment | nul
       : `The render blends ${fmtSec(blend)} at the join until the clip is measured; a jumping join gets a longer blend.`;
   }
   const what =
-    treatment!.verdict === "seamless" ? "seamless" : treatment!.verdict === "slight_jump" ? "a slight jump" : "a visible jump";
+    treatment!.verdict === "seamless"
+      ? "seamless"
+      : treatment!.verdict === "slight_jump"
+        ? "a slight jump"
+        : treatment!.verdict === "snap"
+          ? "a jump at the very end"
+          : "a visible jump";
   if (cfg.seam_mode === "blend") return `The join measured ${what}; the render blends ${fmtSec(blend)}, as set.`;
   return blend === cfg.crossfade_seconds
     ? `The join measured ${what}; the render blends ${fmtSec(blend)}.`

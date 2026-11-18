@@ -54,6 +54,21 @@ TYPICAL_FLOOR = 0.004     # a near-still clip's typical step is noise: don't div
 SEAM_TINY = 0.008
 SEAM_SEAMLESS_RATIO = 2.5
 SEAM_SLIGHT_RATIO = 6.0
+# Snap (the host's take study, 37 takes): long first+last-frame takes often
+# ignore the last-frame target until the final two frames, then jump to it.
+# The last frame lands, so the join alone reads seamless; the approach
+# doesn't. A take snaps when frame L-3 is far from the target (the loop's
+# first frame) or from the last frame (block SSIM on grey, below 0.90), or
+# when the last two frames move more than 8/255 on average.
+SNAP_SSIM = 0.90
+SNAP_STEP = 8.0 / 255.0
+SNAP_BACK = 3
+# Blend-source mismatch: how different the two pictures a loop blend mixes
+# are (the clip's last second against its first, frame by frame; grey RMS,
+# 0-255). Clean loop blends measured 20-27 and ghosted ones 34-50 at 320x180;
+# at 160 px wide the numbers run a little lower. A note, not a gate (D5
+# calibrates it).
+MISMATCH_WARN = 30.0
 # Flicker, % of mean brightness: real calm scenes stay well under 1 %.
 FLICKER_SLIGHT = 1.0
 FLICKER_STRONG = 3.0
@@ -129,19 +144,93 @@ def _fmt_time(seconds: float) -> str:
 # ---------- the readings ----------
 
 
+_SSIM_BLOCK = 8
+_C1 = (0.01 * 255) ** 2
+_C2 = (0.03 * 255) ** 2
+
+
+def _ssim(a: Image.Image, b: Image.Image) -> float:
+    """Structural similarity of two frames on grey, averaged over 8x8
+    blocks (1 = the same picture). Exact sums over the raw pixels (Pillow's
+    multiply rounds each product, which is too coarse for a covariance)."""
+    ga, gb = a.convert("L"), b.convert("L")
+    w, h = ga.size
+    pa, pb = ga.tobytes(), gb.tobytes()
+    n = _SSIM_BLOCK * _SSIM_BLOCK
+    vals: list[float] = []
+    for y in range(0, h - _SSIM_BLOCK + 1, _SSIM_BLOCK):
+        for x in range(0, w - _SSIM_BLOCK + 1, _SSIM_BLOCK):
+            sa = sb = saa = sbb = sab = 0
+            for row in range(y, y + _SSIM_BLOCK):
+                off = row * w + x
+                for va, vb in zip(pa[off:off + _SSIM_BLOCK], pb[off:off + _SSIM_BLOCK], strict=True):
+                    sa += va
+                    sb += vb
+                    saa += va * va
+                    sbb += vb * vb
+                    sab += va * vb
+            ma, mb = sa / n, sb / n
+            var_a, var_b, cov = saa / n - ma * ma, sbb / n - mb * mb, sab / n - ma * mb
+            vals.append(((2 * ma * mb + _C1) * (2 * cov + _C2))
+                        / ((ma * ma + mb * mb + _C1) * (var_a + var_b + _C2)))
+    return sum(vals) / len(vals) if vals else 1.0
+
+
+def _grey_step(a: Image.Image, b: Image.Image) -> float:
+    return ImageStat.Stat(ImageChops.difference(a.convert("L"), b.convert("L"))).mean[0] / 255.0
+
+
+def _approach(first: list[Image.Image], last: list[Image.Image]) -> Optional[dict]:
+    """Whether the clip snaps to its last frame (see SNAP_SSIM): the frame
+    SNAP_BACK before the end against the target (the first frame) and the
+    last frame. None when the end window is too short to tell."""
+    if len(last) <= SNAP_BACK or not first:
+        return None
+    before = last[-SNAP_BACK]
+    to_target = _ssim(before, first[0])
+    to_last = _ssim(before, last[-1])
+    step = _grey_step(last[-2], last[-1])
+    snaps = to_target < SNAP_SSIM or to_last < SNAP_SSIM or step > SNAP_STEP
+    return {"snaps": snaps, "to_target": round(to_target, 3), "to_last": round(to_last, 3),
+            "last_step": round(step, 4)}
+
+
+def _mismatch(first: list[Image.Image], last: list[Image.Image]) -> Optional[float]:
+    """Grey RMS (0-255) between the pictures a loop blend over the end
+    windows would mix: the last window's frames against the first's, in
+    order."""
+    n = min(len(first), len(last))
+    if n == 0:
+        return None
+    total = 0.0
+    for a, b in zip(last[-n:], first[:n], strict=True):
+        diff = ImageChops.difference(a.convert("L"), b.convert("L"))
+        total += ImageStat.Stat(diff).rms[0]
+    return round(total / n, 2)
+
+
 def _seam(first: list[Image.Image], last: list[Image.Image]) -> dict:
     steps = [_diff(a, b) for win in (first, last) for a, b in zip(win, win[1:], strict=False)]
     typical = _median(steps)
     seam = _diff(last[-1], first[0])
     ratio = seam / max(typical, TYPICAL_FLOOR)
+    approach = _approach(first, last)
     if seam <= SEAM_TINY or ratio <= SEAM_SEAMLESS_RATIO:
         verdict, level, text = "seamless", "good", "The join is seamless"
     elif ratio <= SEAM_SLIGHT_RATIO:
         verdict, level, text = "slight_jump", "warn", "There's a slight jump at the join"
     else:
         verdict, level, text = "visible_jump", "bad", "There's a visible jump at the join"
+    if verdict != "visible_jump" and approach and approach["snaps"]:
+        # The last frame lands on the target, but only by jumping to it in
+        # the final frames: a blend over that tail double-exposes, so it is
+        # treated like a visible jump.
+        verdict, level, text = "snap", "bad", "The clip jumps to its last frame at the very end"
+    mismatch = _mismatch(first, last)
     return {"verdict": verdict, "level": level, "text": text, "difference": round(seam, 4),
-            "typical": round(typical, 4), "ratio": round(ratio, 2)}
+            "typical": round(typical, 4), "ratio": round(ratio, 2), "approach": approach,
+            "blend_mismatch": mismatch,
+            "blend_mismatch_level": ("warn" if mismatch is not None and mismatch > MISMATCH_WARN else "good")}
 
 
 def _moving_average(xs: list[float], window: int) -> list[float]:
@@ -341,10 +430,13 @@ def out(project: models.VideoProject, shot: models.VideoShot, entry: dict) -> di
     # Per clip: the scene's treatment is the worst join of all its clips, so
     # a variation's slight jump is still covered when another clip jumps
     # visibly, and a visible jump never is (whatever the blend).
-    covers = seam.get("verdict") != "visible_jump"
+    covers = seam.get("verdict") not in ("visible_jump", "snap")
     seam["treatment"] = treatment
     seam["blend_seconds"] = round(blend, 2)
-    if blend > 0 and seam.get("verdict") in ("slight_jump", "visible_jump"):
+    if seam.get("verdict") == "snap":
+        seam["text"] = ("The raw clip jumps to its last frame in the final frames; a blend over that "
+                        "tail would show two pictures at once, so the loop will jump")
+    elif blend > 0 and seam.get("verdict") in ("slight_jump", "visible_jump"):
         jump = "a slight jump" if seam["verdict"] == "slight_jump" else "a visible jump"
         if covers:
             seam["text"] = f"The raw clip has {jump} at the join; the finished video blends it over {blend:g} s"

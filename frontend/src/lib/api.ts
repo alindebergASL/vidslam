@@ -968,7 +968,7 @@ export type AmbientPresets = {
 
 export type LoopLevel = "good" | "warn" | "bad";
 export type SeamMode = "auto" | "blend";
-export type SeamVerdict = "seamless" | "slight_jump" | "visible_jump";
+export type SeamVerdict = "seamless" | "slight_jump" | "visible_jump" | "snap";
 
 /** What the render does at the loop's join (backend seam_treatment). */
 export type SeamTreatment = {

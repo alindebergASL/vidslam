@@ -805,6 +805,7 @@ function renderSummary(log: string | undefined, fallback: string): string {
   if (kv.seam === "seamless" || kv.seam === "closed" || kv.seam === "drift") parts.push("seamless loop");
   else if (kv.seam === "slight_jump") parts.push(`slight jump, blended${blend}`);
   else if (kv.seam === "visible_jump") parts.push(`visible jump, blended${blend}`);
+  else if (kv.seam === "snap") parts.push(`jumps at the end, blended${blend}`);
   else if (kv.seam) parts.push(`crossfaded loop${blend}`);
   if (kv.clips && Number(kv.clips) > 1) parts.push(`${kv.clips} clips`);
   return parts.join(" · ");

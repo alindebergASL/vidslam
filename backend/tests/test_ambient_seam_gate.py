@@ -918,3 +918,25 @@ def test_a_batch_seam_stop_leaves_a_newer_claim_alone(auth_client, monkeypatch):
                                              models.Event.status == "needs_look").count() == 1
     finally:
         db.close()
+
+
+def test_a_loop_that_snaps_to_its_last_frame_asks_before_rendering(auth_client):
+    """The host's snap: the last frame lands on the target, so the join
+    alone reads seamless, but the take jumps to it in its last two frames.
+    It is treated like a visible jump: no blend covers it (a blend over
+    that tail double-exposes), so a render asks first."""
+    from .test_loop_health import _scroll
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), lambda p: _scroll(p, "if(gte(n,94),0,n)"))
+    assert auth_client.post(f"/api/ambient/{sid}/loop-health").status_code == 200
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["loop_health"]["seam"]["verdict"] == "snap"
+    assert out["loop_health"]["seam"]["level"] == "bad"
+    st = out["seam_treatment"]
+    assert st["verdict"] == "snap" and st["covers"] is False and st["blend_seconds"] >= 2.0
+    r = auth_client.post(f"/api/ambient/{sid}/render")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "seam_jump"
+    assert auth_client.post(f"/api/ambient/{sid}/render?accept_seam=true").status_code == 202

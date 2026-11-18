@@ -302,7 +302,7 @@ class LoopResumeOut(BaseModel):
 Level = Literal["good", "warn", "bad"]
 
 
-SeamVerdict = Literal["seamless", "slight_jump", "visible_jump"]
+SeamVerdict = Literal["seamless", "slight_jump", "visible_jump", "snap"]
 
 
 class SeamTreatmentOut(BaseModel):
