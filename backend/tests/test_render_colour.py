@@ -109,3 +109,37 @@ def test_still_image_drift_is_bt709(tmp_path):
     r.render_image_drift_clip(img, dst, seconds=1.0, width=320, height=180)
     assert _off(_rgb_as_709(dst), RGB) <= 3
     assert _tags(dst)["color_space"] == "bt709"
+
+
+def _y_values(path: Path) -> tuple[int, int]:
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-vf", "extractplanes=y",
+                          "-f", "rawvideo", "-pix_fmt", "gray", "-"], capture_output=True, check=True).stdout
+    return min(raw), max(raw)
+
+
+def test_full_range_bt709_source_is_squeezed(tmp_path):
+    """Tagged BT.709 but full range: the matrix stays, the range must still
+    go 0-255 → 16-235 (not just be relabelled)."""
+    src = tmp_path / "pc709.mkv"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "color=c=black:s=320x180:r=30:d=1[a];color=c=white:s=320x180:r=30:d=1[b];[a][b]hstack",
+                    "-vf", "scale=out_color_matrix=bt709:out_range=pc,format=yuvj420p",
+                    "-c:v", "libx264", "-qp", "0", "-colorspace", "bt709", "-color_range", "pc", str(src)],
+                   check=True)
+    assert r.probe_colour(src) == ("bt709", "pc")
+    lo, hi = _y_values(src)
+    assert lo <= 2 and hi >= 253
+    for i, enc in enumerate((lambda d: r._normalize_clip(src, d, 640, 180),
+                             lambda d: r._encode_normalized(src, d, width=640, height=180, slow_factor=1.0))):
+        dst = tmp_path / f"out{i}.mp4"
+        enc(dst)
+        lo, hi = _y_values(dst)
+        assert 12 <= lo <= 20 and 231 <= hi <= 239, (lo, hi)
+
+
+def test_trim_converts_before_tagging(tmp_path):
+    src = _src(tmp_path / "src.mp4", tags=[])
+    dst = tmp_path / "trim.mp4"
+    r.trim_clip(src, dst, duration=0.5)
+    assert _off(_rgb_as_709(dst), RGB) <= 3
+    assert _tags(dst)["color_space"] == "bt709"

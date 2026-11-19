@@ -219,8 +219,10 @@ def colour_vf(space: str, rng: str) -> str:
     in_range = "pc" if rng == "pc" else "tv"
     if matrix == "bt709" and in_range == "tv":
         return ""
+    # format= pins the converted frames: followed by another scale, ffmpeg
+    # would otherwise keep a full-range yuvj format and only relabel it.
     return (f"scale=in_color_matrix={matrix}:out_color_matrix=bt709:"
-            f"in_range={in_range}:out_range=tv")
+            f"in_range={in_range}:out_range=tv,format=yuv420p")
 
 
 def _with_colour(vf: str, src: Path) -> str:
@@ -1935,7 +1937,9 @@ def slice_audio(src: Path, dst: Path, *, start: float, duration: float) -> Path:
 
 def trim_clip(src: Path, dst: Path, *, duration: float) -> Path:
     """Re-encode the first `duration` seconds of a clip (frame-accurate)."""
-    rc, log = _run(["ffmpeg", "-y", "-i", str(src), "-t", f"{duration:.3f}", "-an", *_X264,
+    conv = colour_vf(*probe_colour(src))  # the output is tagged BT.709 (_X264)
+    rc, log = _run(["ffmpeg", "-y", "-i", str(src), "-t", f"{duration:.3f}", "-an",
+                    *(["-vf", conv] if conv else []), *_X264,
                     "-r", str(FPS), str(dst)])
     if rc != 0:
         raise RuntimeError(f"ffmpeg trim failed: {log[-1000:]}")
