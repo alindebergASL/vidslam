@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -969,7 +970,8 @@ def timer_filter(out: Path, mode: str, *, total: float, height: int, position: s
 
 
 def _encode_normalized(
-    src: Path, dst: Path, *, width: int, height: int, slow_factor: float, extra_vf: str = ""
+    src: Path, dst: Path, *, width: int, height: int, slow_factor: float, extra_vf: str = "",
+    x264: Optional[list[str]] = None,
 ) -> str:
     vf = _with_colour(f"{fit_vf(width, height, _probe_size(src), flags='lanczos')},setsar=1", src)
     if slow_factor and abs(slow_factor - 1.0) > 1e-3:
@@ -978,7 +980,7 @@ def _encode_normalized(
     vf += f",fps={FPS}"
     if extra_vf:
         vf += "," + extra_vf
-    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-an", *_X264, "-r", str(FPS), str(dst)]
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-an", *(x264 or _X264), "-r", str(FPS), str(dst)]
     rc, log = _run(cmd)
     if rc != 0:
         raise RuntimeError(f"ffmpeg ambient normalize failed: {log[-2000:]}")
@@ -1015,7 +1017,8 @@ def seamless_unit_graph(*, length: float, crossfade: float, src: str = "0:v", ou
     )
 
 
-def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: float) -> str:
+def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: float,
+                        x264: Optional[list[str]] = None) -> str:
     """Make `norm` loop without a visible cut. Output length = length - crossfade.
 
     unit = clip[cf, L-cf)  ++  blend(clip[L-cf, L) → clip[0, cf))
@@ -1029,7 +1032,7 @@ def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: flo
     cmd = [
         "ffmpeg", "-y", "-i", str(norm),
         "-filter_complex", flt, "-map", "[v]", "-an",
-        *_X264, "-r", str(FPS), str(unit),
+        *(x264 or _X264), "-r", str(FPS), str(unit),
     ]
     rc, log = _run(cmd)
     if rc != 0:
@@ -1470,6 +1473,90 @@ def _single_unit_pieces(unit: Path, unit_len: float, out: Path, *, total: float,
     return pieces, repeats, fade
 
 
+# Grain pulse. At _X264 (veryfast, crf 20) a still, grainy picture keeps
+# its grain on the keyframe each tiled unit starts with and smooths it away
+# in the frames after, so the loop "breathes" at every repeat (measured on a
+# real rain take: 16-18x a normal frame step at each join; moving scenes
+# ~1.2x). A unit whose own wrap (last frame → first) steps more than
+# GRAIN_PULSE_RATIO times its median step is rebuilt from the source with
+# grain kept (_X264_GRAIN: 3.4-4.4x on the rain take, at ~3.7x the bytes),
+# so most scenes keep today's size.
+GRAIN_PULSE_RATIO = 3.0
+_X264_GRAIN = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "21",
+               "-tune", "grain", *BT709_TAGS]
+_STEP_FLOOR = 0.02  # grey levels: a frozen picture's median step is ~0
+
+
+def unit_wrap_ratio(unit: Path, *, width: int = 320, height: int = 180) -> float:
+    """Step across the unit's own wrap (its last frame → its first, what
+    every tiled repeat shows) over its median frame-to-frame step, on grey
+    frames. 0.0 when it can't be decoded."""
+    rc, raw = _run_bytes(["ffmpeg", "-v", "error", "-i", str(unit), "-vf",
+                          f"scale={width}:{height},format=gray", "-f", "rawvideo", "-"])
+    n = width * height
+    if rc != 0 or len(raw) < 3 * n:
+        return 0.0
+    frames = [raw[i:i + n] for i in range(0, len(raw) - n + 1, n)]
+
+    def step(a: bytes, b: bytes) -> float:
+        return sum(abs(x - y) for x, y in zip(a[::7], b[::7], strict=True)) / len(a[::7])
+
+    steps = sorted(step(a, b) for a, b in zip(frames, frames[1:], strict=False))
+    med = max(steps[len(steps) // 2], _STEP_FLOOR)
+    return step(frames[-1], frames[0]) / med
+
+
+def _run_bytes(cmd: list[str]) -> tuple[int, bytes]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return -1, b""
+    return p.returncode, p.stdout
+
+
+def _build_unit(clip: Path, norm: Path, unit: Path, *, width: int, height: int, slow_factor: float,
+                extra_vf: str, crossfade: float, logs: list[str], label: str = "") -> float:
+    """Normalize `clip` and make its seamless unit; rebuilt with grain kept
+    when the unit pulses at its wrap (see GRAIN_PULSE_RATIO). Returns the
+    normalized length."""
+
+    def make(x264: list[str]) -> float:
+        logs.append(_encode_normalized(clip, norm, width=width, height=height, slow_factor=slow_factor,
+                                       extra_vf=extra_vf, x264=x264))
+        length = _probe_duration(norm)
+        if length <= 0.5:
+            raise RuntimeError(f"normalized loop clip{label} is empty or unreadable")
+        if crossfade > 0 and length > (2 * crossfade + 0.5):
+            logs.append(_make_seamless_unit(norm, unit, length=length, crossfade=crossfade, x264=x264))
+        else:
+            shutil.copyfile(norm, unit)
+        return length
+
+    length = make(_X264)
+    ratio = unit_wrap_ratio(unit)
+    if ratio <= GRAIN_PULSE_RATIO:
+        logs.append(f"grain check{label}: wrap {ratio:.2f}x median step, kept standard encode")
+        return length
+    keep = unit.with_name(unit.stem + "_std" + unit.suffix)
+    keep_norm = norm.with_name(norm.stem + "_std" + norm.suffix)
+    shutil.copyfile(unit, keep)
+    shutil.copyfile(norm, keep_norm)
+    grain_len = make(_X264_GRAIN)
+    grain = unit_wrap_ratio(unit)
+    if grain and grain < ratio * 0.8:
+        logs.append(f"grain check{label}: wrap {ratio:.2f}x median step -> {grain:.2f}x with grain kept "
+                    "(crf 21, tune grain)")
+        keep.unlink(missing_ok=True)
+        keep_norm.unlink(missing_ok=True)
+        return grain_len
+    # Not the encoder (e.g. the clip's own seam): the smaller file wins.
+    os.replace(keep, unit)
+    os.replace(keep_norm, norm)
+    logs.append(f"grain check{label}: wrap {ratio:.2f}x, grain encode {grain:.2f}x did not help; "
+                "kept standard encode")
+    return length
+
+
 def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg binary not found on PATH")
@@ -1486,23 +1573,14 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     wm_vf = watermark_filter(out, inputs.watermark.strip(), height=height, width=width,
                              position=inputs.watermark_position, opacity=inputs.watermark_opacity)
 
-    # 1. Normalize (size/fps/codec, optional slow-down).
-    norm = out / "ambient_norm.mp4"
-    logs.append(_encode_normalized(
-        inputs.clip_path, norm, width=width, height=height, slow_factor=inputs.slow_factor,
-        extra_vf=wm_vf,
-    ))
-    length = _probe_duration(norm)
-    if length <= 0.5:
-        raise RuntimeError("normalized loop clip is empty or unreadable")
-
-    # 2. Seamless unit. Need room for the overlap on both sides of the trim.
+    # 1-2. Normalize (size/fps/codec, optional slow-down), then the
+    #      seamless unit (needs room for the overlap on both sides of the
+    #      trim), grain-checked at its wrap.
     cf = 0.0 if inputs.clip_is_periodic else max(0.0, inputs.crossfade_seconds)
+    norm = out / "ambient_norm.mp4"
     unit = out / "ambient_unit.mp4"
-    if cf > 0 and length > (2 * cf + 0.5):
-        logs.append(_make_seamless_unit(norm, unit, length=length, crossfade=cf))
-    else:
-        shutil.copyfile(norm, unit)
+    length = _build_unit(inputs.clip_path, norm, unit, width=width, height=height,
+                         slow_factor=inputs.slow_factor, extra_vf=wm_vf, crossfade=cf, logs=logs)
     unit_len = _probe_duration(unit) or (length - cf)
 
     total = float(inputs.total_seconds)
@@ -1513,16 +1591,9 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         units, lengths = [unit], [unit_len]
         for i, clip in enumerate(inputs.extra_clips, start=1):
             n_i = out / f"ambient_norm_{i}.mp4"
-            logs.append(_encode_normalized(clip, n_i, width=width, height=height,
-                                           slow_factor=inputs.slow_factor, extra_vf=wm_vf))
-            l_i = _probe_duration(n_i)
-            if l_i <= 0.5:
-                raise RuntimeError(f"normalized loop clip {i + 1} is empty or unreadable")
             u_i = out / f"ambient_unit_{i}.mp4"
-            if cf > 0 and l_i > (2 * cf + 0.5):
-                logs.append(_make_seamless_unit(n_i, u_i, length=l_i, crossfade=cf))
-            else:
-                shutil.copyfile(n_i, u_i)
+            l_i = _build_unit(clip, n_i, u_i, width=width, height=height, slow_factor=inputs.slow_factor,
+                              extra_vf=wm_vf, crossfade=cf, logs=logs, label=f" {i + 1}")
             units.append(u_i)
             lengths.append(_probe_duration(u_i) or (l_i - cf))
         fade = max(0.0, min(inputs.fade_seconds, min(lengths) / 2.5, total / 2.5))
