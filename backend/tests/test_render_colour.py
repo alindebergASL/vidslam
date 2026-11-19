@@ -16,8 +16,11 @@ def _src(path: Path, *, tags: list[str], pix_fmt: str = "yuv420p", matrix: str =
     """A 1 s solid-colour clip converted from RGB with `matrix`/`rng`,
     tagged with `tags` (empty: untagged, as video models return them)."""
     colour = "0x%02X%02X%02X" % RGB
+    # Newer FFmpeg carries the scale's matrix into the stream tags, so an
+    # untagged clip has them cleared explicitly (yuvj keeps full range by its pixel format).
+    clear = "" if tags else ",setparams=range=unknown:color_primaries=unknown:color_trc=unknown:colorspace=unknown"
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s=320x180:r=30:d=1",
-                    "-vf", f"scale=out_color_matrix={matrix}:out_range={rng},format={pix_fmt}",
+                    "-vf", f"scale=out_color_matrix={matrix}:out_range={rng},format={pix_fmt}{clear}",
                     "-c:v", "libx264", "-crf", "1", *tags, str(path)], check=True)
     return path
 
