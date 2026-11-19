@@ -238,9 +238,21 @@ def colour_vf(space: str, rng: str, transfer: str = "", primaries: str = "") -> 
             f"in_range={in_range}:out_range=tv,format=yuv420p")
 
 
+# Frame colour properties, set on every converted or passed-through source:
+# newer FFmpeg writes the stream's tags from the frames, so -color_primaries
+# & co. on the output alone left primaries/transfer unset.
+TAG_709 = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+
+
+def colour_chain(space: str, rng: str, transfer: str = "", primaries: str = "") -> str:
+    """colour_vf plus the BT.709 frame properties: the filter text that
+    makes any source BT.709 limited range and marks it so."""
+    conv = colour_vf(space, rng, transfer, primaries)
+    return f"{conv},{TAG_709}" if conv else TAG_709
+
+
 def _with_colour(vf: str, src: Path) -> str:
-    conv = colour_vf(*probe_colour(src))
-    return f"{conv},{vf}" if conv else vf
+    return f"{colour_chain(*probe_colour(src))},{vf}"
 
 
 def _normalize_clip(src: Path, dst: Path, width: int, height: int,
@@ -1701,7 +1713,7 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
     """filter_complex text joining len(lengths) inputs with rounded linear
     dissolves of `crossfade` seconds; output label [out]. `sizes` (each
     input's width x height, if known) lets near-frame shapes fill (fit_vf);
-    `colours` (each input's colour_vf) converts it to BT.709 first.
+    `colours` (each input's colour_chain) converts it to BT.709 first.
     Trims are by output frame: a length on the FPS grid gives exactly
     that many frames."""
     cf = crossfade
@@ -1772,7 +1784,7 @@ def join_segments(
     cf = max(0.0, min(crossfade, min(lengths) / 3.0))
     graph = join_graph(lengths, crossfade=cf, width=width, height=height,
                        sizes=[_probe_size(p) for p in segments],
-                       colours=[colour_vf(*probe_colour(p)) for p in segments])
+                       colours=[colour_chain(*probe_colour(p)) for p in segments])
     prev = "out"
     cmd = ["ffmpeg", "-y"]
     for p in segments:
@@ -1987,7 +1999,7 @@ def join_clips_with_audio(
     cf = on_frame_grid(cf) if cf > 0 else 0.0
     graph = join_graph(lengths, crossfade=cf, width=width, height=height,
                        sizes=[_probe_size(p) for p in clips],
-                       colours=[colour_vf(*probe_colour(p)) for p in clips])
+                       colours=[colour_chain(*probe_colour(p)) for p in clips])
     audio = any(has_audio)
     if audio:
         graph += ";" + join_audio_graph(lengths, has_audio, crossfade=cf, video_starts=video_starts)
@@ -2020,9 +2032,9 @@ def slice_audio(src: Path, dst: Path, *, start: float, duration: float) -> Path:
 
 def trim_clip(src: Path, dst: Path, *, duration: float) -> Path:
     """Re-encode the first `duration` seconds of a clip (frame-accurate)."""
-    conv = colour_vf(*probe_colour(src))  # the output is tagged BT.709 (_X264)
+    conv = colour_chain(*probe_colour(src))  # the output is tagged BT.709 (_X264)
     rc, log = _run(["ffmpeg", "-y", "-i", str(src), "-t", f"{duration:.3f}", "-an",
-                    *(["-vf", conv] if conv else []), *_X264,
+                    "-vf", conv, *_X264,
                     "-r", str(FPS), str(dst)])
     if rc != 0:
         raise RuntimeError(f"ffmpeg trim failed: {log[-1000:]}")
@@ -2110,7 +2122,7 @@ def render_image_drift_clip(
     vf = (
         # RGB/JPEG → YUV in BT.709 limited range, to match the output tags.
         f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase:"
-        "out_color_matrix=bt709:out_range=tv,format=yuv420p,"
+        f"out_color_matrix=bt709:out_range=tv,format=yuv420p,{TAG_709},"
         f"crop={big_w}:{big_h},"
         f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={width}x{height}:fps={FPS},"
         "setsar=1"

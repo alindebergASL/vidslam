@@ -72,8 +72,8 @@ def _fresh(dst: Path, src_mtime_ns: int) -> bool:
 
 def _make(src: Path, dst: Path) -> Path:
     tmp = dst.with_name(f"{dst.stem}.{os.getpid()}.tmp.mp4")  # pid: workers share the disk
-    conv = renderer.colour_vf(*renderer.probe_colour(src, timeout=30))
-    vf = ",".join(x for x in (conv, "scale=trunc(iw/2)*2:trunc(ih/2)*2", "format=yuv420p") if x)
+    conv = renderer.colour_chain(*renderer.probe_colour(src, timeout=30))
+    vf = f"{conv},scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p"
     cmd = ["ffmpeg", "-y", "-i", str(src), "-map", "0:v:0", "-map", "0:a:0?", "-vf", vf,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", *renderer.BT709_TAGS,
            "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(tmp)]
