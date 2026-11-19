@@ -240,8 +240,15 @@ def test_dark_low_saturation_footage_is_accurate(tmp_path):
 
 
 def test_bt709_primaries_without_matrix_tag_are_not_read_as_bt601(tmp_path):
-    src = _src(tmp_path / "part.mp4", matrix="bt709",
-               tags=["-color_primaries", "bt709", "-color_trc", "bt709"])
+    src = tmp_path / "part.mp4"
+    colour = "0x%02X%02X%02X" % RGB
+    # Matrix tag cleared on the frames (newer FFmpeg would carry the scale's
+    # matrix into the stream), primaries and transfer kept as BT.709.
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s=320x180:r=30:d=1",
+                    "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
+                           "setparams=range=tv:colorspace=unknown:color_primaries=bt709:color_trc=bt709",
+                    "-c:v", "libx264", "-crf", "1", "-color_primaries", "bt709", "-color_trc", "bt709",
+                    str(src)], check=True)
     space, _rng, trc, prim = r.probe_colour(src)
     assert space == "" and (trc, prim) == ("bt709", "bt709")
     dst = tmp_path / "out.mp4"
