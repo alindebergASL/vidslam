@@ -188,33 +188,45 @@ _SWS_MATRIX = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601", "fcc"
                "smpte240m": "smpte240m", "bt2020nc": "bt2020", "bt2020c": "bt2020"}
 
 
-def probe_colour(path: Path, timeout: Optional[float] = None) -> tuple[str, str]:
-    """(color_space, color_range) of the first video stream as ffprobe
-    names them; "" for each that is untagged or unreadable."""
+def probe_colour(path: Path, timeout: Optional[float] = None) -> tuple[str, str, str, str]:
+    """(color_space, color_range, color_transfer, color_primaries) of the
+    first video stream as ffprobe names them; "" for each that is untagged
+    or unreadable. Feeds colour_vf (`colour_vf(*probe_colour(p))`)."""
     rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
-                    "-show_entries", "stream=color_space,color_range,pix_fmt", str(path)], timeout=timeout)
+                    "-show_entries", "stream=color_space,color_range,color_transfer,color_primaries,pix_fmt",
+                    str(path)], timeout=timeout)
     if rc != 0:
-        return "", ""
+        return "", "", "", ""
     try:
         st = json.loads(log)["streams"][0]
     except (KeyError, IndexError, TypeError, ValueError):
-        return "", ""
-    space = str(st.get("color_space") or "")
-    rng = str(st.get("color_range") or "")
-    if space == "unknown":
-        space = ""
-    if rng == "unknown":
-        rng = ""
+        return "", "", "", ""
+    space, rng, trc, prim = (str(st.get(k) or "").replace("unknown", "").replace("unspecified", "")
+                             for k in ("color_space", "color_range", "color_transfer", "color_primaries"))
     if not rng and str(st.get("pix_fmt") or "").startswith("yuvj"):
         rng = "pc"  # JPEG-style pixel formats are full range
-    return space, rng
+    return space, rng, trc, prim
 
 
-def colour_vf(space: str, rng: str) -> str:
+# HDR (PQ/HLG) and wide-gamut sources: zimg converts gamut and transfer
+# (tone-mapping HDR the way frame grabs do: TONEMAP) before the BT.709
+# tags. The input is spelled out because a clip's tags can be partial.
+_ZIN = {"bt2020nc": "2020_ncl", "bt2020c": "2020_cl", "bt709": "709"}
+
+
+def colour_vf(space: str, rng: str, transfer: str = "", primaries: str = "") -> str:
     """Filter converting a source to BT.709 limited range, or "" when it
     already is. Untagged input is read as BT.601: video models and phones
     hand back untagged BT.601-matrix pictures, which showed with shifted
     colours once the output was played as BT.709."""
+    wide = primaries == "bt2020" or space in ("bt2020nc", "bt2020c")
+    if transfer in HDR_TRANSFERS or wide:
+        zin = (f"zscale=pin=2020:min={_ZIN.get(space, '2020_ncl')}:rin={'full' if rng == 'pc' else 'limited'}"
+               f":tin={transfer if transfer in HDR_TRANSFERS else '709'}")
+        if transfer in HDR_TRANSFERS:
+            return (f"{zin}:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+        return f"{zin}:p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p"
     matrix = _SWS_MATRIX.get(space, "bt601")
     in_range = "pc" if rng == "pc" else "tv"
     if matrix == "bt709" and in_range == "tv":
