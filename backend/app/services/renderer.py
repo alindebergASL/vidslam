@@ -184,9 +184,9 @@ def fit_vf(width: int, height: int, size: Optional[tuple[int, int]] = None, *, f
 BT709_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709",
               "-color_trc", "bt709", "-color_range", "tv"]
 
-# ffprobe color_space names → swscale matrix names for the conversion.
-_SWS_MATRIX = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601", "fcc": "fcc",
-               "smpte240m": "smpte240m", "bt2020nc": "bt2020", "bt2020c": "bt2020"}
+# ffprobe color_space names → colorspace-filter matrix names (SDR, non-BT.2020).
+_CS_MATRIX = {"bt709": "bt709", "smpte170m": "smpte170m", "bt470bg": "bt470bg", "fcc": "fcc",
+              "smpte240m": "smpte240m"}
 
 
 def probe_colour(path: Path, timeout: Optional[float] = None) -> tuple[str, str, str, str]:
@@ -228,14 +228,21 @@ def colour_vf(space: str, rng: str, transfer: str = "", primaries: str = "") -> 
             return (f"{zin}:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
                     "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
         return f"{zin}:p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p"
-    matrix = _SWS_MATRIX.get(space, "bt601")
+    # A clip tagged BT.709 by primaries/transfer but with no matrix tag is
+    # BT.709; only a fully untagged one is read as BT.601.
+    matrix = _CS_MATRIX.get(space) or ("bt709" if "bt709" in (primaries, transfer) else "bt470bg")
     in_range = "pc" if rng == "pc" else "tv"
     if matrix == "bt709" and in_range == "tv":
         return ""
-    # format= pins the converted frames: followed by another scale, ffmpeg
-    # would otherwise keep a full-range yuvj format and only relabel it.
-    return (f"scale=in_color_matrix={matrix}:out_color_matrix=bt709:"
-            f"in_range={in_range}:out_range=tv,format=yuv420p")
+    # The colorspace filter converts the matrix only. swscale's YUV->YUV
+    # matrix path (FFmpeg 7.1) also lowered luma by a level or two, which
+    # darkened real low-saturation footage more than the matrix error it
+    # fixed. Its format= output pins full-range input to limited range (a
+    # later scale would otherwise keep yuvj and only relabel it). It needs
+    # even frame sizes: crop drops at most a pixel and leaves values alone.
+    return ("crop=trunc(iw/2)*2:trunc(ih/2)*2,"
+            f"colorspace=ispace={matrix}:space=bt709:iprimaries=bt709:primaries=bt709:"
+            f"itrc=bt709:trc=bt709:irange={in_range}:range=tv:format=yuv420p")
 
 
 # Frame colour properties, set on every converted or passed-through source:
@@ -1569,6 +1576,15 @@ def _build_unit(clip: Path, norm: Path, unit: Path, *, width: int, height: int, 
     return length
 
 
+def _render_log(logs: list[str], limit: int = 8000) -> str:
+    """The stored render log: decisions worth keeping (the grain check
+    lines) first, then the tail of the ffmpeg output, so a long tile/mux
+    log can't push them out."""
+    summary = [line for line in logs if line.startswith("grain check")]
+    tail = "\n".join(logs)[-limit:]
+    return "\n".join(summary) + "\n...\n" + tail if summary else tail
+
+
 def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg binary not found on PATH")
@@ -1676,7 +1692,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         unit_path=unit,
         unit_seconds=unit_len,
         repeats=repeats,
-        log="\n".join(logs)[-8000:],
+        log=_render_log(logs),
     )
 
 
@@ -2122,10 +2138,11 @@ def render_image_drift_clip(
     vf = (
         # RGB/JPEG → YUV in BT.709 limited range, to match the output tags.
         f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase:"
-        f"out_color_matrix=bt709:out_range=tv,format=yuv420p,{TAG_709},"
+        "out_color_matrix=bt709:out_range=tv,format=yuv420p,"
         f"crop={big_w}:{big_h},"
         f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={width}x{height}:fps={FPS},"
-        "setsar=1"
+        # After zoompan, which drops frame colour properties.
+        f"setsar=1,{TAG_709}"
     )
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", str(image),

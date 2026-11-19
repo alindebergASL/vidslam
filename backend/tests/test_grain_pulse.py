@@ -78,3 +78,15 @@ def test_grain_encode_that_does_not_help_is_dropped(tmp_path, monkeypatch):
     assert unit.read_bytes() == clip_seen["first"]
     assert any("did not help" in x for x in logs)
     assert not list(tmp_path.glob("*_std*"))
+
+
+def test_grain_decision_survives_a_long_render_log(tmp_path, monkeypatch):
+    """The grain check line is kept at the head of the stored log even when
+    the tile/mux output fills the 8000-character tail."""
+    clip = _clip(tmp_path / "c.mp4", "testsrc2=s=320x180:r=30:d=2")
+    real = r._tile_and_mux
+    monkeypatch.setattr(r, "_tile_and_mux", lambda *a, **k: real(*a, **k) + "\n" + "x" * 20000)
+    out = tmp_path / "out"
+    res = r.compose_ambient(r.AmbientRenderInputs(project_id=1, out_dir=out, clip_path=clip, total_seconds=4,
+                                                  resolution="720p", fade_seconds=0, crossfade_seconds=0.3))
+    assert "grain check" in res.log

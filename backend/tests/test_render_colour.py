@@ -35,6 +35,16 @@ def _rgb_as_709(path: Path) -> tuple[int, int, int]:
     return raw[i], raw[i + 1], raw[i + 2]
 
 
+def _rgb_as(path: Path, matrix: str) -> tuple[int, int, int]:
+    """Centre pixel decoded with `matrix` (the source's true reading)."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-vf",
+                          f"scale=in_color_matrix={matrix}:in_range=tv,format=rgb24", "-f", "rawvideo", "-"],
+                         capture_output=True, check=True).stdout
+    w, h = r._probe_size(path)
+    i = ((h // 2) * w + w // 2) * 3
+    return raw[i], raw[i + 1], raw[i + 2]
+
+
 def _tags(path: Path) -> dict:
     out = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
                           "-show_entries", "stream=color_space,color_primaries,color_transfer,color_range",
@@ -49,14 +59,17 @@ def _off(a, b) -> int:
 def test_colour_vf_mapping():
     assert r.colour_vf("bt709", "tv") == ""
     assert r.colour_vf("bt709", "") == ""
-    assert "in_color_matrix=bt601" in r.colour_vf("", "")
-    assert "in_color_matrix=bt601" in r.colour_vf("smpte170m", "tv")
-    assert "in_color_matrix=bt601" in r.colour_vf("bt470bg", "tv")
+    assert "ispace=bt470bg" in r.colour_vf("", "")
+    assert "ispace=smpte170m" in r.colour_vf("smpte170m", "tv")
+    assert "ispace=bt470bg" in r.colour_vf("bt470bg", "tv")
+    # BT.709 primaries/transfer without a matrix tag: BT.709, not BT.601.
+    assert r.colour_vf("", "", "bt709", "bt709") == ""
+    assert "ispace=bt709" in r.colour_vf("", "pc", "bt709", "")
     assert "p=bt709" in r.colour_vf("bt2020nc", "tv")  # gamut, not just matrix
     hdr = r.colour_vf("bt2020nc", "tv", "smpte2084", "bt2020")
     assert "tin=smpte2084" in hdr and "tonemap=" in hdr and hdr.endswith("format=yuv420p")
     full = r.colour_vf("bt709", "pc")
-    assert "in_color_matrix=bt709" in full and "in_range=pc" in full and "out_range=tv" in full
+    assert "ispace=bt709" in full and "irange=pc" in full and "range=tv" in full
 
 
 @pytest.mark.parametrize("encode", ["ambient", "normalize"])
@@ -113,7 +126,8 @@ def test_still_image_drift_is_bt709(tmp_path):
     dst = tmp_path / "drift.mp4"
     r.render_image_drift_clip(img, dst, seconds=1.0, width=320, height=180)
     assert _off(_rgb_as_709(dst), RGB) <= 3
-    assert _tags(dst)["color_space"] == "bt709"
+    t = _tags(dst)
+    assert (t["color_space"], t.get("color_primaries"), t.get("color_transfer")) == ("bt709", "bt709", "bt709")
 
 
 def _y_values(path: Path) -> tuple[int, int]:
@@ -187,3 +201,49 @@ def test_hdr_pq_is_tone_mapped_before_tagging(tmp_path):
     # orange) and land far closer to the picture than the raw PQ code values.
     assert after[0] > after[1] > after[2]
     assert _off(after, RGB) < _off(before, RGB)
+
+
+def _plane_y(path: Path, w: int, h: int) -> bytes:
+    return subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-vf",
+                           "extractplanes=y", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                          capture_output=True, check=True).stdout[:w * h]
+
+
+def test_grey_ramp_luma_unchanged(tmp_path):
+    """Greys have no chroma: a matrix conversion must leave luma alone
+    (swscale's YUV->YUV path lowered it by a level, darkening real clips)."""
+    src = tmp_path / "ramp.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "nullsrc=s=320x180:r=30:d=1,geq=lum='16+219*X/W':cb=128:cr=128,format=yuv420p,"
+                    "setparams=range=unknown:color_primaries=unknown:color_trc=unknown:colorspace=unknown",
+                    "-c:v", "libx264", "-qp", "0", str(src)], check=True)
+    assert r.probe_colour(src)[0] == ""
+    dst = tmp_path / "out.mp4"
+    r._normalize_clip(src, dst, 320, 180)
+    a, b = _plane_y(src, 320, 180), _plane_y(dst, 320, 180)
+    assert abs(sum(b) - sum(a)) / len(a) <= 0.5
+
+
+def test_dark_low_saturation_footage_is_accurate(tmp_path):
+    """Real ambient footage is dark and muted: converted and shown as BT.709
+    it must stay within 0.75 (mean over R, G, B) of its BT.601 truth."""
+    global RGB
+    saved, RGB = RGB, (62, 50, 42)  # Y ~ 52, slightly warm
+    try:
+        src = _src(tmp_path / "dark.mp4", tags=[])
+        dst = tmp_path / "out.mp4"
+        r._encode_normalized(src, dst, width=320, height=180, slow_factor=1.0)
+        got, truth = _rgb_as_709(dst), _rgb_as(src, "bt601")
+        assert sum(abs(x - y) for x, y in zip(got, truth, strict=True)) / 3 <= 0.75, (got, truth)
+    finally:
+        RGB = saved
+
+
+def test_bt709_primaries_without_matrix_tag_are_not_read_as_bt601(tmp_path):
+    src = _src(tmp_path / "part.mp4", matrix="bt709",
+               tags=["-color_primaries", "bt709", "-color_trc", "bt709"])
+    space, _rng, trc, prim = r.probe_colour(src)
+    assert space == "" and (trc, prim) == ("bt709", "bt709")
+    dst = tmp_path / "out.mp4"
+    r._normalize_clip(src, dst, 320, 180)
+    assert _off(_rgb_as_709(dst), RGB) <= 3
