@@ -940,3 +940,91 @@ def test_a_loop_that_snaps_to_its_last_frame_asks_before_rendering(auth_client):
     assert r.status_code == 409, r.text
     assert r.json()["detail"]["code"] == "seam_jump"
     assert auth_client.post(f"/api/ambient/{sid}/render?accept_seam=true").status_code == 202
+
+
+def _rewrite_reading(sid: int, shot_id: int, **changes) -> None:
+    """Edit a stored reading as an older build would have left it."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app import models
+    from app.db import SessionLocal
+    from app.services import loop_health
+
+    db = SessionLocal()
+    try:
+        p = db.get(models.VideoProject, sid)
+        data = dict(p.ambient_config_json or {})
+        health = dict(data[loop_health.STATE_KEY])
+        entry = dict(health[str(shot_id)])
+        for k, v in changes.items():
+            if v is None:
+                entry.pop(k, None)
+            else:
+                entry[k] = v
+        health[str(shot_id)] = entry
+        data[loop_health.STATE_KEY] = health
+        p.ambient_config_json = data
+        flag_modified(p, "ambient_config_json")
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_a_reading_from_before_the_snap_check_is_measured_again(auth_client):
+    """A snapping clip measured by an older build was kept as "seamless":
+    that reading has no version, so it is not current, and the render
+    measures again, finds the snap and asks."""
+    from .test_loop_health import _scroll
+
+    scene = _scene(auth_client)
+    sid, shot_id = scene["id"], scene["loop_shot"]["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), lambda p: _scroll(p, "if(gte(n,94),0,n)"))
+    assert auth_client.post(f"/api/ambient/{sid}/loop-health").status_code == 200
+    old_seam = {"verdict": "seamless", "level": "good", "text": "The join is seamless",
+                "difference": 0.0, "typical": 0.01, "ratio": 0.0}
+    _rewrite_reading(sid, shot_id, version=None, seam=old_seam)
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["loop_health"] is None  # not current: read before the snap check
+    r = auth_client.post(f"/api/ambient/{sid}/render")
+    assert r.status_code == 409, r.text
+    assert r.json()["detail"]["code"] == "seam_jump"
+    assert auth_client.get(f"/api/ambient/{sid}").json()["loop_health"]["seam"]["verdict"] == "snap"
+
+
+@pytest.mark.parametrize("batch", [True, False])
+def test_a_variation_that_cannot_be_measured_stops_an_unaccepted_render(auth_client, monkeypatch, batch):
+    """The loop clip reads seamless but a variation the render repeats can't
+    be measured: the scene's treatment rests on the loop clip alone, so an
+    unaccepted render stops and asks (page or batch) instead of repeating
+    the unmeasured clip with a short hedge."""
+    from app.services import ambient, loop_health
+    from app.workers import jobs
+
+    _no_alerts(monkeypatch)
+    scene = _scene(auth_client, variety="takes", variations=2)
+    sid = scene["id"]
+    assert scene["seam_treatment"]["verdict"] == "seamless"
+    variant = scene["variant_shots"][0]
+    _replace(Path(variant["clip_path"]), seamless)  # its reading is stale
+    real = loop_health.measure
+
+    def fail_on_the_variation(clip, *a, **kw):
+        if str(clip) == variant["clip_path"]:
+            raise RuntimeError("ffmpeg took too long")
+        return real(clip, *a, **kw)
+
+    monkeypatch.setattr(loop_health, "measure", fail_on_the_variation)
+    if batch:
+        jobs.render_ambient_job(sid)
+    else:
+        token = ambient.render_claim_token(False)
+        _claim(sid, token)
+        jobs.render_ambient_job(sid, claim_token=token)
+    latest = auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]
+    assert latest["error"] == ambient.SEAM_UNMEASURED_MESSAGE
+    assert not latest["final_video_path"]
+    # Accepted, it renders.
+    token = ambient.render_claim_token(True)
+    _claim(sid, token)
+    jobs.render_ambient_job(sid, claim_token=token)
+    assert auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["status"] == "completed"

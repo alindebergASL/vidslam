@@ -2682,10 +2682,12 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
             # or skipped a variation): don't render an hour of a jumping
             # loop nobody agreed to.
             raise SeamJumpStop(SEAM_STOP_MESSAGE, treatment)
-        if (batch and not accept_seam and cfg.source == "video" and cfg.seam_mode == "auto"
-                and treatment["basis"] == "plan"):
-            # Nobody was asked and even the worker's own reading failed: the
-            # render can't tell whether the loop jumps. Ask, as the page does.
+        if (not accept_seam and cfg.source == "video" and cfg.seam_mode == "auto"
+                and ((batch and treatment["basis"] == "plan") or loop_health.unmeasured(project))):
+            # Nobody accepted it and the worker's own reading failed, for the
+            # loop clip or for a variation the render repeats (the scene's
+            # treatment then rests on the other clips only): the render can't
+            # tell whether that clip jumps. Ask, as the page does.
             raise SeamJumpStop(SEAM_UNMEASURED_MESSAGE, treatment)
         seam = float(treatment["blend_seconds"])
         outputs = compose_ambient(

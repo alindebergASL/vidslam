@@ -38,6 +38,10 @@ from .. import models
 log = logging.getLogger("avs.loop_health")
 
 STATE_KEY = "_loop_health"
+# Bump when what a reading checks changes: older readings are measured again
+# before they gate a render (2: the seam also reads the approach, so a take
+# that snaps to its last frame isn't kept as "seamless").
+MEASURE_VERSION = 2
 
 # ---- thresholds (one place; tuned on synthetic clips and closed Wan/H3 loops) ----
 # Frames are compared at 160 px wide; a difference is the mean absolute
@@ -396,6 +400,8 @@ def current_entry(project: models.VideoProject, shot: Optional[models.VideoShot]
         return None
     if entry.get("clip_mtime_ns") != _clip_stamp(shot.clip_path):
         return None
+    if entry.get("version") != MEASURE_VERSION:
+        return None  # read before the current checks: measure again
     return entry
 
 
@@ -464,7 +470,8 @@ def measure_shot(db: Session, project: models.VideoProject, shot: models.VideoSh
         return None
     stamp = _clip_stamp(shot.clip_path)
     entry = measure(Path(shot.clip_path), still=_is_still(project), timeout=timeout, deadline=deadline)
-    entry.update({"measured_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+    entry.update({"version": MEASURE_VERSION,
+                  "measured_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
                   "clip_path": shot.clip_path, "clip_mtime_ns": stamp})
     db.refresh(project)  # the state may have moved on while we measured
     data = dict(project.ambient_config_json or {})
