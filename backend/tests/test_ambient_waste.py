@@ -182,7 +182,9 @@ def test_failed_clip_keeps_the_finished_ones_and_resumes(auth_client, monkeypatc
     assert [s["id"] for s in after] == [s["id"] for s in segs]
     assert [s["clip_path"] for s in after[:2]] == [s["clip_path"] for s in segs[:2]]
     assert Path(scene["loop_shot"]["clip_path"]).exists()
-    assert auth_client.post(f"/api/ambient/{sid}/render").status_code == 202
+    # The mock's chained clips don't join cleanly (the seam gate is tested
+    # in test_ambient_seam_gate.py): render anyway.
+    assert auth_client.post(f"/api/ambient/{sid}/render?accept_seam=true").status_code == 202
 
     assert auth_client.post(f"/api/ambient/{sid}/resume-loop").status_code == 409  # nothing left to resume
 

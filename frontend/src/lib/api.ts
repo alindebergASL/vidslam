@@ -38,6 +38,17 @@ export function errorText(e: unknown, fallback = "Something went wrong"): string
   return typeof m === "string" && m ? m : fallback;
 }
 
+/** The render's "ask first" refusal (409 {code: "seam_jump" | "seam_unmeasured"}), or null. */
+export function seamAskOf(e: unknown): SeamAsk | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  try {
+    const d = JSON.parse(e.detail);
+    return d && (d.code === "seam_jump" || d.code === "seam_unmeasured") ? (d as SeamAsk) : null;
+  } catch {
+    return null;
+  }
+}
+
 async function req<T>(
   path: string,
   init: RequestInit = {},
@@ -414,12 +425,19 @@ export type Render = {
   version_label?: string;
 };
 
+/** A render that stopped itself to ask (an Ambient loop that jumps at the
+ * join, or whose join couldn't be measured): status "cancelled" with the
+ * reason in `error`. A cancel by the person leaves `error` empty. */
+export function renderStopped(r: Pick<Render, "status" | "error">): boolean {
+  return r.status === "cancelled" && !!r.error;
+}
+
 /** The label to show for a render, whatever the backend sent. */
-export function renderLabel(r: Pick<Render, "status" | "version" | "version_label">): string {
+export function renderLabel(r: Pick<Render, "status" | "version" | "version_label"> & { error?: string }): string {
   if (r.version_label) return r.version_label;
   if (r.version != null) return `Version ${r.version}`;
   if (r.status === "failed") return "Failed attempt";
-  if (r.status === "cancelled") return "Cancelled attempt";
+  if (r.status === "cancelled") return r.error ? "Stopped: loop needs a look" : "Cancelled attempt";
   return r.status === "completed" ? "Version" : "In progress";
 }
 
@@ -865,6 +883,9 @@ export type AmbientConfig = {
   loop_seconds: number;
   total_seconds: number;
   crossfade_seconds: number;
+  /** Render-time: "auto" sizes the seam blend from the measured join (and a
+   *  jumping loop asks before rendering); "blend" uses crossfade_seconds as set. */
+  seam_mode?: SeamMode;
   slow_factor: number;
   fade_seconds: number;
   music_mood: string;
@@ -946,6 +967,39 @@ export type AmbientPresets = {
 };
 
 export type LoopLevel = "good" | "warn" | "bad";
+export type SeamMode = "auto" | "blend";
+export type SeamVerdict = "seamless" | "slight_jump" | "visible_jump" | "snap";
+
+/** What the render does at the loop's join (backend seam_treatment). */
+export type SeamTreatment = {
+  blend_seconds: number;
+  /** The measured join (worst of the scene's clips); null before a reading and for Still + drift. */
+  verdict: SeamVerdict | null;
+  ratio: number | null;
+  /** measured: from the reading; plan: not measured yet (the setting); drift: no blend needed. */
+  basis: "measured" | "plan" | "drift";
+  /** False: the blend won't hide the jump, so a render asks first. */
+  covers: boolean;
+};
+
+/** POST /render's 409 for a loop that visibly jumps (see SeamTreatment.covers). */
+export type SeamJump = {
+  code: "seam_jump";
+  message: string;
+  ratio: number | null;
+  blend_seconds: number;
+  repeat_every_seconds: number;
+};
+
+/** POST /render's 409 when the loop clip's join couldn't be measured (the
+ *  measurement failed or took too long): it may jump; render anyway? */
+export type SeamUnmeasured = {
+  code: "seam_unmeasured";
+  message: string;
+  blend_seconds: number;
+};
+
+export type SeamAsk = SeamJump | SeamUnmeasured;
 
 /** Local measurement of one loop clip: how it joins, flickers, freezes, drifts. */
 export type LoopHealth = {
@@ -954,12 +1008,16 @@ export type LoopHealth = {
   clip_seconds: number;
   sample_fps: number;
   seam: {
-    verdict: "seamless" | "slight_jump" | "visible_jump";
+    verdict: SeamVerdict;
+    /** After the render's blend is considered; raw_level is the clip's own. */
     level: LoopLevel;
+    raw_level?: LoopLevel | null;
+    treatment?: SeamTreatment | null;
     text: string;
     difference: number;
     typical: number;
     ratio: number;
+    blend_seconds?: number;
   };
   flicker: { verdict: "none" | "slight" | "strong"; level: LoopLevel; text: string; percent: number };
   frozen: {
@@ -995,6 +1053,8 @@ export type AmbientScene = {
   loop_health?: LoopHealth | null;
   /** One per variant_shots item, same order. */
   variant_loop_health?: (LoopHealth | null)[];
+  /** The blend the render will use at the loop's join, and why. */
+  seam_treatment?: SeamTreatment | null;
   music_ready: boolean;
   sound_ready?: boolean;
   picture_ready?: boolean;
@@ -1035,6 +1095,7 @@ export const DEFAULT_AMBIENT_CONFIG: AmbientConfig = {
   loop_seconds: 30,
   total_seconds: 3600,
   crossfade_seconds: 2,
+  seam_mode: "auto",
   slow_factor: 1,
   fade_seconds: 4,
   music_mood: "spa",
@@ -1574,7 +1635,8 @@ export type AppEventKind =
   | "budget"
   | "hook_lab";
 
-export type AppEventStatus = "started" | "progress" | "completed" | "failed" | "cancelled";
+/** needs_look: work that stopped to ask (a batch loop that jumps); counts toward the badge. */
+export type AppEventStatus = "started" | "progress" | "completed" | "failed" | "cancelled" | "needs_look";
 
 /** One row of the events table, as the stream and /api/events/recent send it. */
 export type AppEvent = {
@@ -1894,10 +1956,13 @@ export const api = {
   /** Backend-relative paths (e.g. thumbnail_url) → absolute URL. */
   backendUrl: (path: string) => `${API_BASE}${path}`,
 
-  renderAmbient: (id: number) =>
-    req<{ scene_id: number; job_id: string; status: string }>(`/api/ambient/${id}/render`, {
-      method: "POST",
-    }),
+  /** 409 with a SeamAsk detail (see seamAskOf) when the loop visibly jumps or its join couldn't be
+   *  measured; acceptSeam renders anyway (and the worker won't stop on a jump it finds). */
+  renderAmbient: (id: number, acceptSeam = false) =>
+    req<{ scene_id: number; job_id: string; status: string }>(
+      `/api/ambient/${id}/render${acceptSeam ? "?accept_seam=true" : ""}`,
+      { method: "POST" },
+    ),
   publicAsset: (token: string) => `${API_BASE}/api/public-assets/${token}`,
   studioPreview: (jobId: number) => `${API_BASE}/api/studio/jobs/${jobId}/preview`,
   renderDownload: (id: number) => `${API_BASE}/api/renders/${id}/download`,

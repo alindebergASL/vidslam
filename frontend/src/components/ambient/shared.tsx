@@ -11,6 +11,7 @@ import type {
   ModelChoice,
   PhotoRewrite,
   ScenePreset,
+  SeamTreatment,
 } from "@/lib/api";
 
 /** "3600" → "1h", "5400" → "1h 30m", "600" → "10m", "20" → "20s". */
@@ -187,6 +188,94 @@ export function ChipRow<T extends string | number>({
 
 const fmtSec = (n: number) => `${n % 1 ? n.toFixed(1) : n.toFixed(0)}s`;
 
+/** How the loop's join reads, for a badge: label, tone and a sentence. Null
+ *  when there's nothing measured to say (not measured yet; Still + drift). */
+export function seamVerdictView(
+  t: SeamTreatment | null | undefined
+): { label: string; tone: "good" | "warn" | "bad"; title: string } | null {
+  if (!t || t.basis !== "measured" || !t.verdict) return null;
+  const blend = fmtSec(t.blend_seconds);
+  if (t.verdict === "seamless") {
+    return { label: "Seamless join", tone: "good", title: `The join measured seamless; the render blends ${blend} as a hedge.` };
+  }
+  if (t.verdict === "slight_jump") {
+    return {
+      label: `Slight jump · ${blend} blend`,
+      tone: "warn",
+      title: `The raw clip jumps slightly at the join (${t.ratio ?? "?"}× a normal frame step); the render blends it over ${blend}.`,
+    };
+  }
+  if (t.verdict === "snap") {
+    return {
+      label: "Loop jumps at the end",
+      tone: "bad",
+      title: "The clip jumps to its last frame in the final frames; a blend over that tail would show two pictures at once.",
+    };
+  }
+  return {
+    label: t.covers ? `Visible jump · ${blend} blend` : "Loop jumps",
+    tone: t.covers ? "warn" : "bad",
+    title: `The raw clip jumps visibly at the join (${t.ratio ?? "?"}× a normal frame step); a ${blend} blend won't hide it.`,
+  };
+}
+
+/** The blend the render will use at the join for these settings (the
+ *  backend's seam_treatment rule, so an unsaved form shows the real value).
+ *  A seamless join takes min(setting, 0.5): a shorter setting is the
+ *  person's explicit choice and wins (0 = no blend stays 0). */
+export function seamBlendFor(cfg: AmbientConfig, treatment: SeamTreatment | null | undefined): number {
+  if (cfg.source === "image_drift") return 0;
+  const user = Math.max(0, cfg.crossfade_seconds || 0);
+  if (!treatment || treatment.basis !== "measured" || !treatment.verdict || cfg.seam_mode === "blend") return user;
+  if (treatment.verdict === "seamless") return Math.min(user, 0.5);
+  if (treatment.verdict === "slight_jump") return Math.max(user, 1.5);
+  return Math.max(user, 2.0);
+}
+
+/** One line under a crossfade slider: what the render will actually blend. */
+export function seamBlendHint(cfg: AmbientConfig, treatment: SeamTreatment | null | undefined): string {
+  if (cfg.source === "image_drift") return "Not needed: the drift is periodic and already seamless.";
+  const blend = seamBlendFor(cfg, treatment);
+  const measured = treatment?.basis === "measured" && treatment.verdict;
+  if (!measured) {
+    return cfg.seam_mode === "blend"
+      ? `The render blends ${fmtSec(blend)} at the join.`
+      : `The render blends ${fmtSec(blend)} at the join until the clip is measured; a jumping join gets a longer blend.`;
+  }
+  const what =
+    treatment!.verdict === "seamless"
+      ? "seamless"
+      : treatment!.verdict === "slight_jump"
+        ? "a slight jump"
+        : treatment!.verdict === "snap"
+          ? "a jump at the very end"
+          : "a visible jump";
+  if (cfg.seam_mode === "blend") return `The join measured ${what}; the render blends ${fmtSec(blend)}, as set.`;
+  return blend === cfg.crossfade_seconds
+    ? `The join measured ${what}; the render blends ${fmtSec(blend)}.`
+    : `The join measured ${what}, so the render blends ${fmtSec(blend)} (not ${fmtSec(cfg.crossfade_seconds)}).`;
+}
+
+const SEAM_TONE = {
+  good: "border-emerald-500/40 bg-emerald-500/10 text-emerald-200",
+  warn: "border-amber-500/40 bg-amber-500/10 text-amber-200",
+  bad: "border-red-500/40 bg-red-500/10 text-red-200",
+} as const;
+
+/** The measured seam verdict as a small badge (nothing before a reading). */
+export function SeamBadge({ treatment, className }: { treatment: SeamTreatment | null | undefined; className?: string }) {
+  const v = seamVerdictView(treatment);
+  if (!v) return null;
+  return (
+    <span
+      className={clsx("inline-flex items-center rounded-full border px-2 py-0.5 text-[11px]", SEAM_TONE[v.tone], className)}
+      title={v.title}
+    >
+      {v.label}
+    </span>
+  );
+}
+
 /**
  * The loop recipe from the server's plan: which clips the model will make,
  * how they join, and how many times the seamless unit tiles. Shown in the
@@ -196,15 +285,19 @@ export function PlanSummary({
   plan,
   total,
   compact = false,
+  treatment,
 }: {
   plan: LoopPlan | null | undefined;
   total: number;
   compact?: boolean;
+  /** The scene's seam treatment: once the join is measured, its verdict replaces the planned pill. */
+  treatment?: SeamTreatment | null;
 }) {
   if (!plan) {
     return <div className="h-12 skeleton" aria-hidden />;
   }
   const drift = plan.strategy === "drift";
+  const measured = seamVerdictView(treatment);
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap items-center gap-1.5" aria-label="Loop clips">
@@ -238,16 +331,25 @@ export function PlanSummary({
       )}
       {!compact && (
         <div className="flex flex-wrap gap-1.5 text-[11px]">
-          <span
-            className={clsx(
-              "rounded-full border px-2 py-0.5",
-              plan.closed
-                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
-                : "border-amber-500/40 bg-amber-500/10 text-amber-200"
-            )}
-          >
-            {plan.closed ? "Closed loop" : `Open loop · ${fmtSec(plan.seam_crossfade)} crossfade`}
-          </span>
+          {measured ? (
+            <span className={clsx("rounded-full border px-2 py-0.5", SEAM_TONE[measured.tone])} title={measured.title}>
+              {measured.label}
+            </span>
+          ) : (
+            <span
+              className={clsx(
+                "rounded-full border px-2 py-0.5",
+                drift
+                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+                  : "border-amber-500/40 bg-amber-500/10 text-amber-200"
+              )}
+              title={drift ? undefined : "The join is measured once the clip is made, and the blend is sized to it."}
+            >
+              {drift
+                ? "Seamless by construction"
+                : `${plan.closed ? "Closed loop" : "Open loop"} · ${fmtSec(plan.seam_crossfade)} blend until measured`}
+            </span>
+          )}
           {!drift && (
             <span className="rounded-full border border-ink-600 px-2 py-0.5 text-ink-300">
               model max {plan.max_clip_seconds}s{plan.caps_known ? "" : " (assumed)"}

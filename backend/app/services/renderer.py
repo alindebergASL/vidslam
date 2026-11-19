@@ -129,11 +129,13 @@ def _dims_for_aspect(aspect: str, resolution: str = "1080p") -> tuple[int, int]:
 FILL_TOLERANCE = 0.06
 
 
-def _probe_size(path: Path) -> Optional[tuple[int, int]]:
+def _probe_size(path: Path, timeout: Optional[float] = None) -> Optional[tuple[int, int]]:
     """(width, height) of a file's first video stream as ffmpeg shows it,
-    i.e. after rotation metadata (a phone's portrait clip), or None."""
+    i.e. after rotation metadata (a phone's portrait clip), or None (also
+    when ffprobe takes longer than `timeout` seconds)."""
     rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
-                    "-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate", str(path)])
+                    "-show_entries", "stream=width,height:stream_side_data=rotation:stream_tags=rotate", str(path)],
+                   timeout=timeout)
     if rc != 0:
         return None
     try:
@@ -285,11 +287,12 @@ def _concat(clips: list[Path], out: Path) -> str:
     return log
 
 
-def _probe_duration(path: Path) -> float:
+def _probe_duration(path: Path, timeout: Optional[float] = None) -> float:
+    """Seconds, or 0.0 when unreadable (or ffprobe outlasts `timeout`)."""
     cmd = [
         "ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path),
     ]
-    rc, log = _run(cmd)
+    rc, log = _run(cmd, timeout=timeout)
     if rc != 0:
         return 0.0
     try:
@@ -743,6 +746,12 @@ def _make_thumbnail(src: Path, dst: Path) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Crossfade where a music bed joins itself (the bed's own loop point, and
+# where parts of a long bed are joined): long and gentle, so the join is a
+# swell rather than a cut. Capped at a third of the bed for short beds.
+MUSIC_JOIN_CROSSFADE = 6.0
+
+
 @dataclass
 class AmbientRenderInputs:
     project_id: int
@@ -754,6 +763,8 @@ class AmbientRenderInputs:
     slow_factor: float = 1.0
     fade_seconds: float = 4.0
     music_path: Optional[Path] = None
+    # The music bed's own loop point (not tied to the video seam's blend).
+    music_crossfade: float = MUSIC_JOIN_CROSSFADE
     music_volume: float = 0.7
     # Nature-sound bed (rain, waves…), looped and mixed with the music.
     sound_path: Optional[Path] = None
@@ -1472,7 +1483,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     if inputs.music_path is not None and inputs.music_path.exists():
         music_unit = out / "ambient_music_unit.wav"
         mlog, _ = _make_seamless_audio_unit(
-            inputs.music_path, music_unit, crossfade=max(1.0, inputs.crossfade_seconds),
+            inputs.music_path, music_unit, crossfade=inputs.music_crossfade,
             loops=_probe_duration(inputs.music_path) < total,
         )
         logs.append(mlog)

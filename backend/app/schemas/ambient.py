@@ -36,6 +36,7 @@ PictureOrigin = Literal["", "upload", "generated", "studio", "asset"]
 Variety = Literal["none", "takes", "day_night"]
 Corner = Literal["top_left", "top_right", "bottom_left", "bottom_right"]
 Timer = Literal["none", "countdown", "elapsed"]
+SeamMode = Literal["auto", "blend"]
 
 
 class PhotoRewrite(BaseModel):
@@ -67,6 +68,11 @@ class AmbientConfig(BaseModel):
     total_seconds: int = Field(default=3600, ge=20, le=8 * 3600)
     # Seconds of tail→head crossfade that hides the loop seam. 0 disables.
     crossfade_seconds: float = Field(default=2.0, ge=0.0, le=6.0)
+    # How the render picks the seam blend (render-time only; keeps the clip):
+    # "auto" = from the measured join (never shorter than crossfade_seconds
+    # unless the join measured seamless) and a render of a visibly jumping
+    # loop asks first; "blend" = exactly crossfade_seconds, no questions.
+    seam_mode: SeamMode = "auto"
     # setpts multiplier applied to a provider clip: 2.0 = half speed, which is
     # what makes a "slow" generated clip read as "barely moves".
     slow_factor: float = Field(default=1.0, ge=1.0, le=3.0)
@@ -296,9 +302,32 @@ class LoopResumeOut(BaseModel):
 Level = Literal["good", "warn", "bad"]
 
 
+SeamVerdict = Literal["seamless", "slight_jump", "visible_jump", "snap"]
+
+
+class SeamTreatmentOut(BaseModel):
+    """What the render does at the loop's join (services.ambient.seam_treatment)."""
+
+    blend_seconds: float
+    # The loop clip's measured join (the worst of the scene's clips); None
+    # before a reading exists (basis "plan") and for Still + drift.
+    verdict: Optional[SeamVerdict] = None
+    ratio: Optional[float] = None
+    # measured: from the reading; plan: no reading yet, the scene's setting;
+    # drift: Still + drift loops by construction, no blend.
+    basis: Literal["measured", "plan", "drift"]
+    # False when the blend won't hide the jump (a visible jump): the render
+    # asks before going ahead.
+    covers: bool = True
+
+
 class SeamReadingOut(BaseModel):
-    verdict: Literal["seamless", "slight_jump", "visible_jump"]
+    verdict: SeamVerdict
+    # The level after the render's blend is considered (a jump the blend
+    # covers is a warning); raw_level is the clip's own.
     level: Level
+    raw_level: Optional[Level] = None
+    treatment: Optional[SeamTreatmentOut] = None
     text: str
     difference: float  # last frame vs first, mean abs luma difference 0-1
     typical: float     # typical difference between neighbouring frames
@@ -375,6 +404,8 @@ class AmbientOut(BaseModel):
     # the clip changed since); one entry per variant_shots item, same order.
     loop_health: Optional[LoopHealthOut] = None
     variant_loop_health: list[Optional[LoopHealthOut]] = Field(default_factory=list)
+    # The blend the render will use at the loop's join, and why.
+    seam_treatment: Optional[SeamTreatmentOut] = None
     # True once a music bed exists on disk (generated or uploaded).
     music_ready: bool
     # True once a nature-sound bed exists (config.sound != "none").

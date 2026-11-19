@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -17,7 +18,10 @@ MOCK_CAPS = VideoCapabilities(durations=[5, 10], first_frame=True, last_frame=Tr
 def _generate_clip(prompt: str, duration: float, refs_count: int) -> bytes:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg required for mock video provider")
-    h = abs(hash(prompt)) & 0xFFFFFF
+    # A stable hash (Python's str hash changes per process): the same prompt
+    # is always the same colour, so tests that measure joins between mock
+    # clips read the same every run.
+    h = int.from_bytes(hashlib.sha256(prompt.encode("utf-8")).digest()[:3], "big")
     r, g, b = (h >> 16) & 0xFF, (h >> 8) & 0xFF, h & 0xFF
     color = f"0x{r:02X}{g:02X}{b:02X}"
     from ..services.renderer import textfile_arg

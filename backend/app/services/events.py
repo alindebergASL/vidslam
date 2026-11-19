@@ -25,7 +25,9 @@ log = logging.getLogger("avs.events")
 
 KINDS = ("render", "plan", "ambient_loop", "ambient_render", "studio_job", "training", "publish", "budget",
          "hook_lab")
-STATUSES = ("started", "progress", "completed", "failed", "cancelled")
+# needs_look: work that stopped short and wants the person (an Ambient
+# batch scene whose loop jumps at the join was not rendered).
+STATUSES = ("started", "progress", "completed", "failed", "cancelled", "needs_look")
 RETENTION_DAYS = 30
 
 
@@ -139,6 +141,20 @@ def ambient_loop_event(db: Session, project: models.VideoProject, status: str, *
     emit(db, "ambient_loop", "project", project.id, status, title,
          detail=(f"{name}: {str(error)[:600]}" if error else ""), url=project_url(project),
          project_id=project.id)
+
+
+def ambient_seam_event(db: Session, project: models.VideoProject, treatment: dict) -> None:
+    """A batch scene's loop jumps at the join (or its join couldn't be
+    measured, treatment basis "plan"): it was not rendered."""
+    name = _name(project)
+    ratio = treatment.get("ratio")
+    if treatment.get("basis") == "plan":
+        what = "the loop clip's join couldn't be measured, so it may jump"
+    else:
+        what = "the loop clip jumps at the join" + (f" ({ratio:g}× a normal frame step)" if ratio else "")
+    emit(db, "ambient_loop", "project", project.id, "needs_look", f"Loop needs a look: {name}",
+         detail=f"{name}: {what}, so it wasn't rendered. Open the scene to blend it or render anyway.",
+         url=project_url(project), project_id=project.id, severity="warning")
 
 
 def studio_event(db: Session, job: models.AssetGenerationJob, status: str, *, error: str = "") -> None:

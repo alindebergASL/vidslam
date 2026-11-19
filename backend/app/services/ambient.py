@@ -51,6 +51,7 @@ from .model_registry import active_model as _active_model
 from .model_registry import switched_off as _switched_off
 from .provider_keys import ProviderUnavailable as _ProviderUnavailable
 from .renderer import (
+    MUSIC_JOIN_CROSSFADE,
     AmbientRenderInputs,
     _dims_for_aspect,
     best_frame,
@@ -1302,9 +1303,6 @@ def music_bed_seconds(cfg: AmbientConfig) -> float:
     return float(min(90, max(45, cfg.loop_seconds * 2)))
 
 
-MUSIC_JOIN_CROSSFADE = 6.0
-
-
 def music_cap_seconds(model: Optional[str] = None) -> float:
     """Longest track one music call returns, per active model."""
     m = model if model is not None else _active_model("music")
@@ -1374,9 +1372,13 @@ def _generate_music_bed(db: Session, project: models.VideoProject, cfg: AmbientC
 # ---------- loop planning ----------
 
 JOIN_CROSSFADE = 0.5
-# When the chain closes on its anchor frame the seam needs only a hedge
-# against the model not hitting the end frame pixel-exactly.
-CLOSED_SEAM_CROSSFADE = 0.5
+# The seam blend is sized from the measured join (seam_treatment), never
+# from the model's capabilities: a model given the same first and last
+# frame often still ends somewhere else (measured: Wan at 1080p).
+SEAM_SEAMLESS_BLEND = 0.5  # a hedge against a join that is near-exact
+SEAM_SLIGHT_BLEND = 1.5
+SEAM_VISIBLE_BLEND = 2.0
+_SEAM_RANK = {"seamless": 0, "slight_jump": 1, "visible_jump": 2, "snap": 3}
 
 
 def _video_model_for(cfg: AmbientConfig) -> str:
@@ -1455,14 +1457,16 @@ def plan_loop(cfg: AmbientConfig, caps: Optional[VideoCapabilities] = None) -> L
     closed = anchored
     n = len(segments)
     join_cf = JOIN_CROSSFADE if n > 1 else 0.0
-    seam_cf = min(cfg.crossfade_seconds, CLOSED_SEAM_CROSSFADE) if closed else cfg.crossfade_seconds
+    # Until the clip is measured, the render would use the scene's setting.
+    seam_cf = cfg.crossfade_seconds
     raw = sum(segments) - join_cf * (n - 1)
     loop = raw * cfg.slow_factor
     unit = max(1.0, loop - seam_cf)
     if n > 1:
         notes.append(f"{n} chained clips × up to {caps.max_seconds}s — each starts on the previous clip's last frame.")
     if closed:
-        notes.append("Closed loop: an anchor still is both the first and the last frame.")
+        notes.append("Closed loop: an anchor still is both the first and the last frame. The join "
+                     "is measured once the clip is made, and the blend is sized to it.")
     elif n >= 1:
         notes.append(f"Open loop: hidden with a {seam_cf:g}s tail→head crossfade.")
     # With variations, a first-frame-only model still gets a shared start
@@ -1698,7 +1702,8 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
     renders = sorted(project.renders, key=lambda r: r.created_at, reverse=True)
     latest = renders[0] if renders else None
     music = Path(project.music_upload_path) if project.music_upload_path else None
-    plan = plan_loop(cfg)
+    treatment = seam_treatment(project)
+    plan = _plan_with_seam(plan_loop(cfg), cfg, treatment)
     return AmbientOut(
         id=project.id,
         title=project.title,
@@ -1713,6 +1718,7 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         loop_health=loop_health.current(project, shot),
         variant_loop_health=[loop_health.current(project, v)
                              for v in _variant_shots(project)[:variant_count(cfg) - 1]],
+        seam_treatment=treatment,
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         picture_ready=has_picture(project, cfg),
@@ -2196,8 +2202,14 @@ def _finalize_generation(
     generated["billed"] = 0.0 if mocked else generated["estimated_cost"]
     _set_state(project, _GENERATED_KEY, generated)
     db.commit()
-    # Loop health: local and free, a few seconds; never in the way.
+    # Loop health: local and free, a few seconds; never in the way. The
+    # join's verdict is kept with the loop's record.
     loop_health.measure_quietly(db, project.id)
+    treatment = seam_treatment(project)
+    generated["seam_verdict"] = treatment["verdict"]
+    generated["seam_ratio"] = treatment["ratio"]
+    _set_state(project, _GENERATED_KEY, generated)
+    db.commit()
     # Music: (re)generate when asked, and always when the scene wants a bed
     # but doesn't have one yet — a first generate must yield a renderable scene.
     has_music = bool(project.music_upload_path and Path(project.music_upload_path).exists())
@@ -2217,10 +2229,15 @@ def _finalize_generation(
     project.status = "planned"
     events.ambient_loop_event(db, project, "completed")
     db.commit()
-    if render_after:
+    if render_after and seam_needs_a_look(project, treatment):
+        # A batch would render an hour of a jumping loop: stop and say so.
+        events.ambient_seam_event(db, project, treatment)
+        db.commit()
+    elif render_after:
         from ..workers.jobs import render_ambient_job
         from ..workers.queue import enqueue
 
+        # No claim token: the job knows a batch queued it (nobody was asked).
         enqueue(render_ambient_job, project.id)
 
 
@@ -2450,21 +2467,167 @@ def generate_cost(project: models.VideoProject, cfg: AmbientConfig, plan: LoopPl
     return round(sum(ln["cost"] for ln in estimate_ambient_cost(cfg, plan)["lines"] if ln["unit"] not in skip), 2)
 
 
+def _seam_reading(project: models.VideoProject) -> Optional[dict]:
+    """The worst current seam reading among the scene's clips (the loop and
+    its variations), or None while the loop clip has no current reading."""
+    shots = loop_health.clip_shots(project)
+    if not shots:
+        return None
+    entries = [loop_health.current_entry(project, s) for s in shots]
+    if entries[0] is None:
+        return None
+    seams = [dict(e.get("seam") or {}) for e in entries if e]
+    seams = [x for x in seams if x.get("verdict") in _SEAM_RANK]
+    if not seams:
+        return None
+    return max(seams, key=lambda x: (_SEAM_RANK[x["verdict"]], float(x.get("ratio") or 0.0)))
+
+
+def seam_treatment(project: models.VideoProject) -> dict:
+    """What the finished video does at the loop's join: {blend_seconds,
+    verdict, ratio, basis, covers}.
+
+    basis "drift": Still + drift loops by construction, no blend. "plan":
+    no reading yet, so the scene's crossfade. "measured": from the join's
+    reading — seamless gets a short hedge of 0.5 s, a slight jump at least
+    1.5 s, a visible jump at least 2 s (and covers=False: no blend hides
+    it, so a render asks first). The blend is never shorter than the
+    scene's setting unless the join measured seamless. A seamless join
+    takes min(setting, 0.5): a setting below the hedge is the person's
+    explicit choice and wins (0 = "no blend" stays 0). seam_mode "blend"
+    uses the setting as it is. The page mirrors this (seamBlendFor)."""
+    cfg = _config_of(project)
+    if cfg.source == "image_drift":
+        return {"blend_seconds": 0.0, "verdict": None, "ratio": None, "basis": "drift", "covers": True}
+    user = max(0.0, float(cfg.crossfade_seconds or 0.0))
+    seam = _seam_reading(project)
+    if seam is None:
+        return {"blend_seconds": round(user, 2), "verdict": None, "ratio": None, "basis": "plan", "covers": True}
+    verdict = seam["verdict"]
+    if cfg.seam_mode == "blend":
+        blend = user
+    elif verdict == "seamless":
+        # A shorter setting (0 disables the blend) is an explicit choice.
+        blend = min(user, SEAM_SEAMLESS_BLEND)
+    elif verdict == "slight_jump":
+        blend = max(user, SEAM_SLIGHT_BLEND)
+    else:
+        blend = max(user, SEAM_VISIBLE_BLEND)
+    return {"blend_seconds": round(blend, 2), "verdict": verdict,
+            "ratio": round(float(seam.get("ratio") or 0.0), 2), "basis": "measured",
+            "covers": verdict not in ("visible_jump", "snap")}
+
+
+def _plan_with_seam(plan: LoopPlanOut, cfg: AmbientConfig, treatment: dict) -> LoopPlanOut:
+    """The plan with the seam blend the render will actually use, once the
+    clip's join is measured (the plan alone only knows the setting)."""
+    if treatment["basis"] != "measured" or plan.strategy == "drift":
+        return plan
+    blend = float(treatment["blend_seconds"])
+    unit = max(1.0, plan.loop_seconds - blend)
+    per_unit = plan.repeat_every_seconds / plan.unit_seconds if plan.unit_seconds else 1.0
+    return plan.model_copy(update={
+        "seam_crossfade": blend, "unit_seconds": round(unit, 2),
+        "repeats": max(1, math.ceil(cfg.total_seconds / unit)),
+        "repeat_every_seconds": round(unit * per_unit, 2),
+    })
+
+
+def seam_needs_a_look(project: models.VideoProject, treatment: Optional[dict] = None) -> bool:
+    """A render would loop a visibly jumping clip and nobody has said that's OK."""
+    treatment = treatment or seam_treatment(project)
+    return treatment["verdict"] in ("visible_jump", "snap") and _config_of(project).seam_mode == "auto"
+
+
 def render_seam_blend_seconds(project: models.VideoProject) -> float:
     """How many seconds the finished video dissolves across the loop's join
     (the same choice render_scene makes); 0 when the clip loops by
     construction (Still + drift)."""
-    cfg = _config_of(project)
-    if cfg.source == "image_drift":
-        return 0.0
-    seam = float(cfg.crossfade_seconds or 0.0)
-    if bool(_generated_of(project).get("closed")) and cfg.source == "video":
-        seam = min(seam, CLOSED_SEAM_CROSSFADE)
-    return max(0.0, seam)
+    return float(seam_treatment(project)["blend_seconds"])
 
 
-def render_scene(db: Session, project_id: int) -> models.Render:
-    """Tile the loop clip to the full target duration under the music bed."""
+class SeamJumpStop(RuntimeError):
+    """The render found a visibly jumping join that nobody accepted."""
+
+    def __init__(self, message: str, treatment: dict):
+        super().__init__(message)
+        self.treatment = treatment
+
+
+SEAM_STOP_MESSAGE = ("Not rendered: the loop clip jumps visibly at the join and the blend won't hide it. "
+                     "Open the scene to choose a longer blend or render anyway.")
+SEAM_UNMEASURED_MESSAGE = ("Not rendered: the loop clip's join couldn't be measured, so it may jump. "
+                           "Open the scene to measure it again, choose a blend or render anyway.")
+
+# POST /render's claim token says whether the person accepted a jumping
+# join, so the job needs no new argument (a worker deployed before this
+# would fail on an unknown keyword; it just uses the token as it is).
+# A token without either prefix was queued before the gate travelled with
+# the job: its request already passed the gate, so it counts as accepted.
+SEAM_ACCEPTED_CLAIM = "seam:ok:"
+SEAM_ASK_CLAIM = "seam:ask:"
+
+
+def render_claim_token(accept_seam: bool) -> str:
+    return (SEAM_ACCEPTED_CLAIM if accept_seam else SEAM_ASK_CLAIM) + secrets.token_hex(12)
+
+
+def claim_accepts_seam(token: str) -> bool:
+    return not (token or "").startswith(SEAM_ASK_CLAIM)
+
+
+def _stop_for_seam(db: Session, project: models.VideoProject, render: models.Render, stop: SeamJumpStop,
+                   *, batch: bool, claim_token: str) -> models.Render:
+    """End a render the seam gate stopped. Both writes are conditional: a
+    cancel committed meanwhile keeps the render "cancelled" (no reason, no
+    event), and the scene is released only while it is still this render's
+    (a newer Generate or render claim is left alone).
+
+    Asked from the page: the render fails with the reason. Queued by a
+    batch (nobody was asked): the render ends "cancelled" with the reason
+    in its error (the page shows it as stopped, not cancelled), the scene
+    goes back to "planned" and a needs_look event asks."""
+    from sqlalchemy import or_
+
+    db.rollback()
+    stopped = (db.query(models.Render)
+               .filter(models.Render.id == render.id, models.Render.status == "rendering")
+               .update({"status": "cancelled" if batch else "failed", "error": str(stop)},
+                       synchronize_session=False))
+    if not stopped:
+        db.commit()
+        db.refresh(render)
+        log.info("ambient render %s was cancelled before its seam stop landed", render.id)
+        return render
+    P = models.VideoProject
+    held = (P.claim_token == claim_token) if claim_token else or_(P.claim_token == "", P.claim_token.is_(None))
+    (db.query(P).filter(P.id == project.id, P.status == "generating", held)
+     .update({"status": "planned" if batch else "failed"}, synchronize_session=False))
+    db.commit()
+    db.refresh(render)
+    db.refresh(project)
+    if batch:
+        events.ambient_seam_event(db, project, stop.treatment)
+    else:
+        events.render_event(db, render, project, "failed", error=str(stop))
+    db.commit()
+    return render
+
+
+def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
+                 batch: bool = False) -> models.Render:
+    """Tile the loop clip to the full target duration under the music bed.
+
+    `accept_seam`: the person said a visibly jumping join is OK (POST
+    /render?accept_seam=true). Without it, a reading taken here that finds
+    a visible jump (seam_mode "auto") stops the render before composing.
+    Asked from the page (`batch` False), the render fails with
+    SEAM_STOP_MESSAGE and the scene is released. Queued by a batch after
+    its loop was made (`batch`), nobody was asked: as when the batch finds
+    the jump at generate time, the scene goes back to "planned" with a
+    needs_look event, and the render row ends "cancelled" with the reason
+    in its error (no failure event, no alert). A batch render also stops
+    and asks when the join can't be measured at all (SEAM_UNMEASURED_MESSAGE)."""
     from .pipeline import RenderCancelled, _check_cancel, _music_path_if_any
 
     project = db.get(models.VideoProject, project_id)
@@ -2473,7 +2636,6 @@ def render_scene(db: Session, project_id: int) -> models.Render:
     cfg = _config_of(project)
     shot = _loop_shot(project)
     gen = _generated_of(project)
-    closed = bool(gen.get("closed"))
     k = int(gen.get("variants") or 1)
     extra: list[Path] = []
     problem = None
@@ -2496,6 +2658,9 @@ def render_scene(db: Session, project_id: int) -> models.Render:
 
     # Tiling is local FFmpeg work: nothing is billed at render time. The
     # provider spend was incurred (and recorded) when the loop was generated.
+    # What the claim holds while this render runs ("" once a job took a
+    # plain claim over): a seam stop releases the scene only if it still is.
+    claim_token = project.claim_token or ""
     render = models.Render(project_id=project.id, status="rendering", estimated_cost=0.0)
     db.add(render)
     project.status = "generating"
@@ -2506,9 +2671,25 @@ def render_scene(db: Session, project_id: int) -> models.Render:
 
     try:
         _check_cancel(db, render)
-        seam = cfg.crossfade_seconds
-        if closed and cfg.source == "video":
-            seam = min(seam, CLOSED_SEAM_CROSSFADE)
+        if cfg.source == "video" and loop_health.unmeasured(project):
+            loop_health.measure_quietly(db, project.id)  # local, a few seconds
+            db.refresh(project)
+        # Cancelled while measuring: that wins over anything the reading says.
+        _check_cancel(db, render)
+        treatment = seam_treatment(project)
+        if not accept_seam and seam_needs_a_look(project, treatment):
+            # A reading taken just now (the request's own may have failed,
+            # or skipped a variation): don't render an hour of a jumping
+            # loop nobody agreed to.
+            raise SeamJumpStop(SEAM_STOP_MESSAGE, treatment)
+        if (not accept_seam and cfg.source == "video" and cfg.seam_mode == "auto"
+                and ((batch and treatment["basis"] == "plan") or loop_health.unmeasured(project))):
+            # Nobody accepted it and the worker's own reading failed, for the
+            # loop clip or for a variation the render repeats (the scene's
+            # treatment then rests on the other clips only): the render can't
+            # tell whether that clip jumps. Ask, as the page does.
+            raise SeamJumpStop(SEAM_UNMEASURED_MESSAGE, treatment)
+        seam = float(treatment["blend_seconds"])
         outputs = compose_ambient(
             AmbientRenderInputs(
                 project_id=project.id,
@@ -2553,7 +2734,8 @@ def render_scene(db: Session, project_id: int) -> models.Render:
             f"ambient: clips={len(segs) or 1} variations={k} unit={outputs.unit_seconds:.2f}s "
             f"repeats={outputs.repeats} total={project.target_duration_seconds}s "
             f"res={cfg.output_resolution} overlays={overlay_summary(cfg) or 'none'} "
-            f"seam={'closed' if closed else 'crossfade'}\n" + outputs.log[-7000:]
+            f"seam={treatment['verdict'] or ('drift' if treatment['basis'] == 'drift' else 'unmeasured')} "
+            f"blend={seam:g}s\n" + outputs.log[-7000:]
         )
         render.actual_cost = 0.0
         render.status = "completed"
@@ -2568,6 +2750,11 @@ def render_scene(db: Session, project_id: int) -> models.Render:
         project.status = "cancelled"
         db.commit()
         return render
+    except SeamJumpStop as e:
+        # Not a fault (no alert, no retry): the render stops and says why;
+        # the scene is free to render again from the page.
+        log.info("ambient render of scene %s stopped at the join: %s", project.id, e)
+        return _stop_for_seam(db, project, render, e, batch=batch, claim_token=claim_token)
     except Exception as e:  # noqa: BLE001
         log.exception("ambient render failed")
         render.status = "failed"

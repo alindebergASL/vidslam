@@ -464,20 +464,68 @@ def picture_file(scene_id: int, db: Session = Depends(get_db)) -> FileResponse:
     return FileResponse(svc.picture_path(project), media_type="image/png")
 
 
+# The request waits on the inline measurement of the loop clip: all of it
+# gets this long (the worker's own measurement keeps loop_health's longer
+# per-read default and measures the variations).
+INLINE_MEASURE_SECONDS = 45.0
+
+
 @router.post("/{scene_id}/render", status_code=202,
              dependencies=[Depends(rate_limit("generation"))])
-def render_scene(scene_id: int, db: Session = Depends(get_db)) -> dict:
+def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends(get_db)) -> dict:
+    """Queue the full-length render. A loop whose join jumps visibly (the
+    blend won't hide it) answers 409 {code: "seam_jump"}, and a loop clip
+    whose join couldn't be measured answers 409 {code: "seam_unmeasured"},
+    unless `accept_seam` or the scene's seam_mode is "blend". Only the loop
+    clip is measured here (within INLINE_MEASURE_SECONDS); a variation
+    without a reading is measured by the worker, which gets `accept_seam`
+    too: a visible jump it finds that nobody accepted stops the render."""
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is already generating")
     shot = svc._loop_shot(project)
     if shot is None or not shot.clip_path or not Path(shot.clip_path).exists():
         raise HTTPException(409, "generate the loop clip first")
+    from ..services import loop_health
+
+    cfg = svc._config_of(project)
+    # The reading can only change the answer when the gate applies: not
+    # after "Render anyway", and not in seam_mode "blend" (the worker still
+    # measures before it renders).
+    gated = not accept_seam and cfg.seam_mode == "auto"
+    if gated and cfg.source == "video" and loop_health.current_entry(project, shot) is None:
+        # The loop clip has no current reading: measure it now (local, a few
+        # seconds). Its reading alone decides whether the request can tell
+        # if the loop jumps; variations are left to the worker.
+        loop_health.measure_loop(db, project, within=INLINE_MEASURE_SECONDS)
+        db.refresh(project)
+    treatment = svc.seam_treatment(project)
+    if (not accept_seam and cfg.source == "video" and cfg.seam_mode == "auto"
+            and treatment["basis"] == "plan"):
+        # No reading of the loop clip (the measurement failed or took too
+        # long): the render can't know whether the loop jumps. Ask.
+        raise HTTPException(409, {
+            "code": "seam_unmeasured",
+            "message": "The loop's join couldn't be measured, so it may jump.",
+            "blend_seconds": treatment["blend_seconds"],
+        })
+    if not accept_seam and svc.seam_needs_a_look(project, treatment):
+        # The join comes round once per seamless unit (each variation's too).
+        every = svc._plan_with_seam(svc.plan_loop(cfg), cfg, treatment).unit_seconds
+        raise HTTPException(409, {
+            "code": "seam_jump",
+            "message": "The loop jumps at the join, and the blend won't hide it.",
+            "ratio": treatment["ratio"],
+            "blend_seconds": treatment["blend_seconds"],
+            "repeat_every_seconds": every,
+        })
     # Claim before queueing (a conditional UPDATE): a double-click or a
     # second tab can't queue a second render, and the page keeps polling
     # while the job waits for a worker.
     previous = project.status
-    token = uuid.uuid4().hex
+    # The token carries accept_seam to the worker (no new job argument: a
+    # worker deployed before the web would reject one).
+    token = svc.render_claim_token(accept_seam)
     claimed = (
         db.query(models.VideoProject)
         .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
