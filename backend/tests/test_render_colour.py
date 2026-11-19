@@ -1,0 +1,111 @@
+"""Colour correctness: sources are converted to BT.709 limited range and
+outputs are tagged that way, so players don't shift the colours."""
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from app.services import renderer as r
+
+RGB = (192, 64, 32)  # a saturated orange: matrix mistakes move it visibly
+
+
+def _src(path: Path, *, tags: list[str], pix_fmt: str = "yuv420p", matrix: str = "bt601",
+         rng: str = "tv") -> Path:
+    """A 1 s solid-colour clip converted from RGB with `matrix`/`rng`,
+    tagged with `tags` (empty: untagged, as video models return them)."""
+    colour = "0x%02X%02X%02X" % RGB
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s=320x180:r=30:d=1",
+                    "-vf", f"scale=out_color_matrix={matrix}:out_range={rng},format={pix_fmt}",
+                    "-c:v", "libx264", "-crf", "1", *tags, str(path)], check=True)
+    return path
+
+
+def _rgb_as_709(path: Path) -> tuple[int, int, int]:
+    """Centre pixel decoded the way a player shows a BT.709 limited clip."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", "1", "-vf",
+                          "scale=in_color_matrix=bt709:in_range=tv,format=rgb24", "-f", "rawvideo", "-"],
+                         capture_output=True, check=True).stdout
+    w, h = r._probe_size(path)
+    i = ((h // 2) * w + w // 2) * 3
+    return raw[i], raw[i + 1], raw[i + 2]
+
+
+def _tags(path: Path) -> dict:
+    out = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
+                          "-show_entries", "stream=color_space,color_primaries,color_transfer,color_range",
+                          str(path)], capture_output=True, check=True).stdout
+    return json.loads(out)["streams"][0]
+
+
+def _off(a, b) -> int:
+    return max(abs(x - y) for x, y in zip(a, b, strict=True))
+
+
+def test_colour_vf_mapping():
+    assert r.colour_vf("bt709", "tv") == ""
+    assert r.colour_vf("bt709", "") == ""
+    assert "in_color_matrix=bt601" in r.colour_vf("", "")
+    assert "in_color_matrix=bt601" in r.colour_vf("smpte170m", "tv")
+    assert "in_color_matrix=bt601" in r.colour_vf("bt470bg", "tv")
+    assert "in_color_matrix=bt2020" in r.colour_vf("bt2020nc", "tv")
+    full = r.colour_vf("bt709", "pc")
+    assert "in_color_matrix=bt709" in full and "in_range=pc" in full and "out_range=tv" in full
+
+
+@pytest.mark.parametrize("encode", ["ambient", "normalize"])
+def test_untagged_bt601_source_converted_and_tagged(tmp_path, encode):
+    src = _src(tmp_path / "src.mp4", tags=[])
+    assert r.probe_colour(src) == ("", "")
+    # Precondition: shown as BT.709 untouched, the source is visibly off.
+    assert _off(_rgb_as_709(src), RGB) > 8
+    dst = tmp_path / "out.mp4"
+    if encode == "ambient":
+        r._encode_normalized(src, dst, width=320, height=180, slow_factor=1.0)
+    else:
+        r._normalize_clip(src, dst, 320, 180)
+    assert _off(_rgb_as_709(dst), RGB) <= 3
+    t = _tags(dst)
+    assert (t["color_space"], t["color_primaries"], t["color_transfer"], t["color_range"]) == \
+        ("bt709", "bt709", "bt709", "tv")
+
+
+def test_tagged_bt709_source_passes_through(tmp_path):
+    src = _src(tmp_path / "src.mp4", matrix="bt709",
+               tags=["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+                     "-color_range", "tv"])
+    assert r.colour_vf(*r.probe_colour(src)) == ""
+    dst = tmp_path / "out.mp4"
+    r._encode_normalized(src, dst, width=320, height=180, slow_factor=1.0)
+    assert _off(_rgb_as_709(dst), RGB) <= 3
+
+
+def test_full_range_jpeg_style_source(tmp_path):
+    src = _src(tmp_path / "src.mp4", tags=[], pix_fmt="yuvj420p", rng="pc")
+    assert r.probe_colour(src)[1] == "pc"
+    dst = tmp_path / "out.mp4"
+    assert _off(_rgb_as_709(src), RGB) > 8  # shown as limited BT.709, it's visibly off
+    r._encode_normalized(src, dst, width=320, height=180, slow_factor=1.0)
+    assert _off(_rgb_as_709(dst), RGB) <= 5  # range squeeze adds a level or two of rounding
+    assert _tags(dst)["color_range"] == "tv"
+
+
+def test_join_converts_each_segment(tmp_path):
+    a = _src(tmp_path / "a.mp4", tags=[])
+    b = _src(tmp_path / "b.mp4", matrix="bt709", tags=["-colorspace", "bt709", "-color_range", "tv"])
+    dst, _ = r.join_segments([a, b], tmp_path / "j.mp4", aspect_ratio="16:9", crossfade=0.2,
+                             resolution="720p")
+    assert _off(_rgb_as_709(dst), RGB) <= 3
+    assert _tags(dst)["color_space"] == "bt709"
+
+
+def test_still_image_drift_is_bt709(tmp_path):
+    img = tmp_path / "still.png"
+    colour = "0x%02X%02X%02X" % RGB
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={colour}:s=640x360",
+                    "-frames:v", "1", str(img)], check=True)
+    dst = tmp_path / "drift.mp4"
+    r.render_image_drift_clip(img, dst, seconds=1.0, width=320, height=180)
+    assert _off(_rgb_as_709(dst), RGB) <= 3
+    assert _tags(dst)["color_space"] == "bt709"

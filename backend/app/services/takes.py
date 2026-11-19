@@ -108,6 +108,8 @@ def remove_file(db: Session, path: str, *, take_id: Optional[int] = None,
         return False
     try:
         Path(path).unlink(missing_ok=True)
+        from . import previews
+        previews.remove(Path(path))
         return True
     except OSError:
         log.warning("could not delete clip file %s", path)

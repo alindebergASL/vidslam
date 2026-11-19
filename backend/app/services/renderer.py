@@ -176,12 +176,64 @@ def fit_vf(width: int, height: int, size: Optional[tuple[int, int]] = None, *, f
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
 
 
+# Output colour tags. Every encode writes BT.709 limited range and says so:
+# browsers and players assume BT.709 for untagged HD anyway, so the tags
+# only make explicit what is already shown, and the sources are converted
+# to match on the way in (colour_vf).
+BT709_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709",
+              "-color_trc", "bt709", "-color_range", "tv"]
+
+# ffprobe color_space names → swscale matrix names for the conversion.
+_SWS_MATRIX = {"bt709": "bt709", "smpte170m": "bt601", "bt470bg": "bt601", "fcc": "fcc",
+               "smpte240m": "smpte240m", "bt2020nc": "bt2020", "bt2020c": "bt2020"}
+
+
+def probe_colour(path: Path, timeout: Optional[float] = None) -> tuple[str, str]:
+    """(color_space, color_range) of the first video stream as ffprobe
+    names them; "" for each that is untagged or unreadable."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
+                    "-show_entries", "stream=color_space,color_range,pix_fmt", str(path)], timeout=timeout)
+    if rc != 0:
+        return "", ""
+    try:
+        st = json.loads(log)["streams"][0]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return "", ""
+    space = str(st.get("color_space") or "")
+    rng = str(st.get("color_range") or "")
+    if space == "unknown":
+        space = ""
+    if rng == "unknown":
+        rng = ""
+    if not rng and str(st.get("pix_fmt") or "").startswith("yuvj"):
+        rng = "pc"  # JPEG-style pixel formats are full range
+    return space, rng
+
+
+def colour_vf(space: str, rng: str) -> str:
+    """Filter converting a source to BT.709 limited range, or "" when it
+    already is. Untagged input is read as BT.601: video models and phones
+    hand back untagged BT.601-matrix pictures, which showed with shifted
+    colours once the output was played as BT.709."""
+    matrix = _SWS_MATRIX.get(space, "bt601")
+    in_range = "pc" if rng == "pc" else "tv"
+    if matrix == "bt709" and in_range == "tv":
+        return ""
+    return (f"scale=in_color_matrix={matrix}:out_color_matrix=bt709:"
+            f"in_range={in_range}:out_range=tv")
+
+
+def _with_colour(vf: str, src: Path) -> str:
+    conv = colour_vf(*probe_colour(src))
+    return f"{conv},{vf}" if conv else vf
+
+
 def _normalize_clip(src: Path, dst: Path, width: int, height: int,
                     max_seconds: Optional[float] = None, *, exact: bool = False) -> str:
     """Re-encode a clip to a uniform size/fps/codec so they can be
     concatenated, cut to `max_seconds` when it is longer (`exact`: and held
     on its last frame up to `max_seconds` when it is shorter)."""
-    vf = f"{fit_vf(width, height, _probe_size(src))},setsar=1,fps={FPS}"
+    vf = _with_colour(f"{fit_vf(width, height, _probe_size(src))},setsar=1,fps={FPS}", src)
     if exact and max_seconds and max_seconds > 0:
         vf += f",tpad=stop_mode=clone:stop_duration={max_seconds:.3f}"
     limit = ["-t", f"{max_seconds:.3f}"] if max_seconds and max_seconds > 0 else []
@@ -190,7 +242,7 @@ def _normalize_clip(src: Path, dst: Path, width: int, height: int,
         "-vf", vf,
         *limit,
         "-an",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", *BT709_TAGS,
         "-r", str(FPS),
         str(dst),
     ]
@@ -802,7 +854,7 @@ class AmbientRenderOutputs:
 
 
 # Shared x264 settings so every tiled piece is bit-compatible for `-c copy`.
-_X264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20"]
+_X264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20", *BT709_TAGS]
 
 
 _FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -905,7 +957,7 @@ def timer_filter(out: Path, mode: str, *, total: float, height: int, position: s
 def _encode_normalized(
     src: Path, dst: Path, *, width: int, height: int, slow_factor: float, extra_vf: str = ""
 ) -> str:
-    vf = f"{fit_vf(width, height, _probe_size(src), flags='lanczos')},setsar=1"
+    vf = _with_colour(f"{fit_vf(width, height, _probe_size(src), flags='lanczos')},setsar=1", src)
     if slow_factor and abs(slow_factor - 1.0) > 1e-3:
         # Slow the clip down; fps= re-samples so the output stays constant-rate.
         vf += f",setpts={slow_factor:.4f}*PTS"
@@ -1559,10 +1611,12 @@ def on_frame_grid(seconds: float) -> float:
 
 
 def join_graph(lengths: list[float], *, crossfade: float, width: int, height: int,
-               sizes: Optional[list[Optional[tuple[int, int]]]] = None) -> str:
+               sizes: Optional[list[Optional[tuple[int, int]]]] = None,
+               colours: Optional[list[str]] = None) -> str:
     """filter_complex text joining len(lengths) inputs with rounded linear
     dissolves of `crossfade` seconds; output label [out]. `sizes` (each
-    input's width x height, if known) lets near-frame shapes fill (fit_vf).
+    input's width x height, if known) lets near-frame shapes fill (fit_vf);
+    `colours` (each input's colour_vf) converts it to BT.709 first.
     Trims are by output frame: a length on the FPS grid gives exactly
     that many frames."""
     cf = crossfade
@@ -1572,6 +1626,7 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
 
     n = len(lengths)
     sizes = list(sizes or []) + [None] * (n - len(sizes or []))
+    colours = list(colours or []) + [""] * (n - len(colours or []))
     parts: list[str] = []
     order: list[str] = []
     for i in range(n):
@@ -1583,7 +1638,8 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
         # Timestamps from 0 first, so fps's rounding starts on the grid; one
         # cloned frame at the end, so the trim below always finds every
         # frame of L (its sound is cut to exactly L).
-        norm = (f"setpts=PTS-STARTPTS,{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},"
+        conv = f"{colours[i]}," if colours[i] else ""
+        norm = (f"setpts=PTS-STARTPTS,{conv}{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},"
                 f"tpad=stop_mode=clone:stop=1,format=yuv420p")
         parts.append(f"[{i}:v]{norm},split={len(outs)}{labels}" if len(outs) > 1 else f"[{i}:v]{norm}[b{i}]")
         parts[-1] = parts[-1].replace(f"[b{i}]", f"[bb{i}]")
@@ -1630,7 +1686,8 @@ def join_segments(
     lengths = [_probe_duration(p) for p in segments]
     cf = max(0.0, min(crossfade, min(lengths) / 3.0))
     graph = join_graph(lengths, crossfade=cf, width=width, height=height,
-                       sizes=[_probe_size(p) for p in segments])
+                       sizes=[_probe_size(p) for p in segments],
+                       colours=[colour_vf(*probe_colour(p)) for p in segments])
     prev = "out"
     cmd = ["ffmpeg", "-y"]
     for p in segments:
@@ -1844,7 +1901,8 @@ def join_clips_with_audio(
     cf = join_crossfade(lengths, transition, crossfade)
     cf = on_frame_grid(cf) if cf > 0 else 0.0
     graph = join_graph(lengths, crossfade=cf, width=width, height=height,
-                       sizes=[_probe_size(p) for p in clips])
+                       sizes=[_probe_size(p) for p in clips],
+                       colours=[colour_vf(*probe_colour(p)) for p in clips])
     audio = any(has_audio)
     if audio:
         graph += ";" + join_audio_graph(lengths, has_audio, crossfade=cf, video_starts=video_starts)
@@ -1963,7 +2021,9 @@ def render_image_drift_clip(
     x = f"iw/2-(iw/zoom/2)+(iw*0.01)*sin(2*PI*on/{frames})"
     y = "ih/2-(ih/zoom/2)"
     vf = (
-        f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase,"
+        # RGB/JPEG → YUV in BT.709 limited range, to match the output tags.
+        f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase:"
+        "out_color_matrix=bt709:out_range=tv,format=yuv420p,"
         f"crop={big_w}:{big_h},"
         f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={width}x{height}:fps={FPS},"
         "setsar=1"

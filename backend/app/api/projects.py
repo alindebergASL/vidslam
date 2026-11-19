@@ -652,7 +652,9 @@ def take_clip(project_id: int, shot_id: int, take_id: int, db: Session = Depends
     take = _take_of(shot, take_id)
     if not take.clip_path or not Path(take.clip_path).is_file():
         raise HTTPException(404, "this take's file is gone")
-    return FileResponse(take.clip_path, media_type="video/mp4")
+    from ..services import previews
+    # Browsers can't play every format a model returns: a copy they can.
+    return FileResponse(previews.browser_safe(Path(take.clip_path)), media_type="video/mp4")
 
 
 @router.post("/projects/{project_id}/shots/{shot_id}/takes/{take_id}/use", response_model=ShotOut)
