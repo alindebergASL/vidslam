@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -176,12 +177,97 @@ def fit_vf(width: int, height: int, size: Optional[tuple[int, int]] = None, *, f
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
 
 
+# Output colour tags. Every encode writes BT.709 limited range and says so:
+# browsers and players assume BT.709 for untagged HD anyway, so the tags
+# only make explicit what is already shown, and the sources are converted
+# to match on the way in (colour_vf).
+BT709_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709",
+              "-color_trc", "bt709", "-color_range", "tv"]
+
+# ffprobe color_space names → colorspace-filter matrix names (SDR, non-BT.2020).
+_CS_MATRIX = {"bt709": "bt709", "smpte170m": "smpte170m", "bt470bg": "bt470bg", "fcc": "fcc",
+              "smpte240m": "smpte240m"}
+
+
+def probe_colour(path: Path, timeout: Optional[float] = None) -> tuple[str, str, str, str]:
+    """(color_space, color_range, color_transfer, color_primaries) of the
+    first video stream as ffprobe names them; "" for each that is untagged
+    or unreadable. Feeds colour_vf (`colour_vf(*probe_colour(p))`)."""
+    rc, log = _run(["ffprobe", "-v", "quiet", "-print_format", "json", "-select_streams", "v:0",
+                    "-show_entries", "stream=color_space,color_range,color_transfer,color_primaries,pix_fmt",
+                    str(path)], timeout=timeout)
+    if rc != 0:
+        return "", "", "", ""
+    try:
+        st = json.loads(log)["streams"][0]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return "", "", "", ""
+    space, rng, trc, prim = (str(st.get(k) or "").replace("unknown", "").replace("unspecified", "")
+                             for k in ("color_space", "color_range", "color_transfer", "color_primaries"))
+    if not rng and str(st.get("pix_fmt") or "").startswith("yuvj"):
+        rng = "pc"  # JPEG-style pixel formats are full range
+    return space, rng, trc, prim
+
+
+# HDR (PQ/HLG) and wide-gamut sources: zimg converts gamut and transfer
+# (tone-mapping HDR the way frame grabs do: TONEMAP) before the BT.709
+# tags. The input is spelled out because a clip's tags can be partial.
+_ZIN = {"bt2020nc": "2020_ncl", "bt2020c": "2020_cl", "bt709": "709"}
+
+
+def colour_vf(space: str, rng: str, transfer: str = "", primaries: str = "") -> str:
+    """Filter converting a source to BT.709 limited range, or "" when it
+    already is. Untagged input is read as BT.601: video models and phones
+    hand back untagged BT.601-matrix pictures, which showed with shifted
+    colours once the output was played as BT.709."""
+    wide = primaries == "bt2020" or space in ("bt2020nc", "bt2020c")
+    if transfer in HDR_TRANSFERS or wide:
+        zin = (f"zscale=pin=2020:min={_ZIN.get(space, '2020_ncl')}:rin={'full' if rng == 'pc' else 'limited'}"
+               f":tin={transfer if transfer in HDR_TRANSFERS else '709'}")
+        if transfer in HDR_TRANSFERS:
+            return (f"{zin}:t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p")
+        return f"{zin}:p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p"
+    # A clip tagged BT.709 by primaries/transfer but with no matrix tag is
+    # BT.709; only a fully untagged one is read as BT.601.
+    matrix = _CS_MATRIX.get(space) or ("bt709" if "bt709" in (primaries, transfer) else "bt470bg")
+    in_range = "pc" if rng == "pc" else "tv"
+    if matrix == "bt709" and in_range == "tv":
+        return ""
+    # The colorspace filter converts the matrix only. swscale's YUV->YUV
+    # matrix path (FFmpeg 7.1) also lowered luma by a level or two, which
+    # darkened real low-saturation footage more than the matrix error it
+    # fixed. Its format= output pins full-range input to limited range (a
+    # later scale would otherwise keep yuvj and only relabel it). It needs
+    # even frame sizes: crop drops at most a pixel and leaves values alone.
+    return ("crop=trunc(iw/2)*2:trunc(ih/2)*2,"
+            f"colorspace=ispace={matrix}:space=bt709:iprimaries=bt709:primaries=bt709:"
+            f"itrc=bt709:trc=bt709:irange={in_range}:range=tv:format=yuv420p")
+
+
+# Frame colour properties, set on every converted or passed-through source:
+# newer FFmpeg writes the stream's tags from the frames, so -color_primaries
+# & co. on the output alone left primaries/transfer unset.
+TAG_709 = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"
+
+
+def colour_chain(space: str, rng: str, transfer: str = "", primaries: str = "") -> str:
+    """colour_vf plus the BT.709 frame properties: the filter text that
+    makes any source BT.709 limited range and marks it so."""
+    conv = colour_vf(space, rng, transfer, primaries)
+    return f"{conv},{TAG_709}" if conv else TAG_709
+
+
+def _with_colour(vf: str, src: Path) -> str:
+    return f"{colour_chain(*probe_colour(src))},{vf}"
+
+
 def _normalize_clip(src: Path, dst: Path, width: int, height: int,
                     max_seconds: Optional[float] = None, *, exact: bool = False) -> str:
     """Re-encode a clip to a uniform size/fps/codec so they can be
     concatenated, cut to `max_seconds` when it is longer (`exact`: and held
     on its last frame up to `max_seconds` when it is shorter)."""
-    vf = f"{fit_vf(width, height, _probe_size(src))},setsar=1,fps={FPS}"
+    vf = _with_colour(f"{fit_vf(width, height, _probe_size(src))},setsar=1,fps={FPS}", src)
     if exact and max_seconds and max_seconds > 0:
         vf += f",tpad=stop_mode=clone:stop_duration={max_seconds:.3f}"
     limit = ["-t", f"{max_seconds:.3f}"] if max_seconds and max_seconds > 0 else []
@@ -190,7 +276,7 @@ def _normalize_clip(src: Path, dst: Path, width: int, height: int,
         "-vf", vf,
         *limit,
         "-an",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", *BT709_TAGS,
         "-r", str(FPS),
         str(dst),
     ]
@@ -802,7 +888,7 @@ class AmbientRenderOutputs:
 
 
 # Shared x264 settings so every tiled piece is bit-compatible for `-c copy`.
-_X264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20"]
+_X264 = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "20", *BT709_TAGS]
 
 
 _FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -903,16 +989,17 @@ def timer_filter(out: Path, mode: str, *, total: float, height: int, position: s
 
 
 def _encode_normalized(
-    src: Path, dst: Path, *, width: int, height: int, slow_factor: float, extra_vf: str = ""
+    src: Path, dst: Path, *, width: int, height: int, slow_factor: float, extra_vf: str = "",
+    x264: Optional[list[str]] = None,
 ) -> str:
-    vf = f"{fit_vf(width, height, _probe_size(src), flags='lanczos')},setsar=1"
+    vf = _with_colour(f"{fit_vf(width, height, _probe_size(src), flags='lanczos')},setsar=1", src)
     if slow_factor and abs(slow_factor - 1.0) > 1e-3:
         # Slow the clip down; fps= re-samples so the output stays constant-rate.
         vf += f",setpts={slow_factor:.4f}*PTS"
     vf += f",fps={FPS}"
     if extra_vf:
         vf += "," + extra_vf
-    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-an", *_X264, "-r", str(FPS), str(dst)]
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-vf", vf, "-an", *(x264 or _X264), "-r", str(FPS), str(dst)]
     rc, log = _run(cmd)
     if rc != 0:
         raise RuntimeError(f"ffmpeg ambient normalize failed: {log[-2000:]}")
@@ -949,7 +1036,8 @@ def seamless_unit_graph(*, length: float, crossfade: float, src: str = "0:v", ou
     )
 
 
-def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: float) -> str:
+def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: float,
+                        x264: Optional[list[str]] = None) -> str:
     """Make `norm` loop without a visible cut. Output length = length - crossfade.
 
     unit = clip[cf, L-cf)  ++  blend(clip[L-cf, L) → clip[0, cf))
@@ -963,7 +1051,7 @@ def _make_seamless_unit(norm: Path, unit: Path, *, length: float, crossfade: flo
     cmd = [
         "ffmpeg", "-y", "-i", str(norm),
         "-filter_complex", flt, "-map", "[v]", "-an",
-        *_X264, "-r", str(FPS), str(unit),
+        *(x264 or _X264), "-r", str(FPS), str(unit),
     ]
     rc, log = _run(cmd)
     if rc != 0:
@@ -1404,6 +1492,99 @@ def _single_unit_pieces(unit: Path, unit_len: float, out: Path, *, total: float,
     return pieces, repeats, fade
 
 
+# Grain pulse. At _X264 (veryfast, crf 20) a still, grainy picture keeps
+# its grain on the keyframe each tiled unit starts with and smooths it away
+# in the frames after, so the loop "breathes" at every repeat (measured on a
+# real rain take: 16-18x a normal frame step at each join; moving scenes
+# ~1.2x). A unit whose own wrap (last frame → first) steps more than
+# GRAIN_PULSE_RATIO times its median step is rebuilt from the source with
+# grain kept (_X264_GRAIN: 3.4-4.4x on the rain take, at ~3.7x the bytes),
+# so most scenes keep today's size.
+GRAIN_PULSE_RATIO = 3.0
+_X264_GRAIN = ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "21",
+               "-tune", "grain", *BT709_TAGS]
+_STEP_FLOOR = 0.02  # grey levels: a frozen picture's median step is ~0
+
+
+def unit_wrap_ratio(unit: Path, *, width: int = 320, height: int = 180) -> float:
+    """Step across the unit's own wrap (its last frame → its first, what
+    every tiled repeat shows) over its median frame-to-frame step, on grey
+    frames. 0.0 when it can't be decoded."""
+    rc, raw = _run_bytes(["ffmpeg", "-v", "error", "-i", str(unit), "-vf",
+                          f"scale={width}:{height},format=gray", "-f", "rawvideo", "-"])
+    n = width * height
+    if rc != 0 or len(raw) < 3 * n:
+        return 0.0
+    frames = [raw[i:i + n] for i in range(0, len(raw) - n + 1, n)]
+
+    def step(a: bytes, b: bytes) -> float:
+        return sum(abs(x - y) for x, y in zip(a[::7], b[::7], strict=True)) / len(a[::7])
+
+    steps = sorted(step(a, b) for a, b in zip(frames, frames[1:], strict=False))
+    med = max(steps[len(steps) // 2], _STEP_FLOOR)
+    return step(frames[-1], frames[0]) / med
+
+
+def _run_bytes(cmd: list[str]) -> tuple[int, bytes]:
+    try:
+        p = subprocess.run(cmd, capture_output=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return -1, b""
+    return p.returncode, p.stdout
+
+
+def _build_unit(clip: Path, norm: Path, unit: Path, *, width: int, height: int, slow_factor: float,
+                extra_vf: str, crossfade: float, logs: list[str], label: str = "") -> float:
+    """Normalize `clip` and make its seamless unit; rebuilt with grain kept
+    when the unit pulses at its wrap (see GRAIN_PULSE_RATIO). Returns the
+    normalized length."""
+
+    def make(x264: list[str]) -> float:
+        logs.append(_encode_normalized(clip, norm, width=width, height=height, slow_factor=slow_factor,
+                                       extra_vf=extra_vf, x264=x264))
+        length = _probe_duration(norm)
+        if length <= 0.5:
+            raise RuntimeError(f"normalized loop clip{label} is empty or unreadable")
+        if crossfade > 0 and length > (2 * crossfade + 0.5):
+            logs.append(_make_seamless_unit(norm, unit, length=length, crossfade=crossfade, x264=x264))
+        else:
+            shutil.copyfile(norm, unit)
+        return length
+
+    length = make(_X264)
+    ratio = unit_wrap_ratio(unit)
+    if ratio <= GRAIN_PULSE_RATIO:
+        logs.append(f"grain check{label}: wrap {ratio:.2f}x median step, kept standard encode")
+        return length
+    keep = unit.with_name(unit.stem + "_std" + unit.suffix)
+    keep_norm = norm.with_name(norm.stem + "_std" + norm.suffix)
+    shutil.copyfile(unit, keep)
+    shutil.copyfile(norm, keep_norm)
+    grain_len = make(_X264_GRAIN)
+    grain = unit_wrap_ratio(unit)
+    if grain and grain < ratio * 0.8:
+        logs.append(f"grain check{label}: wrap {ratio:.2f}x median step -> {grain:.2f}x with grain kept "
+                    "(crf 21, tune grain)")
+        keep.unlink(missing_ok=True)
+        keep_norm.unlink(missing_ok=True)
+        return grain_len
+    # Not the encoder (e.g. the clip's own seam): the smaller file wins.
+    os.replace(keep, unit)
+    os.replace(keep_norm, norm)
+    logs.append(f"grain check{label}: wrap {ratio:.2f}x, grain encode {grain:.2f}x did not help; "
+                "kept standard encode")
+    return length
+
+
+def _render_log(logs: list[str], limit: int = 8000) -> str:
+    """The stored render log: decisions worth keeping (the grain check
+    lines) first, then the tail of the ffmpeg output, so a long tile/mux
+    log can't push them out."""
+    summary = [line for line in logs if line.startswith("grain check")]
+    tail = "\n".join(logs)[-limit:]
+    return "\n".join(summary) + "\n...\n" + tail if summary else tail
+
+
 def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     if not shutil.which("ffmpeg"):
         raise RuntimeError("ffmpeg binary not found on PATH")
@@ -1420,23 +1601,14 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
     wm_vf = watermark_filter(out, inputs.watermark.strip(), height=height, width=width,
                              position=inputs.watermark_position, opacity=inputs.watermark_opacity)
 
-    # 1. Normalize (size/fps/codec, optional slow-down).
-    norm = out / "ambient_norm.mp4"
-    logs.append(_encode_normalized(
-        inputs.clip_path, norm, width=width, height=height, slow_factor=inputs.slow_factor,
-        extra_vf=wm_vf,
-    ))
-    length = _probe_duration(norm)
-    if length <= 0.5:
-        raise RuntimeError("normalized loop clip is empty or unreadable")
-
-    # 2. Seamless unit. Need room for the overlap on both sides of the trim.
+    # 1-2. Normalize (size/fps/codec, optional slow-down), then the
+    #      seamless unit (needs room for the overlap on both sides of the
+    #      trim), grain-checked at its wrap.
     cf = 0.0 if inputs.clip_is_periodic else max(0.0, inputs.crossfade_seconds)
+    norm = out / "ambient_norm.mp4"
     unit = out / "ambient_unit.mp4"
-    if cf > 0 and length > (2 * cf + 0.5):
-        logs.append(_make_seamless_unit(norm, unit, length=length, crossfade=cf))
-    else:
-        shutil.copyfile(norm, unit)
+    length = _build_unit(inputs.clip_path, norm, unit, width=width, height=height,
+                         slow_factor=inputs.slow_factor, extra_vf=wm_vf, crossfade=cf, logs=logs)
     unit_len = _probe_duration(unit) or (length - cf)
 
     total = float(inputs.total_seconds)
@@ -1447,16 +1619,9 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         units, lengths = [unit], [unit_len]
         for i, clip in enumerate(inputs.extra_clips, start=1):
             n_i = out / f"ambient_norm_{i}.mp4"
-            logs.append(_encode_normalized(clip, n_i, width=width, height=height,
-                                           slow_factor=inputs.slow_factor, extra_vf=wm_vf))
-            l_i = _probe_duration(n_i)
-            if l_i <= 0.5:
-                raise RuntimeError(f"normalized loop clip {i + 1} is empty or unreadable")
             u_i = out / f"ambient_unit_{i}.mp4"
-            if cf > 0 and l_i > (2 * cf + 0.5):
-                logs.append(_make_seamless_unit(n_i, u_i, length=l_i, crossfade=cf))
-            else:
-                shutil.copyfile(n_i, u_i)
+            l_i = _build_unit(clip, n_i, u_i, width=width, height=height, slow_factor=inputs.slow_factor,
+                              extra_vf=wm_vf, crossfade=cf, logs=logs, label=f" {i + 1}")
             units.append(u_i)
             lengths.append(_probe_duration(u_i) or (l_i - cf))
         fade = max(0.0, min(inputs.fade_seconds, min(lengths) / 2.5, total / 2.5))
@@ -1527,7 +1692,7 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
         unit_path=unit,
         unit_seconds=unit_len,
         repeats=repeats,
-        log="\n".join(logs)[-8000:],
+        log=_render_log(logs),
     )
 
 
@@ -1559,10 +1724,12 @@ def on_frame_grid(seconds: float) -> float:
 
 
 def join_graph(lengths: list[float], *, crossfade: float, width: int, height: int,
-               sizes: Optional[list[Optional[tuple[int, int]]]] = None) -> str:
+               sizes: Optional[list[Optional[tuple[int, int]]]] = None,
+               colours: Optional[list[str]] = None) -> str:
     """filter_complex text joining len(lengths) inputs with rounded linear
     dissolves of `crossfade` seconds; output label [out]. `sizes` (each
-    input's width x height, if known) lets near-frame shapes fill (fit_vf).
+    input's width x height, if known) lets near-frame shapes fill (fit_vf);
+    `colours` (each input's colour_chain) converts it to BT.709 first.
     Trims are by output frame: a length on the FPS grid gives exactly
     that many frames."""
     cf = crossfade
@@ -1572,6 +1739,7 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
 
     n = len(lengths)
     sizes = list(sizes or []) + [None] * (n - len(sizes or []))
+    colours = list(colours or []) + [""] * (n - len(colours or []))
     parts: list[str] = []
     order: list[str] = []
     for i in range(n):
@@ -1583,7 +1751,8 @@ def join_graph(lengths: list[float], *, crossfade: float, width: int, height: in
         # Timestamps from 0 first, so fps's rounding starts on the grid; one
         # cloned frame at the end, so the trim below always finds every
         # frame of L (its sound is cut to exactly L).
-        norm = (f"setpts=PTS-STARTPTS,{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},"
+        conv = f"{colours[i]}," if colours[i] else ""
+        norm = (f"setpts=PTS-STARTPTS,{conv}{fit_vf(width, height, sizes[i])},setsar=1,fps={FPS},"
                 f"tpad=stop_mode=clone:stop=1,format=yuv420p")
         parts.append(f"[{i}:v]{norm},split={len(outs)}{labels}" if len(outs) > 1 else f"[{i}:v]{norm}[b{i}]")
         parts[-1] = parts[-1].replace(f"[b{i}]", f"[bb{i}]")
@@ -1630,7 +1799,8 @@ def join_segments(
     lengths = [_probe_duration(p) for p in segments]
     cf = max(0.0, min(crossfade, min(lengths) / 3.0))
     graph = join_graph(lengths, crossfade=cf, width=width, height=height,
-                       sizes=[_probe_size(p) for p in segments])
+                       sizes=[_probe_size(p) for p in segments],
+                       colours=[colour_chain(*probe_colour(p)) for p in segments])
     prev = "out"
     cmd = ["ffmpeg", "-y"]
     for p in segments:
@@ -1844,7 +2014,8 @@ def join_clips_with_audio(
     cf = join_crossfade(lengths, transition, crossfade)
     cf = on_frame_grid(cf) if cf > 0 else 0.0
     graph = join_graph(lengths, crossfade=cf, width=width, height=height,
-                       sizes=[_probe_size(p) for p in clips])
+                       sizes=[_probe_size(p) for p in clips],
+                       colours=[colour_chain(*probe_colour(p)) for p in clips])
     audio = any(has_audio)
     if audio:
         graph += ";" + join_audio_graph(lengths, has_audio, crossfade=cf, video_starts=video_starts)
@@ -1877,7 +2048,9 @@ def slice_audio(src: Path, dst: Path, *, start: float, duration: float) -> Path:
 
 def trim_clip(src: Path, dst: Path, *, duration: float) -> Path:
     """Re-encode the first `duration` seconds of a clip (frame-accurate)."""
-    rc, log = _run(["ffmpeg", "-y", "-i", str(src), "-t", f"{duration:.3f}", "-an", *_X264,
+    conv = colour_chain(*probe_colour(src))  # the output is tagged BT.709 (_X264)
+    rc, log = _run(["ffmpeg", "-y", "-i", str(src), "-t", f"{duration:.3f}", "-an",
+                    "-vf", conv, *_X264,
                     "-r", str(FPS), str(dst)])
     if rc != 0:
         raise RuntimeError(f"ffmpeg trim failed: {log[-1000:]}")
@@ -1963,10 +2136,13 @@ def render_image_drift_clip(
     x = f"iw/2-(iw/zoom/2)+(iw*0.01)*sin(2*PI*on/{frames})"
     y = "ih/2-(ih/zoom/2)"
     vf = (
-        f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase,"
+        # RGB/JPEG → YUV in BT.709 limited range, to match the output tags.
+        f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase:"
+        "out_color_matrix=bt709:out_range=tv,format=yuv420p,"
         f"crop={big_w}:{big_h},"
         f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={width}x{height}:fps={FPS},"
-        "setsar=1"
+        # After zoompan, which drops frame colour properties.
+        f"setsar=1,{TAG_709}"
     )
     cmd = [
         "ffmpeg", "-y", "-loop", "1", "-i", str(image),

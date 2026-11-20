@@ -644,7 +644,9 @@ def shot_clip(project_id: int, shot_id: int, db: Session = Depends(get_db)) -> F
         raise HTTPException(404, "shot not found in project")
     if not shot.clip_path or not Path(shot.clip_path).exists():
         raise HTTPException(404, "clip not generated yet")
-    return FileResponse(shot.clip_path, media_type="video/mp4")
+    from ..services import previews
+    # Browsers can't play every format a model returns: a copy they can.
+    return FileResponse(previews.browser_safe(Path(shot.clip_path)), media_type="video/mp4")
 
 
 def render_outs(db: Session, renders: list[models.Render]) -> list[RenderOut]:
