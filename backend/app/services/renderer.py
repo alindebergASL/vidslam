@@ -189,6 +189,9 @@ _CS_MATRIX = {"bt709": "bt709", "smpte170m": "smpte170m", "bt470bg": "bt470bg", 
               "smpte240m": "smpte240m"}
 
 
+_RGB_PIX = ("rgb", "bgr", "gbr", "argb", "abgr", "0rgb", "0bgr", "x2rgb", "x2bgr", "pal8")
+
+
 def probe_colour(path: Path, timeout: Optional[float] = None) -> tuple[str, str, str, str]:
     """(color_space, color_range, color_transfer, color_primaries) of the
     first video stream as ffprobe names them; "" for each that is untagged
@@ -204,6 +207,8 @@ def probe_colour(path: Path, timeout: Optional[float] = None) -> tuple[str, str,
         return "", "", "", ""
     space, rng, trc, prim = (str(st.get(k) or "").replace("unknown", "").replace("unspecified", "")
                              for k in ("color_space", "color_range", "color_transfer", "color_primaries"))
+    if str(st.get("pix_fmt") or "").startswith(_RGB_PIX):
+        space = "gbr"  # RGB-coded (FFmpeg tags most of these gbr/pc; some are untagged)
     if not rng and str(st.get("pix_fmt") or "").startswith("yuvj"):
         rng = "pc"  # JPEG-style pixel formats are full range
     return space, rng, trc, prim
@@ -220,6 +225,11 @@ def colour_vf(space: str, rng: str, transfer: str = "", primaries: str = "") -> 
     already is. Untagged input is read as BT.601: video models and phones
     hand back untagged BT.601-matrix pictures, which showed with shifted
     colours once the output was played as BT.709."""
+    if space == "gbr":
+        # RGB pixels: one swscale RGB->YUV step with the BT.709 matrix. Fed to
+        # the colorspace filter, an auto-inserted BT.601 limited conversion
+        # was read as irange=pc (and as BT.709 with 709 prim/trc tags).
+        return "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
     wide = primaries == "bt2020" or space in ("bt2020nc", "bt2020c")
     if transfer in HDR_TRANSFERS or wide:
         zin = (f"zscale=pin=2020:min={_ZIN.get(space, '2020_ncl')}:rin={'full' if rng == 'pc' else 'limited'}"
@@ -301,7 +311,10 @@ def _make_end_card(
     label = dst.parent / f".{dst.stem}_text.txt"
     label.write_text(text, encoding="utf-8")
     txt = textfile_arg(label)
-    base = f"color=c={bg_color}:s={width}x{height}:d={duration}"
+    base = f"color=c={bg_color}:s={width}x{height}:d={duration},format=rgb24"
+    # Drawn in RGB and converted once with the BT.709 matrix: FFmpeg's
+    # colour source, drawtext and overlay otherwise code colours as BT.601.
+    to709 = f"scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,{TAG_709}"
 
     if logo_path is not None and logo_path.exists():
         # Logo centered in the upper third, text below center.
@@ -311,9 +324,9 @@ def _make_end_card(
             f"x=(w-text_w)/2:y=h*0.60:line_spacing=18:box=0"
         )
         filter_complex = (
-            f"[1:v]scale={int(width * 0.42)}:-1[lg];"
-            f"[0:v][lg]overlay=(W-w)/2:H*0.22[bg];"
-            f"[bg]{draw}[out]"
+            f"[1:v]scale={int(width * 0.42)}:-1,format=rgba[lg];"
+            f"[0:v][lg]overlay=(W-w)/2:H*0.22:format=rgb[bg];"
+            f"[bg]{draw},{to709}[out]"
         )
         cmd = [
             "ffmpeg", "-y",
@@ -322,7 +335,7 @@ def _make_end_card(
             "-filter_complex", filter_complex,
             "-map", "[out]",
             "-t", str(duration),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", *BT709_TAGS,
             "-r", str(FPS),
             str(dst),
         ]
@@ -331,12 +344,12 @@ def _make_end_card(
             f"{base},"
             f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:"
             f"{txt}:fontcolor={text_color}:fontsize=72:"
-            f"x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=18:box=0"
+            f"x=(w-text_w)/2:y=(h-text_h)/2:line_spacing=18:box=0,{to709}"
         )
         cmd = [
             "ffmpeg", "-y", "-f", "lavfi", "-i", vf,
             "-t", str(duration),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", *BT709_TAGS,
             "-r", str(FPS),
             str(dst),
         ]
@@ -362,7 +375,7 @@ def _concat(clips: list[Path], out: Path) -> str:
         # Fallback: re-encode (clips already normalized, but copy can fail across containers).
         cmd_re = [
             "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(listfile),
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", *BT709_TAGS,
             "-r", str(FPS),
             str(out),
         ]
@@ -433,7 +446,7 @@ def _mux_audio_captions_overlays(
         cmd += ["-vf", ",".join(vf_chain)]
 
     cmd += [
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", *BT709_TAGS,
         "-r", str(FPS),
     ]
 
@@ -2137,7 +2150,7 @@ def render_image_drift_clip(
     y = "ih/2-(ih/zoom/2)"
     vf = (
         # RGB/JPEG → YUV in BT.709 limited range, to match the output tags.
-        f"scale={big_w}:{big_h}:force_original_aspect_ratio=increase:"
+        f"format=rgb24,scale={big_w}:{big_h}:force_original_aspect_ratio=increase:"
         "out_color_matrix=bt709:out_range=tv,format=yuv420p,"
         f"crop={big_w}:{big_h},"
         f"zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={width}x{height}:fps={FPS},"
