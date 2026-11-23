@@ -648,7 +648,10 @@ def shot_clip(project_id: int, shot_id: int, db: Session = Depends(get_db)) -> F
     clip = Path(shot.clip_path)
     db.close()  # a preview transcode can take a while: don't hold a pooled connection
     # Browsers can't play every format a model returns: a copy they can.
-    return FileResponse(previews.browser_safe(clip), media_type="video/mp4")
+    # no-cache: the original served while a copy is being made must not be
+    # reused by the browser once the copy exists (same URL, revalidated).
+    return FileResponse(previews.browser_safe(clip), media_type="video/mp4",
+                        headers={"Cache-Control": "no-cache"})
 
 
 def render_outs(db: Session, renders: list[models.Render]) -> list[RenderOut]:
