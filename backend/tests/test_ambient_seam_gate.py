@@ -79,7 +79,7 @@ def test_a_slight_jump_blends_at_least_one_and_a_half_seconds(auth_client, monke
     monkeypatch.setattr(loop_health, "current_entry", lambda p, s: entry if s is not None else None)
     t = _treatment(sid)
     assert t == {"blend_seconds": 1.5, "verdict": "slight_jump", "ratio": 4.0, "basis": "measured",
-                 "covers": True}
+                 "covers": True, "clip": 0}
     monkeypatch.undo()
     _patch(auth_client, sid, crossfade_seconds=2.5)
     monkeypatch.setattr(loop_health, "current_entry", lambda p, s: entry if s is not None else None)
