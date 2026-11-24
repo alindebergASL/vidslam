@@ -787,7 +787,8 @@ def submit_shot_clip(
     try:
         job = video_jobs.submit(
             db, purpose=purpose, ref_id=shot.id, project_id=project.id, render_id=render_id,
-            context={"after": after, **({"note": note} if note else {}),
+            # audio False: asked for no sound (stripped on download if a model adds it anyway).
+            context={"after": after, **({"note": note} if note else {}), "audio": False,
                      "aspect": project.aspect_ratio or "",
                      **({"fingerprint": fingerprint} if fingerprint else {}), **(context or {})}, start=start,
             webhooks=uses_webhooks(model),

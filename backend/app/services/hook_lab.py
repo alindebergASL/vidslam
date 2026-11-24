@@ -1640,7 +1640,7 @@ def submit_hook_shot(db: Session, project: models.VideoProject, variant: models.
 
     return video_jobs.submit(
         db, purpose=PURPOSE_SHOT, ref_id=variant.id, project_id=project.id, render_id=render.id,
-        context={"index": 0, "duration": seconds, "aspect": project.aspect_ratio or "",
+        context={"index": 0, "duration": seconds, "aspect": project.aspect_ratio or "", "audio": False,
                  "model": model, "inputs": _key(PURPOSE_SHOT, asked)}, start=start,
         webhooks=uses_webhooks(model))
 

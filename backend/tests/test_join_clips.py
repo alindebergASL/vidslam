@@ -150,31 +150,45 @@ def _beeps(path: Path) -> list[float]:
     return [t for t in ends if t < _streams(path)["audio"] - 0.1]
 
 
+def _assert_beeps_on_flashes(clips: list[Path], out: Path) -> None:
+    from app.services.renderer import FPS, join_clips_with_audio
+
+    out, _, _ = join_clips_with_audio(clips, out)
+    flashes, beeps = _flashes(out), _beeps(out)
+    assert flashes == pytest.approx([1.0, 3.0, 5.0], abs=1 / FPS + 0.01), flashes
+    assert len(beeps) == 3, beeps
+    for f, b in zip(flashes, beeps, strict=True):
+        assert abs(b - f) <= 1 / FPS, (flashes, beeps)
+    streams = _streams(out)
+    assert streams["audio"] == pytest.approx(streams["video"], abs=0.1)
+
+
 def test_picture_starting_after_its_sound_keeps_the_beep_on_the_flash(tmp_path):
     """A clip whose picture starts after its sound in the file (video
     start_time > 0, audio 0): the sound is laid on the picture's own
     timeline, so a beep made at the flash still plays on it once joined,
-    and the sound isn't cut short. A sound starting slightly before 0
-    (AAC priming) is fine too."""
-    from app.services.renderer import FPS, _probe_clip, join_clips_with_audio
+    and the sound isn't cut short."""
+    from app.services.renderer import _probe_clip
 
     late = _flash_clip(tmp_path / "late.mp4", tmp_path, video_offset=0.2)
     starts = _start_times(late)
     assert starts["video"] == pytest.approx(0.2, abs=0.01) and starts["audio"] == pytest.approx(0.0, abs=0.01)
     assert _probe_clip(late)[0] == pytest.approx(2.0, abs=0.05)
-    primed = _flash_clip(tmp_path / "primed.mkv", tmp_path)  # Matroska keeps AAC's priming
-    # Usually a little before 0; some FFmpeg builds write exactly 0. The join
-    # below must line the beeps up either way.
-    assert -0.05 < _start_times(primed)["audio"] <= 0
-    for clips in ([late, late, late], [primed, late, primed]):
-        out, _, _ = join_clips_with_audio(clips, tmp_path / "out.mp4")
-        flashes, beeps = _flashes(out), _beeps(out)
-        assert flashes == pytest.approx([1.0, 3.0, 5.0], abs=1 / FPS + 0.01), flashes
-        assert len(beeps) == 3, beeps
-        for f, b in zip(flashes, beeps, strict=True):
-            assert abs(b - f) <= 1 / FPS, (flashes, beeps)
-        streams = _streams(out)
-        assert streams["audio"] == pytest.approx(streams["video"], abs=0.1)
+    _assert_beeps_on_flashes([late, late, late], tmp_path / "out.mp4")
+
+
+def test_sound_starting_before_zero_keeps_the_beep_on_the_flash(tmp_path):
+    """A sound starting slightly before 0 (AAC priming kept by Matroska),
+    joined with late-picture clips: the beeps still land on the flashes.
+    Some FFmpeg builds write no priming (audio starts at exactly 0); the
+    case this tests doesn't arise there, so it is skipped."""
+    late = _flash_clip(tmp_path / "late.mp4", tmp_path, video_offset=0.2)
+    primed = _flash_clip(tmp_path / "primed.mkv", tmp_path)
+    start = _start_times(primed)["audio"]
+    if start == 0:
+        pytest.skip("this FFmpeg build writes no AAC priming (audio starts at 0)")
+    assert -0.05 < start < 0
+    _assert_beeps_on_flashes([primed, late, primed], tmp_path / "out.mp4")
 
 
 def test_sound_ending_before_the_picture_starts_gives_silence_not_an_error(tmp_path):

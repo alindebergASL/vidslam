@@ -254,3 +254,14 @@ def test_bt709_primaries_without_matrix_tag_are_not_read_as_bt601(tmp_path):
     dst = tmp_path / "out.mp4"
     r._normalize_clip(src, dst, 320, 180)
     assert _off(_rgb_as_709(dst), RGB) <= 3
+
+
+def test_hdr_is_tone_mapped_after_scaling_to_the_output(tmp_path, monkeypatch):
+    """Tone-mapping runs at the output size (it was ~3x slower at a 1080p
+    source); SDR sources still convert on their own pixels first."""
+    monkeypatch.setattr(r, "probe_colour", lambda p, timeout=None: ("bt2020nc", "tv", "arib-std-b67", "bt2020"))
+    vf = r._with_colour("scale=320:180,setsar=1", tmp_path / "x.mp4")
+    assert vf.startswith("scale=320:180,setsar=1,") and "tonemap=" in vf
+    monkeypatch.setattr(r, "probe_colour", lambda p, timeout=None: ("", "", "", ""))
+    vf = r._with_colour("scale=320:180,setsar=1", tmp_path / "x.mp4")
+    assert vf.startswith("crop=") and vf.endswith("scale=320:180,setsar=1")

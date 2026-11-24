@@ -79,7 +79,7 @@ def test_a_slight_jump_blends_at_least_one_and_a_half_seconds(auth_client, monke
     monkeypatch.setattr(loop_health, "current_entry", lambda p, s: entry if s is not None else None)
     t = _treatment(sid)
     assert t == {"blend_seconds": 1.5, "verdict": "slight_jump", "ratio": 4.0, "basis": "measured",
-                 "covers": True}
+                 "covers": True, "clip": 0}
     monkeypatch.undo()
     _patch(auth_client, sid, crossfade_seconds=2.5)
     monkeypatch.setattr(loop_health, "current_entry", lambda p, s: entry if s is not None else None)
@@ -230,11 +230,15 @@ def test_a_variation_with_no_reading_is_left_to_the_worker_which_stops_on_a_jump
     out = auth_client.get(f"/api/ambient/{sid}").json()
     assert out["status"] == "failed"
     assert out["latest_render"]["status"] == "failed"
-    assert out["latest_render"]["error"] == ambient.SEAM_STOP_MESSAGE
+    # Names the clip that jumped: the loop clip measured seamless.
+    err = out["latest_render"]["error"]
+    assert err != ambient.SEAM_STOP_MESSAGE and "clip 2 (a variation) jumps at the join" in err
+    assert "the loop clip" not in err
     r = auth_client.post(f"/api/ambient/{sid}/render")
     assert r.status_code == 409, r.text
     detail = r.json()["detail"]
     assert detail["code"] == "seam_jump"
+    assert detail["clip"] == 1 and detail["message"].startswith("Clip 2 (a variation) jumps at the join")
     out = auth_client.get(f"/api/ambient/{sid}").json()
     # The jump comes round once per seamless unit of the blend in use.
     assert detail["repeat_every_seconds"] == out["plan"]["unit_seconds"]
@@ -939,6 +943,9 @@ def test_a_loop_that_snaps_to_its_last_frame_asks_before_rendering(auth_client):
     r = auth_client.post(f"/api/ambient/{sid}/render")
     assert r.status_code == 409, r.text
     assert r.json()["detail"]["code"] == "seam_jump"
+    # Its join step ratio is under 1, so the words say how it jumps instead.
+    msg = r.json()["detail"]["message"]
+    assert "jumps to its last frame at the very end" in msg and "normal frame step" not in msg
     assert auth_client.post(f"/api/ambient/{sid}/render?accept_seam=true").status_code == 202
 
 
@@ -985,6 +992,7 @@ def test_a_reading_from_before_the_snap_check_is_measured_again(auth_client):
     _rewrite_reading(sid, shot_id, version=None, seam=old_seam)
     out = auth_client.get(f"/api/ambient/{sid}").json()
     assert out["loop_health"] is None  # not current: read before the snap check
+    assert out["loop_health_outdated"] == [True]  # the page asks to measure again
     r = auth_client.post(f"/api/ambient/{sid}/render")
     assert r.status_code == 409, r.text
     assert r.json()["detail"]["code"] == "seam_jump"
@@ -1028,3 +1036,29 @@ def test_a_variation_that_cannot_be_measured_stops_an_unaccepted_render(auth_cli
     _claim(sid, token)
     jobs.render_ambient_job(sid, claim_token=token)
     assert auth_client.get(f"/api/ambient/{sid}").json()["latest_render"]["status"] == "completed"
+
+
+def test_a_batch_snap_needs_look_says_how_it_jumps(auth_client, monkeypatch):
+    """A snap's join step ratio is under 1: "(0.49x a normal frame step)"
+    read like no jump. The needs_look event says it jumps at the very end."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient, events
+
+    from .test_loop_health import _scroll
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), lambda p: _scroll(p, "if(gte(n,94),0,n)"))
+    assert auth_client.post(f"/api/ambient/{sid}/loop-health").status_code == 200
+    db = SessionLocal()
+    try:
+        p = db.get(models.VideoProject, sid)
+        events.ambient_seam_event(db, p, ambient.seam_treatment(p))
+        db.commit()
+        ev = db.query(models.Event).filter(models.Event.project_id == sid,
+                                           models.Event.status == "needs_look").one()
+        assert "the loop clip jumps to its last frame at the very end" in ev.detail
+        assert "normal frame step" not in ev.detail
+    finally:
+        db.close()

@@ -514,7 +514,10 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
         every = svc._plan_with_seam(svc.plan_loop(cfg), cfg, treatment).unit_seconds
         raise HTTPException(409, {
             "code": "seam_jump",
-            "message": "The loop jumps at the join, and the blend won't hide it.",
+            # Names the clip (a variation can jump while the loop clip is clean).
+            "message": (lambda w: w[:1].upper() + w[1:])(svc.seam_jump_words(treatment))
+            + ", and the blend won't hide it.",
+            "clip": treatment.get("clip") or 0,
             "ratio": treatment["ratio"],
             "blend_seconds": treatment["blend_seconds"],
             "repeat_every_seconds": every,

@@ -1718,6 +1718,8 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         loop_health=loop_health.current(project, shot),
         variant_loop_health=[loop_health.current(project, v)
                              for v in _variant_shots(project)[:variant_count(cfg) - 1]],
+        loop_health_outdated=[loop_health.outdated(project, s)
+                              for s in [shot, *_variant_shots(project)[:variant_count(cfg) - 1]]],
         seam_treatment=treatment,
         music_ready=bool(music and music.exists()),
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
@@ -2476,7 +2478,9 @@ def _seam_reading(project: models.VideoProject) -> Optional[dict]:
     entries = [loop_health.current_entry(project, s) for s in shots]
     if entries[0] is None:
         return None
-    seams = [dict(e.get("seam") or {}) for e in entries if e]
+    # "clip": which one it is (0 the loop clip, 1.. its variations), so the
+    # messages can name the clip that jumped.
+    seams = [dict(e.get("seam") or {}, clip=i) for i, e in enumerate(entries) if e]
     seams = [x for x in seams if x.get("verdict") in _SEAM_RANK]
     if not seams:
         return None
@@ -2498,11 +2502,13 @@ def seam_treatment(project: models.VideoProject) -> dict:
     uses the setting as it is. The page mirrors this (seamBlendFor)."""
     cfg = _config_of(project)
     if cfg.source == "image_drift":
-        return {"blend_seconds": 0.0, "verdict": None, "ratio": None, "basis": "drift", "covers": True}
+        return {"blend_seconds": 0.0, "verdict": None, "ratio": None, "basis": "drift", "covers": True,
+                "clip": None}
     user = max(0.0, float(cfg.crossfade_seconds or 0.0))
     seam = _seam_reading(project)
     if seam is None:
-        return {"blend_seconds": round(user, 2), "verdict": None, "ratio": None, "basis": "plan", "covers": True}
+        return {"blend_seconds": round(user, 2), "verdict": None, "ratio": None, "basis": "plan", "covers": True,
+                "clip": None}
     verdict = seam["verdict"]
     if cfg.seam_mode == "blend":
         blend = user
@@ -2515,7 +2521,34 @@ def seam_treatment(project: models.VideoProject) -> dict:
         blend = max(user, SEAM_VISIBLE_BLEND)
     return {"blend_seconds": round(blend, 2), "verdict": verdict,
             "ratio": round(float(seam.get("ratio") or 0.0), 2), "basis": "measured",
-            "covers": verdict not in ("visible_jump", "snap")}
+            "covers": verdict not in ("visible_jump", "snap"), "clip": int(seam.get("clip") or 0)}
+
+
+def seam_clip_name(treatment: dict) -> str:
+    """The clip a seam reading is about, in words: the loop clip, or a
+    variation by its place in the scene (clip 2, 3, ...)."""
+    clip = int(treatment.get("clip") or 0)
+    return "the loop clip" if clip == 0 else f"clip {clip + 1} (a variation)"
+
+
+def seam_jump_words(treatment: dict) -> str:
+    """'<clip> jumps ...': a snap (the take jumps to its last frame at the
+    very end; its join step ratio is under 1, so the ratio would read as no
+    jump) or a visible jump at the join."""
+    who = seam_clip_name(treatment)
+    if treatment.get("verdict") == "snap":
+        return f"{who} jumps to its last frame at the very end"
+    ratio = treatment.get("ratio")
+    return f"{who} jumps at the join" + (f" ({ratio:g}× a normal frame step)" if ratio else "")
+
+
+def seam_stop_message(treatment: dict) -> str:
+    """The render's stop reason, naming the clip that jumped (a variation
+    can stop a scene whose loop clip measured seamless)."""
+    if int(treatment.get("clip") or 0) == 0 and treatment.get("verdict") != "snap":
+        return SEAM_STOP_MESSAGE
+    return (f"Not rendered: {seam_jump_words(treatment)}, and the blend won't hide it. "
+            "Open the scene to choose a longer blend or render anyway.")
 
 
 def _plan_with_seam(plan: LoopPlanOut, cfg: AmbientConfig, treatment: dict) -> LoopPlanOut:
@@ -2681,7 +2714,7 @@ def render_scene(db: Session, project_id: int, *, accept_seam: bool = False,
             # A reading taken just now (the request's own may have failed,
             # or skipped a variation): don't render an hour of a jumping
             # loop nobody agreed to.
-            raise SeamJumpStop(SEAM_STOP_MESSAGE, treatment)
+            raise SeamJumpStop(seam_stop_message(treatment), treatment)
         if (not accept_seam and cfg.source == "video" and cfg.seam_mode == "auto"
                 and ((batch and treatment["basis"] == "plan") or loop_health.unmeasured(project))):
             # Nobody accepted it and the worker's own reading failed, for the

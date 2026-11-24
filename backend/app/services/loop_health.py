@@ -405,6 +405,17 @@ def current_entry(project: models.VideoProject, shot: Optional[models.VideoShot]
     return entry
 
 
+def outdated(project: models.VideoProject, shot: Optional[models.VideoShot]) -> bool:
+    """The shot's clip has a reading of the clip as it is now, but from an
+    older version of the checks (not shown: the page asks to measure again)."""
+    if shot is None or not shot.clip_path or shot.status != "completed":
+        return False
+    entry = _stored(project).get(str(shot.id))
+    return bool(entry and entry.get("clip_path") == shot.clip_path
+                and entry.get("clip_mtime_ns") == _clip_stamp(shot.clip_path)
+                and entry.get("version") != MEASURE_VERSION)
+
+
 def unmeasured(project: models.VideoProject) -> bool:
     """Whether any clip the scene uses (the loop or a variation) has no
     current reading: never measured, or changed since."""

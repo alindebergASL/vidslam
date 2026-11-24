@@ -985,8 +985,11 @@ export type SeamTreatment = {
 /** POST /render's 409 for a loop that visibly jumps (see SeamTreatment.covers). */
 export type SeamJump = {
   code: "seam_jump";
+  /** Names the clip that jumps (a variation can, while the loop clip is clean) and says how. */
   message: string;
   ratio: number | null;
+  /** Which clip: 0 the loop clip, 1.. its variations. Absent from older servers. */
+  clip?: number;
   blend_seconds: number;
   repeat_every_seconds: number;
 };
@@ -1053,6 +1056,8 @@ export type AmbientScene = {
   loop_health?: LoopHealth | null;
   /** One per variant_shots item, same order. */
   variant_loop_health?: (LoopHealth | null)[];
+  /** Per clip (loop clip first): a reading exists but from older checks, so it isn't shown. */
+  loop_health_outdated?: boolean[];
   /** The blend the render will use at the loop's join, and why. */
   seam_treatment?: SeamTreatment | null;
   music_ready: boolean;

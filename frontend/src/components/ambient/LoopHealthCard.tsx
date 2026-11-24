@@ -134,7 +134,7 @@ export function LoopHealthCard({
           disabled={busy || disabled}
           title={disabled ? "Measure once the loop is ready." : "Measures every variation's clip again. Free."}
         >
-          {busy ? "Measuring…" : health ? "Measure again" : "Measure now"}
+          {busy ? "Measuring…" : health || scene.loop_health_outdated?.[idx] ? "Measure again" : "Measure now"}
           <span className="text-ink-400"> · free</span>
         </button>
       </div>
@@ -197,9 +197,11 @@ export function LoopHealthCard({
         </>
       ) : (
         <div className="text-xs text-ink-400">
-          {clipReady(idx)
-            ? "Not measured yet, or the clip changed since. Measure now to see how it joins."
-            : "This variation has no clip yet."}
+          {!clipReady(idx)
+            ? "This variation has no clip yet."
+            : scene.loop_health_outdated?.[idx]
+              ? "This clip's reading is from an older version of the checks. Measure again to see how it joins."
+              : "Not measured yet, or the clip changed since. Measure now to see how it joins."}
         </div>
       )}
     </div>
