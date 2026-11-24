@@ -725,9 +725,9 @@ function Inner() {
         {seamAsk && seamAsk.code === "seam_jump" && (
           <Dialog title="The loop jumps at the join" onClose={() => setSeamAsk(null)}>
             <p className="text-sm text-ink-200">
-              The loop jumps every {fmtSeconds(seamAsk.repeat_every_seconds)}
-              {seamAsk.ratio ? ` (the join is ${seamAsk.ratio}× a normal frame step)` : ""}: a{" "}
-              {fmtSeconds(seamAsk.blend_seconds)} blend won&apos;t hide it.
+              {seamAsk.message.replace(/, and the blend won't hide it\.$/, "")}, every{" "}
+              {fmtSeconds(seamAsk.repeat_every_seconds)}: a {fmtSeconds(seamAsk.blend_seconds)} blend won&apos;t
+              hide it.
               {longerBlends(seamAsk.blend_seconds).length > 0
                 ? " A longer blend turns the jump into a slow dissolve."
                 : " That is already the longest blend."}{" "}

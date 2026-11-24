@@ -269,7 +269,16 @@ def colour_chain(space: str, rng: str, transfer: str = "", primaries: str = "") 
 
 
 def _with_colour(vf: str, src: Path) -> str:
-    return f"{colour_chain(*probe_colour(src))},{vf}"
+    """`vf` with the source's conversion to BT.709. HDR and BT.2020 sources
+    are converted after `vf` (its scale): zimg's tone-mapping and gamut
+    conversion run on float RGB, about 3x slower at a 1080p source than at
+    a 720p output, and 4K phone HDR worse still. Others convert first, on
+    the source's own pixels."""
+    space, rng, transfer, primaries = probe_colour(src)
+    chain = colour_chain(space, rng, transfer, primaries)
+    if transfer in HDR_TRANSFERS or primaries == "bt2020" or space in ("bt2020nc", "bt2020c"):
+        return f"{vf},{chain}"
+    return f"{chain},{vf}"
 
 
 def _normalize_clip(src: Path, dst: Path, width: int, height: int,
@@ -1711,13 +1720,16 @@ def compose_ambient(inputs: AmbientRenderInputs) -> AmbientRenderOutputs:
 
 def extract_frame(src: Path, dst: Path, *, last: bool) -> Path:
     """Write the first or last decoded frame of `src` as a PNG. The last frame
-    is what the next chained segment starts from."""
+    is what the next chained segment starts from: the last video frame by its
+    own timestamp (extract_frame_at), never a seek back from the container's
+    length, which counts a sound track that outlasts the picture (Wan's AAC
+    runs 31-80 ms past its video, even with generate_audio off). A leftover
+    `dst` (an earlier chain's frame) is never mistaken for this one."""
     if last:
-        dur = _probe_duration(src)
-        cmd = ["ffmpeg", "-y", "-ss", f"{max(0.0, dur - 0.08):.3f}", "-i", str(src),
-               "-frames:v", "1", "-update", "1", str(dst)]
-    else:
-        cmd = ["ffmpeg", "-y", "-i", str(src), "-frames:v", "1", "-update", "1", str(dst)]
+        extract_frame_at(src, dst, math.inf)
+        return dst
+    dst.unlink(missing_ok=True)
+    cmd = ["ffmpeg", "-y", "-i", str(src), "-frames:v", "1", "-update", "1", str(dst)]
     rc, log = _run(cmd)
     if rc != 0 or not dst.exists():
         raise RuntimeError(f"ffmpeg frame extract failed: {log[-1500:]}")
@@ -1809,7 +1821,9 @@ def join_segments(
     if len(segments) == 1:
         _encode_normalized(segments[0], dst, width=width, height=height, slow_factor=1.0)
         return dst, _probe_duration(dst)
-    lengths = [_probe_duration(p) for p in segments]
+    # The picture's own length: a sound track past it (Wan's) would push the
+    # trims past the last frame and cut the dissolve short.
+    lengths = [_probe_clip(p)[0] or _probe_duration(p) for p in segments]
     cf = max(0.0, min(crossfade, min(lengths) / 3.0))
     graph = join_graph(lengths, crossfade=cf, width=width, height=height,
                        sizes=[_probe_size(p) for p in segments],

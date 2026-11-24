@@ -108,5 +108,5 @@ def test_rgb_video_source_codes_known_colour_as_bt709(tmp_path, codec, pix, ext,
     elif path == "ambient":
         r._encode_normalized(src, dst, width=320, height=180, slow_factor=1.0)
     else:
-        assert previews._make(src, dst) == dst
+        assert previews._make(src, dst)[0] == dst  # (path, ffmpeg rc) since #62
     _assert_709(dst, (128, 60, 64, 60))

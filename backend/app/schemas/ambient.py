@@ -404,6 +404,9 @@ class AmbientOut(BaseModel):
     # the clip changed since); one entry per variant_shots item, same order.
     loop_health: Optional[LoopHealthOut] = None
     variant_loop_health: list[Optional[LoopHealthOut]] = Field(default_factory=list)
+    # Per clip (the loop clip first): a reading of the clip as it is now exists
+    # but from an older version of the checks, so it isn't shown; measure again.
+    loop_health_outdated: list[bool] = Field(default_factory=list)
     # The blend the render will use at the loop's join, and why.
     seam_treatment: Optional[SeamTreatmentOut] = None
     # True once a music bed exists on disk (generated or uploaded).
