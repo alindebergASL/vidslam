@@ -70,7 +70,8 @@ def test_a_repeating_clip_loops_on_a_whole_number_of_periods(tmp_path):
     assert r["out"] <= 27.0  # never into the mismatched end
     assert r["ratio"] < lh.SEAM_SEAMLESS_RATIO and r["verdict"] == "seamless" and r["found"] is True
     assert r["raw_ratio"] > lh.SEAM_SLIGHT_RATIO
-    assert r["ghost_ok"] is True and r["ghost_dip"] <= lp.GHOST_DIP_MAX
+    assert r["mismatch_ok"] is True and r["mismatch"] is not None and r["mismatch"] <= lp.MISMATCH_MAX
+    assert r["snap"] is False and r["usable_end"] is None
     assert r["crossfade"] in (0.5, 1.5)  # seamless, +1 s when the join is calm
     assert r["crossfade"] <= 2 * min(r["in"], 30.0 - r["out"]) + 1e-6
 
@@ -90,30 +91,99 @@ def test_the_crossfade_rule():
     assert lp.crossfade_for(5.9, True) == 3.0 and lp.crossfade_for(6.1, False) is None
 
 
-def test_a_half_and_half_mix_of_two_different_pictures_reads_as_a_ghost():
-    from PIL import Image, ImageDraw
+def two_pictures(path: Path, seconds: float = 12.0) -> Path:
+    """Stripes for the first half, the same stripes shifted half a period
+    for the second: a dissolve from one half into the other overlays two
+    different pictures (a ghost)."""
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"nullsrc=s=320x180:r=24:d={seconds},"
+                    f"geq=lum='128+90*sin(2*PI*(X/16+if(gte(T,{seconds / 2}),0.5,0)))':cb=128:cr=128",
+                    *ENC, str(path)], check=True)
+    return path
 
+
+def test_the_blend_mismatch_reads_two_different_pictures_as_a_ghost(tmp_path):
+    """The dissolve's two sources, frame by frame (the host's reading: clean
+    loop blends 20-27, ghost ones 34-50 at 320 px grey): the same picture
+    reads ~0, stripes in each other's gaps read far above MISMATCH_MAX."""
     from app.services import loop_point as lp
 
-    def bars(offset: int) -> Image.Image:
-        im = Image.new("RGB", (160, 90), (40, 40, 40))
-        d = ImageDraw.Draw(im)
-        for x in range(offset, 160, 16):
-            d.rectangle([x, 0, x + 7, 89], fill=(220, 220, 220))
-        return im
+    clip = two_pictures(tmp_path / "two.mp4")
+    size = (320, 180)
+    same = lp.blend_mismatch(clip, 24, 96, 6, 24.0, size)  # 1 s and 4 s: both in the first half
+    ghost = lp.blend_mismatch(clip, 24, 240, 6, 24.0, size)  # 1 s against 10 s: the shifted half
+    assert same is not None and same < 5
+    assert ghost is not None and ghost > lp.MISMATCH_MAX
 
-    assert lp.ghost_dip(bars(0), bars(0)) < 0.02
-    assert lp.ghost_dip(bars(0), bars(8)) > lp.GHOST_DIP_MAX  # stripes in each other's gaps
+
+def test_a_pair_whose_dissolve_mixes_two_pictures_is_not_used(tmp_path, monkeypatch):
+    """A candidate whose dissolve would overlay two different pictures is
+    rejected (found False, mismatch_ok False), whatever its join ratio."""
+    from app.services import loop_point as lp
+
+    clip = repeating(tmp_path / "rep.mp4")
+    monkeypatch.setattr(lp, "blend_mismatch", lambda *a, **k: 45.0)
+    r = lp.find_loop_point(clip)
+    assert r["mismatch"] == 45.0 and r["mismatch_ok"] is False and r["found"] is False
+
+
+def snapping(path: Path, *, seconds: float = 12.0, period: float = 4.0, rate: int = 24) -> Path:
+    """A full-frame texture swaying once every `period` seconds whose last
+    two frames jump to where frame 0 shows it (a take that snaps to its
+    last-frame target): the whole clip's join lands, its tail jumps."""
+    from .test_loop_health import TEXTURE
+
+    n = int(seconds * rate)
+    t = f"if(gte(n,{n - 2}),0,t)"  # inside the quoted crop option: commas need no escape
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", TEXTURE.format(d=seconds),
+                    "-vf", f"crop=320:180:x='160+120*sin(2*PI*{t}/{period}+0.9)':y=0",
+                    "-t", str(seconds), *ENC, "-r", str(rate), str(path)], check=True)
+    return path
+
+
+def test_a_snapping_take_loops_clear_of_its_snapping_tail(tmp_path):
+    """On a take that snaps, the search never ends the loop in, or blends
+    over, the last SNAP_BACK + 1 frames."""
+    from app.services import loop_health as lh
+    from app.services import loop_point as lp
+
+    clip = snapping(tmp_path / "snap.mp4")
+    assert lh.measure(clip)["seam"]["verdict"] == "snap"  # control: the whole clip snaps
+    r = lp.find_loop_point(clip, snap=True)
+    n = 12 * 24
+    assert r["snap"] is True and r["usable_end"] == pytest.approx((n - lh.SNAP_BACK - 1) / 24, abs=1e-3)
+    assert r["found"] is True, r
+    assert r["out"] + r["crossfade"] / 2 <= r["usable_end"] + 1e-6
+    # The render's cut respects it too: the unit and its dissolve end before the tail.
+    from app.services.renderer import loop_frames
+
+    frames = loop_frames(12.0, r["in"], r["out"], r["crossfade"], fps=24, usable_end=r["usable_end"])
+    assert frames is not None
+    _a, b, h = frames
+    assert b + h <= n - lh.SNAP_BACK - 1
+
+
+def test_loop_frames_keeps_the_dissolve_out_of_a_snapping_tail():
+    from app.services.renderer import loop_frames
+
+    # A 10 s clip at 24 fps, stretch 2-9.9 s with a 2 s dissolve: the
+    # dissolve's far side would reach frame 262; a usable end at 9.8 s
+    # (frame 235) leaves room for a quarter-second half at most.
+    a, b, h = loop_frames(10.0, 2.0, 9.6, 2.0, fps=24)
+    assert b + h > 235
+    a, b, h = loop_frames(10.0, 2.0, 9.6, 2.0, fps=24, usable_end=9.8)
+    assert b + h <= 235
 
 
 def test_ratios_do_not_depend_on_the_frame_rate(tmp_path):
     from app.services import loop_health as lh
     from app.services import loop_point as lp
 
-    r25 = lh.measure(stripes(tmp_path / "s25.mp4", 25))["seam"]
-    r50 = lh.measure(stripes(tmp_path / "s50.mp4", 50))["seam"]
-    assert r25["typical"] > lh.TYPICAL_FLOOR  # the steps, not the floor, set the ratio
-    assert r50["ratio"] == pytest.approx(r25["ratio"], rel=0.15), (r25, r50)
+    # The finder's ratios are scaled to REFERENCE_FPS (loop_health's seam
+    # verdict isn't: its thresholds were calibrated on takes as measured).
+    stripes(tmp_path / "s25.mp4", 25)
+    stripes(tmp_path / "s50.mp4", 50)
+    assert lh.REFERENCE_FPS == 24.0
     f25 = lp.find_loop_point(tmp_path / "s25.mp4")
     f50 = lp.find_loop_point(tmp_path / "s50.mp4")
     assert f50["raw_ratio"] == pytest.approx(f25["raw_ratio"], rel=0.15), (f25, f50)
@@ -280,13 +350,13 @@ def test_a_new_loop_that_jumps_gets_a_loop_point_by_itself(auth_client, monkeypa
 
     rep = repeating(tmp_path / "rep.mp4")
     real_measure = loop_health.measure
-    monkeypatch.setattr(loop_health, "measure", lambda clip, still=False: real_measure(rep, still=still))
+    monkeypatch.setattr(loop_health, "measure", lambda clip, still=False, **kw: real_measure(rep, still=still, **kw))
     seen = []
     real_find = loop_point.find_loop_point
 
-    def spy(clip, min_loop=None):
+    def spy(clip, min_loop=None, *, snap=False):
         seen.append(clip)
-        return real_find(rep, min_loop)
+        return real_find(rep, min_loop, snap=snap)
 
     monkeypatch.setattr(loop_point, "find_loop_point", spy)
     scene = _scene(auth_client)
@@ -353,3 +423,30 @@ def test_a_running_search_turns_away_a_second_one(auth_client):
     r = auth_client.post(f"/api/ambient/{sid}/find-loop-point")
     assert r.status_code == 409 and "Already" in r.json()["detail"]
     assert auth_client.get(f"/api/ambient/{sid}").json()["status"] == out["status"]
+
+
+def test_a_new_loop_that_snaps_is_searched_clear_of_its_tail(auth_client, monkeypatch, tmp_path):
+    """The host's 11-16 correction: a snap take (its join alone reads
+    seamless) also starts a search, told to keep clear of the snapping
+    tail; the stretch found is kept even when its own join ratio is no
+    better than the whole clip's, and the render's treatment then comes
+    from it (so the render doesn't ask)."""
+    from app.services import loop_health, loop_point
+
+    snap = snapping(tmp_path / "snap.mp4")
+    real_measure = loop_health.measure
+    monkeypatch.setattr(loop_health, "measure", lambda clip, still=False, **kw: real_measure(snap, still=still, **kw))
+    calls = []
+    real_find = loop_point.find_loop_point
+
+    def spy(clip, min_loop=None, *, snap=False):
+        calls.append(snap)
+        return real_find(tmp_path / "snap.mp4", min_loop, snap=snap)
+
+    monkeypatch.setattr(loop_point, "find_loop_point", spy)
+    scene = _scene(auth_client)
+    assert calls == [True]
+    lp = scene["loop_point"]
+    assert lp is not None and lp["snap"] is True, scene
+    st = scene["seam_treatment"]
+    assert st["loop_point"] is True and st["verdict"] != "snap"
