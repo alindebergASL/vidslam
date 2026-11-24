@@ -476,3 +476,38 @@ def test_the_blend_stays_within_the_width_the_ghost_check_looked_at(auth_client,
     finally:
         db.close()
     assert t["loop_point"] is True and t["blend_seconds"] == expected
+
+
+def test_a_usable_pair_beats_a_calm_one_past_the_crossfade_rule():
+    """Calm 6.1 x 0.85 < 5.5, but 6.1 is past the rule (nothing found): the
+    usable 5.5 pair must be picked."""
+    from app.services import loop_point as lp
+
+    calm_past = {"ratio": 6.1, "calm": True, "mismatch_ok": True}
+    usable = {"ratio": 5.5, "calm": False, "mismatch_ok": True}
+    assert lp.crossfade_for(6.1, True) is None and lp.crossfade_for(5.5, False) is not None
+    assert min([calm_past, usable], key=lp._rank) is usable
+
+
+def test_a_seamless_loop_point_keeps_a_zero_blend(auth_client, monkeypatch):
+    """crossfade_seconds 0 means no blend: a seamless found stretch doesn't
+    switch a dissolve on by itself (as for the whole clip)."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    from .test_ambient import SHORT
+
+    sid = auth_client.post("/api/ambient", json={"config": {**SHORT, "crossfade_seconds": 0.0},
+                                                 "generate": False}).json()["id"]
+    lp = {"in": 2.0, "out": 9.0, "ratio": 1.0, "crossfade": 0.5, "checked_blend": 0.5,
+          "mismatch": 12.0, "mismatch_ok": True}
+    monkeypatch.setattr(ambient, "active_loop_point", lambda p: lp)
+    monkeypatch.setattr(ambient, "_loop_room", lambda lp, cfg: 10.0)
+    monkeypatch.setattr(ambient, "_loop_seconds", lambda lp, cfg: 7.0)
+    db = SessionLocal()
+    try:
+        t = ambient.seam_treatment(db.get(models.VideoProject, sid))
+    finally:
+        db.close()
+    assert t["verdict"] == "seamless" and t["blend_seconds"] == 0.0

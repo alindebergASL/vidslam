@@ -2752,7 +2752,9 @@ def seam_treatment(project: models.VideoProject) -> dict:
         if cfg.seam_mode == "blend":
             blend = user
         elif verdict == "seamless":
-            blend = found_cf
+            # As for the whole clip: a shorter setting (0 = no blend) is the
+            # person's explicit choice and wins.
+            blend = min(user, found_cf)
         else:
             blend = max(user, found_cf)
         if cfg.seam_mode != "blend":

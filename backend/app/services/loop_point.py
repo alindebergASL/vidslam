@@ -145,6 +145,14 @@ def _pick(pairs: list[tuple[float, int, int]], *, apart: int) -> list[tuple[floa
     return chosen
 
 
+def _rank(r: dict) -> tuple:
+    """Usable pairs first (no ghost, within the crossfade rule), then the
+    calm preference: a calm pair just past the rule mustn't beat a usable one
+    and leave the search with nothing found."""
+    usable = r["mismatch_ok"] and crossfade_for(r["ratio"], r["calm"]) is not None
+    return (not usable, not r["mismatch_ok"], r["ratio"] * (CALM_PREFERENCE if r["calm"] else 1.0))
+
+
 def find_loop_point(clip: Path, min_loop: Optional[float] = None, *, snap: bool = False) -> dict:
     """The best loop stretch of `clip`: {in, out, ratio, raw_ratio,
     crossfade, calm, mismatch, mismatch_ok, verdict, found, snap,
@@ -257,10 +265,7 @@ def find_loop_point(clip: Path, min_loop: Optional[float] = None, *, snap: bool 
         r["mismatch"] = blend_mismatch(clip, r["a"], r["b"], r["half"], fps, msize)
         r["mismatch_ok"] = r["mismatch"] is None or r["mismatch"] <= MISMATCH_MAX
 
-    def rank(r: dict) -> tuple:
-        return (not r["mismatch_ok"], r["ratio"] * (CALM_PREFERENCE if r["calm"] else 1.0))
-
-    pick = min(refined, key=rank)
+    pick = min(refined, key=_rank)
     t_in, t_out = pick["a"] / fps, pick["b"] / fps
     ratio = pick["ratio"]
     cf = crossfade_for(ratio, pick["calm"])
