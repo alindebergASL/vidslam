@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timedelta
@@ -227,6 +228,8 @@ def complete(db: Session, job_id: int, *, cost: Optional[float] = None,
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"vjob_{job.id}.mp4"
         path.write_bytes(data)
+        if (job.context_json or {}).get("audio") is False:
+            _strip_unasked_audio(path, job)
     except Exception as e:  # noqa: BLE001
         # The provider finished (and billed) the clip; only our download
         # failed. Record the spend before failing, or the ledger and the
@@ -251,6 +254,46 @@ def complete(db: Session, job_id: int, *, cost: Optional[float] = None,
     except Exception:  # noqa: BLE001
         log.exception("video job %s: completion handler failed", job_id)
     return "completed"
+
+
+def _strip_unasked_audio(path: Path, job: models.VideoJob) -> None:
+    """Remux a clip asked for without sound to its picture only (a stream
+    copy: fast, lossless), when the model sent a sound track anyway.
+    OpenRouter's Wan 3.0 ignores generate_audio false; its track runs past
+    the picture (20-80 ms), which pushed the container's length past the last
+    frame. The file keeps its path; on any trouble the original is kept."""
+    import json
+    import subprocess
+
+    def streams(p: Path) -> dict[str, float]:
+        out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,duration",
+                              "-of", "json", str(p)], capture_output=True, text=True, timeout=60)
+        found: dict[str, float] = {}
+        for st in json.loads(out.stdout or "{}").get("streams", []):
+            kind = st.get("codec_type")
+            if kind in ("video", "audio") and kind not in found:
+                try:
+                    found[kind] = float(st.get("duration") or 0.0)
+                except (TypeError, ValueError):
+                    found[kind] = 0.0
+        return found
+
+    try:
+        before = streams(path)
+        if "audio" not in before or "video" not in before:
+            return
+        tmp = path.with_name(f"{path.stem}.picture.mp4")
+        rc = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(path), "-map", "0:v:0", "-c", "copy",
+                             "-an", str(tmp)], capture_output=True, timeout=300).returncode
+        if rc != 0 or "audio" in streams(tmp):
+            tmp.unlink(missing_ok=True)
+            log.warning("video job %s: couldn't strip the unasked-for sound; kept as downloaded", job.id)
+            return
+        os.replace(tmp, path)
+        log.info("video job %s (%s): stripped a sound track the request didn't ask for (%+d ms past the picture)",
+                 job.id, job.model or job.provider, round((before["audio"] - before["video"]) * 1000))
+    except Exception:  # noqa: BLE001 — the clip as downloaded is still usable
+        log.warning("video job %s: couldn't check the clip's sound; kept as downloaded", job.id, exc_info=True)
 
 
 def fail(db: Session, job_id: int, error: str) -> str:
