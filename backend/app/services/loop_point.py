@@ -253,7 +253,8 @@ def find_loop_point(clip: Path, min_loop: Optional[float] = None, *, snap: bool 
         r["calm"] = (energy(t_in) + energy(t_out)) / 2.0 < CALM_SHARE * coarse_typical
         cf = crossfade_for(r["ratio"], r["calm"]) or NOMINAL_DISSOLVE
         half = min(int(round(cf * fps / 2.0)), r["a"], total_frames - guard - r["b"], (r["b"] - r["a"]) // 4)
-        r["mismatch"] = blend_mismatch(clip, r["a"], r["b"], max(1, half), fps, msize)
+        r["half"] = max(1, half)
+        r["mismatch"] = blend_mismatch(clip, r["a"], r["b"], r["half"], fps, msize)
         r["mismatch_ok"] = r["mismatch"] is None or r["mismatch"] <= MISMATCH_MAX
 
     def rank(r: dict) -> tuple:
@@ -274,6 +275,9 @@ def find_loop_point(clip: Path, min_loop: Optional[float] = None, *, snap: bool 
         "ratio": round(ratio, 2), "raw_ratio": round(raw_ratio, 2) if math.isfinite(raw_ratio) else None,
         "crossfade": round(cf_used, 3), "calm": bool(pick["calm"]),
         "mismatch": pick["mismatch"], "mismatch_ok": bool(pick["mismatch_ok"]),
+        # The dissolve width the mismatch check looked at: a wider blend would
+        # mix frames it never compared (seam_treatment keeps within it).
+        "checked_blend": round(2 * pick["half"] / fps, 3),
         "verdict": verdict_for(ratio), "found": bool(found),
         "snap": bool(snap), "usable_end": round(usable_end, 3) if snap else None,
         "clip_seconds": round(duration, 3), "fps": round(fps, 3),

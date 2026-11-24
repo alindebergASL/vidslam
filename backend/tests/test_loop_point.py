@@ -450,3 +450,29 @@ def test_a_new_loop_that_snaps_is_searched_clear_of_its_tail(auth_client, monkey
     assert lp is not None and lp["snap"] is True, scene
     st = scene["seam_treatment"]
     assert st["loop_point"] is True and st["verdict"] != "snap"
+
+
+@pytest.mark.parametrize("mode, expected", [("auto", 1.0), ("blend", 2.0)])
+def test_the_blend_stays_within_the_width_the_ghost_check_looked_at(auth_client, monkeypatch, mode, expected):
+    """A stretch checked for ghosting over a 1 s dissolve isn't rendered with
+    the scene's 2 s default: the outer second mixes frames the check never
+    compared. A blend the person chose (seam_mode "blend") is theirs."""
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    from .test_ambient import SHORT
+
+    sid = auth_client.post("/api/ambient", json={"config": {**SHORT, "crossfade_seconds": 2.0, "seam_mode": mode},
+                                                 "generate": False}).json()["id"]
+    lp = {"in": 2.0, "out": 9.0, "ratio": 3.0, "crossfade": 1.0, "checked_blend": 1.0,
+          "mismatch": 22.0, "mismatch_ok": True}
+    monkeypatch.setattr(ambient, "active_loop_point", lambda p: lp)
+    monkeypatch.setattr(ambient, "_loop_room", lambda lp, cfg: 10.0)
+    monkeypatch.setattr(ambient, "_loop_seconds", lambda lp, cfg: 7.0)
+    db = SessionLocal()
+    try:
+        t = ambient.seam_treatment(db.get(models.VideoProject, sid))
+    finally:
+        db.close()
+    assert t["loop_point"] is True and t["blend_seconds"] == expected

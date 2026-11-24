@@ -2755,6 +2755,12 @@ def seam_treatment(project: models.VideoProject) -> dict:
             blend = found_cf
         else:
             blend = max(user, found_cf)
+        if cfg.seam_mode != "blend":
+            # Within the dissolve the mismatch (ghost) check looked at: a wider
+            # one mixes frames it never compared. A blend the person chose
+            # (seam_mode "blend") is theirs. Stretches found before the check
+            # recorded its width keep their own crossfade.
+            blend = min(blend, float(lp.get("checked_blend") or found_cf or blend))
         blend = min(blend, _loop_room(lp, cfg))
         return {"blend_seconds": round(blend, 2), "verdict": verdict, "ratio": round(ratio, 2),
                 "basis": "measured", "loop_point": True, "clip": 0,
