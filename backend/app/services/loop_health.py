@@ -631,7 +631,7 @@ def _playable(path: Path) -> bool:
 
 
 def _preview_graph(clip: Path, duration: float, loop: Optional[tuple[float, float]],
-                   blend: float) -> tuple[str, float, str]:
+                   blend: float, usable_end: Optional[float] = None) -> tuple[str, float, str]:
     """(filter_complex, join time, cache key) for the seam preview: the raw
     join (the end, then the start), or with `loop` / `blend` the join as the
     render makes it: the loop unit's end, then its start."""
@@ -643,7 +643,7 @@ def _preview_graph(clip: Path, duration: float, loop: Optional[tuple[float, floa
 
     fps = _probe_fps(clip) or 30.0
     if loop is not None:
-        frames = loop_frames(duration, loop[0], loop[1], blend, fps=fps)
+        frames = loop_frames(duration, loop[0], loop[1], blend, fps=fps, usable_end=usable_end)
         if frames is None:
             raise RuntimeError("the loop point is outside the clip")
         a, b, h = frames
@@ -666,7 +666,7 @@ def _preview_graph(clip: Path, duration: float, loop: Optional[tuple[float, floa
 
 
 def seam_preview(clip: Path, *, loop: Optional[tuple[float, float]] = None,
-                 blend: float = 0.0) -> tuple[Path, float]:
+                 blend: float = 0.0, usable_end: Optional[float] = None) -> tuple[Path, float]:
     """A short MP4: the last few seconds of the loop, then its first few,
     so the join plays in the middle. Made once per version of the clip and
     kept next to it; returns (path, join time in seconds). Overlapping
@@ -675,14 +675,19 @@ def seam_preview(clip: Path, *, loop: Optional[tuple[float, float]] = None,
 
     `loop` (clip seconds in, out) and `blend` (seconds of dissolve): play
     the join as the render makes it (the found loop stretch, dissolved);
-    without them, the raw clip's own join."""
+    without them, the raw clip's own join. `usable_end` (clip seconds):
+    a snapping tail the render leaves out, so the preview does too.
+
+    The length is the picture's (a sound track past it, as Wan's, would
+    count frames that don't exist)."""
     stamp = clip.stat().st_mtime_ns
+    from .loop_point import picture_seconds
     from .renderer import _probe_duration
 
-    duration = _probe_duration(clip)
+    duration = picture_seconds(clip) or _probe_duration(clip)
     if duration <= 0:
         raise RuntimeError("could not read the clip")
-    graph, tail, key = _preview_graph(clip, duration, loop, blend)
+    graph, tail, key = _preview_graph(clip, duration, loop, blend, usable_end)
     prefix = f"seam_{clip.stem}_"
     dst = clip.with_name(f"{prefix}{stamp}{key}.mp4")
     if _playable(dst):

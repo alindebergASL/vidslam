@@ -511,3 +511,197 @@ def test_a_seamless_loop_point_keeps_a_zero_blend(auth_client, monkeypatch):
     finally:
         db.close()
     assert t["verdict"] == "seamless" and t["blend_seconds"] == 0.0
+
+
+# ---------- host review of #64: picture length, fail-closed check, guards, the queue ----------
+
+
+def with_sound_past(clip: Path, extra: float = 0.08) -> Path:
+    """`clip` with an AAC track `extra` seconds longer than the picture (as
+    Wan's downloads: 69-80 ms), so the container outlasts the video."""
+    out = clip.with_name(clip.stem + "_aac.mp4")
+    seconds = float(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                                    "stream=duration", "-of", "csv=p=0", str(clip)],
+                                   capture_output=True, text=True, check=True).stdout.strip())
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(clip), "-f", "lavfi", "-i",
+                    f"sine=frequency=220:duration={seconds + extra}", "-map", "0:v", "-map", "1:a",
+                    "-c:v", "copy", "-c:a", "aac", str(out)], check=True)
+    return out
+
+
+def test_frames_are_counted_from_the_picture_not_the_container(tmp_path):
+    """A sound track past the picture made the container longer: the finder
+    counted frames that don't exist, so the snap guard was off by those
+    frames (and a mismatch read past the end got nothing, which passed)."""
+    from app.services import loop_health as lh
+    from app.services import loop_point as lp
+    from app.services.renderer import _probe_duration
+
+    clip = with_sound_past(snapping(tmp_path / "snap.mp4"))
+    assert _probe_duration(clip) > 12.05  # the container counts the sound
+    assert lp.picture_seconds(clip) == pytest.approx(12.0, abs=1e-3)
+    r = lp.find_loop_point(clip, snap=True)
+    n = 12 * 24  # the picture's frames
+    assert r["clip_seconds"] == pytest.approx(12.0, abs=1e-3)
+    assert r["usable_end"] == pytest.approx((n - lh.SNAP_BACK - 1) / 24, abs=1e-3)
+
+
+def test_a_mismatch_that_cannot_be_read_fails_closed(tmp_path, monkeypatch):
+    """Frames the check can't read (past the picture's end) no longer count
+    as a pass: the stretch isn't used."""
+    from app.services import loop_point as lp
+
+    clip = with_sound_past(repeating(tmp_path / "rep.mp4"))
+    # Past the last picture frame the check reads nothing, not a stale frame.
+    assert lp.blend_mismatch(clip, 24, 30 * 24 + 2, 6, 24.0, (320, 180)) is None
+    monkeypatch.setattr(lp, "blend_mismatch", lambda *a, **k: None)
+    r = lp.find_loop_point(clip)
+    assert r["mismatch"] is None and r["mismatch_ok"] is False and r["found"] is False
+
+
+def test_the_seam_preview_cuts_like_the_render(tmp_path, monkeypatch):
+    """The preview of a found stretch counts the picture's frames and leaves
+    a snapping tail out, as the render does."""
+    from app.services import loop_health as lh
+    from app.services import renderer
+
+    clip = with_sound_past(repeating(tmp_path / "rep.mp4"))
+    seen = []
+    real = renderer.loop_frames
+
+    def spy(length, a, b, cf, **kw):
+        seen.append((length, kw.get("usable_end")))
+        return real(length, a, b, cf, **kw)
+
+    monkeypatch.setattr(renderer, "loop_frames", spy)
+    path, join_at = lh.seam_preview(clip, loop=(2.0, 22.0), blend=1.0, usable_end=29.5)
+    assert path.exists() and join_at > 0
+    assert seen and seen[0][0] == pytest.approx(30.0, abs=1e-3) and seen[0][1] == 29.5
+
+
+def test_the_frames_read_in_one_pass_are_the_frames_a_seek_reads(tmp_path):
+    """One decode pass (select by frame number) instead of a keyframe seek
+    per sample: the same pixels, frame for frame."""
+    from app.services import loop_health as lh
+    from app.services import loop_point as lp
+
+    clip = tmp_path / "gop.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=4",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-g", "48", str(clip)], check=True)
+    size = (160, 90)
+
+    def seek(i: int):
+        start = max(0.0, (i - 0.5) / 30)
+        return lh._read_frames(["-ss", f"{start:.4f}", "-t", f"{1.5 / 30:.4f}", "-i", str(clip)], "", size)[0]
+
+    idx = [0, 5, 17, 47, 48, 49, 90, 119]
+    got = lp._frames_at(clip, idx, size)
+    assert sorted(got) == idx
+    assert all(got[i].tobytes() == seek(i).tobytes() for i in idx)
+    assert lp._frames_at(clip, [500], size) == {}
+
+
+def test_find_measures_first_so_a_snapping_take_keeps_its_guard(auth_client, monkeypatch):
+    """A Find with no current reading (a new take) measures first, as the
+    render does: a snapping take is searched clear of its tail."""
+    from app.services import loop_point
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), snapping)  # the reading is stale now
+    calls = []
+    real_find = loop_point.find_loop_point
+
+    def spy(clip, min_loop=None, *, snap=False):
+        calls.append(snap)
+        return real_find(clip, min_loop, snap=snap)
+
+    monkeypatch.setattr(loop_point, "find_loop_point", spy)
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    assert calls == [True]
+
+
+def test_find_leaves_a_seamless_clip_whole(auth_client, monkeypatch):
+    """As after generation: a clip whose own join is seamless isn't trimmed
+    by a manual Find (a trim made such joins worse)."""
+    from app.services import loop_point
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    assert auth_client.post(f"/api/ambient/{sid}/loop-health").status_code == 200
+    assert auth_client.get(f"/api/ambient/{sid}").json()["seam_treatment"]["verdict"] == "seamless"
+    calls = []
+    monkeypatch.setattr(loop_point, "find_loop_point", lambda *a, **k: calls.append(1))
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert calls == [] and out["loop_point"] is None
+    st = out["loop_point_state"]
+    assert st["status"] == "done" and st["found"] is False and "joins seamlessly" in st["message"]
+
+
+def _running_state(sid: int, **extra) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    started = datetime.now(timezone.utc) - timedelta(seconds=extra.pop("age", 0))
+    db = SessionLocal()
+    try:
+        p = db.get(models.VideoProject, sid)
+        ambient._set_state(p, ambient._LOOP_POINT_KEY,
+                           {"status": "running", "started_at": started.isoformat(), **extra})
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_a_search_still_queued_is_not_read_as_failed_or_queued_twice(auth_client, monkeypatch):
+    """The queue is asked (as the sweepers do): a search waiting behind a
+    long render past the stale age still reads "running", and a second click
+    doesn't queue a duplicate; one whose entry is gone reads failed at once."""
+    from app.services import ambient
+    from app.workers import queue
+
+    sid = _scene(auth_client)["id"]
+    _running_state(sid, age=ambient.LOOP_POINT_STALE_SECONDS + 60, job_id="rq-search")
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "alive" if qid == "rq-search" else "gone")
+    assert auth_client.get(f"/api/ambient/{sid}").json()["loop_point_state"]["status"] == "running"
+    r = auth_client.post(f"/api/ambient/{sid}/find-loop-point")
+    assert r.status_code == 409 and "Already" in r.json()["detail"]
+
+    _running_state(sid, job_id="rq-dead")  # young, but its worker is gone
+    st = auth_client.get(f"/api/ambient/{sid}").json()["loop_point_state"]
+    assert st["status"] == "failed"
+
+    monkeypatch.setattr(queue, "queue_entry_state", lambda qid: "unknown")  # Redis didn't answer: the age rule
+    _running_state(sid, job_id="rq-x")
+    assert auth_client.get(f"/api/ambient/{sid}").json()["loop_point_state"]["status"] == "running"
+
+
+def test_the_search_keeps_its_queue_id(auth_client):
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    sid = _scene(auth_client)["id"]
+    _running_state(sid)
+    db = SessionLocal()
+    try:
+        p = db.get(models.VideoProject, sid)
+        ambient.note_loop_point_job(db, p, "rq-123")
+        db.refresh(p)
+        assert (p.ambient_config_json or {})[ambient._LOOP_POINT_KEY]["job_id"] == "rq-123"
+    finally:
+        db.close()
+
+
+def test_the_checked_blend_is_kept_with_the_stretch():
+    from app.services import ambient
+
+    class Shot:
+        clip_path = __file__
+
+    entry = ambient._loop_entry({"in": 1.0, "out": 9.0, "checked_blend": 1.0, "crossfade": 1.0}, Shot())
+    assert entry["checked_blend"] == 1.0

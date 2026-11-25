@@ -2534,8 +2534,8 @@ def _loop_room(lp: dict, cfg: AmbientConfig) -> float:
 
 
 def _loop_entry(found: dict, shot: models.VideoShot) -> dict:
-    keep = ("in", "out", "crossfade", "ratio", "raw_ratio", "calm", "mismatch", "mismatch_ok", "verdict",
-            "clip_seconds", "snap", "usable_end")
+    keep = ("in", "out", "crossfade", "ratio", "raw_ratio", "calm", "mismatch", "mismatch_ok", "checked_blend",
+            "verdict", "clip_seconds", "snap", "usable_end")
     return {**{k: found[k] for k in keep if k in found}, "intro": True,
             "clip_path": shot.clip_path, "clip_mtime_ns": loop_health._clip_stamp(shot.clip_path),
             "found_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()}
@@ -2598,8 +2598,21 @@ def loop_point_state(project: models.VideoProject) -> Optional[dict]:
 
 
 def _running(state: Optional[dict]) -> bool:
+    """A search is still on its way: its job is queued or running (asked of
+    the queue, as the sweepers do: a search waiting behind a long render
+    isn't "didn't finish"); without a job id yet, or when Redis doesn't
+    answer, a flag younger than LOOP_POINT_STALE_SECONDS."""
     if not state or state.get("status") != "running":
         return False
+    job_id = str(state.get("job_id") or "")
+    if job_id:
+        from ..workers.queue import queue_entry_state
+
+        entry = queue_entry_state(job_id)
+        if entry == "alive":
+            return True
+        if entry == "gone":
+            return False
     try:
         started = datetime.fromisoformat(str(state.get("started_at")))
     except ValueError:
@@ -2617,6 +2630,17 @@ def claim_loop_point_search(db: Session, project: models.VideoProject) -> bool:
         "status": "running", "started_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat()})
     db.commit()
     return True
+
+
+def note_loop_point_job(db: Session, project: models.VideoProject, job_id: str) -> None:
+    """Keep the queue id of the search just started (see _running). A search
+    that already finished (inline) is left as it is."""
+    db.refresh(project)
+    st = (project.ambient_config_json or {}).get(_LOOP_POINT_KEY) or {}
+    if st.get("status") != "running":
+        return
+    _set_state(project, _LOOP_POINT_KEY, {**st, "job_id": str(job_id)[:80]})
+    db.commit()
 
 
 def _finish_loop_point_search(db: Session, project: models.VideoProject, status: str, *,
@@ -2644,6 +2668,21 @@ def find_better_loop_point(db: Session, project_id: int) -> None:
         shot = _loop_shot(project)
         if shot is None or not shot.clip_path or not Path(shot.clip_path).is_file():
             _finish_loop_point_search(db, project, "failed", message="There's no loop clip to look at.")
+            return
+        if loop_health.current_entry(project, shot) is None:
+            # No current reading (a new take, an old one): measure first, as
+            # the render does, so a snapping take is searched clear of its tail.
+            loop_health.measure_quietly(db, project.id)
+            db.refresh(project)
+            shot = _loop_shot(project)
+            if shot is None or not shot.clip_path or not Path(shot.clip_path).is_file():
+                _finish_loop_point_search(db, project, "failed", message="There's no loop clip to look at.")
+                return
+        if ((loop_health.current_entry(project, shot) or {}).get("seam") or {}).get("verdict") == "seamless":
+            # As after generation: a clip whose own join is seamless loops
+            # whole (a trim made such a join worse).
+            _finish_loop_point_search(db, project, "done", found=False,
+                                      message="No better loop point: the whole clip already joins seamlessly.")
             return
         clip, stamp = shot.clip_path, loop_health._clip_stamp(shot.clip_path)
         found = loop_point.find_loop_point(Path(clip), snap=_snaps(project, shot))

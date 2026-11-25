@@ -616,6 +616,9 @@ def find_loop_point(scene_id: int, db: Session = Depends(get_db)) -> dict:
     except Exception:
         svc.release_loop_point_search(db, project, "Couldn't start the search; try again.")
         raise
+    # While it waits behind other work its queue entry says it's alive (a
+    # second click is turned away, not queued again).
+    svc.note_loop_point_job(db, project, job_id)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
 
 
@@ -648,13 +651,16 @@ def seam_preview(scene_id: int, shot_id: Optional[int] = None, db: Session = Dep
     # dissolved); otherwise the raw clip's own join.
     loop_shot = svc._loop_shot(project)
     lp = svc.active_loop_point(project) if loop_shot is not None and shot.id == loop_shot.id else None
-    loop, blend = None, 0.0
+    loop, blend, usable_end = None, 0.0, None
     if lp is not None:
         cfg = svc._config_of(project)
         loop = (float(lp["in"]), float(lp["out"]))
         blend = float(svc.seam_treatment(project)["blend_seconds"]) / svc._slow(cfg)
+        # A snapping tail the render leaves out stays out of the preview too.
+        usable_end = float(lp["usable_end"]) if lp.get("usable_end") is not None else None
     try:
-        path, join_at = loop_health.seam_preview(Path(shot.clip_path), loop=loop, blend=blend)
+        path, join_at = loop_health.seam_preview(Path(shot.clip_path), loop=loop, blend=blend,
+                                                 usable_end=usable_end)
     except RuntimeError as e:
         raise HTTPException(500, str(e)) from None
     return FileResponse(path, media_type="video/mp4", headers={"X-Join-At": f"{join_at:.2f}",

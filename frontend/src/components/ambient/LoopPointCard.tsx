@@ -76,6 +76,10 @@ export function LoopPointCard({
   const applies = lp ? lp.applies : scene.loop_point_applies ?? true;
   const inUse = !!lp && !lp.off && lp.applies;
   const perHour = lp && lp.loop_seconds > 0 ? Math.round(3600 / lp.loop_seconds) : null;
+  // In / out are the clip's own seconds; a slowed scene plays the stretch
+  // longer in the finished video, so the two are labelled apart.
+  const clipSpan = lp ? lp.out_seconds - lp.in_seconds : 0;
+  const slowed = !!lp && Math.abs(lp.loop_seconds - clipSpan) > 0.05;
 
   return (
     <div className="px-4 py-3 border-t border-ink-800 space-y-2">
@@ -107,7 +111,8 @@ export function LoopPointCard({
       {lp && applies && (
         <div className="space-y-1.5">
           <p className="text-sm" aria-live="polite">
-            {inUse ? "Loops" : "Found"} {sec(lp.in_seconds)} → {sec(lp.out_seconds)} ({sec(lp.loop_seconds)}
+            {inUse ? "Loops" : "Found"} {sec(lp.in_seconds)} → {sec(lp.out_seconds)} of the clip (
+            {slowed ? `${sec(lp.loop_seconds)} in the video, slowed` : sec(lp.loop_seconds)}
             {perHour ? `, repeats ~${perHour}×/h` : ""}) · seam: {VERDICT[lp.verdict]}
             {inUse && t?.loop_point ? `, blended ${blendSec(t.blend_seconds)}` : ""}
             {inUse && lp.intro ? " · opens on the clip's first frames" : ""}
@@ -130,7 +135,9 @@ export function LoopPointCard({
         </div>
       )}
 
-      {state && state.status !== "running" && state.message && !(state.found && inUse) && (
+      {/* A search that found a stretch is described above (in use or not):
+          its "Loops a–b s" message would contradict "Use the whole clip". */}
+      {state && state.status !== "running" && state.message && !state.found && (
         <p className={state.status === "failed" ? "text-xs text-red-300" : "text-xs text-ink-400"}>{state.message}</p>
       )}
     </div>

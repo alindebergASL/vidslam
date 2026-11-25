@@ -77,6 +77,15 @@ def verdict_for(ratio: float) -> str:
     return "slight_jump" if ratio <= lh.SEAM_SLIGHT_RATIO else "visible_jump"
 
 
+def picture_seconds(clip: Path) -> float:
+    """The video stream's length (the file's when the stream doesn't say);
+    0 when it can't be read."""
+    from .renderer import _probe_video
+
+    info = _probe_video(clip)
+    return float(info.duration) if info is not None and info.duration > 0 else 0.0
+
+
 def default_min_loop(duration: float) -> float:
     return min(max(MIN_LOOP_FLOOR, MIN_LOOP_SHARE * duration), 0.8 * duration)
 
@@ -90,22 +99,27 @@ def blend_mismatch(clip: Path, a: int, b: int, half: int, fps: float,
     half = max(1, half)
     picks = sorted({int(round(k * (2 * half - 1) / max(1, MISMATCH_SAMPLES - 1)))
                     for k in range(MISMATCH_SAMPLES)})
-    tails: list[Image.Image] = []
-    heads: list[Image.Image] = []
-    for off in picks:
-        fb = _frame_at(clip, b - half + off, fps, size)
-        fa = _frame_at(clip, a - half + off, fps, size)
-        if fa is None or fb is None:
-            return None
-        tails.append(fb)
-        heads.append(fa)
-    return lh._mismatch(heads, tails)
+    tail_idx = [b - half + off for off in picks]
+    head_idx = [a - half + off for off in picks]
+    if min(tail_idx + head_idx) < 0:
+        return None
+    got = _frames_at(clip, tail_idx + head_idx, size)
+    if any(i not in got for i in tail_idx + head_idx):
+        return None
+    return lh._mismatch([got[i] for i in head_idx], [got[i] for i in tail_idx])
 
 
-def _frame_at(clip: Path, index: int, fps: float, size: tuple[int, int]) -> Optional[Image.Image]:
-    start = max(0.0, (index - 0.5) / fps)
-    got = lh._read_frames(["-ss", f"{start:.4f}", "-t", f"{1.5 / fps:.4f}", "-i", str(clip)], "", size)
-    return got[0] if got else None
+def _frames_at(clip: Path, indices: list[int], size: tuple[int, int]) -> dict[int, Image.Image]:
+    """The clip's native frames at `indices` (counted from the first decoded
+    frame), read in ONE decode pass (select by frame number, no seeks):
+    a seek per frame went back to a keyframe each time. Indices past the
+    last frame are missing from the result."""
+    want = sorted(set(int(i) for i in indices if i >= 0))
+    if not want:
+        return {}
+    expr = "+".join(f"eq(n\\,{i})" for i in want)
+    got = lh._read_frames(["-i", str(clip), "-fps_mode", "passthrough"], f"select={expr}", size)
+    return dict(zip(want, got, strict=False))
 
 
 def _window(clip: Path, first: int, count: int, fps: float, size: tuple[int, int]) -> list[Image.Image]:
@@ -163,7 +177,11 @@ def find_loop_point(clip: Path, min_loop: Optional[float] = None, *, snap: bool 
     SNAP_BACK + 1 frames are left out (usable_end). Raises LoopPointError
     when the clip can't be read or is too short."""
     t0 = time.monotonic()
-    duration, size = lh._probe(clip)
+    _container, size = lh._probe(clip)
+    # The picture's own length: a sound track that runs past it (Wan's AAC,
+    # 69-80 ms) made the container longer, so frames past the last one were
+    # counted, the mismatch read nothing there and passed.
+    duration = picture_seconds(clip) or _container
     if duration <= 0:
         raise LoopPointError("could not read the clip")
     if duration < MIN_CLIP_SECONDS:
@@ -263,7 +281,8 @@ def find_loop_point(clip: Path, min_loop: Optional[float] = None, *, snap: bool 
         half = min(int(round(cf * fps / 2.0)), r["a"], total_frames - guard - r["b"], (r["b"] - r["a"]) // 4)
         r["half"] = max(1, half)
         r["mismatch"] = blend_mismatch(clip, r["a"], r["b"], r["half"], fps, msize)
-        r["mismatch_ok"] = r["mismatch"] is None or r["mismatch"] <= MISMATCH_MAX
+        # Fails closed: a dissolve whose frames couldn't be read isn't passed.
+        r["mismatch_ok"] = r["mismatch"] is not None and r["mismatch"] <= MISMATCH_MAX
 
     pick = min(refined, key=_rank)
     t_in, t_out = pick["a"] / fps, pick["b"] / fps
