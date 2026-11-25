@@ -783,3 +783,61 @@ def test_a_stretch_render_is_exactly_its_length_in_frames(tmp_path):
         crossfade_seconds=1.0, fade_seconds=3.0, loop_in=2.13, loop_out=9.07, intro=True))
     frames = _raw_yavg([out.final_video_path], "[0:v]scale=320:180,setsar=1[o]", "o")
     assert len(frames) == round(total * FPS)
+
+
+def _still_frames(n: int, *, base: int, blip: bool) -> list:
+    """Near-still 100x100 grey frames: neighbouring frames differ by a 50-px
+    blip (about 0.001 of the frame), far below TYPICAL_FLOOR."""
+    from PIL import Image
+
+    out = []
+    for i in range(n):
+        im = Image.new("RGB", (100, 100), (base, base, base))
+        if blip and i % 2:
+            for x in range(50):
+                im.putpixel((x, 0), (base + 51, base + 51, base + 51))
+        out.append(im)
+    return out
+
+
+def test_a_near_still_join_keeps_its_verdict_and_records_its_unfloored_ratio():
+    """Rain/snow/candle: the join (2 grey levels everywhere) reads seamless
+    against TYPICAL_FLOOR, exactly as #60 calibrated it; the unfloored ratio
+    against the clip's own steps is kept beside it as raw_ratio."""
+    from app.services import loop_health as lh
+
+    first = _still_frames(6, base=100, blip=True)
+    last = _still_frames(6, base=102, blip=True)
+    seam = lh._seam(first, last)
+    assert seam["verdict"] == "seamless"
+    assert seam["ratio"] == pytest.approx(seam["difference"] / lh.TYPICAL_FLOOR, abs=0.02)
+    assert seam["raw_ratio"] is not None and seam["raw_ratio"] > lh.SEAM_SEAMLESS_RATIO
+
+
+@pytest.mark.parametrize("raw_ratio, searched", [(8.0, True), (None, False), (1.5, False)])
+def test_a_hidden_jump_starts_the_automatic_search(auth_client, monkeypatch, raw_ratio, searched):
+    """A seamless verdict with an unfloored ratio above SEAM_SEAMLESS_RATIO
+    starts the automatic search after generation; a reading without
+    raw_ratio (stored before it was kept) or a low one doesn't."""
+    from app.services import loop_health, loop_point
+
+    real_measure = loop_health.measure
+
+    def measure(clip, still=False, **kw):
+        reading = real_measure(clip, still=still, **kw)
+        reading["seam"].update(verdict="seamless", level="good", ratio=1.9)
+        reading["seam"].pop("raw_ratio", None)
+        if raw_ratio is not None:
+            reading["seam"]["raw_ratio"] = raw_ratio
+        return reading
+
+    monkeypatch.setattr(loop_health, "measure", measure)
+    calls = []
+
+    def spy(clip, min_loop=None, *, snap=False):
+        calls.append(snap)
+        return {"found": False}
+
+    monkeypatch.setattr(loop_point, "find_loop_point", spy)
+    _scene(auth_client)
+    assert bool(calls) is searched

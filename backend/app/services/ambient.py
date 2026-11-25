@@ -2552,6 +2552,15 @@ def _improves(found: dict) -> bool:
     return bool(found.get("snap")) or raw is None or float(found["ratio"]) < float(raw)
 
 
+def _hidden_jump(entry: Optional[dict]) -> bool:
+    """A join that reads seamless only because of TYPICAL_FLOOR: against the
+    clip's own (tiny) steps it jumps. Readings stored before raw_ratio was
+    kept don't trigger."""
+    seam = (entry or {}).get("seam") or {}
+    raw = seam.get("raw_ratio")
+    return seam.get("verdict") == "seamless" and raw is not None and raw > loop_health.SEAM_SEAMLESS_RATIO
+
+
 def _snaps(project: models.VideoProject, shot: models.VideoShot) -> bool:
     entry = loop_health.current_entry(project, shot)
     return ((entry or {}).get("seam") or {}).get("verdict") == "snap"
@@ -2571,7 +2580,8 @@ def _maybe_find_loop_point(db: Session, project: models.VideoProject, cfg: Ambie
         return
     entry = loop_health.current_entry(project, shot)
     raw_verdict = ((entry or {}).get("seam") or {}).get("verdict")
-    if raw_verdict == "seamless" and plan.closed:
+    hidden = _hidden_jump(entry)
+    if raw_verdict == "seamless" and plan.closed and not hidden:
         return
     try:
         found = loop_point.find_loop_point(Path(shot.clip_path), snap=raw_verdict == "snap")
@@ -2580,7 +2590,7 @@ def _maybe_find_loop_point(db: Session, project: models.VideoProject, cfg: Ambie
         return
     # A seamless clip keeps looping whole (an open plan's clip that joins
     # well needs no trim).
-    if raw_verdict != "seamless" and _improves(found):
+    if (raw_verdict != "seamless" or hidden) and _improves(found):
         generated["loop"] = _loop_entry(found, shot)
 
 
@@ -2684,7 +2694,8 @@ def find_better_loop_point(db: Session, project_id: int) -> None:
                 _finish_loop_point_search(db, project, "failed",
                                           message="Couldn't measure the loop clip's join; try again.")
                 return
-        if ((loop_health.current_entry(project, shot) or {}).get("seam") or {}).get("verdict") == "seamless":
+        entry = loop_health.current_entry(project, shot)
+        if ((entry or {}).get("seam") or {}).get("verdict") == "seamless" and not _hidden_jump(entry):
             # As after generation: a clip whose own join is seamless loops
             # whole (a trim made such a join worse).
             _finish_loop_point_search(db, project, "done", found=False,

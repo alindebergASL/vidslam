@@ -251,8 +251,14 @@ def _seam(first: list[Image.Image], last: list[Image.Image]) -> dict:
         # treated like a visible jump.
         verdict, level, text = "snap", "bad", "The clip jumps to its last frame at the very end"
     mismatch = _mismatch(first, last)
+    # The ratio without TYPICAL_FLOOR: a near-still scene (rain, snow, a
+    # candle) reads seamless against the floor even when its join visibly
+    # jumps against its own tiny steps. Only a trigger for the loop-point
+    # search; the verdict above stays on the floored ratio (#60's calibration).
+    raw_ratio = round(seam / typical, 2) if typical > 0 else None
     return {"verdict": verdict, "level": level, "text": text, "difference": round(seam, 4),
-            "typical": round(typical, 4), "ratio": round(ratio, 2), "approach": approach,
+            "typical": round(typical, 4), "ratio": round(ratio, 2), "raw_ratio": raw_ratio,
+            "approach": approach,
             "blend_mismatch": mismatch,
             "blend_mismatch_level": ("warn" if mismatch is not None and mismatch > MISMATCH_WARN else "good")}
 
