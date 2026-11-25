@@ -705,3 +705,139 @@ def test_the_checked_blend_is_kept_with_the_stretch():
 
     entry = ambient._loop_entry({"in": 1.0, "out": 9.0, "checked_blend": 1.0, "crossfade": 1.0}, Shot())
     assert entry["checked_blend"] == 1.0
+
+
+def test_find_whose_measurement_fails_again_does_not_search_blind(auth_client, monkeypatch):
+    """No current reading and the Find's own measurement fails too (a read
+    timeout, say): without a reading there is no snap guard, so the search
+    ends failed instead of searching a possibly snapping take blind."""
+    from app.services import loop_health, loop_point
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), snapping)  # the reading is stale now
+
+    def broken(*a, **k):
+        raise TimeoutError("the measurement ran out of time")
+
+    monkeypatch.setattr(loop_health, "measure", broken)
+    calls = []
+    monkeypatch.setattr(loop_point, "find_loop_point", lambda *a, **k: calls.append(1))
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    st = out["loop_point_state"]
+    assert calls == [] and out["loop_point"] is None
+    assert st["status"] == "failed" and "Couldn't measure the loop clip's join" in st["message"]
+
+
+def test_the_seam_preview_route_passes_the_stretchs_usable_end(auth_client, monkeypatch, tmp_path):
+    """GET seam-preview plays the found stretch as the render cuts it: a
+    snap take's stretch (its sound running past the picture, as Wan's) hands
+    its usable_end to the preview, so the dissolve stays out of the tail."""
+    from app.services import loop_health, loop_point
+
+    snap = with_sound_past(snapping(tmp_path / "snap.mp4"))
+    real_measure = loop_health.measure
+    monkeypatch.setattr(loop_health, "measure", lambda clip, still=False, **kw: real_measure(snap, still=still, **kw))
+    real_find = loop_point.find_loop_point
+    monkeypatch.setattr(loop_point, "find_loop_point",
+                        lambda clip, min_loop=None, *, snap=False: real_find(tmp_path / "snap_aac.mp4", min_loop,
+                                                                             snap=snap))
+    scene = _scene(auth_client)
+    assert scene["loop_point"] is not None and scene["loop_point"]["snap"] is True, scene
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    db = SessionLocal()
+    try:
+        lp = ambient.active_loop_point(db.get(models.VideoProject, scene["id"]))
+    finally:
+        db.close()
+    assert lp is not None and lp.get("usable_end"), lp
+    seen = {}
+    out = tmp_path / "preview.mp4"
+    out.write_bytes(b"\0")
+
+    def spy(clip, *, loop=None, blend=0.0, usable_end=None):
+        seen.update(loop=loop, usable_end=usable_end)
+        return out, 1.0
+
+    monkeypatch.setattr(loop_health, "seam_preview", spy)
+    r = auth_client.get(f"/api/ambient/{scene['id']}/seam-preview")
+    assert r.status_code == 200, r.text
+    assert seen["loop"] is not None and seen["usable_end"] == pytest.approx(float(lp["usable_end"]))
+
+
+def test_a_stretch_render_is_exactly_its_length_in_frames(tmp_path):
+    """The intro and tail pieces were cut by a duration rounded to the
+    millisecond (6.4667 s → 6.467), which let one more frame through: the
+    video came out a frame long, ending on a frame faded fully to black."""
+    from app.services.renderer import FPS, AmbientRenderInputs, compose_ambient
+
+    clip = tmp_path / "drift.mp4"
+    _slow_drift_clip(clip, seconds=10, start=0)
+    total = 31.0
+    out = compose_ambient(AmbientRenderInputs(
+        project_id=0, out_dir=tmp_path / "out", clip_path=clip, total_seconds=total,
+        crossfade_seconds=1.0, fade_seconds=3.0, loop_in=2.13, loop_out=9.07, intro=True))
+    frames = _raw_yavg([out.final_video_path], "[0:v]scale=320:180,setsar=1[o]", "o")
+    assert len(frames) == round(total * FPS)
+
+
+def _still_frames(n: int, *, base: int, blip: bool) -> list:
+    """Near-still 100x100 grey frames: neighbouring frames differ by a 50-px
+    blip (about 0.001 of the frame), far below TYPICAL_FLOOR."""
+    from PIL import Image
+
+    out = []
+    for i in range(n):
+        im = Image.new("RGB", (100, 100), (base, base, base))
+        if blip and i % 2:
+            for x in range(50):
+                im.putpixel((x, 0), (base + 51, base + 51, base + 51))
+        out.append(im)
+    return out
+
+
+def test_a_near_still_join_keeps_its_verdict_and_records_its_unfloored_ratio():
+    """Rain/snow/candle: the join (2 grey levels everywhere) reads seamless
+    against TYPICAL_FLOOR, exactly as #60 calibrated it; the unfloored ratio
+    against the clip's own steps is kept beside it as raw_ratio."""
+    from app.services import loop_health as lh
+
+    first = _still_frames(6, base=100, blip=True)
+    last = _still_frames(6, base=102, blip=True)
+    seam = lh._seam(first, last)
+    assert seam["verdict"] == "seamless"
+    assert seam["ratio"] == pytest.approx(seam["difference"] / lh.TYPICAL_FLOOR, abs=0.02)
+    assert seam["raw_ratio"] is not None and seam["raw_ratio"] > lh.SEAM_SEAMLESS_RATIO
+
+
+@pytest.mark.parametrize("raw_ratio, searched", [(8.0, True), (None, False), (1.5, False)])
+def test_a_hidden_jump_starts_the_automatic_search(auth_client, monkeypatch, raw_ratio, searched):
+    """A seamless verdict with an unfloored ratio above SEAM_SEAMLESS_RATIO
+    starts the automatic search after generation; a reading without
+    raw_ratio (stored before it was kept) or a low one doesn't."""
+    from app.services import loop_health, loop_point
+
+    real_measure = loop_health.measure
+
+    def measure(clip, still=False, **kw):
+        reading = real_measure(clip, still=still, **kw)
+        reading["seam"].update(verdict="seamless", level="good", ratio=1.9)
+        reading["seam"].pop("raw_ratio", None)
+        if raw_ratio is not None:
+            reading["seam"]["raw_ratio"] = raw_ratio
+        return reading
+
+    monkeypatch.setattr(loop_health, "measure", measure)
+    calls = []
+
+    def spy(clip, min_loop=None, *, snap=False):
+        calls.append(snap)
+        return {"found": False}
+
+    monkeypatch.setattr(loop_point, "find_loop_point", spy)
+    _scene(auth_client)
+    assert bool(calls) is searched

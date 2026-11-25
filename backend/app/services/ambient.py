@@ -2552,6 +2552,15 @@ def _improves(found: dict) -> bool:
     return bool(found.get("snap")) or raw is None or float(found["ratio"]) < float(raw)
 
 
+def _hidden_jump(entry: Optional[dict]) -> bool:
+    """A join that reads seamless only because of TYPICAL_FLOOR: against the
+    clip's own (tiny) steps it jumps. Readings stored before raw_ratio was
+    kept don't trigger."""
+    seam = (entry or {}).get("seam") or {}
+    raw = seam.get("raw_ratio")
+    return seam.get("verdict") == "seamless" and raw is not None and raw > loop_health.SEAM_SEAMLESS_RATIO
+
+
 def _snaps(project: models.VideoProject, shot: models.VideoShot) -> bool:
     entry = loop_health.current_entry(project, shot)
     return ((entry or {}).get("seam") or {}).get("verdict") == "snap"
@@ -2561,7 +2570,7 @@ def _maybe_find_loop_point(db: Session, project: models.VideoProject, cfg: Ambie
                            plan: LoopPlanOut, generated: dict) -> None:
     """After a loop is made: look for a better loop point when the clip's
     join isn't seamless (a snap included: the take jumps to its last frame
-    at the very end) or the plan is open (free, a few seconds; never in the
+    at the very end) or the plan is open (free, about 23-40 CPU-s; never in the
     way). Kept in generated["loop"] when it beats the whole clip. A snapping
     take is searched clear of its snapping tail."""
     if cfg.source != "video" or plan.strategy == "drift" or not loop_point_applies(project):
@@ -2571,7 +2580,8 @@ def _maybe_find_loop_point(db: Session, project: models.VideoProject, cfg: Ambie
         return
     entry = loop_health.current_entry(project, shot)
     raw_verdict = ((entry or {}).get("seam") or {}).get("verdict")
-    if raw_verdict == "seamless" and plan.closed:
+    hidden = _hidden_jump(entry)
+    if raw_verdict == "seamless" and plan.closed and not hidden:
         return
     try:
         found = loop_point.find_loop_point(Path(shot.clip_path), snap=raw_verdict == "snap")
@@ -2580,7 +2590,7 @@ def _maybe_find_loop_point(db: Session, project: models.VideoProject, cfg: Ambie
         return
     # A seamless clip keeps looping whole (an open plan's clip that joins
     # well needs no trim).
-    if raw_verdict != "seamless" and _improves(found):
+    if (raw_verdict != "seamless" or hidden) and _improves(found):
         generated["loop"] = _loop_entry(found, shot)
 
 
@@ -2678,7 +2688,14 @@ def find_better_loop_point(db: Session, project_id: int) -> None:
             if shot is None or not shot.clip_path or not Path(shot.clip_path).is_file():
                 _finish_loop_point_search(db, project, "failed", message="There's no loop clip to look at.")
                 return
-        if ((loop_health.current_entry(project, shot) or {}).get("seam") or {}).get("verdict") == "seamless":
+            if loop_health.current_entry(project, shot) is None:
+                # The measurement failed again (a read timeout, say): without
+                # a reading there is no snap guard, so don't search blind.
+                _finish_loop_point_search(db, project, "failed",
+                                          message="Couldn't measure the loop clip's join; try again.")
+                return
+        entry = loop_health.current_entry(project, shot)
+        if ((entry or {}).get("seam") or {}).get("verdict") == "seamless" and not _hidden_jump(entry):
             # As after generation: a clip whose own join is seamless loops
             # whole (a trim made such a join worse).
             _finish_loop_point_search(db, project, "done", found=False,
