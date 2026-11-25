@@ -222,6 +222,8 @@ notes that the thumbnail wasn't set.
 
 ### Production hardening
 
+Hosting and sizing notes: [docs/hosting.md](docs/hosting.md)
+
 - **Every render has its own files** (`render_<id>.mp4` / `.jpg`). Before
   this, new renders overwrote one `final.mp4`, so render history and A/B
   compare showed the latest video for every version.

@@ -2570,7 +2570,7 @@ def _maybe_find_loop_point(db: Session, project: models.VideoProject, cfg: Ambie
                            plan: LoopPlanOut, generated: dict) -> None:
     """After a loop is made: look for a better loop point when the clip's
     join isn't seamless (a snap included: the take jumps to its last frame
-    at the very end) or the plan is open (free, a few seconds; never in the
+    at the very end) or the plan is open (free, about 23-40 CPU-s; never in the
     way). Kept in generated["loop"] when it beats the whole clip. A snapping
     take is searched clear of its snapping tail."""
     if cfg.source != "video" or plan.strategy == "drift" or not loop_point_applies(project):
