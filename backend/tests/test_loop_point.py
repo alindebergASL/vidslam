@@ -705,3 +705,65 @@ def test_the_checked_blend_is_kept_with_the_stretch():
 
     entry = ambient._loop_entry({"in": 1.0, "out": 9.0, "checked_blend": 1.0, "crossfade": 1.0}, Shot())
     assert entry["checked_blend"] == 1.0
+
+
+def test_find_whose_measurement_fails_again_does_not_search_blind(auth_client, monkeypatch):
+    """No current reading and the Find's own measurement fails too (a read
+    timeout, say): without a reading there is no snap guard, so the search
+    ends failed instead of searching a possibly snapping take blind."""
+    from app.services import loop_health, loop_point
+
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    _replace(Path(scene["loop_shot"]["clip_path"]), snapping)  # the reading is stale now
+
+    def broken(*a, **k):
+        raise TimeoutError("the measurement ran out of time")
+
+    monkeypatch.setattr(loop_health, "measure", broken)
+    calls = []
+    monkeypatch.setattr(loop_point, "find_loop_point", lambda *a, **k: calls.append(1))
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    st = out["loop_point_state"]
+    assert calls == [] and out["loop_point"] is None
+    assert st["status"] == "failed" and "Couldn't measure the loop clip's join" in st["message"]
+
+
+def test_the_seam_preview_route_passes_the_stretchs_usable_end(auth_client, monkeypatch, tmp_path):
+    """GET seam-preview plays the found stretch as the render cuts it: a
+    snap take's stretch (its sound running past the picture, as Wan's) hands
+    its usable_end to the preview, so the dissolve stays out of the tail."""
+    from app.services import loop_health, loop_point
+
+    snap = with_sound_past(snapping(tmp_path / "snap.mp4"))
+    real_measure = loop_health.measure
+    monkeypatch.setattr(loop_health, "measure", lambda clip, still=False, **kw: real_measure(snap, still=still, **kw))
+    real_find = loop_point.find_loop_point
+    monkeypatch.setattr(loop_point, "find_loop_point",
+                        lambda clip, min_loop=None, *, snap=False: real_find(tmp_path / "snap_aac.mp4", min_loop,
+                                                                             snap=snap))
+    scene = _scene(auth_client)
+    assert scene["loop_point"] is not None and scene["loop_point"]["snap"] is True, scene
+    from app import models
+    from app.db import SessionLocal
+    from app.services import ambient
+
+    db = SessionLocal()
+    try:
+        lp = ambient.active_loop_point(db.get(models.VideoProject, scene["id"]))
+    finally:
+        db.close()
+    assert lp is not None and lp.get("usable_end"), lp
+    seen = {}
+    out = tmp_path / "preview.mp4"
+    out.write_bytes(b"\0")
+
+    def spy(clip, *, loop=None, blend=0.0, usable_end=None):
+        seen.update(loop=loop, usable_end=usable_end)
+        return out, 1.0
+
+    monkeypatch.setattr(loop_health, "seam_preview", spy)
+    r = auth_client.get(f"/api/ambient/{scene['id']}/seam-preview")
+    assert r.status_code == 200, r.text
+    assert seen["loop"] is not None and seen["usable_end"] == pytest.approx(float(lp["usable_end"]))

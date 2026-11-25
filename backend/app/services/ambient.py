@@ -2678,6 +2678,12 @@ def find_better_loop_point(db: Session, project_id: int) -> None:
             if shot is None or not shot.clip_path or not Path(shot.clip_path).is_file():
                 _finish_loop_point_search(db, project, "failed", message="There's no loop clip to look at.")
                 return
+            if loop_health.current_entry(project, shot) is None:
+                # The measurement failed again (a read timeout, say): without
+                # a reading there is no snap guard, so don't search blind.
+                _finish_loop_point_search(db, project, "failed",
+                                          message="Couldn't measure the loop clip's join; try again.")
+                return
         if ((loop_health.current_entry(project, shot) or {}).get("seam") or {}).get("verdict") == "seamless":
             # As after generation: a clip whose own join is seamless loops
             # whole (a trim made such a join worse).
