@@ -1169,7 +1169,9 @@ def _end_piece(unit: Path, dst: Path, *, unit_len: float, length: float,
     end."""
     loops = 1 if length <= unit_len + 1e-3 else 2
     flt = ("[0:v][1:v]concat=n=2:v=1:a=0," if loops == 2 else "[0:v]")
-    flt += f"trim=duration={length:.3f},setpts=PTS-STARTPTS"
+    # By frame count: a duration rounded to the millisecond (6.4667 s → 6.467)
+    # let one more frame through, the faded-to-black one after the fade-out.
+    flt += f"trim=end_frame={max(1, int(round(length * FPS)))},setpts=PTS-STARTPTS"
     if extra_vf:
         flt += "," + extra_vf
     if fade_in > 0:
@@ -1408,7 +1410,9 @@ def _end_piece_from(sources: list[Path], dst: Path, *, length: float,
     """`sources` played back to back, cut to `length`, with the fades."""
     n = len(sources)
     flt = "".join(f"[{i}:v]" for i in range(n)) + (f"concat=n={n}:v=1:a=0," if n > 1 else "")
-    flt += f"trim=duration={length:.3f},setpts=PTS-STARTPTS"
+    # By frame count: a duration rounded to the millisecond (6.4667 s → 6.467)
+    # let one more frame through, the faded-to-black one after the fade-out.
+    flt += f"trim=end_frame={max(1, int(round(length * FPS)))},setpts=PTS-STARTPTS"
     if extra_vf:
         flt += "," + extra_vf
     if fade_in > 0:

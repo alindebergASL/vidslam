@@ -767,3 +767,19 @@ def test_the_seam_preview_route_passes_the_stretchs_usable_end(auth_client, monk
     r = auth_client.get(f"/api/ambient/{scene['id']}/seam-preview")
     assert r.status_code == 200, r.text
     assert seen["loop"] is not None and seen["usable_end"] == pytest.approx(float(lp["usable_end"]))
+
+
+def test_a_stretch_render_is_exactly_its_length_in_frames(tmp_path):
+    """The intro and tail pieces were cut by a duration rounded to the
+    millisecond (6.4667 s → 6.467), which let one more frame through: the
+    video came out a frame long, ending on a frame faded fully to black."""
+    from app.services.renderer import FPS, AmbientRenderInputs, compose_ambient
+
+    clip = tmp_path / "drift.mp4"
+    _slow_drift_clip(clip, seconds=10, start=0)
+    total = 31.0
+    out = compose_ambient(AmbientRenderInputs(
+        project_id=0, out_dir=tmp_path / "out", clip_path=clip, total_seconds=total,
+        crossfade_seconds=1.0, fade_seconds=3.0, loop_in=2.13, loop_out=9.07, intro=True))
+    frames = _raw_yavg([out.final_video_path], "[0:v]scale=320:180,setsar=1[o]", "o")
+    assert len(frames) == round(total * FPS)
