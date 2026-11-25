@@ -319,6 +319,9 @@ class SeamTreatmentOut(BaseModel):
     # False when the blend won't hide the jump (a visible jump): the render
     # asks before going ahead.
     covers: bool = True
+    # True when the render loops a found stretch of the clip (loop_point)
+    # rather than the whole clip; verdict and ratio are then that join's.
+    loop_point: bool = False
 
 
 class SeamReadingOut(BaseModel):
@@ -330,7 +333,8 @@ class SeamReadingOut(BaseModel):
     treatment: Optional[SeamTreatmentOut] = None
     text: str
     difference: float  # last frame vs first, mean abs luma difference 0-1
-    typical: float     # typical difference between neighbouring frames
+    typical: float     # typical difference between neighbouring frames (scaled to 24 fps)
+    max_step: Optional[float] = None  # the biggest of those steps (scaled the same way)
     ratio: float       # difference / typical (with a floor for near-still clips)
     blend_seconds: float = 0.0  # how long the finished video dissolves across the join
 
@@ -357,6 +361,42 @@ class DriftReadingOut(BaseModel):
     level: Level
     text: str
     distance: float  # first vs last second's average colour, 0-1
+
+
+class LoopPointOut(BaseModel):
+    """The stretch of the loop clip the render loops (services.loop_point):
+    clip seconds [in_seconds, out_seconds), dissolved over `crossfade`
+    centred on the join, and opened on the clip's own start (intro)."""
+
+    in_seconds: float
+    out_seconds: float
+    loop_seconds: float  # out − in, in the finished video (slow-down applied)
+    crossfade: float
+    ratio: float
+    raw_ratio: Optional[float] = None
+    verdict: SeamVerdict
+    calm: bool = False
+    # Grey RMS (0-255) between the two pictures the dissolve mixes; above
+    # ~30 they are different pictures (a ghost) and the stretch isn't used.
+    mismatch: Optional[float] = None
+    mismatch_ok: bool = True
+    # The take snaps to its last frame; its snapping tail is left out.
+    snap: bool = False
+    intro: bool = True
+    # "Use the whole clip": the stretch is kept but not used.
+    off: bool = False
+    # False when it applies to nothing: variations / day-night play whole clips.
+    applies: bool = True
+
+
+class LoopPointStateOut(BaseModel):
+    """The last "find a better loop point" run."""
+
+    status: Literal["running", "done", "failed"]
+    found: Optional[bool] = None
+    message: str = ""
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
 
 
 class LoopHealthOut(BaseModel):
@@ -409,6 +449,13 @@ class AmbientOut(BaseModel):
     loop_health_outdated: list[bool] = Field(default_factory=list)
     # The blend the render will use at the loop's join, and why.
     seam_treatment: Optional[SeamTreatmentOut] = None
+    # The found loop stretch of the loop clip (None: the whole clip loops),
+    # and the last finder run.
+    loop_point: Optional[LoopPointOut] = None
+    # Whether "find a better loop point" applies to this scene (single-clip
+    # video loops only; variations and day-night loop whole clips).
+    loop_point_applies: bool = False
+    loop_point_state: Optional[LoopPointStateOut] = None
     # True once a music bed exists on disk (generated or uploaded).
     music_ready: bool
     # True once a nature-sound bed exists (config.sound != "none").
