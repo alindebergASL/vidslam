@@ -262,6 +262,10 @@ function Inner() {
 
   const useIt = async () => {
     if (!proposal) return;
+    if (dirty) {
+      toast.error("Save or discard your edits first: the rewrite is applied to the saved script.");
+      return;
+    }
     if (proposal.version !== story.script_version) {
       toast.error("The script changed since this rewrite was made; enhance it again.");
       return;

@@ -267,3 +267,65 @@ def test_a_write_on_a_cast_only_script_uses_the_outline_cast(auth_client):
     assert got["status"] == "ready", got["error"]
     assert "@cast OLDIE" not in got["script_text"] and "@cast MARA" in got["script_text"]
     assert got["parsed"]["warnings"] == []
+
+
+# ---------- Codex findings on #68 ----------
+
+
+def test_lengthen_shares_the_asked_minutes_across_the_pieces(auth_client, monkeypatch):
+    """A whole-story Lengthen to N minutes asks for N minutes in all, not N
+    for every chapter it rewrites."""
+    from app.services import sound_studio
+
+    from .test_sound_scripts import _written
+
+    got = _written(auth_client)
+    asked: list = []
+    real = sound_studio.enhance_text
+
+    def spy(text, action, **kw):  # noqa: ANN001, ANN003, ANN202
+        asked.append(kw.get("minutes"))
+        return real(text, action, **kw)
+
+    monkeypatch.setattr(sound_studio, "enhance_text", spy)
+    r = auth_client.post(f"/api/sound/stories/{got['id']}/enhance",
+                         json={"action": "lengthen", "scope": "story", "minutes": 20})
+    assert r.status_code in (200, 202), r.text
+    assert len(asked) > 1, asked
+    assert all(m is not None and 1 <= m < 20 for m in asked), asked
+    assert sum(asked) <= 20 + len(asked), asked
+
+
+def test_an_edit_saved_after_cancel_is_not_overwritten_by_the_chapter_in_flight(auth_client, monkeypatch):
+    """Cancel keeps a running job's chapter in flight, but an edit saved
+    before it lands retires that run: the edit stays."""
+    from app import models
+    from app.api.sound import update_story
+    from app.providers.mock_chat import MockChatProvider
+    from app.schemas.sound import StoryUpdate
+    from app.services import sound_studio
+
+    from .test_sound_scripts import _db, _new, _story
+
+    s = _new(auth_client, script_text="NARRATOR: The first night.\n")
+    real = MockChatProvider.story_chapter
+    edited = "NARRATOR: My own words, saved by hand.\n"
+
+    def chapter(self, **kw):  # noqa: ANN001, ANN003, ANN202
+        out = real(self, **kw)
+        if kw["index"] == 0:
+            db = _db()
+            try:
+                story = db.query(models.SoundStory).get(s["id"])
+                sound_studio.cancel(db, story)
+                db.refresh(story)
+                update_story(s["id"], StoryUpdate(script_text=edited, script_version=story.script_version), db)
+            finally:
+                db.close()
+        return out
+
+    monkeypatch.setattr(MockChatProvider, "story_chapter", chapter)
+    r = auth_client.post(f"/api/sound/stories/{s['id']}/write", json={"replace": True})
+    assert r.status_code == 202, r.text
+    got = _story(auth_client, s["id"])
+    assert got["script_text"] == edited, got["script_text"][:200]

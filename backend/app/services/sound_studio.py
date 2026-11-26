@@ -729,6 +729,10 @@ def enhance_range(db: Session, story_id: int, gen: str = "") -> None:
     try:
         parts = segments(text)
         total = sum(1 for _, _, on in parts if on) or 1
+        # Lengthen asks for N minutes in all: each piece gets its share, by
+        # length, so four chapters don't each grow to N minutes.
+        asked = job.get("minutes")
+        voiced = sum(len(text[a:b].strip("\n")) for a, b, on in parts if on and text[a:b].strip()) or 1
         k = -1
         for a, b, on in parts:
             span = text[a:b]
@@ -745,9 +749,10 @@ def enhance_range(db: Session, story_id: int, gen: str = "") -> None:
             for piece in pieces(body, prompting.AUDIO_SCRIPT_MAX):
                 if not _alive(story_id, gen):
                     return
+                share = max(1, round(float(asked) * len(piece) / voiced)) if asked else None
                 rewritten.append(enhance_text(piece, str(job.get("action")), header=header, style=style,
                                               title=story.title or "", premise=story.premise or "",
-                                              minutes=job.get("minutes")))
+                                              minutes=share))
             new = "\n".join(rewritten)
             # Every rewritten chapter is checked whole, with the cast.
             check_part(header, new, style=style, title=story.title or "", premise=story.premise or "")

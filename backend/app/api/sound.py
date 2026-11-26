@@ -153,6 +153,10 @@ def update_story(story_id: int, body: StoryUpdate, db: Session = Depends(get_db)
     if body.script_text is not None and text != story.script_text:
         story.script_text = text
         story.script_version = (story.script_version or 0) + 1
+        if (story.claim_token or "").startswith(sound_studio.RUNNING):
+            # A cancelled job's chapter still in flight must not land over
+            # this edit: its run is retired (its save then finds no claim).
+            story.claim_token = ""
         if story.status == "draft" and text.strip():
             story.status = "ready"
     story.title, story.premise, story.settings_json = title, premise, settings
