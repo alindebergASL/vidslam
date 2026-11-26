@@ -841,3 +841,79 @@ def test_a_hidden_jump_starts_the_automatic_search(auth_client, monkeypatch, raw
     monkeypatch.setattr(loop_point, "find_loop_point", spy)
     _scene(auth_client)
     assert bool(calls) is searched
+
+
+def _hidden(monkeypatch, raw_ratio=8.0):
+    from app.services import loop_health
+
+    real_measure = loop_health.measure
+
+    def measure(clip, still=False, **kw):
+        reading = real_measure(clip, still=still, **kw)
+        reading["seam"].update(verdict="seamless", level="good", ratio=1.9, raw_ratio=raw_ratio)
+        return reading
+
+    monkeypatch.setattr(loop_health, "measure", measure)
+
+
+def test_a_hidden_jump_keeps_the_stretch_the_automatic_search_found(auth_client, monkeypatch, tmp_path):
+    from app.services import loop_point
+
+    rep = repeating(tmp_path / "rep.mp4")
+    _hidden(monkeypatch)
+    real_find = loop_point.find_loop_point
+    calls = []
+
+    def find(clip, min_loop=None, *, snap=False):
+        calls.append(snap)
+        return real_find(rep, min_loop, snap=snap)
+
+    monkeypatch.setattr(loop_point, "find_loop_point", find)
+    scene = _scene(auth_client)
+    assert calls == [False]
+    assert scene["loop_point"] is not None, scene.get("loop_point")
+
+
+def test_find_searches_a_hidden_jump(auth_client, monkeypatch):
+    from app.services import loop_point
+
+    _hidden(monkeypatch)
+    monkeypatch.setattr(loop_point, "find_loop_point", lambda *a, **k: {"found": False, "ratio": 9.0})
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    calls = []
+    monkeypatch.setattr(loop_point, "find_loop_point",
+                        lambda *a, **k: calls.append(1) or {"found": False, "ratio": 9.0})
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    st = auth_client.get(f"/api/ambient/{sid}").json()["loop_point_state"]
+    assert calls == [1], st
+    assert "joins seamlessly" not in st["message"], st
+
+
+def test_find_reads_again_a_seamless_reading_stored_without_raw_ratio(auth_client, monkeypatch):
+    """A seamless reading stored before raw_ratio was kept can't tell a hidden
+    jump: Find reads the loop clip again and searches when the new reading
+    shows one."""
+    from app.services import loop_health, loop_point
+
+    real_measure = loop_health.measure
+
+    def old_reading(clip, still=False, **kw):
+        reading = real_measure(clip, still=still, **kw)
+        reading["seam"].update(verdict="seamless", level="good", ratio=1.9)
+        reading["seam"].pop("raw_ratio", None)
+        return reading
+
+    monkeypatch.setattr(loop_health, "measure", old_reading)
+    scene = _scene(auth_client)
+    sid = scene["id"]
+    seam = auth_client.get(f"/api/ambient/{sid}").json()["seam_treatment"]
+    assert seam["verdict"] == "seamless", seam
+    _hidden(monkeypatch)  # the clip read again now shows its hidden jump
+    calls = []
+    monkeypatch.setattr(loop_point, "find_loop_point",
+                        lambda *a, **k: calls.append(1) or {"found": False, "ratio": 9.0})
+    assert auth_client.post(f"/api/ambient/{sid}/find-loop-point").status_code == 202
+    st = auth_client.get(f"/api/ambient/{sid}").json()["loop_point_state"]
+    assert calls == [1], st
+    assert "joins seamlessly" not in st["message"], st

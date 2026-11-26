@@ -1,7 +1,7 @@
 # Hosting and sizing notes
 
-Notes from a sizing review on 2026-11-24. Nothing here has been built yet; it records the options and when to
-revisit them.
+Notes from a sizing review on 2026-11-24. Studio moved to t3a.medium on 2026-11-25 (see Today); nothing else
+here has been built yet. The rest records the options and when to revisit them.
 
 ## Today
 
@@ -53,8 +53,8 @@ type change.
 
 ## Scenarios tabled
 
-**Three t9g.medium (vid, studio, shared database).** About $91 a month, against $122 today or about $88 after
-studio moves to t3a.medium. Tabled because:
+**Three t9g.medium (vid, studio, shared database).** About $91 a month, against about $88 now (vid's t3.large
+about $61 plus studio's t3a.medium about $27; about $122 before studio's move on 2026-11-25). Tabled because:
 - vid needs 8 GB for builds and checks;
 - the databases are tiny, so a separate database server mostly adds cost, a network hop and a single point of
   failure for both sites;

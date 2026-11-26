@@ -19,8 +19,8 @@ import pytest
 from .test_runware import API, IMG_URL, KEY, _answer, _respond, live  # noqa: F401 — fixture
 
 EDIT = "runware/alibaba:qwen-image-edit@2511"
-PIC = "https://vid.ai-lab1.com/public/a/scene.jpg"
-FACE = "https://vid.ai-lab1.com/public/a/face.jpg"
+PIC = "https://example.com/public/a/scene.jpg"
+FACE = "https://example.com/public/a/face.jpg"
 
 
 @pytest.mark.parametrize("bad", [

@@ -16,8 +16,8 @@ IMG_URL = "https://im.runware.ai/image/out.jpg"
 VID_URL = "https://vm.runware.ai/video/out.mp4"
 JPEG = b"\xff\xd8\xff\xe0fake-runware"
 MP4 = b"\x00\x00\x00\x18ftypmp42fake"
-PIC = "https://vid.ai-lab1.com/public/a/scene.jpg"
-FACE = "https://vid.ai-lab1.com/public/a/face.jpg"
+PIC = "https://example.com/public/a/scene.jpg"
+FACE = "https://example.com/public/a/face.jpg"
 # A real 1×1 PNG (base64 of it fits the schemas' data URI pattern).
 PNG_BYTES = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010806000000"
                           "1f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")

@@ -131,9 +131,9 @@ def test_project_estimate_counts_free_spark_shots_as_free(auth_client, monkeypat
 def test_key_test_names_the_sogni_account(auth_client, monkeypatch):
     _settings(monkeypatch, SOGNI_API_KEY="sogni_dev_test123456789")
     respx.get("https://api.sogni.ai/v2/account/me").mock(return_value=httpx.Response(
-        200, json={"status": "success", "data": {"username": "alindy", "emailVerified": True}}))
+        200, json={"status": "success", "data": {"username": "example-user", "emailVerified": True}}))
     r = auth_client.post("/api/settings/keys/sogni/test").json()
-    assert r["ok"] is True and "account alindy" in r["detail"]
+    assert r["ok"] is True and "account example-user" in r["detail"]
     assert "sogni_dev_test123456789" not in str(r)
 
 

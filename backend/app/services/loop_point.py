@@ -1,7 +1,9 @@
 """Loop-point finder: the stretch of a loop clip whose end matches its start
 best, so the finished video loops [in, out) instead of the whole clip. Free
-and local (ffmpeg + Pillow on small frames, no numpy). On real 30 s clips a
-search takes about 23-40 CPU-s (measured on the 2-vCPU servers).
+and local (ffmpeg + Pillow on small frames, no numpy). A search takes about
+23-40 CPU-s on 8-15 s clips and about 65-80 CPU-s on a 30 s chained clip
+(measured on vid, a t3.large); it runs inside generation when the join isn't
+seamless.
 
 1. Coarse: frames at 8 fps, 160 px wide. Every pair (i, j) at least
    `min_loop` apart is scored on the mean difference of frames i+k and j+k
