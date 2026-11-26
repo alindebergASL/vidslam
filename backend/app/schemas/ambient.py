@@ -480,6 +480,9 @@ class AmbientOut(BaseModel):
     # music (every part of the bed), Generate sound, and a generated picture.
     music_cost: float = 0.0
     sound_cost: float = 0.0
+    # Whether Generate sound has a sound to make (sound "auto" matches the
+    # preset or weather; a scene with neither has nothing to match).
+    sound_resolved: bool = False
     picture_cost: float = 0.0
     # Set when loop clips exist: changing the picture or a clip setting
     # discards them, and needs discard_loop=true.

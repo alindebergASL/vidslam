@@ -263,3 +263,14 @@ def test_queue_entry_not_written_over_a_finished_scene(auth_client, monkeypatch)
     db = SessionLocal()
     assert db.get(models.VideoProject, sid).queue_job_id == ""
     db.close()
+
+
+def test_sound_resolved_says_whether_generate_sound_has_a_sound_to_make(auth_client):
+    """"Match the scene" on a custom scene with no weather matches nothing:
+    the page then offers no free Generate sound that the server refuses."""
+    out = auth_client.get(f"/api/ambient/{_scene(auth_client, sound='rain')}").json()
+    assert out["sound_resolved"] is True
+    sid = _scene(auth_client, sound="auto", scene_preset="custom", weather="any", scene_prompt="a quiet room")
+    out = auth_client.get(f"/api/ambient/{sid}").json()
+    assert out["sound_resolved"] is False and out["sound_cost"] == 0
+    assert auth_client.post(f"/api/ambient/{sid}/sound").status_code == 409

@@ -1117,6 +1117,8 @@ export type AmbientScene = {
   /** Rate-card prices of Generate music, Generate sound and a generated picture (USD). */
   music_cost?: number;
   sound_cost?: number;
+  /** Whether Generate sound has a sound to make ("Match the scene" can have nothing to match). */
+  sound_resolved?: boolean;
   picture_cost?: number;
   /** Loop clips already made: a new picture or a setting that needs a new clip discards them. */
   loop_at_stake?: { cost: number; from_ledger: boolean; partial: boolean } | null;

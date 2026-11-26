@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
 import { IMAGE_ACCEPT } from "@/components/Dropzone";
-import { askBeforeDiscard, loopAtStakeText } from "@/components/ambient/shared";
+import { askBeforeDiscard, loopAtStakeText, ownPictureVideo } from "@/components/ambient/shared";
 import { api, AmbientScene, DEFAULT_AMBIENT_CONFIG, errorText } from "@/lib/api";
 
 /** Pictures the user brought (services.ambient.OWN_PICTURE). */
@@ -122,6 +122,10 @@ export function ScenePicture({
   const nothingToDescribe =
     (!described || described.toLowerCase() === "the scene in the given image") &&
     (scene.config.scene_preset === "custom" || scene.config.scene_preset === DEFAULT_AMBIENT_CONFIG.scene_preset);
+  // A video scene made from your picture hides the preset, look and picture
+  // model in Settings (they don't change its clip), yet a generated picture
+  // would be made from them: remove the picture first to see and set them.
+  const hiddenStill = own && ownPictureVideo(scene.config);
 
   // Every picture change needs a new loop: when one is already made, ask
   // first and say about what it cost (the server refuses without the flag).
@@ -188,9 +192,11 @@ export function ScenePicture({
             <button
               type="button"
               className="btn-ghost text-xs"
-              disabled={lock || (own && nothingToDescribe)}
+              disabled={lock || hiddenStill || (own && nothingToDescribe)}
               title={
-                own && nothingToDescribe
+                hiddenStill
+                  ? "Remove your picture first to choose the preset, look and picture model a generated one is made from"
+                  : own && nothingToDescribe
                   ? "Describe the scene in Settings first: there is nothing to make a picture from"
                   : own
                   ? "One image call: makes a new picture from the description and replaces yours"

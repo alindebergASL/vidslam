@@ -672,13 +672,25 @@ function Inner() {
                 <button
                   type="button"
                   className="btn-ghost text-sm"
-                  disabled={inFlight || busy !== null}
+                  disabled={inFlight || busy !== null || scene.sound_resolved === false}
+                  title={
+                    scene.sound_resolved === false
+                      ? "\"Match the scene\" has nothing to match here: pick a sound in Settings"
+                      : undefined
+                  }
                   onClick={() => run("sound", () => api.regenerateAmbientSound(id), "Nature sound regenerated")}
                 >
                   {busy === "sound" ? "Generating…" : scene.sound_ready ? "Regenerate sound" : "Generate sound"}
-                  {busy !== "sound" && <span className="text-ink-400">{priceTag(scene.sound_cost)}</span>}
+                  {busy !== "sound" && scene.sound_resolved !== false && (
+                    <span className="text-ink-400">{priceTag(scene.sound_cost)}</span>
+                  )}
                 </button>
               </div>
+              {scene.sound_resolved === false && (
+                <p className="text-xs text-ink-400 mt-2">
+                  &ldquo;Match the scene&rdquo; has nothing to match for this scene: pick a sound in Settings.
+                </p>
+              )}
               {scene.sound_ready && (
                 <audio
                   key={`s-${cacheBust}`}
@@ -747,7 +759,7 @@ function Inner() {
             </div>
           )}
 
-          <RenderHistory projectId={id} aspect={scene.aspect_ratio} linkFor={(rid) => `/ambient/${id}?render=${rid}`} />
+          <RenderHistory projectId={id} aspect={scene.aspect_ratio} />
         </div>
 
         {seamAsk && seamAsk.code === "seam_unmeasured" && (

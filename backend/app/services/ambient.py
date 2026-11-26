@@ -1810,6 +1810,7 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         generate_cost=generate_cost(project, cfg, plan),
         music_cost=music_cost(cfg),
         sound_cost=sound_cost(cfg),
+        sound_resolved=bool(resolve_sound_prompt(cfg)),
         picture_cost=round(still_cost(cfg), 4),
         loop_at_stake=None if project.status == "generating" else loop_at_stake(db, project),
         resume=resume_info(project, cfg),
