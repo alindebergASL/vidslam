@@ -126,6 +126,10 @@ export function ScenePicture({
   // model in Settings (they don't change its clip), yet a generated picture
   // would be made from them: remove the picture first to see and set them.
   const hiddenStill = own && ownPictureVideo(scene.config);
+  // With no picture, only a custom scene with no description has nothing to
+  // make one from (a preset has its own prompt): as the server refuses.
+  const noText = !described || described.toLowerCase() === "the scene in the given image";
+  const blocked = own ? nothingToDescribe : !has && noText && scene.config.scene_preset === "custom";
 
   // Every picture change needs a new loop: when one is already made, ask
   // first and say about what it cost (the server refuses without the flag).
@@ -192,11 +196,11 @@ export function ScenePicture({
             <button
               type="button"
               className="btn-ghost text-xs"
-              disabled={lock || hiddenStill || (own && nothingToDescribe)}
+              disabled={lock || hiddenStill || blocked}
               title={
                 hiddenStill
                   ? "Remove your picture first to choose the preset, look and picture model a generated one is made from"
-                  : own && nothingToDescribe
+                  : blocked
                   ? "Describe the scene in Settings first: there is nothing to make a picture from"
                   : own
                   ? "One image call: makes a new picture from the description and replaces yours"

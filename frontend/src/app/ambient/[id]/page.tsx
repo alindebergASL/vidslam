@@ -119,10 +119,17 @@ function Inner() {
     api.ambientPresets().then(setPresets).catch(() => {});
   }, [id, reload]);
 
-  const inFlight =
-    scene?.status === "generating" ||
-    scene?.loop_status === "submitted" ||
-    scene?.loop_status === "polling";
+  // No picture, no description and no preset: a loop would be made of nothing.
+  // (/new stores "the scene in the given image" for a picture with no description.)
+  const description = (scene?.config.scene_prompt ?? "").trim().toLowerCase();
+  const nothingToMake =
+    !!scene &&
+    !scene.picture_ready &&
+    scene.config.scene_preset === "custom" &&
+    (!description || description === "the scene in the given image");
+  // A clip is only made while the scene is generating: a clip left marked
+  // in flight after a cancel or failure (a killed worker) locks nothing.
+  const inFlight = scene?.status === "generating";
   // Every 2.5 s while the scene is being made (12 s while the live stream is
   // connected), paused while the tab is hidden; an event for this scene
   // reloads at once.
@@ -480,8 +487,12 @@ function Inner() {
                 <button
                   type="button"
                   className="btn-ghost text-sm"
-                  disabled={inFlight || busy !== null}
-                  title={`Buys the whole loop: ${loopCost}`}
+                  disabled={inFlight || busy !== null || nothingToMake}
+                  title={
+                    nothingToMake
+                      ? "Describe the scene in Settings, pick a preset or add a picture first"
+                      : `Buys the whole loop: ${loopCost}`
+                  }
                   onClick={() => run("loop", startLoop, startMsg)}
                 >
                   {loopReady ? "Regenerate loop" : resume ? "Start over" : "Generate loop"}

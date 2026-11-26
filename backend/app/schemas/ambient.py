@@ -220,6 +220,9 @@ class AmbientPresetsOut(BaseModel):
     scenes: list[ScenePresetOut]
     music_moods: list[MusicMoodOut]
     sounds: list[SoundPresetOut] = Field(default_factory=list)
+    # What "Match the scene" picks: by weather first, then by preset.
+    auto_sound_by_scene: dict[str, str] = Field(default_factory=dict)
+    auto_sound_by_weather: dict[str, str] = Field(default_factory=dict)
     looks: list[OptionOut] = Field(default_factory=list)
     times_of_day: list[OptionOut] = Field(default_factory=list)
     weathers: list[OptionOut] = Field(default_factory=list)

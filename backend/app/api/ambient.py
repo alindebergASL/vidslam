@@ -215,6 +215,16 @@ def _check_scene(config) -> None:
         check_or_422(text, kind="image")
 
 
+def _require_a_description(project: models.VideoProject, *, picture: bool) -> None:
+    """/new stores a placeholder description for a picture scene with none.
+    It describes nothing for a generated picture, nor for a loop once the
+    picture is gone: refuse (422) rather than pay for a picture of nothing."""
+    cfg = svc._config_of(project)
+    if (cfg.scene_preset == "custom" and cfg.scene_prompt.strip().lower() == svc.PICTURE_PLACEHOLDER_PROMPT
+            and (picture or not cfg.picture_origin)):
+        raise HTTPException(422, "Describe the scene first: there is nothing to make it from")
+
+
 def _check_scene_prompts(project: models.VideoProject, *, loop: bool = False,
                          clip_prompts: Optional[list[str]] = None) -> None:
     """A clean deployment: the scene's text and the picture prompt made
@@ -306,6 +316,7 @@ def generate_loop(
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is already generating")
+    _require_a_description(project, picture=False)
     _check_scene_prompts(project, loop=True)
     job_id = _enqueue_generation(db, project, regenerate_music)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
@@ -425,6 +436,7 @@ def generate_picture(scene_id: int, discard_loop: bool = False, db: Session = De
     project = _get_scene(db, scene_id)
     _picture_busy(project)
     provider_gate.require_still(svc._config_of(project))  # the scene's chosen model, not a silent swap
+    _require_a_description(project, picture=True)
     _check_scene_prompts(project)
     try:
         svc.generate_picture(db, project, discard_loop=discard_loop)

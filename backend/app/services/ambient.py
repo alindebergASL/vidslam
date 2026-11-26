@@ -853,6 +853,8 @@ def presets() -> AmbientPresetsOut:
         scenes=scenes,
         music_moods=MUSIC_MOODS,
         sounds=SOUND_PRESETS,
+        auto_sound_by_scene=dict(_AUTO_SOUND_BY_SCENE),
+        auto_sound_by_weather=dict(_AUTO_SOUND_BY_WEATHER),
         looks=[OptionOut(id=k, label=v[0]) for k, v in LOOKS.items()],
         times_of_day=[OptionOut(id=k, label=v[0]) for k, v in TIMES_OF_DAY.items()],
         weathers=[OptionOut(id=k, label=v[0]) for k, v in WEATHERS.items()],
@@ -1051,6 +1053,10 @@ def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: s
     return project
 
 
+# What /new stores as the description of a picture scene with none.
+PICTURE_PLACEHOLDER_PROMPT = "the scene in the given image"
+
+
 def clear_picture(db: Session, project: models.VideoProject, *, discard_loop: bool = False) -> models.VideoProject:
     had = bool(_config_of(project).picture_origin)
     if had:
@@ -1060,6 +1066,10 @@ def clear_picture(db: Session, project: models.VideoProject, *, discard_loop: bo
         _invalidate_loop(project)
     _set_state(project, "picture_origin", "")
     _set_state(project, _PICTURE_CAST_KEY, None)
+    if _config_of(project).scene_prompt.strip().lower() == PICTURE_PLACEHOLDER_PROMPT:
+        # /new's stand-in for "no description": it describes nothing once
+        # the picture is gone.
+        _set_state(project, "scene_prompt", "")
     db.commit()
     db.refresh(project)
     return project
@@ -2045,6 +2055,24 @@ def _segment_shots(db: Session, project: models.VideoProject, n: int) -> list[mo
 
 # What every segment after the first adds to the clip prompt.
 _CONTINUE = " Continue the exact same shot from the given first frame, same lighting."
+
+
+def fail_unmade_clips(db: Session, project: models.VideoProject) -> None:
+    """After a scene left "generating" is released (Reset, or the sweeper):
+    its loop and variation shots still marked submitted or polling have
+    nothing making them (a worker killed mid-step), so they read failed
+    and the page offers Generate again. Not while a clip job is pending.
+    The caller commits."""
+    if project.mode != AMBIENT_MODE:
+        return
+    from . import video_jobs
+
+    if video_jobs.pending_for(db, project_id=project.id, purposes=("shot", "avatar", "ambient_segment")) != 0:
+        return
+    (db.query(models.VideoShot)
+     .filter(models.VideoShot.project_id == project.id, models.VideoShot.status.in_(("submitted", "polling")))
+     .update({"status": "failed", "error": "Stopped before the clip was made; generate again"},
+             synchronize_session=False))
 
 
 def clip_shots(project: models.VideoProject) -> list[models.VideoShot]:

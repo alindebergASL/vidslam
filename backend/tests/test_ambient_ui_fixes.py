@@ -274,3 +274,74 @@ def test_sound_resolved_says_whether_generate_sound_has_a_sound_to_make(auth_cli
     out = auth_client.get(f"/api/ambient/{sid}").json()
     assert out["sound_resolved"] is False and out["sound_cost"] == 0
     assert auth_client.post(f"/api/ambient/{sid}/sound").status_code == 409
+
+
+def _killed_mid_drift(auth_client, monkeypatch) -> int:
+    """A Still + drift scene whose worker was killed after the shot went
+    "submitted": generating, its queue entry gone, nothing making the clip."""
+    from app import models
+    from app.db import SessionLocal
+    from app.workers import queue
+
+    monkeypatch.setattr(queue, "queue_entry_state", lambda job_id: "gone")
+    sid = _scene(auth_client, source="image_drift")
+    auth_client.post(f"/api/ambient/{sid}/generate-loop")
+    db = SessionLocal()
+    shots = db.query(models.VideoShot).filter(models.VideoShot.project_id == sid).all()
+    assert shots
+    for s in shots:
+        s.status = "submitted"
+    db.commit()
+    db.close()
+    _set(sid, status="generating", claim_token="", queue_job_id="rq-lost",
+         updated_at=datetime.utcnow() - timedelta(hours=1))
+    scene = auth_client.get(f"/api/ambient/{sid}").json()
+    assert scene["stuck"] is True and scene["loop_status"] == "submitted", scene
+    return sid
+
+
+def test_reset_on_a_stuck_drift_scene_frees_its_clip_too(auth_client, monkeypatch):
+    """Reset leaves no clip marked in flight: the page is usable again."""
+    sid = _killed_mid_drift(auth_client, monkeypatch)
+    r = auth_client.post(f"/api/projects/{sid}/cancel")
+    assert r.status_code == 200 and r.json()["action"] == "released", r.text
+    scene = auth_client.get(f"/api/ambient/{sid}").json()
+    assert scene["status"] == "cancelled" and scene["loop_status"] == "failed", scene
+    assert scene["stuck"] is False
+
+
+def test_the_sweeper_frees_a_stuck_drift_scenes_clip_too(auth_client, monkeypatch):
+    from app.db import SessionLocal
+    from app.services import sweepers
+
+    sid = _killed_mid_drift(auth_client, monkeypatch)
+    db = SessionLocal()
+    try:
+        sweepers.sweep_renders(db, now=datetime.utcnow() + timedelta(hours=6))
+    finally:
+        db.close()
+    scene = auth_client.get(f"/api/ambient/{sid}").json()
+    assert scene["status"] == "failed" and scene["loop_status"] == "failed", scene
+
+
+def test_a_removed_pictures_placeholder_describes_nothing(auth_client):
+    """/new stores a placeholder description for a picture scene with none:
+    it pays for no generated picture, it is cleared when the picture is
+    removed, and an older stored one buys no loop of nothing."""
+    sid = _scene(auth_client, scene_preset="custom", scene_prompt="the scene in the given image")
+    r = auth_client.post(f"/api/ambient/{sid}/picture",
+                         files={"file": ("pic.png", make_png_bytes((1920, 1080), (30, 160, 60)), "image/png")})
+    assert r.status_code == 200, r.text
+    assert auth_client.post(f"/api/ambient/{sid}/picture/generate?discard_loop=true").status_code == 422
+    assert auth_client.request("DELETE", f"/api/ambient/{sid}/picture").status_code in (200, 204)
+    assert auth_client.get(f"/api/ambient/{sid}").json()["config"]["scene_prompt"] == ""
+
+    old = _scene(auth_client, scene_preset="custom", scene_prompt="the scene in the given image")
+    assert auth_client.post(f"/api/ambient/{old}/generate-loop").status_code == 422
+    assert auth_client.post(f"/api/ambient/{old}/picture/generate").status_code == 422
+
+
+def test_presets_say_what_match_the_scene_picks(auth_client):
+    out = auth_client.get("/api/ambient/presets").json()
+    assert out["auto_sound_by_weather"].get("light_rain") == "rain"
+    assert "custom" not in out["auto_sound_by_scene"] and out["auto_sound_by_scene"]

@@ -950,6 +950,9 @@ export type AmbientPresets = {
   scenes: ScenePreset[];
   music_moods: MusicMood[];
   sounds?: MusicMood[];
+  /** What "Match the scene" picks: by weather first, then by preset. */
+  auto_sound_by_scene?: Record<string, string>;
+  auto_sound_by_weather?: Record<string, string>;
   looks?: AmbientOption[];
   times_of_day?: AmbientOption[];
   weathers?: AmbientOption[];

@@ -107,11 +107,13 @@ function Inner() {
   const [picture, setPicture] = useState<{ file?: File; picked?: PickedImage; url: string } | null>(null);
   const [picking, setPicking] = useState(false);
   const fileRef = useRef<HTMLInputElement | null>(null);
-  // A picture you bring is the scene: the preset no longer applies, its name
-  // is a fair default title, and nothing is bought until you say so.
+  // A picture you bring is the scene: the default preset gives way to it (a
+  // preset you chose stays: an indoor one shapes the light of time of day
+  // and weather, and "Match the scene" picks its sound), its name is a fair
+  // default title, and nothing is bought until you say so.
   const choosePicture = (next: { file?: File; picked?: PickedImage; url: string }, name: string) => {
     setPicture(next);
-    setCfg((c) => ({ ...c, scene_preset: "custom" }));
+    setCfg((c) => (c.scene_preset === DEFAULT_AMBIENT_CONFIG.scene_preset ? { ...c, scene_preset: "custom" } : c));
     const base = name.replace(/\.[a-z0-9]{2,5}$/i, "").replace(/[_-]+/g, " ").trim().slice(0, 120);
     if (base) setTitle((t) => (t.trim() ? t : base));
     setAfter("save");
@@ -796,7 +798,7 @@ function Inner() {
                   className="input"
                   value={title}
                   placeholder={
-                    preset && preset.id !== "custom" ? `${preset.label} — ${fmtDuration(cfg.total_seconds)}` : "Untitled scene"
+                    preset ? `${preset.label} — ${fmtDuration(cfg.total_seconds)}` : "Untitled scene"
                   }
                   onChange={(e) => setTitle(e.target.value)}
                 />

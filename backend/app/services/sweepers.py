@@ -276,6 +276,9 @@ def sweep_renders(db: Session, *, now: Optional[datetime] = None) -> dict:
         if was == "planning":
             events.plan_event(db, project, "failed", error="Stopped unexpectedly; try again")
         elif project.mode == "ambient_loop":
+            from . import ambient as _ambient
+
+            _ambient.fail_unmade_clips(db, project)
             events.ambient_loop_event(db, project, "failed", error="Stopped unexpectedly; try again")
         else:
             events.emit(db, "render", "project", project.id, "failed",

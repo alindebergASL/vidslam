@@ -763,6 +763,11 @@ export function SoundControls({
             }
             onChange={(e) => set("sound_prompt", e.target.value)}
           />
+          {cfg.sound === "auto" && !cfg.sound_prompt.trim() && presets && !autoSoundMatches(cfg, presets) && (
+            <p className="text-[11px] text-amber-300 mt-1">
+              &ldquo;Match the scene&rdquo; has nothing to match here: pick a sound or write a sound prompt.
+            </p>
+          )}
         </>
       )}
       {children}
@@ -819,6 +824,11 @@ const OWN_PICTURE = ["upload", "studio", "asset"];
 /** A video scene built from a picture the user brought, with no stills of
  *  its own to make (services.ambient.own_picture_video): its preset, look and
  *  Picture model don't reach the clip. */
+/** Whether "Match the scene" finds a sound (services.ambient.resolve_sound_prompt). */
+export function autoSoundMatches(cfg: AmbientConfig, presets: AmbientPresets): boolean {
+  return !!(presets.auto_sound_by_weather?.[cfg.weather] || presets.auto_sound_by_scene?.[cfg.scene_preset]);
+}
+
 export function ownPictureVideo(cfg: AmbientConfig): boolean {
   return cfg.source === "video" && OWN_PICTURE.includes(cfg.picture_origin) && cfg.variety !== "day_night";
 }
