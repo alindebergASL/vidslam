@@ -365,7 +365,7 @@ def story_script_job(story_id: int, claim_token: str = "") -> None:
             return
         db.commit()
         with spend.scope(ref=sound_studio.ref(story_id)), provider_keys.continuing():  # checked when queued
-            sound_studio.write_story(db, story_id)
+            sound_studio.write_story(db, story_id, sound_studio.running_token(claim_token))
     finally:
         db.close()
 
@@ -382,6 +382,6 @@ def story_enhance_job(story_id: int, claim_token: str = "") -> None:
             return
         db.commit()
         with spend.scope(ref=sound_studio.ref(story_id)), provider_keys.continuing():  # checked when queued
-            sound_studio.enhance_range(db, story_id)
+            sound_studio.enhance_range(db, story_id, sound_studio.running_token(claim_token))
     finally:
         db.close()

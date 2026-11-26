@@ -29,7 +29,7 @@ import uuid
 from datetime import datetime
 from typing import Callable, Optional
 
-from sqlalchemy import update
+from sqlalchemy import case, update
 from sqlalchemy.orm import Session
 
 from .. import models
@@ -51,8 +51,23 @@ WRITER_KEY = "writer"
 ENHANCE_KEY = "enhance"
 TASK_KEY = "task"
 
+# A job that took its claim over keeps it as RUNNING + token (its
+# generation). Cancel keeps it (the call in flight is paid for, so its
+# result is still saved) but stops the job before its next call; a newer
+# claim replaces it, and every write the job makes is filtered on it, so a
+# job whose story was claimed again changes nothing.
+RUNNING = "run:"
+
 STOPPED = "Stopped unexpectedly; Resume continues where it left off"
 CANCELLED = "Cancelled; Resume continues where it left off"
+
+
+class EmptyRewrite(ValueError):
+    """Enhance came back with nothing (or only the chapter heading)."""
+
+
+class _Superseded(Exception):
+    """The job's claim was cancelled or replaced: it stops, writing nothing."""
 
 
 class WriterRefused(ValueError):
@@ -137,10 +152,17 @@ def check_doc(doc: StoryDoc, *, title: str = "", premise: str = "", settings: Op
 def check_script_text(text: str, *, style: str = "", title: str = "", premise: str = "",
                       settings: Optional[dict] = None) -> Optional[StoryDoc]:
     """check_doc on a whole script (None when it is empty: only the
-    premise is checked then)."""
+    premise is checked then). With a script, the title and premise still
+    get the explicit-content check of a clean deployment (check_story's
+    covers the script, not them)."""
+    from . import explicit_check
+
     if not (text or "").strip():
         check_premise(title, premise)
         return None
+    about = "\n".join(x.strip() for x in (title or "", premise or "") if x and x.strip())
+    if about:
+        explicit_check.check(about)
     doc = story_script.parse(text, style=style)
     check_doc(doc, title=title, premise=premise, settings=settings)
     return doc
@@ -199,6 +221,7 @@ def enqueue_claimed(db: Session, story: models.SoundStory, job: Callable, *args,
         raise
     db.query(models.SoundStory).filter(
         models.SoundStory.id == story.id, models.SoundStory.status == "scripting",
+        models.SoundStory.claim_token.in_((token, running_token(token))),
     ).update({"queue_job_id": str(job_id or "")[:80]}, synchronize_session=False)
     db.commit()
     return str(job_id or "")
@@ -206,26 +229,46 @@ def enqueue_claimed(db: Session, story: models.SoundStory, job: Callable, *args,
 
 def consume_claim(db: Session, story_id: int, token: str, status: str = "scripting") -> bool:
     """The job takes the claim over (conditional UPDATE, committed by the
-    caller): a cancel while it waited, or a newer claim, makes it a no-op."""
+    caller): a cancel while it waited, or a newer claim, makes it a no-op.
+    The token becomes running_token(token), the job's generation."""
+    if not token or token.startswith(RUNNING):
+        return False
     done = (db.query(models.SoundStory)
             .filter(models.SoundStory.id == story_id, models.SoundStory.status == status,
                     models.SoundStory.claim_token == token)
-            .update({"claim_token": ""}, synchronize_session=False))
+            .update({"claim_token": running_token(token)}, synchronize_session=False))
     if done != 1:
         log.info("sound story %s claim was cancelled or replaced; skipping its job", story_id)
         return False
     return True
 
 
-def _status_now(story_id: int) -> Optional[str]:
-    """The story's status read in a fresh session (a Cancel from the web
-    commits there while the job runs)."""
+def running_token(token: str) -> str:
+    return f"{RUNNING}{token}"
+
+
+def _held(query, story_id: int, gen: str):  # noqa: ANN001, ANN202 — a SoundStory query
+    """`query` narrowed to the story while no newer claim replaced this job's
+    (generation `gen`): it may still save the result of its call in flight,
+    even after a Cancel."""
+    S = models.SoundStory
+    return query.filter(S.id == story_id, S.claim_token == gen)
+
+
+def _mine(query, story_id: int, gen: str):  # noqa: ANN001, ANN202 — a SoundStory query
+    """`query` narrowed to the story while this job (generation `gen`)
+    still runs it: claimed by it and not cancelled."""
+    return _held(query, story_id, gen).filter(models.SoundStory.status == "scripting")
+
+
+def _alive(story_id: int, gen: str) -> bool:
+    """Whether this job still holds the story, read in a fresh session (a
+    Cancel or a newer claim commits there while the job runs)."""
     from ..db import SessionLocal
 
     s = SessionLocal()
     try:
-        row = s.query(models.SoundStory.status).filter(models.SoundStory.id == story_id).first()
-        return row[0] if row else None
+        return _mine(s.query(models.SoundStory.id), story_id, gen).first() is not None
     finally:
         s.close()
 
@@ -246,10 +289,14 @@ def cancel(db: Session, story: models.SoundStory) -> dict:
     to = "cancelled" if task == WRITER_KEY else _back_to(progress)
     if task == ENHANCE_KEY:
         progress[ENHANCE_KEY] = {**(progress.get(ENHANCE_KEY) or {}), "status": "cancelled"}
-    waiting = story.claim_token != ""
-    done = (db.query(models.SoundStory)
-            .filter(models.SoundStory.id == story.id, models.SoundStory.status == "scripting")
-            .update({"status": to, "claim_token": "", "progress_json": progress,
+    waiting = not (story.claim_token or "").startswith(RUNNING)
+    S = models.SoundStory
+    # A running job keeps its generation (its call in flight is still
+    # saved); a claim no job has taken yet is given back.
+    keep = case((S.claim_token.startswith(RUNNING), S.claim_token), else_="")
+    done = (db.query(S)
+            .filter(S.id == story.id, S.status == "scripting")
+            .update({"status": to, "claim_token": keep, "progress_json": progress,
                      "error": CANCELLED if to == "cancelled" else ""}, synchronize_session=False))
     if done != 1:
         db.rollback()
@@ -369,11 +416,25 @@ def chapter_heading(index: int, title: str) -> str:
     return f"# Chapter {index + 1}: {title}".rstrip(": ")
 
 
-def write_story(db: Session, story_id: int) -> None:
-    """The writer job's body (claim consumed by the caller): the outline,
-    then each missing chapter, committed one by one; stops before the next
-    call when the story was cancelled. Ends 'ready', 'cancelled' or
-    'failed' (with what was written kept)."""
+def _with_cast(header: str, text: str) -> str:
+    """`text` (a script with no lines yet) with its @cast lines replaced by
+    `header`: the cast the writer's outline gave is the one the chapters are
+    written and checked with."""
+    rest = "\n".join(ln for ln in (text or "").splitlines() if not ln.strip().lower().startswith("@cast")).strip()
+    return f"{header}\n\n{rest}\n" if rest else f"{header}\n"
+
+
+def write_story(db: Session, story_id: int, gen: str = "") -> None:
+    """The writer job's body (claim consumed by the caller; `gen` is the
+    claim it holds, running_token(token)): the outline, then each missing
+    chapter, committed one by one; stops before the next call when the
+    story was cancelled or claimed again, and none of its writes land once
+    its claim is gone. Ends 'ready', 'cancelled' or 'failed' (with what was
+    written kept).
+
+    A "Write again" (writer["replace"]) keeps the old script until the first
+    new chapter is written over it. Every chapter is checked alone with the
+    cast and then with the whole story it would join before it is saved."""
     from .safety import UnsafeScriptError
 
     story = db.get(models.SoundStory, story_id)
@@ -386,25 +447,31 @@ def write_story(db: Session, story_id: int) -> None:
     progress = dict(story.progress_json or {})
     writer = dict(progress.get(WRITER_KEY) or {})
     n = chapter_count(minutes)
+    start_text = story.script_text or ""
     story_event(db, story, "started")
     db.commit()
 
     def save(**fields) -> None:  # noqa: ANN003
         nonlocal progress
         progress = {**progress, WRITER_KEY: dict(writer)}
-        db.query(models.SoundStory).filter(models.SoundStory.id == story_id).update(
+        done = _held(db.query(models.SoundStory), story_id, gen).update(
             {"progress_json": progress, "heartbeat_at": datetime.utcnow(), **fields},
             synchronize_session=False)
+        if done != 1:
+            raise _Superseded()
 
     def finish(status: str, error: str = "") -> None:
-        done = (db.query(models.SoundStory)
-                .filter(models.SoundStory.id == story_id, models.SoundStory.status == "scripting")
-                .update({"status": status, "error": error, "claim_token": ""}, synchronize_session=False))
+        done = _mine(db.query(models.SoundStory), story_id, gen).update(
+            {"status": status, "error": error, "claim_token": ""}, synchronize_session=False)
         db.commit()
         if done == 1:
             db.refresh(story)
             story_event(db, story, status if status != "ready" else "completed", error=error)
             db.commit()
+
+    def check_whole(text: str) -> None:
+        check_script_text(text, style=style, title=story.title or "", premise=story.premise or "",
+                          settings=settings)
 
     try:
         outline = writer.get("outline")
@@ -420,22 +487,27 @@ def write_story(db: Session, story_id: int) -> None:
                        premise=story.premise or "")
             writer.update({"outline": outline, "chapters_done": 0, "chapters": n, "model": used})
             fields: dict = {}
-            if not (story.script_text or "").strip():
-                fields = {"script_text": header + "\n", "script_version": (story.script_version or 0) + 1}
+            old = story.script_text or ""
+            if not writer.get("replace") and not parse_story(story, old).speech():
+                # No lines yet: the outline's cast replaces any cast there.
+                new_text = _with_cast(header, old)
+                if new_text != old:
+                    fields = {"script_text": new_text, "script_version": (story.script_version or 0) + 1}
             if not (story.title or "").strip() and outline.get("title"):
                 fields["title"] = outline["title"]
             save(**fields)
             db.commit()
             db.refresh(story)
-        header = header_of(story.script_text) or cast_lines(outline)
         total = len(outline.get("chapters") or []) or n
         per = minutes / total
         for i in range(int(writer.get("chapters_done") or 0), total):
-            if _status_now(story_id) != "scripting":
+            if not _alive(story_id, gen):
                 log.info("sound story %s cancelled before chapter %s", story_id, i + 1)
                 return
             db.refresh(story)
-            previous = (story.script_text or "")[-1500:]
+            replacing = bool(writer.get("replace"))
+            header = cast_lines(outline) if replacing else (header_of(story.script_text) or cast_lines(outline))
+            previous = "" if replacing else (story.script_text or "")[-1500:]
             reply, _ = _ask(lambda chat, i=i, previous=previous: chat.story_chapter(
                 premise=story.premise or "", outline=outline, index=i, minutes=per, style=style,
                 sfx_density=density, previous=previous), text=story.premise or "")
@@ -445,19 +517,33 @@ def write_story(db: Session, story_id: int) -> None:
             part = f"{chapter_heading(i, outline['chapters'][i]['title'])}\n{body}"
             check_part(header, part, style=style, title=story.title or "", premise=story.premise or "")
             db.refresh(story)
-            text = (story.script_text or "").rstrip() + "\n\n" + part + "\n"
+            base = header if replacing else (story.script_text or "").rstrip()
+            text = base + "\n\n" + part + "\n"
+            # The chapter with the story it joins (facts from earlier chapters,
+            # such as a character's age, count): nothing unsafe is saved.
+            check_whole(text)
             writer["chapters_done"] = i + 1
+            writer.pop("replace", None)
             save(script_text=text, script_version=(story.script_version or 0) + 1)
             story_event(db, story, "progress", detail=f"Chapter {i + 1} of {total} written")
             db.commit()
             db.refresh(story)
         # The whole story, as a save checks it.
-        check_script_text(story.script_text, style=style, title=story.title or "", premise=story.premise or "",
-                          settings=settings)
+        try:
+            check_whole(story.script_text)
+        except UnsafeScriptError:
+            # Never leave refused text saved: back to the script this run began with.
+            if (story.script_text or "") != start_text:
+                save(script_text=start_text, script_version=(story.script_version or 0) + 1)
+                db.commit()
+            raise
         writer["finished"] = True
         save()
         db.commit()
         finish("ready")
+    except _Superseded:
+        db.rollback()
+        log.info("sound story %s: the writer's claim was cancelled or replaced; stopping", story_id)
     except (WriterRefused, UnsafeScriptError) as e:
         db.rollback()
         finish("failed", str(e))
@@ -483,10 +569,14 @@ def writer_progress(story: models.SoundStory) -> dict:
             "has_outline": bool(w.get("outline")), "finished": bool(w.get("finished"))}
 
 
-def reset_writer(story: models.SoundStory) -> None:
-    """A fresh Write: forget an earlier run's outline and chapters."""
+def reset_writer(story: models.SoundStory, *, replace: bool = False) -> None:
+    """A fresh Write: forget an earlier run's outline and chapters. With
+    `replace` the script it has is kept until the job writes the first new
+    chapter over it."""
     progress = dict(story.progress_json or {})
     progress.pop(WRITER_KEY, None)
+    if replace:
+        progress[WRITER_KEY] = {"replace": True}
     story.progress_json = progress
 
 
@@ -573,13 +663,17 @@ def enhance_text(text: str, action: str, *, header: str = "", style: str = "", t
                  premise: str = "", minutes: Optional[int] = None) -> str:
     """One Enhance call on at most prompting.AUDIO_SCRIPT_MAX characters,
     checked as a written part is (check_part). A chapter keeps its own
-    heading. Raises EnhanceRefused or UnsafeScriptError."""
+    heading. Raises EnhanceRefused, UnsafeScriptError or EmptyRewrite (an
+    empty reply, or only the heading back, is never a rewrite)."""
     from . import prompting
 
     out = _bare(prompting.enhance(text, "audio_script", direction=direction(action, minutes))["text"])
     first = text.lstrip().splitlines()[0] if text.strip() else ""
     if first.startswith("#") and not out.startswith(first):
         out = f"{first}\n" + "\n".join(ln for ln in out.splitlines() if not ln.startswith("#")).strip()
+    said = text.strip() != first.strip() if first.startswith("#") else bool(text.strip())
+    if said and (not out.strip() or (first.startswith("#") and out.strip() == first.strip())):
+        raise EmptyRewrite("The text model returned an empty rewrite; try again. Your text is unchanged.")
     check_part(header, out, style=style, title=title, premise=premise)
     return out
 
@@ -594,11 +688,13 @@ def enhance_estimate(story: models.SoundStory, start: int, end: int) -> dict:
     return {"calls": calls, "unit_cost": unit, "cost": round(calls * unit, 4)}
 
 
-def enhance_range(db: Session, story_id: int) -> None:
-    """The Enhance job's body (claim consumed by the caller): each chapter
-    (or piece) of the range rewritten and checked, the result kept as a
-    proposal (progress_json["enhance"]), then the story goes back to what it
-    was. Stops before the next call when cancelled."""
+def enhance_range(db: Session, story_id: int, gen: str = "") -> None:
+    """The Enhance job's body (claim consumed by the caller; `gen` is the
+    claim it holds): each chapter (or piece) of the range rewritten and
+    checked, the result kept as a proposal (progress_json["enhance"]), then
+    the story goes back to what it was. Stops before the next call when
+    cancelled or claimed again; once a newer claim replaced its own, nothing
+    it writes lands (the proposal belongs to the newer Enhance)."""
     from . import prompting
     from .safety import UnsafeScriptError
 
@@ -622,10 +718,8 @@ def enhance_range(db: Session, story_id: int) -> None:
         if after:
             cur["after"] = after
         prog[ENHANCE_KEY] = cur
-        done = (db.query(models.SoundStory)
-                .filter(models.SoundStory.id == story_id, models.SoundStory.status == "scripting")
-                .update({"status": _back_to(prog), "claim_token": "", "progress_json": prog},
-                        synchronize_session=False))
+        done = _mine(db.query(models.SoundStory), story_id, gen).update(
+            {"status": _back_to(prog), "claim_token": "", "progress_json": prog}, synchronize_session=False)
         db.commit()
         if done == 1:
             db.refresh(story)
@@ -642,14 +736,14 @@ def enhance_range(db: Session, story_id: int) -> None:
                 out_parts.append(span)
                 continue
             k += 1
-            if _status_now(story_id) != "scripting":
+            if not _alive(story_id, gen):
                 return
             lead = span[: len(span) - len(span.lstrip("\n"))]
             trail = span[len(span.rstrip("\n")):]
             body = span.strip("\n")
             rewritten = []
             for piece in pieces(body, prompting.AUDIO_SCRIPT_MAX):
-                if _status_now(story_id) != "scripting":
+                if not _alive(story_id, gen):
                     return
                 rewritten.append(enhance_text(piece, str(job.get("action")), header=header, style=style,
                                               title=story.title or "", premise=story.premise or "",
@@ -661,8 +755,10 @@ def enhance_range(db: Session, story_id: int) -> None:
             db.refresh(story)
             prog = dict(story.progress_json or {})
             prog[ENHANCE_KEY] = {**(prog.get(ENHANCE_KEY) or job), "done": k + 1, "total": total}
-            db.query(models.SoundStory).filter(models.SoundStory.id == story_id).update(
-                {"progress_json": prog, "heartbeat_at": datetime.utcnow()}, synchronize_session=False)
+            if _mine(db.query(models.SoundStory), story_id, gen).update(
+                    {"progress_json": prog, "heartbeat_at": datetime.utcnow()}, synchronize_session=False) != 1:
+                db.rollback()
+                return
             story_event(db, story, "progress", detail=f"Enhance: part {k + 1} of {total}")
             db.commit()
             db.refresh(story)
@@ -673,6 +769,9 @@ def enhance_range(db: Session, story_id: int) -> None:
     except UnsafeScriptError as e:
         db.rollback()
         finish("failed", f"The rewrite was refused: {e} Your text is unchanged.")
+    except EmptyRewrite as e:
+        db.rollback()
+        finish("failed", str(e))
     except Exception as e:  # noqa: BLE001
         db.rollback()
         log.exception("sound story %s: enhance failed", story_id)

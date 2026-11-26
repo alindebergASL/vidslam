@@ -16,6 +16,7 @@ import {
   fmtMinutes,
   usd,
 } from "@/components/sound/shared";
+import { spliceCodePoints, toCodePoints } from "@/lib/textOffsets";
 import { usePoll } from "@/lib/usePoll";
 import {
   api,
@@ -62,13 +63,20 @@ function Inner() {
   const dirty = !!story && text !== story.script_text;
   const dirtyRef = useRef(false);
   dirtyRef.current = dirty;
+  // The script_version the text in the editor was loaded from: a save of
+  // edits made before a newer version (the writer's) is a 409, never a
+  // silent overwrite.
+  const baseVersion = useRef<number | null>(null);
 
   const reload = useCallback(async () => {
     try {
       const s = await api.getStory(id);
       setStory(s);
       // Never overwrite edits in progress.
-      if (!dirtyRef.current) setText(s.script_text);
+      if (!dirtyRef.current) {
+        setText(s.script_text);
+        baseVersion.current = s.script_version;
+      }
     } catch (e) {
       if (String(errorText(e, "")).startsWith("404") || (e as { status?: number })?.status === 404) setNotFound(true);
     }
@@ -109,13 +117,16 @@ function Inner() {
     });
   }, [job?.status, job?.after]);
 
-  const run = async (key: string, fn: () => Promise<unknown>, ok?: string) => {
+  // Resolves true when `fn` worked (an error is shown and gives false).
+  const run = async (key: string, fn: () => Promise<unknown>, ok?: string): Promise<boolean> => {
     setBusy(key);
     try {
       await fn();
       if (ok) toast.success(ok);
+      return true;
     } catch (e) {
       toast.error(errorText(e, "Something went wrong"));
+      return false;
     } finally {
       setBusy(null);
       reload();
@@ -143,14 +154,22 @@ function Inner() {
     run(
       "save",
       async () => {
-        const s = await api.updateStory(story.id, { script_text: next, script_version: story.script_version });
+        const s = await api.updateStory(story.id, {
+          script_text: next,
+          script_version: baseVersion.current ?? story.script_version,
+        });
         setStory(s);
         setText(s.script_text);
+        baseVersion.current = s.script_version;
       },
       msg
     );
 
   const askWrite = () => {
+    if (dirty) {
+      toast.error("Save or discard your changes first, then write.");
+      return;
+    }
     const price = est?.write;
     setConfirm({
       title: hasLines ? "Write the story again?" : "Write this story?",
@@ -165,7 +184,11 @@ function Inner() {
     });
   };
 
-  const askResume = () =>
+  const askResume = () => {
+    if (dirty) {
+      toast.error("Save or discard your changes first, then resume.");
+      return;
+    }
     setConfirm({
       title: "Resume writing?",
       body: `The ${w.chapters_done} finished chapter${w.chapters_done === 1 ? "" : "s"} stay; the writer continues with the next one.`,
@@ -175,6 +198,7 @@ function Inner() {
           await api.resumeStory(story.id);
         }),
     });
+  };
 
   const cancel = () =>
     run(
@@ -204,8 +228,9 @@ function Inner() {
         toast.error("Select some of the script first (in Edit), or pick a chapter or the whole story.");
         return;
       }
-      body.start = start;
-      body.end = end;
+      // The textarea counts UTF-16 units; the API counts code points.
+      body.start = toCodePoints(story.script_text, start);
+      body.end = toCodePoints(story.script_text, end);
       body.text = story.script_text.slice(start, end);
     } else if (scope === "chapter") {
       body.chapter_line = opts.chapterLine;
@@ -242,8 +267,10 @@ function Inner() {
       return;
     }
     const before = story.script_text;
-    const next = before.slice(0, proposal.start) + proposal.after + before.slice(proposal.end);
-    await save(next, "Rewrite used");
+    // proposal.start/end are code points (the API's offsets).
+    const next = spliceCodePoints(before, proposal.start, proposal.end, proposal.after);
+    // A save that failed keeps the proposal (it was paid for).
+    if (!(await save(next, "Rewrite used"))) return;
     setUndo({ text: before, after: next });
     if (proposal.fromJob) await api.dismissStoryEnhance(story.id).catch(() => {});
     setProposal(null);
@@ -257,7 +284,7 @@ function Inner() {
 
   const doUndo = async () => {
     if (!undo) return;
-    await save(undo.text, "Undone");
+    if (!(await save(undo.text, "Undone"))) return;
     setUndo(null);
   };
 
@@ -455,7 +482,10 @@ function Inner() {
             {dirty && (
               <div className="flex items-center gap-2">
                 <span className="text-xs text-amber-300">Unsaved changes</span>
-                <button type="button" className="btn-ghost" onClick={() => setText(story.script_text)}>
+                <button type="button" className="btn-ghost" onClick={() => {
+                    setText(story.script_text);
+                    baseVersion.current = story.script_version;
+                  }}>
                   Discard
                 </button>
                 <button type="button" className="btn-primary" disabled={busy === "save"} onClick={() => save()}>

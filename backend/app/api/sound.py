@@ -237,10 +237,9 @@ def write(story_id: int, body: Optional[WriteIn] = None, db: Session = Depends(g
     _require_writer()
     price = sound_studio.write_estimate(story.target_minutes or 10)
     spend.require_budget_for(db, price["cost"])
-    sound_studio.reset_writer(story)
-    if has_lines:
-        story.script_text = ""
-        story.script_version = (story.script_version or 0) + 1
+    # A replaced script stays until the job writes the first new chapter
+    # over it (a refused outline or a failed claim loses nothing).
+    sound_studio.reset_writer(story, replace=has_lines)
     story.estimated_cost = price["cost"]
     db.commit()
     job_id = _enqueue(db, story, story_script_job, sound_studio.WRITER_KEY)
