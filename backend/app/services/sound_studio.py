@@ -1,0 +1,764 @@
+"""Sound Studio stories: the checks on save, the writer job, Enhance, the
+claims and Cancel / Resume (api/sound.py).
+
+A story is written chapter by chapter in a job on RQ that holds a claim
+(status 'scripting', a random claim_token the job consumes before it
+starts, as ambient's loop job does). Every finished chapter is committed at
+once, so a Cancel (checked between chapters) or a killed worker keeps the
+chapters already paid for, and Resume continues at the next missing
+chapter (progress_json["writer"]). Enhance on a selection up to
+prompting.AUDIO_SCRIPT_MAX characters runs in the request; a chapter or the
+whole story is a job under the same claim, and its result is kept as a
+proposal (progress_json["enhance"]) the editor shows as before/after.
+
+Every script that is saved, every written chapter and every Enhance output
+is checked (check_script_text / check_part): the spoken words with the
+markup removed (safety.validate_script and check_script), then the whole
+story check of PR1 (story_script.check_story: the minors check of every
+window with the cast header in front and, on a clean deployment, the
+explicit-content check). A premise alone is checked by check_premise. Spend
+is recorded with ref "sound_story:<id>" and no project.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import math
+import re
+import uuid
+from datetime import datetime
+from typing import Callable, Optional
+
+from sqlalchemy import update
+from sqlalchemy.orm import Session
+
+from .. import models
+from ..config import get_settings
+from . import events, story_script
+from .sound_estimate import MINUTES_PER_CHAPTER_CALL
+from .story_script import StoryDoc
+
+log = logging.getLogger("avs.sound_studio")
+
+# A story a job is working on: no edit, no second job.
+BUSY = ("scripting", "generating", "rendering")
+STYLES = tuple(story_script.WPM_BY_STYLE)
+# Styles left out on a clean deployment (romance-type presets).
+ADULT_STYLES = ("romance",)
+SFX_DENSITIES = ("none", "low", "medium", "high")
+ENHANCE_ACTIONS = ("tighten", "lengthen", "asmr", "sfx", "sleep")
+WRITER_KEY = "writer"
+ENHANCE_KEY = "enhance"
+TASK_KEY = "task"
+
+STOPPED = "Stopped unexpectedly; Resume continues where it left off"
+CANCELLED = "Cancelled; Resume continues where it left off"
+
+
+class WriterRefused(ValueError):
+    """The writer (or Enhance) model would not write it: `reason` "minor"
+    or "declined" (prompting.refusal), or the reply couldn't be read."""
+
+    def __init__(self, message: str, reason: str = "declined") -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def ref(story_id: int) -> str:
+    return f"sound_story:{story_id}"
+
+
+def story_url(story_id: int) -> str:
+    return f"/sound/stories/{story_id}"
+
+
+def style_of(story: models.SoundStory) -> str:
+    return str((story.settings_json or {}).get("style") or "")
+
+
+def parse_story(story: models.SoundStory, text: Optional[str] = None) -> StoryDoc:
+    return story_script.parse(story.script_text if text is None else text, style=style_of(story))
+
+
+def chapter_count(minutes: int) -> int:
+    return max(1, math.ceil(max(1, int(minutes or 1)) / MINUTES_PER_CHAPTER_CALL))
+
+
+def max_minutes() -> int:
+    return int(get_settings().sound_story_max_minutes)
+
+
+# ---------- checks ----------
+
+
+def check_premise(title: str, premise: str) -> None:
+    """A premise (and title) before anything is written: the script word
+    check (minors and sexual content: every mode), the minors check of the
+    story path (minor_check.check_long, kind "story", fails closed) and, on a
+    clean deployment, the explicit-content check. Raises UnsafeScriptError
+    (UnsafePromptError / ExplicitContentError): a 422."""
+    from . import explicit_check, minor_check
+    from .safety import check_script
+
+    text = "\n".join(x.strip() for x in (title or "", premise or "") if x and x.strip())
+    if not text:
+        return
+    check_script(text)
+    minor_check.check_long(text, kind="story")
+    explicit_check.check(text)
+
+
+def _spoken(doc: StoryDoc) -> str:
+    """The words read aloud, every tag and cue removed."""
+    return "\n".join(i.spoken_text for i in doc.speech() if i.spoken_text.strip())
+
+
+def music_prompts(settings: Optional[dict]) -> tuple[str, ...]:
+    m = str((settings or {}).get("music_prompt") or "").strip()
+    return (m,) if m else ()
+
+
+def check_doc(doc: StoryDoc, *, title: str = "", premise: str = "", settings: Optional[dict] = None) -> str:
+    """The checks a script gets wherever it comes from (a save, a written
+    chapter, an Enhance rewrite): the spoken words without markup
+    (safety.validate_script and check_script), then story_script.check_story
+    (minors in every mode, explicit content on a clean deployment). Returns
+    the story context. Raises UnsafeScriptError."""
+    from .safety import check_script, validate_script
+
+    spoken = _spoken(doc)
+    if spoken.strip():
+        validate_script(spoken)
+        check_script(spoken)
+    return str(story_script.check_story(doc, title=title, premise=premise,
+                                        music_prompts=music_prompts(settings)))
+
+
+def check_script_text(text: str, *, style: str = "", title: str = "", premise: str = "",
+                      settings: Optional[dict] = None) -> Optional[StoryDoc]:
+    """check_doc on a whole script (None when it is empty: only the
+    premise is checked then)."""
+    if not (text or "").strip():
+        check_premise(title, premise)
+        return None
+    doc = story_script.parse(text, style=style)
+    check_doc(doc, title=title, premise=premise, settings=settings)
+    return doc
+
+
+def header_of(text: str) -> str:
+    """The script's @cast lines (the cast every part is read with)."""
+    return "\n".join(ln for ln in (text or "").splitlines() if ln.strip().lower().startswith("@cast"))
+
+
+def check_part(header: str, part: str, *, style: str = "", title: str = "", premise: str = "") -> None:
+    """One chapter (or one Enhance rewrite) checked with the cast in front
+    (check_doc on the header plus the part)."""
+    doc = story_script.parse(f"{header}\n\n{part}" if header else part, style=style, max_minutes=0)
+    check_doc(doc, title=title, premise=premise)
+
+
+# ---------- claims ----------
+
+
+def claim(db: Session, story: models.SoundStory, task: str) -> tuple[str, str]:
+    """Claim the story for a job (conditional UPDATE: two requests can't
+    both get through): status 'scripting' and a fresh claim_token. Returns
+    (token, previous status). Raises LookupError when it is busy."""
+    previous = story.status
+    token = uuid.uuid4().hex
+    progress = dict(story.progress_json or {})
+    progress[TASK_KEY] = task
+    progress["previous"] = previous
+    done = (db.query(models.SoundStory)
+            .filter(models.SoundStory.id == story.id, models.SoundStory.status.notin_(BUSY))
+            .update({"status": "scripting", "claim_token": token, "queue_job_id": "", "error": "",
+                     "progress_json": progress, "heartbeat_at": datetime.utcnow()},
+                    synchronize_session=False))
+    db.commit()
+    if done != 1:
+        raise LookupError("this story is busy; wait or cancel first")
+    return token, previous
+
+
+def enqueue_claimed(db: Session, story: models.SoundStory, job: Callable, *args, task: str) -> str:
+    """Claim, then queue `job(story.id, *args, claim_token=token)`; the
+    queue entry is recorded while the story is still claimed. If nothing
+    was queued (Redis gone), the claim is given back."""
+    from ..workers.queue import enqueue
+
+    token, previous = claim(db, story, task)
+    try:
+        job_id = enqueue(job, story.id, *args, claim_token=token)
+    except Exception:
+        db.query(models.SoundStory).filter(
+            models.SoundStory.id == story.id, models.SoundStory.status == "scripting",
+            models.SoundStory.claim_token == token,
+        ).update({"status": previous, "claim_token": ""}, synchronize_session=False)
+        db.commit()
+        raise
+    db.query(models.SoundStory).filter(
+        models.SoundStory.id == story.id, models.SoundStory.status == "scripting",
+    ).update({"queue_job_id": str(job_id or "")[:80]}, synchronize_session=False)
+    db.commit()
+    return str(job_id or "")
+
+
+def consume_claim(db: Session, story_id: int, token: str, status: str = "scripting") -> bool:
+    """The job takes the claim over (conditional UPDATE, committed by the
+    caller): a cancel while it waited, or a newer claim, makes it a no-op."""
+    done = (db.query(models.SoundStory)
+            .filter(models.SoundStory.id == story_id, models.SoundStory.status == status,
+                    models.SoundStory.claim_token == token)
+            .update({"claim_token": ""}, synchronize_session=False))
+    if done != 1:
+        log.info("sound story %s claim was cancelled or replaced; skipping its job", story_id)
+        return False
+    return True
+
+
+def _status_now(story_id: int) -> Optional[str]:
+    """The story's status read in a fresh session (a Cancel from the web
+    commits there while the job runs)."""
+    from ..db import SessionLocal
+
+    s = SessionLocal()
+    try:
+        row = s.query(models.SoundStory.status).filter(models.SoundStory.id == story_id).first()
+        return row[0] if row else None
+    finally:
+        s.close()
+
+
+def _back_to(progress: dict) -> str:
+    prev = str(progress.get("previous") or "draft")
+    return "draft" if prev in BUSY else prev
+
+
+def cancel(db: Session, story: models.SoundStory) -> dict:
+    """Cancel the story's job. Waiting in the queue (its claim not taken
+    yet): released at once. Running: marked, and the job stops before its
+    next call (the call in flight is still paid for and kept)."""
+    if story.status != "scripting":
+        return {"status": story.status, "action": "noop"}
+    progress = dict(story.progress_json or {})
+    task = progress.get(TASK_KEY)
+    to = "cancelled" if task == WRITER_KEY else _back_to(progress)
+    if task == ENHANCE_KEY:
+        progress[ENHANCE_KEY] = {**(progress.get(ENHANCE_KEY) or {}), "status": "cancelled"}
+    waiting = story.claim_token != ""
+    done = (db.query(models.SoundStory)
+            .filter(models.SoundStory.id == story.id, models.SoundStory.status == "scripting")
+            .update({"status": to, "claim_token": "", "progress_json": progress,
+                     "error": CANCELLED if to == "cancelled" else ""}, synchronize_session=False))
+    if done != 1:
+        db.rollback()
+        db.refresh(story)
+        return {"status": story.status, "action": "noop"}
+    db.refresh(story)
+    story_event(db, story, "cancelled")
+    db.commit()
+    return {"status": story.status, "action": "released" if waiting else "signalled"}
+
+
+# ---------- events ----------
+
+
+def story_event(db: Session, story: models.SoundStory, status: str, *, detail: str = "",
+                error: str = "") -> None:
+    events.sound_story_event(db, story, status, detail=detail, error=error)
+
+
+# ---------- the writer ----------
+
+
+def _ask(call: Callable, *, text: str = "") -> tuple[str, str]:
+    """One writer call through the active chat model (prompting._chat_for:
+    the planner, or the adult text model in adult mode): (reply, model). A
+    refusal (prompting.refusal) in adult mode is retried once with the
+    adult fallback model; outside adult mode it stands. A refusal that
+    remains raises WriterRefused."""
+    from . import content_mode, model_registry, prompting
+
+    adult = content_mode.adult_mode()
+
+    def run(m: str) -> tuple[str, str]:
+        chat = prompting._chat_for(m)
+        out = call(chat)
+        return out, getattr(chat, "model", "") or m or model_registry.active_model("chat")
+
+    out, used = run("")
+    why = prompting.refusal(out, text) if out.strip() else "declined"
+    if why == "declined" and adult:
+        fallback = get_settings().adult_text_fallback_model or ""
+        if fallback and fallback != used:
+            log.info("story writer: %s declined; retrying with %s", used, fallback)
+            out, used = run(fallback)
+            why = prompting.refusal(out, text) if out.strip() else "declined"
+    if why == "minor":
+        raise WriterRefused("The writer refused this story: it appears to sexualise a minor.", "minor")
+    if why:
+        if not content_mode.features():
+            msg = f"The writer ({used}) declined to write this; this server writes general-audience stories only."
+        else:
+            msg = f"The writer ({used}) declined to write this; change the premise and try again."
+        raise WriterRefused(msg, "declined")
+    return out, used
+
+
+_NAME_OK = re.compile(r"^[A-Z][A-Z0-9 .'\-]{0,39}$")
+
+
+def read_outline(reply: str, chapters: int) -> dict:
+    """The writer's outline, checked and trimmed: a title, a cast of at most
+    12 (NARRATOR first), exactly `chapters` chapters."""
+    from ..providers.openrouter_chat import extract_json
+
+    try:
+        data = extract_json(reply)
+    except Exception:  # noqa: BLE001
+        raise WriterRefused("The writer's outline couldn't be read; try again.", "unreadable") from None
+    cast: list[dict] = []
+    seen: set[str] = set()
+    for c in data.get("cast") or []:
+        if not isinstance(c, dict):
+            continue
+        name = " ".join(str(c.get("name") or "").upper().replace("[", " ").replace("]", " ").replace(":", " ")
+                        .split())[:40]
+        if not name or not _NAME_OK.match(name) or name in seen:
+            continue
+        seen.add(name)
+        pan = str(c.get("pan") or "").lower()
+        desc = " ".join(str(c.get("description") or "").replace("[", "(").replace("]", ")").split())[:300]
+        cast.append({"name": name, "pan": pan if pan in story_script.PLACEMENTS else "",
+                     "description": desc})
+    if story_script.NARRATOR not in seen:
+        cast.insert(0, {"name": story_script.NARRATOR, "pan": "center", "description": "calm adult narrator"})
+    cast = cast[:12]
+    raw = [c for c in data.get("chapters") or [] if isinstance(c, dict)]
+    out_ch = []
+    for i in range(chapters):
+        c = raw[i] if i < len(raw) else {}
+        title = " ".join(str(c.get("title") or f"Chapter {i + 1}").replace("#", " ").split())[:120]
+        out_ch.append({"title": title, "summary": " ".join(str(c.get("summary") or "").split())[:800]})
+    return {"title": " ".join(str(data.get("title") or "").split())[:200], "cast": cast, "chapters": out_ch}
+
+
+def cast_lines(outline: dict) -> str:
+    out = []
+    for c in outline.get("cast") or []:
+        pan = f" [{c['pan']}]" if c.get("pan") else ""
+        out.append(f"@cast {c['name']}{pan}: {c.get('description') or ''}".rstrip())
+    return "\n".join(out)
+
+
+# A chapter's own structure lines are the app's (headings, cast): the
+# writer's are dropped.
+_STRUCTURE_RE = re.compile(r"^\s*(?:#|@cast\b)", re.I)
+
+
+def clean_chapter(reply: str) -> str:
+    t = (reply or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    return "\n".join(ln.rstrip() for ln in t.splitlines() if not _STRUCTURE_RE.match(ln)).strip()
+
+
+def chapter_heading(index: int, title: str) -> str:
+    return f"# Chapter {index + 1}: {title}".rstrip(": ")
+
+
+def write_story(db: Session, story_id: int) -> None:
+    """The writer job's body (claim consumed by the caller): the outline,
+    then each missing chapter, committed one by one; stops before the next
+    call when the story was cancelled. Ends 'ready', 'cancelled' or
+    'failed' (with what was written kept)."""
+    from .safety import UnsafeScriptError
+
+    story = db.get(models.SoundStory, story_id)
+    if story is None:
+        return
+    settings = dict(story.settings_json or {})
+    style = str(settings.get("style") or "")
+    density = str(settings.get("sfx_density") or "medium")
+    minutes = max(1, min(int(story.target_minutes or 10), max_minutes()))
+    progress = dict(story.progress_json or {})
+    writer = dict(progress.get(WRITER_KEY) or {})
+    n = chapter_count(minutes)
+    story_event(db, story, "started")
+    db.commit()
+
+    def save(**fields) -> None:  # noqa: ANN003
+        nonlocal progress
+        progress = {**progress, WRITER_KEY: dict(writer)}
+        db.query(models.SoundStory).filter(models.SoundStory.id == story_id).update(
+            {"progress_json": progress, "heartbeat_at": datetime.utcnow(), **fields},
+            synchronize_session=False)
+
+    def finish(status: str, error: str = "") -> None:
+        done = (db.query(models.SoundStory)
+                .filter(models.SoundStory.id == story_id, models.SoundStory.status == "scripting")
+                .update({"status": status, "error": error, "claim_token": ""}, synchronize_session=False))
+        db.commit()
+        if done == 1:
+            db.refresh(story)
+            story_event(db, story, status if status != "ready" else "completed", error=error)
+            db.commit()
+
+    try:
+        outline = writer.get("outline")
+        if not outline:
+            reply, used = _ask(lambda chat: chat.story_outline(
+                premise=story.premise or "", title=story.title or "", minutes=minutes, style=style,
+                sfx_density=density, chapters=n), text=story.premise or "")
+            outline = read_outline(reply, n)
+            header = cast_lines(outline)
+            # The cast (who each character is, and their age) is checked with
+            # the premise before any chapter is written.
+            check_part(header, "", style=style, title=outline.get("title") or story.title or "",
+                       premise=story.premise or "")
+            writer.update({"outline": outline, "chapters_done": 0, "chapters": n, "model": used})
+            fields: dict = {}
+            if not (story.script_text or "").strip():
+                fields = {"script_text": header + "\n", "script_version": (story.script_version or 0) + 1}
+            if not (story.title or "").strip() and outline.get("title"):
+                fields["title"] = outline["title"]
+            save(**fields)
+            db.commit()
+            db.refresh(story)
+        header = header_of(story.script_text) or cast_lines(outline)
+        total = len(outline.get("chapters") or []) or n
+        per = minutes / total
+        for i in range(int(writer.get("chapters_done") or 0), total):
+            if _status_now(story_id) != "scripting":
+                log.info("sound story %s cancelled before chapter %s", story_id, i + 1)
+                return
+            db.refresh(story)
+            previous = (story.script_text or "")[-1500:]
+            reply, _ = _ask(lambda chat, i=i, previous=previous: chat.story_chapter(
+                premise=story.premise or "", outline=outline, index=i, minutes=per, style=style,
+                sfx_density=density, previous=previous), text=story.premise or "")
+            body = clean_chapter(reply)
+            if not body:
+                raise WriterRefused("The writer returned an empty chapter; Resume tries again.", "unreadable")
+            part = f"{chapter_heading(i, outline['chapters'][i]['title'])}\n{body}"
+            check_part(header, part, style=style, title=story.title or "", premise=story.premise or "")
+            db.refresh(story)
+            text = (story.script_text or "").rstrip() + "\n\n" + part + "\n"
+            writer["chapters_done"] = i + 1
+            save(script_text=text, script_version=(story.script_version or 0) + 1)
+            story_event(db, story, "progress", detail=f"Chapter {i + 1} of {total} written")
+            db.commit()
+            db.refresh(story)
+        # The whole story, as a save checks it.
+        check_script_text(story.script_text, style=style, title=story.title or "", premise=story.premise or "",
+                          settings=settings)
+        writer["finished"] = True
+        save()
+        db.commit()
+        finish("ready")
+    except (WriterRefused, UnsafeScriptError) as e:
+        db.rollback()
+        finish("failed", str(e))
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        log.exception("sound story %s: writing failed", story_id)
+        finish("failed", f"Writing stopped: {str(e)[:300]}. Resume continues where it left off.")
+
+
+def can_resume(story: models.SoundStory) -> bool:
+    """A writer run that stopped part-way (cancelled, failed or swept)
+    before it finished: Resume continues at the next missing chapter (or
+    the outline, when that is what stopped)."""
+    progress = story.progress_json or {}
+    w = progress.get(WRITER_KEY) or {}
+    return (story.status in ("cancelled", "failed") and progress.get(TASK_KEY) == WRITER_KEY
+            and not w.get("finished"))
+
+
+def writer_progress(story: models.SoundStory) -> dict:
+    w = (story.progress_json or {}).get(WRITER_KEY) or {}
+    return {"chapters_done": int(w.get("chapters_done") or 0), "chapters": int(w.get("chapters") or 0),
+            "has_outline": bool(w.get("outline")), "finished": bool(w.get("finished"))}
+
+
+def reset_writer(story: models.SoundStory) -> None:
+    """A fresh Write: forget an earlier run's outline and chapters."""
+    progress = dict(story.progress_json or {})
+    progress.pop(WRITER_KEY, None)
+    story.progress_json = progress
+
+
+def write_estimate(minutes: int) -> dict:
+    calls = 1 + chapter_count(minutes)
+    unit = float(get_settings().cost_chat_per_story_call)
+    return {"calls": calls, "unit_cost": unit, "cost": round(calls * unit, 4)}
+
+
+def remaining_write_estimate(story: models.SoundStory) -> dict:
+    w = (story.progress_json or {}).get(WRITER_KEY) or {}
+    n = int(w.get("chapters") or chapter_count(story.target_minutes or 10))
+    calls = (0 if w.get("outline") else 1) + max(0, n - int(w.get("chapters_done") or 0))
+    unit = float(get_settings().cost_chat_per_story_call)
+    return {"calls": calls, "unit_cost": unit, "cost": round(calls * unit, 4)}
+
+
+# ---------- Enhance ----------
+
+
+def direction(action: str, minutes: Optional[int] = None) -> str:
+    from ..providers.openrouter_chat import AUDIO_SCRIPT_ACTIONS
+
+    text = AUDIO_SCRIPT_ACTIONS[action]
+    return f"{action}: " + text.replace("{minutes}", str(int(minutes or 5)))
+
+
+def pieces(text: str, size: int) -> list[str]:
+    """`text` cut at line ends into pieces of at most `size` characters (a
+    single longer line is cut between words)."""
+    out: list[str] = []
+    buf = ""
+    for ln in text.split("\n"):
+        while len(ln) > size:
+            cut = ln.rfind(" ", 0, size)
+            cut = cut if cut > 0 else size
+            if buf:
+                out.append(buf)
+                buf = ""
+            out.append(ln[:cut])
+            ln = ln[cut:].lstrip()
+        cand = f"{buf}\n{ln}" if buf else ln
+        if len(cand) > size and buf:
+            out.append(buf)
+            buf = ln
+        else:
+            buf = cand
+    if buf.strip():
+        out.append(buf)
+    return out
+
+
+def segments(text: str) -> list[tuple[int, int, bool]]:
+    """`text` cut at its chapter headings into (start, end, enhance) parts
+    that cover all of it: each chapter from its heading to the next one,
+    and the text before the first heading (enhanced only when it says
+    anything besides the cast and notes)."""
+    starts: list[int] = []
+    pos = 0
+    for ln in text.splitlines(keepends=True):
+        if ln.startswith("#"):
+            starts.append(pos)
+        pos += len(ln)
+    if not starts or starts[0] != 0:
+        head = text[: starts[0]] if starts else text
+        said = any(ln.strip() and not ln.strip().lower().startswith(("@cast", "//")) for ln in head.splitlines())
+        out = [(0, len(head), said)]
+    else:
+        out = []
+    for k, st in enumerate(starts):
+        out.append((st, starts[k + 1] if k + 1 < len(starts) else len(text), True))
+    return [x for x in out if x[1] > x[0]]
+
+
+def _bare(reply: str) -> str:
+    t = (reply or "").strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+
+def enhance_text(text: str, action: str, *, header: str = "", style: str = "", title: str = "",
+                 premise: str = "", minutes: Optional[int] = None) -> str:
+    """One Enhance call on at most prompting.AUDIO_SCRIPT_MAX characters,
+    checked as a written part is (check_part). A chapter keeps its own
+    heading. Raises EnhanceRefused or UnsafeScriptError."""
+    from . import prompting
+
+    out = _bare(prompting.enhance(text, "audio_script", direction=direction(action, minutes))["text"])
+    first = text.lstrip().splitlines()[0] if text.strip() else ""
+    if first.startswith("#") and not out.startswith(first):
+        out = f"{first}\n" + "\n".join(ln for ln in out.splitlines() if not ln.startswith("#")).strip()
+    check_part(header, out, style=style, title=title, premise=premise)
+    return out
+
+
+def enhance_estimate(story: models.SoundStory, start: int, end: int) -> dict:
+    from . import prompting
+
+    text = (story.script_text or "")[start:end]
+    calls = sum(len(pieces(text[a:b].strip("\n"), prompting.AUDIO_SCRIPT_MAX))
+                for a, b, on in segments(text) if on and text[a:b].strip()) or 1
+    unit = float(get_settings().cost_chat_per_story_call)
+    return {"calls": calls, "unit_cost": unit, "cost": round(calls * unit, 4)}
+
+
+def enhance_range(db: Session, story_id: int) -> None:
+    """The Enhance job's body (claim consumed by the caller): each chapter
+    (or piece) of the range rewritten and checked, the result kept as a
+    proposal (progress_json["enhance"]), then the story goes back to what it
+    was. Stops before the next call when cancelled."""
+    from . import prompting
+    from .safety import UnsafeScriptError
+
+    story = db.get(models.SoundStory, story_id)
+    if story is None:
+        return
+    progress = dict(story.progress_json or {})
+    job = dict(progress.get(ENHANCE_KEY) or {})
+    start, end = int(job.get("start") or 0), int(job.get("end") or 0)
+    text = (story.script_text or "")[start:end]
+    style = style_of(story)
+    header = header_of(story.script_text)
+    out_parts: list[str] = []
+    story_event(db, story, "started", detail="Enhance")
+    db.commit()
+
+    def finish(state: str, error: str = "", after: str = "") -> None:
+        prog = dict(story.progress_json or {})
+        cur = dict(prog.get(ENHANCE_KEY) or job)
+        cur.update({"status": state, "error": error})
+        if after:
+            cur["after"] = after
+        prog[ENHANCE_KEY] = cur
+        done = (db.query(models.SoundStory)
+                .filter(models.SoundStory.id == story_id, models.SoundStory.status == "scripting")
+                .update({"status": _back_to(prog), "claim_token": "", "progress_json": prog},
+                        synchronize_session=False))
+        db.commit()
+        if done == 1:
+            db.refresh(story)
+            story_event(db, story, "completed" if state == "ready" else "failed", detail="Enhance", error=error)
+            db.commit()
+
+    try:
+        parts = segments(text)
+        total = sum(1 for _, _, on in parts if on) or 1
+        k = -1
+        for a, b, on in parts:
+            span = text[a:b]
+            if not on or not span.strip():
+                out_parts.append(span)
+                continue
+            k += 1
+            if _status_now(story_id) != "scripting":
+                return
+            lead = span[: len(span) - len(span.lstrip("\n"))]
+            trail = span[len(span.rstrip("\n")):]
+            body = span.strip("\n")
+            rewritten = []
+            for piece in pieces(body, prompting.AUDIO_SCRIPT_MAX):
+                if _status_now(story_id) != "scripting":
+                    return
+                rewritten.append(enhance_text(piece, str(job.get("action")), header=header, style=style,
+                                              title=story.title or "", premise=story.premise or "",
+                                              minutes=job.get("minutes")))
+            new = "\n".join(rewritten)
+            # Every rewritten chapter is checked whole, with the cast.
+            check_part(header, new, style=style, title=story.title or "", premise=story.premise or "")
+            out_parts.append(lead + new + (trail or ("\n" if b < len(text) else "")))
+            db.refresh(story)
+            prog = dict(story.progress_json or {})
+            prog[ENHANCE_KEY] = {**(prog.get(ENHANCE_KEY) or job), "done": k + 1, "total": total}
+            db.query(models.SoundStory).filter(models.SoundStory.id == story_id).update(
+                {"progress_json": prog, "heartbeat_at": datetime.utcnow()}, synchronize_session=False)
+            story_event(db, story, "progress", detail=f"Enhance: part {k + 1} of {total}")
+            db.commit()
+            db.refresh(story)
+        finish("ready", after="".join(out_parts))
+    except prompting.EnhanceRefused as e:
+        db.rollback()
+        finish("failed", refused_message(e))
+    except UnsafeScriptError as e:
+        db.rollback()
+        finish("failed", f"The rewrite was refused: {e} Your text is unchanged.")
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        log.exception("sound story %s: enhance failed", story_id)
+        finish("failed", f"Enhance stopped: {str(e)[:300]}. Your text is unchanged.")
+
+
+def refused_message(e) -> str:  # noqa: ANN001 — prompting.EnhanceRefused
+    if e.reason == "minor":
+        return "This text was refused: it appears to sexualise a minor. Your text is unchanged."
+    if e.reason == "unsafe_rewrite":
+        return "The rewrite was refused by the minors check, so your text is unchanged."
+    return f"The text model ({e.model}) declined to rewrite this, so your text is unchanged."
+
+
+# ---------- the sweeper ----------
+
+
+def sweep(db: Session, *, now: datetime, limit, heartbeat) -> dict:  # noqa: ANN001 — timedeltas
+    """Stories a dead worker left 'scripting' (or generating / rendering):
+    past the queue time limit, or without a heartbeat for `heartbeat`, and
+    whose queue entry is gone -> failed (Resume continues)."""
+    from ..workers.queue import queue_entry_state
+
+    S = models.SoundStory
+    out = {"failed": 0}
+    rows = (db.query(S).filter(S.status.in_(BUSY), S.updated_at <= now - min(limit, heartbeat))
+            .order_by(S.id).limit(50).all())
+    for story in rows:
+        beat = story.heartbeat_at or story.updated_at
+        stale = story.updated_at <= now - limit or (beat is not None and beat <= now - heartbeat)
+        if not stale or queue_entry_state(story.queue_job_id or "") != "gone":
+            continue
+        progress = dict(story.progress_json or {})
+        to = "failed"
+        if progress.get(TASK_KEY) == ENHANCE_KEY:
+            to = _back_to(progress)
+            progress[ENHANCE_KEY] = {**(progress.get(ENHANCE_KEY) or {}), "status": "failed", "error": STOPPED}
+        res = db.execute(update(S).where(S.id == story.id, S.status == story.status,
+                                         S.updated_at == story.updated_at)
+                         .values(status=to, error=STOPPED if to == "failed" else "", claim_token="",
+                                 progress_json=progress, updated_at=datetime.utcnow()))
+        if res.rowcount != 1:
+            db.rollback()
+            continue
+        db.refresh(story)
+        story_event(db, story, "failed", error=STOPPED)
+        db.commit()
+        out["failed"] += 1
+    return out
+
+
+# ---------- output ----------
+
+
+def doc_out(doc: StoryDoc) -> dict:
+    return {
+        "chapters": [{"index": c.index, "title": c.title, "line": c.line, "items": c.item_count,
+                      "est_seconds": round(c.est_seconds, 1)} for c in doc.chapters],
+        "cast": [{"name": c.name, "pan": c.pan, "description": c.description, "declared": c.declared}
+                 for c in doc.cast.values()],
+        "warnings": [{"line": w.line, "message": w.message} for w in doc.warnings],
+        "est_seconds": round(doc.est_seconds, 1),
+        "voiced_chars": doc.voiced_chars,
+        "words": doc.word_count,
+        "sfx": len(doc.sfx()),
+    }
+
+
+def to_out(story: models.SoundStory, *, full: bool = True) -> dict:
+    progress = dict(story.progress_json or {})
+    out = {
+        "id": story.id, "title": story.title or "", "kind": story.kind or "story", "premise": story.premise or "",
+        "target_minutes": story.target_minutes or 10, "settings": dict(story.settings_json or {}),
+        "script_version": story.script_version or 0, "status": story.status, "error": story.error or "",
+        "estimated_cost": story.estimated_cost or 0.0, "actual_cost": story.actual_cost or 0.0,
+        "task": progress.get(TASK_KEY) if story.status in BUSY else None,
+        "writer": writer_progress(story), "can_resume": can_resume(story),
+        "created_at": story.created_at.isoformat() if story.created_at else None,
+        "updated_at": story.updated_at.isoformat() if story.updated_at else None,
+    }
+    if full:
+        out["script_text"] = story.script_text or ""
+        out["enhance"] = progress.get(ENHANCE_KEY)
+        out["parsed"] = doc_out(parse_story(story))
+    return out
+
+
+def dumps(x) -> str:  # noqa: ANN001
+    return json.dumps(x, ensure_ascii=False)

@@ -368,7 +368,7 @@ def test_activity_active_lists_running_work(auth_client):
     assert out["studio"]["count"] == 3 and len(out["studio"]["jobs"]) == 3
     assert kinds["training"]["stage"] == "Training (50%)"
     assert kinds["training"]["url"] == "/cast?avatar=4"
-    assert out["counts"] == {"projects": 1, "ambient": 0, "studio": 3, "training": 1, "publish": 0}
+    assert out["counts"] == {"projects": 1, "ambient": 0, "studio": 3, "training": 1, "publish": 0, "sound": 0}
 
 
 # ---------- retention ----------

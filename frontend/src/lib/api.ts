@@ -1692,7 +1692,8 @@ export type AppEventKind =
   | "training"
   | "publish"
   | "budget"
-  | "hook_lab";
+  | "hook_lab"
+  | "sound_story";
 
 /** needs_look: work that stopped to ask (a batch loop that jumps); counts toward the badge. */
 export type AppEventStatus = "started" | "progress" | "completed" | "failed" | "cancelled" | "needs_look";
@@ -1739,7 +1740,7 @@ export type Activity = {
     count: number;
     jobs: { id: number; output_kind: string; status: string; stage: string; prompt: string; label: string; started_at: string | null }[];
   };
-  counts: { projects: number; ambient: number; studio: number; training: number; publish: number };
+  counts: { projects: number; ambient: number; studio: number; training: number; publish: number; sound: number };
 };
 
 /** The largest video "Frame from a video" may upload, in MB: the same as the
@@ -1777,6 +1778,100 @@ async function postVideo(
   }
   return (await r.json()) as StudioJob;
 }
+
+
+// ---------- Sound Studio (audio stories) ----------
+
+export type SoundStyle =
+  | ""
+  | "asmr"
+  | "whisper"
+  | "sleep"
+  | "meditation"
+  | "cozy"
+  | "spooky"
+  | "romance"
+  | "drama"
+  | "adventure"
+  | "podcast";
+export type SfxDensity = "none" | "low" | "medium" | "high";
+export type StoryEnhanceAction = "tighten" | "lengthen" | "asmr" | "sfx" | "sleep";
+export type StoryEnhanceScope = "selection" | "chapter" | "story";
+
+export type StorySettings = {
+  style: SoundStyle | string;
+  sfx_density: SfxDensity;
+  beds?: boolean;
+  voice_provider?: string;
+  voice_model?: string;
+  music_prompt?: string;
+};
+
+export type StoryParse = {
+  chapters: { index: number; title: string; line: number; items: number; est_seconds: number }[];
+  cast: { name: string; pan: string | null; description: string; declared: boolean }[];
+  warnings: { line: number; message: string }[];
+  est_seconds: number;
+  voiced_chars: number;
+  words: number;
+  sfx: number;
+};
+
+export type StoryEnhanceProposal = {
+  status: "running" | "ready" | "failed" | "cancelled";
+  action: StoryEnhanceAction;
+  scope: StoryEnhanceScope;
+  start: number;
+  end: number;
+  before: string;
+  after: string;
+  script_version: number;
+  done?: number;
+  total?: number;
+  error?: string;
+};
+
+export type SoundStorySummary = {
+  id: number;
+  title: string;
+  kind: "story" | "asmr";
+  premise: string;
+  target_minutes: number;
+  settings: StorySettings;
+  script_version: number;
+  /** draft | scripting | ready | generating | rendering | completed | failed | cancelled */
+  status: string;
+  error: string;
+  estimated_cost: number;
+  actual_cost: number;
+  /** What a job is doing while the story is busy: "writer" | "enhance". */
+  task: string | null;
+  writer: { chapters_done: number; chapters: number; has_outline: boolean; finished: boolean };
+  can_resume: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type SoundStory = SoundStorySummary & {
+  script_text: string;
+  enhance: StoryEnhanceProposal | null;
+  parsed: StoryParse;
+};
+
+export type SoundConfig = { max_minutes: number; styles: string[]; enhance_sync_max: number; minutes_per_chapter: number };
+
+export type CallPrice = { calls: number; unit_cost: number; cost: number };
+
+export type StoryEstimate = {
+  generate: CostEstimate & { minutes?: number; voiced_chars?: number; note?: string };
+  write: CallPrice;
+  enhance?: CallPrice;
+  minutes: number;
+};
+
+export type StoryEnhanceResult =
+  | { mode: "sync"; start: number; end: number; before: string; after: string; script_version: number; price: CallPrice }
+  | { mode: "job"; job_id: string; start: number; end: number; price: CallPrice };
 
 export const api = {
   base: API_BASE,
@@ -2645,4 +2740,67 @@ export const api = {
   setSpendBudget: (b: SpendBudget) =>
     req<SpendBudget>("/api/spend/budget", { method: "PUT", body: JSON.stringify(b) }),
   openRouterAccount: () => req<OpenRouterAccount>("/api/spend/openrouter"),
+
+  // Sound Studio (audio stories)
+  soundConfig: () => req<SoundConfig>("/api/sound/config"),
+  listStories: () => req<SoundStorySummary[]>("/api/sound/stories"),
+  getStory: (id: number) => req<SoundStory>(`/api/sound/stories/${id}`),
+  createStory: (body: {
+    title?: string;
+    kind?: "story" | "asmr";
+    premise?: string;
+    target_minutes?: number;
+    settings?: StorySettings;
+    script_text?: string;
+  }) => req<SoundStory>("/api/sound/stories", { method: "POST", body: JSON.stringify(body) }),
+  updateStory: (
+    id: number,
+    body: {
+      title?: string;
+      premise?: string;
+      target_minutes?: number;
+      settings?: StorySettings;
+      script_text?: string;
+      script_version?: number;
+    }
+  ) => req<SoundStory>(`/api/sound/stories/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteStory: (id: number) => req<void>(`/api/sound/stories/${id}`, { method: "DELETE" }),
+  parseStory: (script_text: string, style = "") =>
+    req<StoryParse>("/api/sound/parse", { method: "POST", body: JSON.stringify({ script_text, style }) }),
+  storyEstimate: (body: {
+    story_id?: number;
+    premise?: string;
+    target_minutes?: number;
+    settings?: StorySettings;
+    script_text?: string;
+    enhance_scope?: StoryEnhanceScope;
+    start?: number;
+    end?: number;
+    chapter_line?: number;
+  }) => req<StoryEstimate>("/api/sound/estimate", { method: "POST", body: JSON.stringify(body) }),
+  writeStory: (id: number, replace = false) =>
+    req<{ story_id: number; job_id: string; status: string; price: CallPrice }>(`/api/sound/stories/${id}/write`, {
+      method: "POST",
+      body: JSON.stringify({ replace }),
+    }),
+  resumeStory: (id: number) =>
+    req<{ story_id: number; job_id: string; status: string; price: CallPrice }>(`/api/sound/stories/${id}/resume`, {
+      method: "POST",
+    }),
+  cancelStory: (id: number) =>
+    req<{ status: string; action: string }>(`/api/sound/stories/${id}/cancel`, { method: "POST" }),
+  enhanceStory: (
+    id: number,
+    body: {
+      action: StoryEnhanceAction;
+      scope: StoryEnhanceScope;
+      start?: number;
+      end?: number;
+      text?: string;
+      chapter_line?: number;
+      script_version?: number;
+      minutes?: number;
+    }
+  ) => req<StoryEnhanceResult>(`/api/sound/stories/${id}/enhance`, { method: "POST", body: JSON.stringify(body) }),
+  dismissStoryEnhance: (id: number) => req<SoundStory>(`/api/sound/stories/${id}/enhance`, { method: "DELETE" }),
 };

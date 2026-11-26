@@ -204,14 +204,16 @@ class OpenRouterChatProvider(ChatProvider):
         return {k: str(out.get(k) or "").strip() for k in ("scene", "light", "camera")}
 
 
-    def enhance_prompt(self, text: str, kind: str, model: str = "") -> str:
+    def enhance_prompt(self, text: str, kind: str, model: str = "", direction: str = "") -> str:
         """One short call: the user's prompt improved for `kind` (see
-        ENHANCE_GUIDES), with a hint for the target `model`'s family."""
+        ENHANCE_GUIDES), with a hint for the target `model`'s family. For an
+        audio story script (kind "audio_script") `direction` is the Enhance
+        action (AUDIO_SCRIPT_ACTIONS) and its detail."""
         body: dict = {
             "model": self.model,
             "temperature": 0.4,
             "messages": [
-                {"role": "system", "content": enhance_system_prompt(kind, model)},
+                {"role": "system", "content": enhance_system_prompt(kind, model, direction)},
                 {"role": "user", "content": text},
             ],
         }
@@ -238,7 +240,63 @@ class OpenRouterChatProvider(ChatProvider):
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
         if not isinstance(content, str):
             raise RuntimeError("OpenRouter returned no message")
-        return clean_enhanced(content)
+        return clean_enhanced(content, cap=AUDIO_SCRIPT_REPLY_CAP if kind == "audio_script" else 4000)
+
+    # ---------- Sound Studio: the story writer ----------
+
+    def _story_call(self, user: str, *, note: str, max_tokens: int) -> str:
+        """One writer call under story_system(): the reply text as is (the
+        caller reads refusals and parses it). Spend is recorded with `note`
+        (the story's spend scope attributes it)."""
+        body: dict = {
+            "model": self.model,
+            "temperature": 0.8,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": story_system()},
+                {"role": "user", "content": user},
+            ],
+        }
+        url = f"{get_settings().openrouter_base_url.rstrip('/')}/chat/completions"
+        with httpx.Client(timeout=300.0) as client:
+            r = client.post(url, headers=self._headers(), json=body)
+            r.raise_for_status()
+            data = r.json()
+        if "choices" not in data:
+            err = data.get("error") or {}
+            raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
+        from ..services import spend
+
+        spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
+                                generation_id=str(data.get("id") or ""),
+                                estimate=get_settings().cost_chat_per_story_call, note=note)
+        try:
+            content = data["choices"][0]["message"]["content"]
+        except (IndexError, KeyError, TypeError):
+            raise RuntimeError("OpenRouter returned no message") from None
+        if isinstance(content, list):
+            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
+        if not isinstance(content, str):
+            raise RuntimeError("OpenRouter returned no message")
+        return content
+
+    def story_outline(self, *, premise: str, title: str, minutes: int, style: str, sfx_density: str,
+                      chapters: int) -> str:
+        """The plan of an audio story: JSON {"title", "cast": [{"name",
+        "pan", "description"}], "chapters": [{"title", "summary"}]} (or a
+        refusal sentinel). Returns the reply text as is."""
+        return self._story_call(story_outline_request(premise=premise, title=title, minutes=minutes, style=style,
+                                                      sfx_density=sfx_density, chapters=chapters),
+                                note="story outline", max_tokens=3000)
+
+    def story_chapter(self, *, premise: str, outline: dict, index: int, minutes: float, style: str,
+                      sfx_density: str, previous: str = "") -> str:
+        """One chapter of the story in the script markup (no heading), or a
+        refusal sentinel. Returns the reply text as is."""
+        return self._story_call(story_chapter_request(premise=premise, outline=outline, index=index,
+                                                      minutes=minutes, style=style, sfx_density=sfx_density,
+                                                      previous=previous),
+                                note="story chapter", max_tokens=8000)
 
     def hook_ideas(self, *, script: str, hook: str, n: int, styles: list[str]) -> str:
         """One short call: other openings for the script (see HOOK_IDEAS_SYSTEM)."""
@@ -1154,7 +1212,9 @@ def model_family_hint(kind: str, model: str) -> str:
     return ""
 
 
-def enhance_system_prompt(kind: str, model: str = "") -> str:
+def enhance_system_prompt(kind: str, model: str = "", direction: str = "") -> str:
+    if kind == "audio_script":
+        return audio_script_system(direction)
     guide = ENHANCE_GUIDES.get(kind)
     if guide is None:
         raise ValueError(f"unknown prompt kind {kind!r}")
@@ -1165,9 +1225,9 @@ def enhance_system_prompt(kind: str, model: str = "") -> str:
 _LABEL = re.compile(r"^\s*(?:improved |enhanced |final )?(?:prompt|script)\s*:\s*", re.I)
 
 
-def clean_enhanced(text: str) -> str:
+def clean_enhanced(text: str, cap: int = 4000) -> str:
     """The reply as a bare prompt: no code fences, wrapping quotes or a
-    leading "Prompt:" label; capped at 4000 chars."""
+    leading "Prompt:" label; capped at `cap` chars (4000)."""
     t = (text or "").strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
@@ -1177,4 +1237,133 @@ def clean_enhanced(text: str) -> str:
         t = t[1:-1]
     elif len(t) >= 2 and t[0] == "\u201c" and t[-1] == "\u201d":
         t = t[1:-1]
-    return t.strip()[:4000]
+    return t.strip()[:cap]
+
+
+# ---------- Sound Studio: the story writer and the script Enhance ----------
+
+# The script markup the writer and Enhance write (services/story_script.py).
+_STORY_MARKUP = """Script markup (plain text, one cue per line):
+- Narration is a plain line. A character speaks with `NAME [tags]: words` (NAME in capitals, declared in the cast).
+- Voice directions are square-bracket tags at the start of a line or inside it, from this list only: {tags}. [left], [right] or [center] after a name places the voice.
+- A sound effect is its own line: `[sfx: short description | Ns]` (N seconds, 1 to 10), optionally `| under` to play under the line before it. Never use square brackets inside a sound description.
+- `(pause N)` waits N seconds. `@bed ambience "description"` starts a background ambience; `@bed stop` stops it.
+- Never write `#` headings, `@cast` lines, comments, notes, labels or markdown: only the script lines."""
+
+_STORY_RULES = """Rules:
+- Every character in anything romantic, sexual or suggestive is an adult (18 or older), stated plainly in the cast. Never write sexual or suggestive content involving a minor, childlike traits, school settings or ages under 18, and never sexualise a character introduced as a minor, even in a later scene.
+- Romance and adult themes between adults follow the premise; never add them when the premise doesn't ask for them.
+- No real people, no defamatory or hateful content, no instructions for harm.
+- If the premise sexualises a minor or childlike traits, reply with exactly REFUSED_MINOR. If you won't write it for any other reason, reply with exactly DECLINED: never a partial, safer or different story."""
+
+_STORY_RULES_CLEAN = """Rules:
+- This app is for a general audience: the story stays non-sexual and non-explicit (no nudity, sexual acts or sexual language). If the premise asks for sexual, nude or explicit content, don't write it: reply with exactly DECLINED.
+- Never write anything suggestive involving a minor, childlike traits, school settings or ages under 18.
+- No real people, no defamatory or hateful content, no instructions for harm.
+- If the premise sexualises a minor or childlike traits, reply with exactly REFUSED_MINOR. If you won't write it for any other reason, reply with exactly DECLINED."""
+
+STORY_SYSTEM = (
+    "You write audio stories that are read aloud by voice actors with sound effects: ASMR, sleep stories, cozy, "
+    "spooky, drama, adventure and more. Write for the ear: plain spoken sentences, a clear voice for each "
+    "character, sensory detail, and pacing that suits the style (slow and soothing for sleep and ASMR).\n\n"
+    + _STORY_MARKUP + "\n\n" + _STORY_RULES)
+
+# STORY_SYSTEM on a clean deployment (ADULT_FEATURES=false): general audience
+# only, the romance and intimacy voice tags left out, sexual premises declined.
+STORY_SYSTEM_CLEAN = (
+    "You write audio stories for a general audience that are read aloud by voice actors with sound effects: "
+    "ASMR, sleep stories, cozy, spooky, drama, adventure and more. Write for the ear: plain spoken sentences, a "
+    "clear voice for each character, sensory detail, and pacing that suits the style (slow and soothing for "
+    "sleep and ASMR).\n\n" + _STORY_MARKUP + "\n\n" + _STORY_RULES_CLEAN)
+
+
+def _tag_list(clean: bool) -> str:
+    from ..services import story_script
+
+    tags = story_script.GENERAL_TAGS if clean else story_script.VOICE_TAGS
+    return ", ".join(f"[{t}]" for t in sorted(tags))
+
+
+def story_system() -> str:
+    """The writer's instructions: the clean ones on a clean deployment."""
+    from ..services import content_mode
+
+    clean = not content_mode.features()
+    base = STORY_SYSTEM_CLEAN if clean else STORY_SYSTEM
+    return base.replace("{tags}", _tag_list(clean))
+
+
+SFX_DENSITY_WORDS = {
+    "none": "no sound effects at all",
+    "low": "a sound effect now and then (about one a minute)",
+    "medium": "regular sound effects (two or three a minute)",
+    "high": "rich sound design (four or more a minute) and an ambience bed for each scene",
+}
+
+
+def story_outline_request(*, premise: str, title: str, minutes: int, style: str, sfx_density: str,
+                          chapters: int) -> str:
+    """The user message of the outline call."""
+    return (
+        "Plan an audio story. Reply with JSON only: {\"title\": \"...\", \"cast\": [{\"name\": \"NARRATOR\", "
+        "\"pan\": \"center\", \"description\": \"...\"}], \"chapters\": [{\"title\": \"...\", \"summary\": \"...\"}]}"
+        f" with exactly {chapters} chapters. Names in capitals; NARRATOR first; pan is left, right or center; "
+        "each description says who the character is, their age as an adult or child, and how the voice sounds "
+        "(one sentence, no square brackets). Or reply with exactly REFUSED_MINOR or DECLINED.\n\n"
+        + json.dumps({"premise": premise, "title": title, "minutes": minutes, "style": style or "any",
+                      "sound_effects": SFX_DENSITY_WORDS.get(sfx_density, SFX_DENSITY_WORDS["medium"])},
+                     ensure_ascii=False))
+
+
+def story_chapter_request(*, premise: str, outline: dict, index: int, minutes: float, style: str,
+                          sfx_density: str, previous: str = "") -> str:
+    """The user message of one chapter call."""
+    from ..services import story_script
+
+    wpm = story_script.WPM_BY_STYLE.get(style, story_script.DEFAULT_WPM)
+    chapters = outline.get("chapters") or []
+    this = chapters[index] if 0 <= index < len(chapters) else {}
+    return (
+        f"Write chapter {index + 1} of {len(chapters)} of this audio story in the script markup: about "
+        f"{int(minutes * wpm)} spoken words (about {minutes:g} minutes read aloud). Only the script lines: no "
+        "heading. Or reply with exactly REFUSED_MINOR or DECLINED.\n\n"
+        + json.dumps({"premise": premise, "title": outline.get("title") or "", "style": style or "any",
+                      "sound_effects": SFX_DENSITY_WORDS.get(sfx_density, SFX_DENSITY_WORDS["medium"]),
+                      "cast": outline.get("cast") or [], "chapters": chapters,
+                      "this_chapter": this, "end_of_previous_chapter": previous[-1500:]},
+                     ensure_ascii=False))
+
+
+# Enhance for an audio story script: what each action asks for.
+AUDIO_SCRIPT_ACTIONS: dict[str, str] = {
+    "tighten": "Tighten the text: cut repetition and filler, keep every event, character and cue that matters.",
+    "lengthen": "Lengthen the text to about {minutes} minutes read aloud by adding description, sensations and "
+                "dialogue that fit the story; add no new plot turns.",
+    "asmr": "Add whisper and ASMR direction: voice tags such as [whispers], [softly], [slowly], [short pause] "
+            "and close, gentle sensory detail.",
+    "sfx": "Add sound-effect cues ([sfx: ...] lines) and, where a scene changes, an ambience bed, where they "
+           "help the listener picture the scene.",
+    "sleep": "Slow it down for sleep: calmer wording, longer sentences, (pause N) cues and [slowly] or [softly] "
+             "tags; no sudden sounds or tension.",
+}
+# The longest rewrite kept of one Enhance call on a script (a chapter can be
+# lengthened).
+AUDIO_SCRIPT_REPLY_CAP = 40000
+
+_AUDIO_SCRIPT_GUIDE = (
+    "You edit part of an audio story script. Keep its meaning, characters, names and the order of events; "
+    "keep every speaker line's NAME and every cue you don't change; never add a `#` heading or `@cast` line. "
+    "Reply with the edited script lines only: no preamble, no notes, no markdown.\n\n" + _STORY_MARKUP)
+
+
+def audio_script_system(direction: str = "") -> str:
+    """The Enhance instructions for an audio story script: the guide, the
+    action (`direction`), and the story rules (the clean ones on a clean
+    deployment)."""
+    from ..services import content_mode
+
+    clean = not content_mode.features()
+    rules = (_STORY_RULES_CLEAN if clean else _STORY_RULES).replace("the premise", "the text").replace(
+        "write it", "rewrite it").replace("story.", "text.")
+    guide = _AUDIO_SCRIPT_GUIDE.replace("{tags}", _tag_list(clean))
+    return "\n\n".join(x for x in (guide, (direction or "").strip(), rules) if x)
