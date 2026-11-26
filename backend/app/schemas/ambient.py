@@ -220,6 +220,9 @@ class AmbientPresetsOut(BaseModel):
     scenes: list[ScenePresetOut]
     music_moods: list[MusicMoodOut]
     sounds: list[SoundPresetOut] = Field(default_factory=list)
+    # What "Match the scene" picks: by weather first, then by preset.
+    auto_sound_by_scene: dict[str, str] = Field(default_factory=dict)
+    auto_sound_by_weather: dict[str, str] = Field(default_factory=dict)
     looks: list[OptionOut] = Field(default_factory=list)
     times_of_day: list[OptionOut] = Field(default_factory=list)
     weathers: list[OptionOut] = Field(default_factory=list)
@@ -464,12 +467,26 @@ class AmbientOut(BaseModel):
     picture_ready: bool = False
     # Changes whenever the picture file is replaced (cache-bust for <img>).
     picture_version: str = ""
+    # Changes whenever the loop clip file is replaced (cache-bust for <video>).
+    clip_version: str = ""
+    # True when the scene says "generating" but nothing is making it: no live
+    # render, no clip still being made, and its queue entry is gone. The page
+    # offers a reset (the project cancel endpoint).
+    stuck: bool = False
     # How many times the loop unit tiles into the total output.
     repeats: int
     plan: LoopPlanOut
     # Rate-card estimate of what Generate loop would buy now (the loop, plus
     # the music and sound beds the scene doesn't have yet).
     generate_cost: float = 0.0
+    # Rate-card prices of the scene page's other paid buttons: Generate
+    # music (every part of the bed), Generate sound, and a generated picture.
+    music_cost: float = 0.0
+    sound_cost: float = 0.0
+    # Whether Generate sound has a sound to make (sound "auto" matches the
+    # preset or weather; a scene with neither has nothing to match).
+    sound_resolved: bool = False
+    picture_cost: float = 0.0
     # Set when loop clips exist: changing the picture or a clip setting
     # discards them, and needs discard_loop=true.
     loop_at_stake: Optional[LoopAtStakeOut] = None

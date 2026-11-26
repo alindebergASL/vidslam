@@ -162,6 +162,12 @@ function Inner() {
                         alt=""
                         className="block w-full aspect-video object-cover bg-black"
                       />
+                    ) : s.picture_ready ? (
+                      <img
+                        src={api.ambientPictureUrl(s.id, s.picture_version || s.updated_at)}
+                        alt=""
+                        className="block w-full aspect-video object-cover bg-black"
+                      />
                     ) : (
                       <SceneArt
                         palette={preset?.palette}
@@ -180,7 +186,7 @@ function Inner() {
                       {s.status === "generating" && (
                         <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
                       )}
-                      {sceneStatusLabel(s)}
+                      {s.stuck ? "Looks stuck" : sceneStatusLabel(s)}
                     </span>
                     <span className="absolute bottom-2 right-2 rounded-md bg-ink-950/70 backdrop-blur-sm px-2 py-0.5 text-xs font-medium text-ink-100">
                       {fmtDuration(s.total_seconds)}
@@ -228,8 +234,8 @@ function EmptyState({
       <div className="max-w-xl">
         <div className="text-lg font-medium">Start with a one-hour classic</div>
         <p className="text-sm text-ink-300 mt-1">
-          Each of these creates a scene and starts generating its 30-second loop and a matching
-          music bed as soon as you click{cost !== null ? `, for about $${cost.toFixed(2)}` : ""}. You
+          {cost !== null ? `About $${cost.toFixed(2)} each. ` : ""}Each of these creates a scene and starts
+          generating its 30-second loop and a matching music bed as soon as you click. You
           don&apos;t see the picture first; to check it before paying for the video, use the scene
           builder. Rendering the full hour is free.
         </p>
@@ -245,13 +251,15 @@ function EmptyState({
           >
             <SceneArt palette={p.palette} emoji={p.emoji} image={previewSrc(p)} className="aspect-video" />
             <div className="p-4">
+              {cost !== null && (
+                <div className="text-xs text-ink-100 font-medium mb-1">
+                  About ${cost.toFixed(2)} · generates right away
+                </div>
+              )}
               <div className="text-sm font-medium">
                 {busy === p.id ? "Creating…" : `${p.label} — 1h`}
               </div>
               <div className="text-xs text-ink-300 mt-0.5">{p.tagline}</div>
-              {cost !== null && (
-                <div className="text-xs text-ink-400 mt-1">Generates right away · about ${cost.toFixed(2)}</div>
-              )}
             </div>
           </button>
         ))}
@@ -341,16 +349,23 @@ function BatchPanel({ presets, onDone }: { presets: AmbientPresets; onDone: (n: 
       </div>
       <div className="flex flex-wrap items-center justify-between gap-3 mt-4">
         <div className="text-sm text-ink-300">
-          {picked.length ? `${picked.length} scene${picked.length === 1 ? "" : "s"}` : "Pick presets"}
-          {estimate !== null && (
+          {estimate !== null && picked.length ? (
             <>
-              {" "}· about <span className="text-ink-100 font-medium">${estimate.toFixed(2)}</span> in total, charged
-              as each scene generates
+              About <span className="text-ink-100 font-medium">${estimate.toFixed(2)}</span> in total for{" "}
+              {picked.length} scene{picked.length === 1 ? "" : "s"}, charged as each scene generates
             </>
+          ) : picked.length ? (
+            `${picked.length} scene${picked.length === 1 ? "" : "s"}`
+          ) : (
+            "Pick presets"
           )}
         </div>
         <button type="button" className="btn-primary disabled:opacity-50" disabled={!picked.length || busy} onClick={submit}>
-          {busy ? "Creating…" : `Create ${picked.length || ""} scene${picked.length === 1 ? "" : "s"}`}
+          {busy
+            ? "Creating…"
+            : `${estimate !== null && picked.length ? `About $${estimate.toFixed(2)} · ` : ""}Create ${picked.length || ""} scene${
+                picked.length === 1 ? "" : "s"
+              }`}
         </button>
       </div>
     </section>

@@ -14,7 +14,7 @@ import math
 import re
 import secrets
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -853,6 +853,8 @@ def presets() -> AmbientPresetsOut:
         scenes=scenes,
         music_moods=MUSIC_MOODS,
         sounds=SOUND_PRESETS,
+        auto_sound_by_scene=dict(_AUTO_SOUND_BY_SCENE),
+        auto_sound_by_weather=dict(_AUTO_SOUND_BY_WEATHER),
         looks=[OptionOut(id=k, label=v[0]) for k, v in LOOKS.items()],
         times_of_day=[OptionOut(id=k, label=v[0]) for k, v in TIMES_OF_DAY.items()],
         weathers=[OptionOut(id=k, label=v[0]) for k, v in WEATHERS.items()],
@@ -1051,6 +1053,10 @@ def set_picture(db: Session, project: models.VideoProject, raw: bytes, origin: s
     return project
 
 
+# What /new stores as the description of a picture scene with none.
+PICTURE_PLACEHOLDER_PROMPT = "the scene in the given image"
+
+
 def clear_picture(db: Session, project: models.VideoProject, *, discard_loop: bool = False) -> models.VideoProject:
     had = bool(_config_of(project).picture_origin)
     if had:
@@ -1060,6 +1066,10 @@ def clear_picture(db: Session, project: models.VideoProject, *, discard_loop: bo
         _invalidate_loop(project)
     _set_state(project, "picture_origin", "")
     _set_state(project, _PICTURE_CAST_KEY, None)
+    if _config_of(project).scene_prompt.strip().lower() == PICTURE_PLACEHOLDER_PROMPT:
+        # /new's stand-in for "no description": it describes nothing once
+        # the picture is gone.
+        _set_state(project, "scene_prompt", "")
     db.commit()
     db.refresh(project)
     return project
@@ -1697,6 +1707,77 @@ def _ensure_variant_shots(db: Session, project: models.VideoProject,
     return have
 
 
+def clip_version(shot: Optional[models.VideoShot]) -> str:
+    """Changes whenever the loop clip file is replaced: its mtime in ns."""
+    if shot is None or not shot.clip_path:
+        return ""
+    try:
+        return str(Path(shot.clip_path).stat().st_mtime_ns)
+    except OSError:
+        return ""
+
+
+# How long a "generating" scene must have shown no activity (no write to the
+# scene, no clip job moving) before it can count as stuck: covers the moment
+# between the claim and storing its queue entry, and a clip job handing over
+# to the next step.
+STUCK_GRACE = timedelta(minutes=3)
+_DONE_RENDER = ("completed", "failed", "cancelled", "expired")
+
+
+def is_stuck(db: Session, project: models.VideoProject, *, now: Optional[datetime] = None) -> bool:
+    """A scene left "generating" with nothing making it: no live render, no
+    clip still being made, and its queue entry gone. Only where the project
+    cancel can then free it (the page's Reset), so it follows that cancel:
+    - a claim no job has taken yet (token still set): its entry is gone;
+    - a claim a job took (token consumed): its RQ entry is gone and no loop
+      chain is under way. A chain between clips, or making the finished
+      loop's music and sound, has nothing queued or in flight but is still
+      working; an inline or background run always reads as gone. Both are
+      left to the sweeper's time limit.
+    Never while Redis doesn't answer ("unknown")."""
+    if project.status != "generating":
+        return False
+    from ..workers.queue import queue_entry_state
+    from . import video_jobs
+    from .pipeline import HOOK_CLAIM
+
+    token = project.claim_token or ""
+    if token.startswith(HOOK_CLAIM):
+        return False  # the hook lab's "Make videos": stopped there, not here
+    qid = (project.queue_job_id or "").strip()
+    if not token:
+        if not qid or ":" in qid:
+            return False
+        chain = (project.ambient_config_json or {}).get(_CHAIN_KEY)
+        if chain and not chain.get("failed"):
+            return False
+    R = models.Render
+    if db.query(R.id).filter(R.project_id == project.id, R.status.notin_(_DONE_RENDER)).first() is not None:
+        return False
+    if video_jobs.pending_for(db, project_id=project.id, purposes=("shot", "avatar", "ambient_segment")) > 0:
+        return False
+    now = now or datetime.utcnow()
+    last_job = (db.query(models.VideoJob.updated_at).filter(models.VideoJob.project_id == project.id)
+                .order_by(models.VideoJob.updated_at.desc()).limit(1).scalar())
+    last = max((t for t in (project.updated_at, last_job) if t is not None), default=None)
+    if last is not None and last > now - STUCK_GRACE:
+        return False
+    return queue_entry_state(qid) == "gone"
+
+
+def music_cost(cfg: AmbientConfig) -> float:
+    """Rate-card price of Generate music: every part of the bed."""
+    if cfg.music_mood == "none":
+        return 0.0
+    return round(get_settings().cost_music_per_generation * len(music_parts(cfg)), 4)
+
+
+def sound_cost(cfg: AmbientConfig) -> float:
+    """Rate-card price of Generate sound (0 when the scene has no sound bed)."""
+    return round(get_settings().cost_sound_per_generation, 4) if resolve_sound_prompt(cfg) else 0.0
+
+
 def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
     cfg = _config_of(project)
     shot = _loop_shot(project)
@@ -1732,9 +1813,15 @@ def to_out(db: Session, project: models.VideoProject) -> AmbientOut:
         sound_ready=cfg.sound != "none" and sound_path(project).exists(),
         picture_ready=has_picture(project, cfg),
         picture_version=(str(picture_path(project).stat().st_mtime_ns) if has_picture(project, cfg) else ""),
+        clip_version=clip_version(shot),
+        stuck=is_stuck(db, project),
         repeats=plan.repeats,
         plan=plan,
         generate_cost=generate_cost(project, cfg, plan),
+        music_cost=music_cost(cfg),
+        sound_cost=sound_cost(cfg),
+        sound_resolved=bool(resolve_sound_prompt(cfg)),
+        picture_cost=round(still_cost(cfg), 4),
         loop_at_stake=None if project.status == "generating" else loop_at_stake(db, project),
         resume=resume_info(project, cfg),
         latest_render=RenderOut.model_validate(latest) if latest else None,
@@ -1819,6 +1906,17 @@ _CLIP_KEYS = ("scene_preset", "scene_prompt", "source", "loop_seconds",
               "time_of_day", "weather", "variety", "variations")
 
 
+# What only shapes a picture the scene makes itself: a video scene that
+# starts from its own picture (and makes no other stills) never uses them.
+_PICTURE_ONLY_KEYS = frozenset({"scene_preset", "look", "look_strength"})
+
+
+def own_picture_video(cfg: AmbientConfig) -> bool:
+    """A video scene built from a picture the user brought, with no stills
+    of its own to make (Day to night makes its other times of day)."""
+    return cfg.source == "video" and cfg.picture_origin in OWN_PICTURE and cfg.variety != "day_night"
+
+
 def _clip_changed(old: AmbientConfig, cfg: AmbientConfig) -> bool:
     """Whether saving `cfg` over `old` needs a new loop clip."""
     cfg = cfg.model_copy(update={"picture_origin": old.picture_origin})
@@ -1826,7 +1924,14 @@ def _clip_changed(old: AmbientConfig, cfg: AmbientConfig) -> bool:
     still_changed = old.still_model != cfg.still_model and uses_still_model(cfg)
     # The rewrite changes the prompt only when one applies before or after.
     rewrite_changed = _rewrite_key(old) != _rewrite_key(cfg)
-    return any(getattr(old, k) != getattr(cfg, k) for k in _CLIP_KEYS) or still_changed or rewrite_changed
+    keys = _CLIP_KEYS
+    prompt_changed = False
+    if own_picture_video(old) and own_picture_video(cfg):
+        # Preset and look don't reach the clip; time of day and weather do
+        # (light_phrase), and so does the preset where it says indoors.
+        keys = tuple(k for k in _CLIP_KEYS if k not in _PICTURE_ONLY_KEYS)
+        prompt_changed = any(variant_prompt(old, i) != variant_prompt(cfg, i) for i in range(variant_count(cfg)))
+    return any(getattr(old, k) != getattr(cfg, k) for k in keys) or still_changed or rewrite_changed or prompt_changed
 
 
 def update_scene(db: Session, project: models.VideoProject, body: AmbientUpdate, *,
@@ -1950,6 +2055,24 @@ def _segment_shots(db: Session, project: models.VideoProject, n: int) -> list[mo
 
 # What every segment after the first adds to the clip prompt.
 _CONTINUE = " Continue the exact same shot from the given first frame, same lighting."
+
+
+def fail_unmade_clips(db: Session, project: models.VideoProject) -> None:
+    """After a scene left "generating" is released (Reset, or the sweeper):
+    its loop and variation shots still marked submitted or polling have
+    nothing making them (a worker killed mid-step), so they read failed
+    and the page offers Generate again. Not while a clip job is pending.
+    The caller commits."""
+    if project.mode != AMBIENT_MODE:
+        return
+    from . import video_jobs
+
+    if video_jobs.pending_for(db, project_id=project.id, purposes=("shot", "avatar", "ambient_segment")) != 0:
+        return
+    (db.query(models.VideoShot)
+     .filter(models.VideoShot.project_id == project.id, models.VideoShot.status.in_(("submitted", "polling")))
+     .update({"status": "failed", "error": "Stopped before the clip was made; generate again"},
+             synchronize_session=False))
 
 
 def clip_shots(project: models.VideoProject) -> list[models.VideoShot]:

@@ -411,6 +411,10 @@ def _release_waiting_claim(db: Session, project: models.VideoProject, *, strande
         events.plan_event(db, project, "cancelled")
     else:
         kind = "ambient_loop" if project.mode == "ambient_loop" else "render"
+        if project.mode == "ambient_loop":
+            from ..services import ambient as _ambient
+
+            _ambient.fail_unmade_clips(db, project)
         events.emit(db, kind, "project", project.id, "cancelled", f"Cancelled: {events._name(project)}",
                     url=events.project_url(project), project_id=project.id)
     db.commit()

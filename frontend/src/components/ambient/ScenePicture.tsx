@@ -3,8 +3,11 @@ import { useEffect, useRef, useState } from "react";
 import clsx from "clsx";
 import { useToast } from "@/components/Toaster";
 import { IMAGE_ACCEPT } from "@/components/Dropzone";
-import { askBeforeDiscard } from "@/components/ambient/shared";
-import { api, AmbientScene, errorText } from "@/lib/api";
+import { askBeforeDiscard, loopAtStakeText, ownPictureVideo } from "@/components/ambient/shared";
+import { api, AmbientScene, DEFAULT_AMBIENT_CONFIG, errorText } from "@/lib/api";
+
+/** Pictures the user brought (services.ambient.OWN_PICTURE). */
+const OWN_PICTURE = ["upload", "studio", "asset"];
 
 export type PickedImage = { kind: "studio" | "asset"; id: number; url: string; label: string };
 
@@ -110,13 +113,37 @@ export function ScenePicture({
   const [picking, setPicking] = useState(false);
   const origin = scene.config.picture_origin;
   const has = !!scene.picture_ready;
+  // Generating over a picture you brought replaces it: say so, and price it.
+  const own = has && OWN_PICTURE.includes(origin);
+  const cost = scene.picture_cost != null && scene.picture_cost >= 0.005 ? `~$${scene.picture_cost.toFixed(2)}` : "";
+  // Nothing to make a picture from: no description, and the preset is the default one.
+  // (/new stores "the scene in the given image" for a picture with no description.)
+  const described = scene.config.scene_prompt.trim();
+  const nothingToDescribe =
+    (!described || described.toLowerCase() === "the scene in the given image") &&
+    (scene.config.scene_preset === "custom" || scene.config.scene_preset === DEFAULT_AMBIENT_CONFIG.scene_preset);
+  // A video scene made from your picture hides the preset, look and picture
+  // model in Settings (they don't change its clip), yet a generated picture
+  // would be made from them: remove the picture first to see and set them.
+  const hiddenStill = own && ownPictureVideo(scene.config);
+  // With no picture, only a custom scene with no description has nothing to
+  // make one from (a preset has its own prompt): as the server refuses.
+  const noText = !described || described.toLowerCase() === "the scene in the given image";
+  const blocked = own ? nothingToDescribe : !has && noText && scene.config.scene_preset === "custom";
 
   // Every picture change needs a new loop: when one is already made, ask
   // first and say about what it cost (the server refuses without the flag).
-  const run = async (key: string, action: string, fn: (discardLoop: boolean) => Promise<AmbientScene>, ok: string) => {
+  const run = async (
+    key: string,
+    action: string,
+    fn: (discardLoop: boolean) => Promise<AmbientScene>,
+    ok: string,
+    // The caller already asked (and said what is discarded).
+    confirmed = false
+  ) => {
     setBusy(key);
     try {
-      const next = await askBeforeDiscard(scene, true, action, fn);
+      const next = confirmed ? await fn(true) : await askBeforeDiscard(scene, true, action, fn);
       if (!next) return;
       onChange(next);
       toast.success(ok);
@@ -169,13 +196,40 @@ export function ScenePicture({
             <button
               type="button"
               className="btn-ghost text-xs"
-              disabled={lock}
-              title="One image call: preview the scene before paying for any video"
-              onClick={() =>
-                run("gen", "Generating a new picture", (d) => api.generateAmbientPicture(scene.id, d), "Picture generated")
+              disabled={lock || hiddenStill || blocked}
+              title={
+                hiddenStill
+                  ? "Remove your picture first to choose the preset, look and picture model a generated one is made from"
+                  : blocked
+                  ? "Describe the scene in Settings first: there is nothing to make a picture from"
+                  : own
+                  ? "One image call: makes a new picture from the description and replaces yours"
+                  : "One image call: preview the scene before paying for any video"
               }
+              onClick={() => {
+                if (!own) {
+                  run("gen", "Generating a new picture", (d) => api.generateAmbientPicture(scene.id, d), "Picture generated");
+                  return;
+                }
+                // One question covers both: the picture and any loop made from it.
+                const stake = scene.loop_at_stake ? ` This also discards ${loopAtStakeText(scene)}.` : "";
+                if (
+                  !window.confirm(
+                    `Replace your picture with one generated from the description${cost ? ` (${cost})` : ""}? Your picture is not kept.${stake}`
+                  )
+                )
+                  return;
+                run("gen", "", (d) => api.generateAmbientPicture(scene.id, d), "Picture generated", true);
+              }}
             >
-              {busy === "gen" ? "Generating…" : origin === "generated" ? "Regenerate preview" : "Generate preview"}
+              {busy === "gen"
+                ? "Generating…"
+                : own
+                ? "Replace with a generated picture"
+                : origin === "generated"
+                ? "Regenerate preview"
+                : "Generate preview"}
+              {busy !== "gen" && cost && <span className="text-ink-400"> · {cost}</span>}
             </button>
             {has && (
               <button

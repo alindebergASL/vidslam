@@ -85,7 +85,7 @@ def _enqueue_generation(db: Session, project: models.VideoProject, *args,
     claimed = (
         db.query(models.VideoProject)
         .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
-        .update({"status": "generating", "claim_token": token}, synchronize_session=False)
+        .update({"status": "generating", "claim_token": token, "queue_job_id": ""}, synchronize_session=False)
     )
     db.commit()
     if not claimed:
@@ -116,6 +116,15 @@ def _record_queue_entry(db: Session, scene_id: int, job_id) -> None:  # noqa: AN
     db.query(models.VideoProject).filter(
         models.VideoProject.id == scene_id, models.VideoProject.status == "generating",
     ).update({"queue_job_id": str(job_id or "")[:80]}, synchronize_session=False)
+    db.commit()
+
+
+def _record_batch_queue_entry(db: Session, scene_ids: list[int], job_id) -> None:  # noqa: ANN001
+    """A batch's scenes wait as drafts for one job that generates them in
+    turn: each keeps that job's queue entry, so a scene the job is making
+    isn't read as stuck (or swept) while the job is still running."""
+    db.query(models.VideoProject).filter(models.VideoProject.id.in_(scene_ids)).update(
+        {"queue_job_id": str(job_id or "")[:80]}, synchronize_session=False)
     db.commit()
 
 
@@ -176,6 +185,7 @@ def batch_create(body: AmbientBatchRequest, db: Session = Depends(get_db)) -> di
         created.append(project.id)
         total += svc.estimate_ambient_cost(cfg)["total"]
     job_id = enqueue(ambient_batch_job, created, body.render)
+    _record_batch_queue_entry(db, created, job_id)
     db.expire_all()
     return {
         "scene_ids": created,
@@ -203,6 +213,16 @@ def _check_scene(config) -> None:
         from ..services.minor_check import check_or_422
 
         check_or_422(text, kind="image")
+
+
+def _require_a_description(project: models.VideoProject, *, picture: bool) -> None:
+    """/new stores a placeholder description for a picture scene with none.
+    It describes nothing for a generated picture, nor for a loop once the
+    picture is gone: refuse (422) rather than pay for a picture of nothing."""
+    cfg = svc._config_of(project)
+    if (cfg.scene_preset == "custom" and cfg.scene_prompt.strip().lower() == svc.PICTURE_PLACEHOLDER_PROMPT
+            and (picture or not cfg.picture_origin)):
+        raise HTTPException(422, "Describe the scene first: there is nothing to make it from")
 
 
 def _check_scene_prompts(project: models.VideoProject, *, loop: bool = False,
@@ -296,6 +316,7 @@ def generate_loop(
     project = _get_scene(db, scene_id)
     if project.status == "generating":
         raise HTTPException(409, "scene is already generating")
+    _require_a_description(project, picture=False)
     _check_scene_prompts(project, loop=True)
     job_id = _enqueue_generation(db, project, regenerate_music)
     return {"scene_id": scene_id, "job_id": job_id, "status": "enqueued"}
@@ -415,6 +436,7 @@ def generate_picture(scene_id: int, discard_loop: bool = False, db: Session = De
     project = _get_scene(db, scene_id)
     _picture_busy(project)
     provider_gate.require_still(svc._config_of(project))  # the scene's chosen model, not a silent swap
+    _require_a_description(project, picture=True)
     _check_scene_prompts(project)
     try:
         svc.generate_picture(db, project, discard_loop=discard_loop)
@@ -533,7 +555,7 @@ def render_scene(scene_id: int, accept_seam: bool = False, db: Session = Depends
     claimed = (
         db.query(models.VideoProject)
         .filter(models.VideoProject.id == project.id, models.VideoProject.status != "generating")
-        .update({"status": "generating", "claim_token": token}, synchronize_session=False)
+        .update({"status": "generating", "claim_token": token, "queue_job_id": ""}, synchronize_session=False)
     )
     db.commit()
     if not claimed:

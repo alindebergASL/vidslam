@@ -950,6 +950,9 @@ export type AmbientPresets = {
   scenes: ScenePreset[];
   music_moods: MusicMood[];
   sounds?: MusicMood[];
+  /** What "Match the scene" picks: by weather first, then by preset. */
+  auto_sound_by_scene?: Record<string, string>;
+  auto_sound_by_weather?: Record<string, string>;
   looks?: AmbientOption[];
   times_of_day?: AmbientOption[];
   weathers?: AmbientOption[];
@@ -1106,10 +1109,20 @@ export type AmbientScene = {
   picture_ready?: boolean;
   /** Changes whenever the picture file is replaced (image cache-bust). */
   picture_version?: string;
+  /** Changes whenever the loop clip file is replaced (video cache-bust). */
+  clip_version?: string;
+  /** "Generating" with nothing making it: offer a reset (cancelRender). */
+  stuck?: boolean;
   repeats: number;
   plan: LoopPlan;
   /** Rate-card estimate of what Generate loop would buy now (USD). */
   generate_cost?: number;
+  /** Rate-card prices of Generate music, Generate sound and a generated picture (USD). */
+  music_cost?: number;
+  sound_cost?: number;
+  /** Whether Generate sound has a sound to make ("Match the scene" can have nothing to match). */
+  sound_resolved?: boolean;
+  picture_cost?: number;
   /** Loop clips already made: a new picture or a setting that needs a new clip discards them. */
   loop_at_stake?: { cost: number; from_ledger: boolean; partial: boolean } | null;
   /** A loop that failed part-way and can be continued from the failed clip. */
@@ -2015,8 +2028,8 @@ export const api = {
   renderThumb: (id: number) => `${API_BASE}/api/renders/${id}/thumbnail`,
   exportRendersUrl: (projectId: number) =>
     `${API_BASE}/api/projects/${projectId}/renders/export`,
-  shotClip: (projectId: number, shotId: number) =>
-    `${API_BASE}/api/projects/${projectId}/shots/${shotId}/clip`,
+  shotClip: (projectId: number, shotId: number, v?: string) =>
+    `${API_BASE}/api/projects/${projectId}/shots/${shotId}/clip${v ? `?v=${encodeURIComponent(v)}` : ""}`,
   publicRender: (token: string) => `${API_BASE}/api/public-renders/${token}`,
   publicRenderThumb: (token: string) => `${API_BASE}/api/public-renders/${token}/thumbnail`,
   publicRenderMeta: (token: string) =>
