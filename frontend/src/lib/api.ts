@@ -1847,7 +1847,12 @@ export type SoundStorySummary = {
   /** What a job is doing while the story is busy: "writer" | "enhance". */
   task: string | null;
   writer: { chapters_done: number; chapters: number; has_outline: boolean; finished: boolean };
+  /** Whether the writer's Resume applies (a part-written story). */
   can_resume: boolean;
+  /** The voices and sounds (a clips run): progress, and whether its Resume applies. */
+  clips: StoryClipsProgress;
+  /** How each character is voiced (NAME → its own choice). */
+  cast_voices: Record<string, CastVoice>;
   created_at: string | null;
   updated_at: string | null;
 };
@@ -1858,14 +1863,137 @@ export type SoundStory = SoundStorySummary & {
   parsed: StoryParse;
 };
 
-export type SoundConfig = { max_minutes: number; styles: string[]; enhance_sync_max: number; minutes_per_chapter: number };
+export type SoundConfig = {
+  max_minutes: number;
+  styles: string[];
+  enhance_sync_max: number;
+  minutes_per_chapter: number;
+  voices?: {
+    default: { provider: string; model: string };
+    providers: string[];
+    elevenlabs_models: string[];
+    openrouter_models: { id: string; name: string }[];
+  };
+  preview_max_minutes?: number;
+  max_clip_chars?: number;
+};
+
+/** How one character is voiced (its own choice; else the story's). */
+export type CastVoice = {
+  provider?: string;
+  model?: string;
+  voice_id?: string;
+  seed?: number;
+  voice_settings?: { stability?: number; similarity_boost?: number; style?: number; speed?: number };
+  loudness?: number;
+};
+
+export type StoryClipsProgress = {
+  total: number;
+  done: number;
+  flagged: number;
+  made: number;
+  reused: number;
+  finished: boolean;
+  can_resume: boolean;
+  preview: { duration: number; clips: number; created_at: string | null } | null;
+};
+
+export type SoundClipTake = {
+  id: number;
+  take_no: number;
+  selected: boolean;
+  /** done | flagged (failed its check twice: listen before using it) */
+  status: string;
+  error: string;
+  duration: number | null;
+  provider: string;
+  model: string;
+  cost_usd: number;
+  attempts: number;
+  fingerprint: string;
+  lufs: number | null;
+  url: string;
+  created_at: string | null;
+};
+
+/** One cue block: a voice clip (lines merged) or a sound effect. */
+export type SoundClipBlock = {
+  key: string;
+  kind: "voice" | "sfx";
+  chapter: number;
+  seq: number;
+  lines: number[];
+  part: number;
+  /** The price of a new take. */
+  cost: number;
+  est_seconds: number;
+  speaker?: string;
+  tags?: string[];
+  text?: string;
+  chars?: number;
+  provider?: string;
+  model?: string;
+  prompt?: string;
+  seconds?: number;
+  placement?: string;
+  asset_id?: number | null;
+  /** missing | done | flagged | outdated (made with another voice or model) */
+  state: string;
+  selected: number | null;
+  takes: SoundClipTake[];
+};
+
+export type StoryClips = {
+  clips: SoundClipBlock[];
+  progress: StoryClipsProgress;
+  chapters: { index: number; title: string }[];
+};
+
+export type StoryPreviewScope = { chapter?: number; start_line?: number; end_line?: number; first_minutes?: number };
+
+export type StoryPreviewResult = {
+  duration: number;
+  clips: number;
+  made: number;
+  reused: number;
+  flagged: number;
+  price: ClipEstimate;
+  url: string;
+};
+
+export type ClipEstimate = CostEstimate & { clips?: number; missing?: number };
+
+export type SoundAsset = {
+  id: number;
+  kind: string;
+  name: string;
+  prompt: string;
+  seconds: number;
+  loop: boolean;
+  provider: string;
+  model: string;
+  source: string;
+  story_id: number | null;
+  cost_usd: number;
+  created_at: string | null;
+  url: string;
+  cached?: boolean;
+};
+
+export type EffectsRequest = { prompt: string; seconds: number; loop: boolean; variations: number };
 
 export type CallPrice = { calls: number; unit_cost: number; cost: number };
 
 export type StoryEstimate = {
-  generate: CostEstimate & { minutes?: number; voiced_chars?: number; note?: string };
+  /** What Generate pays now: the clips still missing. */
+  generate: ClipEstimate;
+  /** The whole story's price with beds and music (as if nothing were made yet, less what is). */
+  full?: CostEstimate & { minutes?: number; voiced_chars?: number };
   write: CallPrice;
   enhance?: CallPrice;
+  regenerate?: ClipEstimate;
+  preview?: ClipEstimate;
   minutes: number;
 };
 
@@ -2762,6 +2890,7 @@ export const api = {
       settings?: StorySettings;
       script_text?: string;
       script_version?: number;
+      cast?: Record<string, CastVoice>;
     }
   ) => req<SoundStory>(`/api/sound/stories/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteStory: (id: number) => req<void>(`/api/sound/stories/${id}`, { method: "DELETE" }),
@@ -2777,6 +2906,8 @@ export const api = {
     start?: number;
     end?: number;
     chapter_line?: number;
+    cue_key?: string;
+    preview?: StoryPreviewScope;
   }) => req<StoryEstimate>("/api/sound/estimate", { method: "POST", body: JSON.stringify(body) }),
   writeStory: (id: number, replace = false) =>
     req<{ story_id: number; job_id: string; status: string; price: CallPrice }>(`/api/sound/stories/${id}/write`, {
@@ -2803,4 +2934,37 @@ export const api = {
     }
   ) => req<StoryEnhanceResult>(`/api/sound/stories/${id}/enhance`, { method: "POST", body: JSON.stringify(body) }),
   dismissStoryEnhance: (id: number) => req<SoundStory>(`/api/sound/stories/${id}/enhance`, { method: "DELETE" }),
+
+  // Sound Studio: voices and sound effects of a story
+  generateStoryClips: (id: number) =>
+    req<{ story_id: number; job_id: string; status: string; price: ClipEstimate }>(
+      `/api/sound/stories/${id}/generate`,
+      { method: "POST" }
+    ),
+  storyClips: (id: number) => req<StoryClips>(`/api/sound/stories/${id}/clips`),
+  regenerateClip: (id: number, cue_key: string) =>
+    req<{ take: SoundClipTake; price: ClipEstimate }>(`/api/sound/stories/${id}/clips/regenerate`, {
+      method: "POST",
+      body: JSON.stringify({ cue_key }),
+    }),
+  selectClipTake: (id: number, takeId: number) =>
+    req<SoundClipTake>(`/api/sound/stories/${id}/clips/${takeId}/select`, { method: "POST" }),
+  /** A take's audio (its url from the API, made absolute). */
+  soundUrl: (path: string, v?: string | number) =>
+    `${API_BASE}${path}${v !== undefined ? `?v=${encodeURIComponent(String(v))}` : ""}`,
+  previewStory: (id: number, scope: StoryPreviewScope) =>
+    req<StoryPreviewResult>(`/api/sound/stories/${id}/preview`, { method: "POST", body: JSON.stringify(scope) }),
+  storyPreviewUrl: (id: number, v?: string | null) =>
+    `${API_BASE}/api/sound/stories/${id}/preview/audio${v ? `?v=${encodeURIComponent(v)}` : ""}`,
+
+  // Sound Studio: the effects tool and the library
+  effectsEstimate: (body: EffectsRequest) =>
+    req<CostEstimate>("/api/sound/effects/estimate", { method: "POST", body: JSON.stringify(body) }),
+  makeEffects: (body: EffectsRequest) =>
+    req<{ assets: SoundAsset[]; price: CostEstimate }>("/api/sound/effects", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  soundAssets: () => req<SoundAsset[]>("/api/sound/assets"),
+  deleteSoundAsset: (assetId: number) => req<void>(`/api/sound/assets/${assetId}`, { method: "DELETE" }),
 };

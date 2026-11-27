@@ -385,3 +385,21 @@ def story_enhance_job(story_id: int, claim_token: str = "") -> None:
             sound_studio.enhance_range(db, story_id, sound_studio.running_token(claim_token))
     finally:
         db.close()
+
+
+def story_clips_job(story_id: int, claim_token: str = "") -> None:
+    """Sound Studio: make a story's voice clips and sound effects (queued by
+    POST /api/sound/stories/{id}/generate or /resume with the story claimed
+    'generating'). Cancelled or replaced while queued: does nothing."""
+    from ..services import sound_clips, sound_studio
+
+    db = SessionLocal()
+    try:
+        if not sound_studio.consume_claim(db, story_id, claim_token, status="generating"):
+            db.rollback()
+            return
+        db.commit()
+        with spend.scope(ref=sound_studio.ref(story_id)), provider_keys.continuing():  # checked when queued
+            sound_clips.generate_story(db, story_id, sound_studio.running_token(claim_token))
+    finally:
+        db.close()

@@ -16,8 +16,15 @@ export default function SoundStudioPage() {
   );
 }
 
+const LIVE = [
+  {
+    name: "Sound Effects",
+    href: "/sound/effects",
+    text: "One-off effects and loops from a description, up to four takes, saved to your library.",
+  },
+];
+
 const COMING = [
-  { name: "Sound Effects", text: "One-off effects and loops from a description, saved to your library." },
   { name: "Music", text: "Background music and beds for stories and videos." },
   { name: "Vocal tracks", text: "Sung or spoken vocal tracks." },
 ];
@@ -44,7 +51,7 @@ function Inner() {
   useEffect(() => {
     reload();
   }, [reload]);
-  const busy = stories.some((s) => s.status === "scripting");
+  const busy = stories.some((s) => s.status === "scripting" || s.status === "generating");
   const poke = usePoll(reload, { enabled: busy, interval: 3000 });
   useEvents({ kind: "sound_story" }, () => poke());
 
@@ -114,7 +121,7 @@ function Inner() {
                   <button
                     type="button"
                     className="text-ink-400 hover:text-red-300 disabled:opacity-40"
-                    disabled={s.status === "scripting"}
+                    disabled={s.status === "scripting" || s.status === "generating"}
                     onClick={() => remove(s)}
                   >
                     Delete
@@ -131,6 +138,14 @@ function Inner() {
           More tools
         </h2>
         <ul className="grid gap-3 sm:grid-cols-3">
+          {LIVE.map((t) => (
+            <li key={t.name}>
+              <Link href={t.href} className="card card-hover p-4 block h-full">
+                <span className="font-medium">{t.name}</span>
+                <p className="text-xs text-ink-400 mt-2">{t.text}</p>
+              </Link>
+            </li>
+          ))}
           {COMING.map((t) => (
             <li key={t.name} className="card p-4 opacity-70" aria-disabled="true">
               <div className="flex items-center justify-between">

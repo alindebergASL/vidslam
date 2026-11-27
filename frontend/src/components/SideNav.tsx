@@ -14,6 +14,7 @@ const items: { href: string; label: string; icon: string; running?: CountKey }[]
   { href: "/studio", label: "Studio", icon: "✦", running: "studio" },
   { href: "/projects", label: "Projects", icon: "▷", running: "projects" },
   { href: "/ambient", label: "Ambient", icon: "∿", running: "ambient" },
+  { href: "/sound", label: "Sound Studio", icon: "♪", running: "sound" },
   { href: "/publishing", label: "Publishing", icon: "⇪", running: "publish" },
   { href: "/results", label: "Results", icon: "↗" },
   { href: "/cast", label: "Cast", icon: "☺", running: "training" },

@@ -41,6 +41,8 @@ export function fmtMinutes(seconds: number): string {
 
 export function storyStatusLabel(status: string, task?: string | null): string {
   if (status === "scripting") return task === "enhance" ? "Enhancing" : "Writing";
+  if (status === "generating")
+    return task === "preview" ? "Making a preview" : task === "regenerate" ? "Making a take" : "Generating voices";
   return (
     {
       draft: "Draft",
