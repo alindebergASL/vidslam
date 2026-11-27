@@ -10,6 +10,7 @@ they would cost) and refused when the chat model is switched off. POST
 """
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -290,6 +291,14 @@ def enhance(story_id: int, body: EnhanceIn, db: Session = Depends(get_db)) -> Re
         raise HTTPException(409, "The selection doesn't match the saved script; save first.")
     if not text.strip():
         raise HTTPException(422, "There is nothing to enhance there.")
+    cap = sound_studio.max_minutes()
+    minutes = body.minutes
+    if minutes is not None and minutes > cap:
+        raise HTTPException(422, f"A story is at most {cap} minutes long.")
+    if body.action == "lengthen" and minutes is None:
+        # Lengthen with no length asked: from the range's own length.
+        now = story_script.parse(text, style=sound_studio.style_of(story), max_minutes=0).est_seconds
+        minutes = max(1, min(cap, math.ceil(now / 60.0)))
     _require_writer()
     price = sound_studio.enhance_estimate(story, a, b)
     spend.require_budget_for(db, price["cost"])
@@ -299,7 +308,7 @@ def enhance(story_id: int, body: EnhanceIn, db: Session = Depends(get_db)) -> Re
             with spend.scope(ref=sound_studio.ref(story_id)):
                 after = sound_studio.enhance_text(text, body.action, header=sound_studio.header_of(story.script_text),
                                                   style=style, title=story.title or "",
-                                                  premise=story.premise or "", minutes=body.minutes)
+                                                  premise=story.premise or "", minutes=minutes)
         except prompting.EnhanceRefused as e:
             raise HTTPException(422, sound_studio.refused_message(e)) from None
         except UnsafeScriptError as e:
@@ -311,7 +320,7 @@ def enhance(story_id: int, body: EnhanceIn, db: Session = Depends(get_db)) -> Re
     progress = dict(story.progress_json or {})
     progress[sound_studio.ENHANCE_KEY] = {
         "status": "running", "action": body.action, "scope": body.scope, "start": a, "end": b, "before": text,
-        "after": "", "script_version": story.script_version or 0, "minutes": body.minutes, "done": 0,
+        "after": "", "script_version": story.script_version or 0, "minutes": minutes, "done": 0,
         "total": sum(1 for _, _, on in sound_studio.segments(text) if on) or 1, "error": "",
     }
     story.progress_json = progress

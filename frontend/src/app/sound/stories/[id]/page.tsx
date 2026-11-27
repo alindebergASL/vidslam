@@ -59,6 +59,15 @@ function Inner() {
   );
   const area = useRef<HTMLTextAreaElement | null>(null);
   const sel = useRef<{ start: number; end: number }>({ start: 0, end: 0 });
+  // A selection is only good for the text it was made in: a new text (a
+  // save, the writer's chapter, a reload) or a newly mounted editor (Edit,
+  // or the writer finishing) forgets it, so a paid Enhance never goes to
+  // old offsets.
+  const scriptVersion = story?.script_version;
+  const editorShown = editing && story?.status !== "scripting";
+  useEffect(() => {
+    sel.current = { start: 0, end: 0 };
+  }, [text, scriptVersion, editorShown]);
 
   const dirty = !!story && text !== story.script_text;
   const dirtyRef = useRef(false);
@@ -630,7 +639,9 @@ function EnhanceMenu({
   const [chapterLine, setChapterLine] = useState<number | undefined>(chapters[0]?.line);
   const [minutes, setMinutes] = useState(target);
   useEffect(() => {
-    if (chapterLine === undefined && chapters[0]) setChapterLine(chapters[0].line);
+    // A chapter choice that matches no chapter any more (the script
+    // changed) goes back to the first, the one the dropdown shows.
+    if (!chapters.some((c) => c.line === chapterLine)) setChapterLine(chapters[0]?.line);
   }, [chapters, chapterLine]);
   return (
     <section className="card p-3 flex flex-col gap-2" aria-labelledby="enhance-h">

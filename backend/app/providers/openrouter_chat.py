@@ -1315,18 +1315,30 @@ def story_outline_request(*, premise: str, title: str, minutes: int, style: str,
                      ensure_ascii=False))
 
 
-def story_chapter_request(*, premise: str, outline: dict, index: int, minutes: float, style: str,
-                          sfx_density: str, previous: str = "") -> str:
-    """The user message of one chapter call."""
+# The share of a chapter's minutes asked for as spoken words: sound cues,
+# pauses and tags take the rest (more of it the denser the sound design),
+# so a story asked for at the cap still fits under it.
+WORDS_SHARE = {"none": 0.9, "low": 0.85, "medium": 0.8, "high": 0.75}
+
+
+def chapter_words(minutes: float, *, style: str, sfx_density: str) -> int:
     from ..services import story_script
 
     wpm = story_script.WPM_BY_STYLE.get(style, story_script.DEFAULT_WPM)
+    return int(minutes * wpm * WORDS_SHARE.get(sfx_density, WORDS_SHARE["medium"]))
+
+
+def story_chapter_request(*, premise: str, outline: dict, index: int, minutes: float, style: str,
+                          sfx_density: str, previous: str = "") -> str:
+    """The user message of one chapter call."""
     chapters = outline.get("chapters") or []
     this = chapters[index] if 0 <= index < len(chapters) else {}
+    words = chapter_words(minutes, style=style, sfx_density=sfx_density)
     return (
         f"Write chapter {index + 1} of {len(chapters)} of this audio story in the script markup: about "
-        f"{int(minutes * wpm)} spoken words (about {minutes:g} minutes read aloud). Only the script lines: no "
-        "heading. Or reply with exactly REFUSED_MINOR or DECLINED.\n\n"
+        f"{words} spoken words (about {minutes:g} minutes read aloud with its sound cues and pauses; "
+        "stay at or under it). Only the script lines: no heading. Or reply with exactly REFUSED_MINOR or "
+        "DECLINED.\n\n"
         + json.dumps({"premise": premise, "title": outline.get("title") or "", "style": style or "any",
                       "sound_effects": SFX_DENSITY_WORDS.get(sfx_density, SFX_DENSITY_WORDS["medium"]),
                       "cast": outline.get("cast") or [], "chapters": chapters,

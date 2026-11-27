@@ -13,7 +13,9 @@ proposal (progress_json["enhance"]) the editor shows as before/after.
 
 Every script that is saved, every written chapter and every Enhance output
 is checked (check_script_text / check_part): the spoken words with the
-markup removed (safety.validate_script and check_script), then the whole
+markup removed (safety.validate_script and check_script), what no voice
+reads but is kept or sent to models (notes, headings, dropped markup,
+overridden cast lines: check_unvoiced, as prose with the cast), then the whole
 story check of PR1 (story_script.check_story: the minors check of every
 window with the cast header in front and, on a clean deployment, the
 explicit-content check). A premise alone is checked by check_premise. Spend
@@ -128,23 +130,113 @@ def _spoken(doc: StoryDoc) -> str:
     return "\n".join(i.spoken_text for i in doc.speech() if i.spoken_text.strip())
 
 
+# A parser warning that some of the line was dropped (an unknown [tag], an
+# unknown @ command, a malformed @cast line, a cue it couldn't read): the
+# raw line is then text no voice reads and check_story never judges.
+_DROPPED_RE = re.compile(r"\b(?:skipped|removed|ignored)\b", re.I)
+_CAST_DECL_RE = re.compile(r"^@cast\s+([^\[:]+?)\s*((?:\[[^\]]*\]\s*)*):\s*(.*)$", re.I)
+
+
+def _raw_lines(text: str) -> list[str]:
+    """The script's lines as story_script.parse numbers them (from 1)."""
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
+def _cast_decls(text: str) -> list[tuple[int, str, str]]:
+    """Every well-formed @cast line: (line number, NAME, the declaration
+    after the name, spaces folded)."""
+    out = []
+    for n, ln in enumerate(_raw_lines(text), start=1):
+        m = _CAST_DECL_RE.match(ln.strip())
+        if m:
+            name = " ".join(m.group(1).split()).upper()
+            out.append((n, name, " ".join(f"{m.group(2)}:{m.group(3)}".split()).lower()))
+    return out
+
+
+def _dropped_lines(doc: StoryDoc) -> set[int]:
+    return {w.line for w in doc.warnings if w.line and _DROPPED_RE.search(w.message)}
+
+
+def unvoiced_text(text: str, doc: StoryDoc) -> str:
+    """The text of `text` (parsed as `doc`) that no voice reads and
+    check_story never judges, one piece per line: notes (// lines), chapter
+    headings (an empty chapter's too), a @cast declaration a later one
+    overrides, and the raw line wherever the parser dropped part of one
+    (an unknown [tag], an unknown @ command, a malformed @cast line, a cue
+    it couldn't read). It is still saved, shown and sent to models as
+    context, so it is checked too (check_unvoiced)."""
+    lines = _raw_lines(text)
+    picked: dict[int, str] = {}
+    for i in doc.items:
+        if i.kind == "comment" and i.text.strip():
+            picked[i.line] = i.text
+    for ch in doc.chapters:
+        if ch.line and ch.title.strip():
+            picked[ch.line] = ch.title
+    for n in _dropped_lines(doc):
+        if 0 < n <= len(lines) and lines[n - 1].strip():
+            picked[n] = lines[n - 1].strip()
+    for n, name, _ in _cast_decls(text):
+        final = doc.cast.get(name)
+        m = _CAST_DECL_RE.match(lines[n - 1].strip())
+        if final is None or " ".join(m.group(3).split()) != final.description:
+            picked[n] = lines[n - 1].strip()
+    return "\n".join(picked[k] for k in sorted(picked))
+
+
+def check_prose(text: str, doc: StoryDoc) -> None:
+    """Text that isn't read aloud but is kept or sent to models (notes,
+    headings, the outline's chapter plan), checked as prose with the cast
+    in front: the script word check, the minors check of the story path
+    (minor_check.check_long, kind "story") and, on a clean deployment, the
+    explicit-content check. Raises UnsafeScriptError."""
+    from . import explicit_check, minor_check
+    from .safety import check_script
+
+    if not (text or "").strip():
+        return
+    check_script(text)
+    minor_check.check_long(text, kind="story", context=story_script.cast_header(doc))
+    explicit_check.check(story_script.normalize(text, dashes=False))
+
+
+def check_unvoiced(text: str, doc: StoryDoc) -> None:
+    check_prose(unvoiced_text(text, doc), doc)
+
+
+def context_tail(text: str, *, style: str = "", size: int = 1500) -> str:
+    """The end of a script as the writer is shown it (the end of the
+    previous chapter): only the lines it voices and its cues, never a note,
+    heading or line the parser dropped part of."""
+    doc = story_script.parse(text, style=style, max_minutes=0)
+    keep = {i.line for i in doc.items if i.kind in ("speech", "sfx", "pause", "bed")} - _dropped_lines(doc)
+    lines = _raw_lines(text)
+    out = "\n".join(lines[n - 1].strip() for n in sorted(keep) if 0 < n <= len(lines))
+    return out[-size:]
+
+
 def music_prompts(settings: Optional[dict]) -> tuple[str, ...]:
     m = str((settings or {}).get("music_prompt") or "").strip()
     return (m,) if m else ()
 
 
-def check_doc(doc: StoryDoc, *, title: str = "", premise: str = "", settings: Optional[dict] = None) -> str:
+def check_doc(doc: StoryDoc, *, title: str = "", premise: str = "", settings: Optional[dict] = None,
+              text: Optional[str] = None) -> str:
     """The checks a script gets wherever it comes from (a save, a written
     chapter, an Enhance rewrite): the spoken words without markup
-    (safety.validate_script and check_script), then story_script.check_story
-    (minors in every mode, explicit content on a clean deployment). Returns
-    the story context. Raises UnsafeScriptError."""
+    (safety.validate_script and check_script), with `text` (the script
+    `doc` was parsed from) what no voice reads (check_unvoiced), then
+    story_script.check_story (minors in every mode, explicit content on a
+    clean deployment). Returns the story context. Raises UnsafeScriptError."""
     from .safety import check_script, validate_script
 
     spoken = _spoken(doc)
     if spoken.strip():
         validate_script(spoken)
         check_script(spoken)
+    if text is not None:
+        check_unvoiced(text, doc)
     return str(story_script.check_story(doc, title=title, premise=premise,
                                         music_prompts=music_prompts(settings)))
 
@@ -164,7 +256,7 @@ def check_script_text(text: str, *, style: str = "", title: str = "", premise: s
     if about:
         explicit_check.check(about)
     doc = story_script.parse(text, style=style)
-    check_doc(doc, title=title, premise=premise, settings=settings)
+    check_doc(doc, title=title, premise=premise, settings=settings, text=text)
     return doc
 
 
@@ -176,8 +268,9 @@ def header_of(text: str) -> str:
 def check_part(header: str, part: str, *, style: str = "", title: str = "", premise: str = "") -> None:
     """One chapter (or one Enhance rewrite) checked with the cast in front
     (check_doc on the header plus the part)."""
-    doc = story_script.parse(f"{header}\n\n{part}" if header else part, style=style, max_minutes=0)
-    check_doc(doc, title=title, premise=premise)
+    text = f"{header}\n\n{part}" if header else part
+    doc = story_script.parse(text, style=style, max_minutes=0)
+    check_doc(doc, title=title, premise=premise, text=text)
 
 
 # ---------- claims ----------
@@ -335,36 +428,103 @@ def _ask(call: Callable, *, text: str = "") -> tuple[str, str]:
         return out, getattr(chat, "model", "") or m or model_registry.active_model("chat")
 
     out, used = run("")
-    why = prompting.refusal(out, text) if out.strip() else "declined"
+    why = writer_refusal(out, text) if out.strip() else "declined"
     if why == "declined" and adult:
         fallback = get_settings().adult_text_fallback_model or ""
         if fallback and fallback != used:
             log.info("story writer: %s declined; retrying with %s", used, fallback)
             out, used = run(fallback)
-            why = prompting.refusal(out, text) if out.strip() else "declined"
-    if why == "minor":
-        raise WriterRefused("The writer refused this story: it appears to sexualise a minor.", "minor")
+            why = writer_refusal(out, text) if out.strip() else "declined"
     if why:
-        if not content_mode.features():
-            msg = f"The writer ({used}) declined to write this; this server writes general-audience stories only."
-        else:
-            msg = f"The writer ({used}) declined to write this; change the premise and try again."
-        raise WriterRefused(msg, "declined")
+        raise _refused(why, used)
     return out, used
+
+
+def _refused(why: str, used: str) -> WriterRefused:
+    from . import content_mode
+
+    if why == "minor":
+        return WriterRefused("The writer refused this story: it appears to sexualise a minor.", "minor")
+    if not content_mode.features():
+        msg = f"The writer ({used}) declined to write this; this server writes general-audience stories only."
+    else:
+        msg = f"The writer ({used}) declined to write this; change the premise and try again."
+    return WriterRefused(msg, "declined")
+
+
+_MINOR_SENTINEL_RE = re.compile(r"\bREFUSED_MINOR\b")
+_DECLINED_RE = re.compile(r"\bDECLINED\b")
+_DECLINED_LEAD_RE = re.compile(r"^\W*DECLINED\b")
+# A reply this short that says DECLINED anywhere is a refusal, explained
+# or wrapped ("DECLINED\n\nI won't write this.", {"error": "DECLINED"}).
+SHORT_REPLY = 600
+
+
+def writer_refusal(out: str, text: str = "") -> Optional[str]:
+    """prompting.refusal, and the sentinel however it comes: REFUSED_MINOR
+    anywhere in a reply is a minors refusal (no story says it); DECLINED
+    leading a reply, or anywhere in a short one, is a refusal (a minors one
+    when it names a minor or `text` mentions one)."""
+    from . import prompting
+
+    why = prompting.refusal(out, text)
+    if why:
+        return why
+    flat = " ".join((out or "").split())
+    if _MINOR_SENTINEL_RE.search(flat):
+        return "minor"
+    if _DECLINED_LEAD_RE.match(flat) or (len(flat) <= SHORT_REPLY and _DECLINED_RE.search(flat)):
+        return prompting.refusal(f"DECLINED: {flat[:200]}", text) or "declined"
+    return None
+
+
+def outline_refusal(data: object, text: str = "") -> Optional[str]:
+    """A refusal wrapped in the outline's JSON ({"refusal": "REFUSED_MINOR"},
+    {"title": "DECLINED"}, {"chapters": [], "reason": "I can't write
+    this."}), as hook_lab.wrapped_refusal reads a hook planner's: REFUSED_MINOR
+    anywhere; DECLINED as a whole value or leading one, or under a refusal
+    key; a refusal in words when the outline has no chapter to write."""
+    from . import prompting
+    from .hook_lab import _REFUSAL_KEYS, _strings
+
+    found: Optional[str] = None
+    for t, _ in _strings(data):
+        flat = " ".join(str(t).split())
+        if _MINOR_SENTINEL_RE.search(flat):
+            return "minor"
+        if _DECLINED_LEAD_RE.match(flat):
+            found = prompting.refusal(f"DECLINED: {flat[:200]}", text) or "declined"
+    if found:
+        return found
+    if isinstance(data, dict) and any(data.get(k) for k in _REFUSAL_KEYS):
+        return prompting.refusal("DECLINED", text) or "declined"
+    chapters = data.get("chapters") if isinstance(data, dict) else None
+    if not (isinstance(chapters, list) and any(isinstance(c, dict) for c in chapters)):
+        for t, _ in _strings(data):
+            why = prompting.refusal(str(t), text)
+            if why:
+                return why
+    return None
 
 
 _NAME_OK = re.compile(r"^[A-Z][A-Z0-9 .'\-]{0,39}$")
 
 
-def read_outline(reply: str, chapters: int) -> dict:
+def read_outline(reply: str, chapters: int, *, text: str = "", model: str = "") -> dict:
     """The writer's outline, checked and trimmed: a title, a cast of at most
-    12 (NARRATOR first), exactly `chapters` chapters."""
+    12 (NARRATOR first), exactly `chapters` chapters. A refusal wrapped in
+    its JSON (outline_refusal) raises WriterRefused."""
     from ..providers.openrouter_chat import extract_json
 
     try:
         data = extract_json(reply)
     except Exception:  # noqa: BLE001
         raise WriterRefused("The writer's outline couldn't be read; try again.", "unreadable") from None
+    why = outline_refusal(data, text)
+    if why:
+        raise _refused(why, model or "the writer")
+    if not isinstance(data, dict):
+        raise WriterRefused("The writer's outline couldn't be read; try again.", "unreadable")
     cast: list[dict] = []
     seen: set[str] = set()
     for c in data.get("cast") or []:
@@ -451,17 +611,25 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
     story_event(db, story, "started")
     db.commit()
 
-    def save(**fields) -> None:  # noqa: ANN003
+    def save(expect: Optional[int] = None, **fields) -> None:  # noqa: ANN003
+        """Commit-ready update while the claim is this job's; with `expect`
+        (a script it saves) only over the script_version it read, so a script
+        saved meanwhile is never overwritten."""
         nonlocal progress
         progress = {**progress, WRITER_KEY: dict(writer)}
-        done = _held(db.query(models.SoundStory), story_id, gen).update(
-            {"progress_json": progress, "heartbeat_at": datetime.utcnow(), **fields},
-            synchronize_session=False)
+        q = _held(db.query(models.SoundStory), story_id, gen)
+        if expect is not None:
+            q = q.filter(models.SoundStory.script_version == expect)
+        done = q.update({"progress_json": progress, "heartbeat_at": datetime.utcnow(), **fields},
+                        synchronize_session=False)
         if done != 1:
             raise _Superseded()
 
-    def finish(status: str, error: str = "") -> None:
-        done = _mine(db.query(models.SoundStory), story_id, gen).update(
+    def finish(status: str, error: str = "", *, held: bool = False) -> None:
+        # `held`: the story is finished even when it was cancelled after its
+        # last chapter was asked for (that chapter is paid for and saved).
+        scope = _held if held else _mine
+        done = scope(db.query(models.SoundStory), story_id, gen).update(
             {"status": status, "error": error, "claim_token": ""}, synchronize_session=False)
         db.commit()
         if done == 1:
@@ -476,15 +644,20 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
     try:
         outline = writer.get("outline")
         if not outline:
+            seen_version = story.script_version or 0
             reply, used = _ask(lambda chat: chat.story_outline(
                 premise=story.premise or "", title=story.title or "", minutes=minutes, style=style,
                 sfx_density=density, chapters=n), text=story.premise or "")
-            outline = read_outline(reply, n)
+            outline = read_outline(reply, n, text=story.premise or "", model=used)
             header = cast_lines(outline)
             # The cast (who each character is, and their age) is checked with
             # the premise before any chapter is written.
             check_part(header, "", style=style, title=outline.get("title") or story.title or "",
                        premise=story.premise or "")
+            # The plan every chapter call is sent (the title, each chapter's
+            # title and summary) and the title saved: checked as prose with
+            # the cast, explicit content too on a clean deployment.
+            check_prose(outline_text(outline), story_script.parse(header, style=style, max_minutes=0))
             writer.update({"outline": outline, "chapters_done": 0, "chapters": n, "model": used})
             fields: dict = {}
             old = story.script_text or ""
@@ -492,23 +665,27 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
                 # No lines yet: the outline's cast replaces any cast there.
                 new_text = _with_cast(header, old)
                 if new_text != old:
-                    fields = {"script_text": new_text, "script_version": (story.script_version or 0) + 1}
+                    fields = {"script_text": new_text, "script_version": seen_version + 1}
             if not (story.title or "").strip() and outline.get("title"):
                 fields["title"] = outline["title"]
-            save(**fields)
+            save(expect=seen_version if "script_text" in fields else None, **fields)
             db.commit()
             db.refresh(story)
         total = len(outline.get("chapters") or []) or n
-        per = minutes / total
+        cap = max_minutes() * 60.0
         for i in range(int(writer.get("chapters_done") or 0), total):
             if not _alive(story_id, gen):
                 log.info("sound story %s cancelled before chapter %s", story_id, i + 1)
                 return
             db.refresh(story)
             replacing = bool(writer.get("replace"))
-            header = cast_lines(outline) if replacing else (header_of(story.script_text) or cast_lines(outline))
-            previous = "" if replacing else (story.script_text or "")[-1500:]
-            reply, _ = _ask(lambda chat, i=i, previous=previous: chat.story_chapter(
+            seen_text, seen_version = story.script_text or "", story.script_version or 0
+            header = cast_lines(outline) if replacing else (header_of(seen_text) or cast_lines(outline))
+            previous = "" if replacing else context_tail(seen_text, style=style)
+            per = chapter_minutes(0.0 if replacing else parse_story(story, seen_text).est_seconds,
+                                  minutes=minutes, cap=cap, left=total - i,
+                                  squeeze=float(writer.get("squeeze") or 1.0), index=i)
+            reply, _ = _ask(lambda chat, i=i, previous=previous, per=per: chat.story_chapter(
                 premise=story.premise or "", outline=outline, index=i, minutes=per, style=style,
                 sfx_density=density, previous=previous), text=story.premise or "")
             body = clean_chapter(reply)
@@ -516,15 +693,23 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
                 raise WriterRefused("The writer returned an empty chapter; Resume tries again.", "unreadable")
             part = f"{chapter_heading(i, outline['chapters'][i]['title'])}\n{body}"
             check_part(header, part, style=style, title=story.title or "", premise=story.premise or "")
-            db.refresh(story)
-            base = header if replacing else (story.script_text or "").rstrip()
+            base = header if replacing else seen_text.rstrip()
             text = base + "\n\n" + part + "\n"
+            if story_script.parse(text, style=style, max_minutes=0).est_seconds > cap:
+                # Too long for the cap: the next try asks for less (and one
+                # that can't fit is refused before it is paid for).
+                writer["squeeze"] = round(float(writer.get("squeeze") or 1.0) * 0.6, 3)
+                save()
+                db.commit()
+                raise WriterRefused(f"Chapter {i + 1} came out longer than the {max_minutes()}-minute limit "
+                                    "allows; Resume asks for a shorter one.", "too_long")
             # The chapter with the story it joins (facts from earlier chapters,
             # such as a character's age, count): nothing unsafe is saved.
             check_whole(text)
             writer["chapters_done"] = i + 1
             writer.pop("replace", None)
-            save(script_text=text, script_version=(story.script_version or 0) + 1)
+            writer.pop("squeeze", None)
+            save(expect=seen_version, script_text=text, script_version=seen_version + 1)
             story_event(db, story, "progress", detail=f"Chapter {i + 1} of {total} written")
             db.commit()
             db.refresh(story)
@@ -534,13 +719,15 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
         except UnsafeScriptError:
             # Never leave refused text saved: back to the script this run began with.
             if (story.script_text or "") != start_text:
-                save(script_text=start_text, script_version=(story.script_version or 0) + 1)
+                v = story.script_version or 0
+                save(expect=v, script_text=start_text, script_version=v + 1)
                 db.commit()
             raise
         writer["finished"] = True
         save()
         db.commit()
-        finish("ready")
+        # Ready even when Cancel came while the last chapter was written.
+        finish("ready", held=True)
     except _Superseded:
         db.rollback()
         log.info("sound story %s: the writer's claim was cancelled or replaced; stopping", story_id)
@@ -553,14 +740,50 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
         finish("failed", f"Writing stopped: {str(e)[:300]}. Resume continues where it left off.")
 
 
+# The shortest chapter worth asking for, in seconds: with less room left
+# under the cap, the chapter is refused before it is paid for.
+MIN_CHAPTER_SECONDS = 30.0
+
+
+def chapter_minutes(so_far: float, *, minutes: float, cap: float, left: int, squeeze: float = 1.0,
+                    index: int = 0) -> float:
+    """The minutes chapter `index` is asked for: its share of what is left
+    of the story's length (`so_far` seconds written of `minutes`), never
+    more than its share of the room left under the cap (`cap` seconds,
+    less the gaps between chapters), times `squeeze` (smaller after a
+    chapter came out too long). Raises WriterRefused when there's no room
+    left for a chapter."""
+    from .story_script import CHAPTER_GAP
+
+    left = max(1, left)
+    room = cap - so_far - CHAPTER_GAP * left
+    if room / left < MIN_CHAPTER_SECONDS:
+        raise WriterRefused(f"The story is already about {so_far / 60:.0f} minutes, at the "
+                            f"{cap / 60:.0f}-minute limit: there's no room for chapter {index + 1}. Shorten "
+                            "the script or lower the length, then Resume.", "too_long")
+    share = max(MIN_CHAPTER_SECONDS, (minutes * 60.0 - so_far) / left)
+    return round(max(MIN_CHAPTER_SECONDS, min(share, room / left) * squeeze) / 60.0, 2)
+
+
+def outline_text(outline: dict) -> str:
+    """The outline's title and chapter plan as prose (what check_prose reads)."""
+    out = [str(outline.get("title") or "")]
+    for c in outline.get("chapters") or []:
+        out += [str(c.get("title") or ""), str(c.get("summary") or "")]
+    return "\n".join(x for x in out if x.strip())
+
+
 def can_resume(story: models.SoundStory) -> bool:
-    """A writer run that stopped part-way (cancelled, failed or swept)
-    before it finished: Resume continues at the next missing chapter (or
-    the outline, when that is what stopped)."""
+    """A writer run that stopped part-way (cancelled, failed or swept):
+    Resume continues at the next missing chapter (or the outline, when that
+    is what stopped; or only the final check, when every chapter landed).
+    Judged on the writer's own progress, so an Enhance on the story since
+    (its task, its cancel, the sweep or a queue rollback) keeps it."""
     progress = story.progress_json or {}
     w = progress.get(WRITER_KEY) or {}
-    return (story.status in ("cancelled", "failed") and progress.get(TASK_KEY) == WRITER_KEY
-            and not w.get("finished"))
+    if story.status not in ("cancelled", "failed"):
+        return False
+    return progress.get(TASK_KEY) in (WRITER_KEY, ENHANCE_KEY) or (bool(w) and not w.get("finished"))
 
 
 def writer_progress(story: models.SoundStory) -> dict:
@@ -667,7 +890,12 @@ def enhance_text(text: str, action: str, *, header: str = "", style: str = "", t
     empty reply, or only the heading back, is never a rewrite)."""
     from . import prompting
 
+    # What no voice reads is sent to the model too: checked first (a script
+    # saved before these checks may hold some).
+    sent = f"{header}\n\n{text}" if header else text
+    check_unvoiced(sent, story_script.parse(sent, style=style, max_minutes=0))
     out = _bare(prompting.enhance(text, "audio_script", direction=direction(action, minutes))["text"])
+    out = _reply_cast(text, out, header)
     first = text.lstrip().splitlines()[0] if text.strip() else ""
     if first.startswith("#") and not out.startswith(first):
         out = f"{first}\n" + "\n".join(ln for ln in out.splitlines() if not ln.startswith("#")).strip()
@@ -675,6 +903,28 @@ def enhance_text(text: str, action: str, *, header: str = "", style: str = "", t
     if said and (not out.strip() or (first.startswith("#") and out.strip() == first.strip())):
         raise EmptyRewrite("The text model returned an empty rewrite; try again. Your text is unchanged.")
     check_part(header, out, style=style, title=title, premise=premise)
+    return out
+
+
+def _reply_cast(text: str, out: str, header: str) -> str:
+    """An Enhance reply's @cast lines: dropped when the range it rewrote
+    had none (the cast is the header's); otherwise a reply that declares a
+    name the header (or the reply itself) already declares, differently,
+    is refused: the later line would win, and the story would be checked
+    with the new declaration in place of the one it has."""
+    from .safety import UnsafeScriptError
+
+    def is_cast(ln: str) -> bool:
+        return ln.strip().lower().startswith("@cast")
+
+    if not any(is_cast(ln) for ln in text.splitlines()):
+        return "\n".join(ln for ln in out.splitlines() if not is_cast(ln)).strip()
+    known = {name: decl for _, name, decl in _cast_decls(header)}
+    for _, name, decl in _cast_decls(out):
+        if name in known and known[name] != decl:
+            raise UnsafeScriptError(f"The rewrite changes how {name} is declared in the cast; the cast is "
+                                    "edited by hand only.")
+        known[name] = decl
     return out
 
 
