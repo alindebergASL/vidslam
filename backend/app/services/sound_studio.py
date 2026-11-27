@@ -62,6 +62,9 @@ REGEN_KEY = "regenerate"
 PREVIEW_KEY = "preview"
 # Tasks Cancel or a stopped worker leave 'cancelled' / 'failed' with a Resume.
 RESUMABLE_TASKS = (WRITER_KEY, CLIPS_KEY)
+# progress_json: the task and previous status a regenerate or preview lock
+# found (sweep puts them back if the request dies holding it).
+HELD_FROM_KEY = "held_from"
 
 # A job that took its claim over keeps it as RUNNING + token (its
 # generation). Cancel keeps it (the call in flight is paid for, so its
@@ -314,19 +317,24 @@ def check_part(header: str, part: str, *, style: str = "", title: str = "", prem
 # ---------- claims ----------
 
 
-def claim(db: Session, story: models.SoundStory, task: str, status: str = "scripting") -> tuple[str, str]:
+def claim(db: Session, story: models.SoundStory, task: str, status: str = "scripting", *,
+          progress_extra: Optional[dict] = None, fields: Optional[dict] = None) -> tuple[str, str]:
     """Claim the story for a job (conditional UPDATE: two requests can't
     both get through): `status` ('scripting', or 'generating' for the
-    clips) and a fresh claim_token. Returns (token, previous status).
-    Raises LookupError when it is busy."""
+    clips) and a fresh claim_token. `progress_extra` (keys of
+    progress_json) and `fields` (columns) are written by the same
+    conditional UPDATE, so nothing is saved over a story another request
+    claimed meanwhile. Returns (token, previous status). Raises LookupError
+    when it is busy."""
     previous = story.status
     token = uuid.uuid4().hex
     progress = dict(story.progress_json or {})
+    progress.update(progress_extra or {})
     progress[TASK_KEY] = task
     progress["previous"] = previous
     done = (db.query(models.SoundStory)
             .filter(models.SoundStory.id == story.id, models.SoundStory.status.notin_(BUSY))
-            .update({"status": status, "claim_token": token, "queue_job_id": "", "error": "",
+            .update({**(fields or {}), "status": status, "claim_token": token, "queue_job_id": "", "error": "",
                      "progress_json": progress, "heartbeat_at": datetime.utcnow()},
                     synchronize_session=False))
     db.commit()
@@ -336,13 +344,14 @@ def claim(db: Session, story: models.SoundStory, task: str, status: str = "scrip
 
 
 def enqueue_claimed(db: Session, story: models.SoundStory, job: Callable, *args, task: str,
-                    status: str = "scripting") -> str:
+                    status: str = "scripting", progress_extra: Optional[dict] = None,
+                    fields: Optional[dict] = None) -> str:
     """Claim, then queue `job(story.id, *args, claim_token=token)`; the
     queue entry is recorded while the story is still claimed. If nothing
     was queued (Redis gone), the claim is given back."""
     from ..workers.queue import enqueue
 
-    token, previous = claim(db, story, task, status)
+    token, previous = claim(db, story, task, status, progress_extra=progress_extra, fields=fields)
     try:
         job_id = enqueue(job, story.id, *args, claim_token=token)
     except Exception:
@@ -1122,8 +1131,16 @@ def sweep(db: Session, *, now: datetime, limit, heartbeat) -> dict:  # noqa: ANN
         to = "failed"
         if progress.get(TASK_KEY) in (REGEN_KEY, PREVIEW_KEY):
             # A regenerate or preview request that died holding the lock:
-            # the story goes back to what it was (its finished clips kept).
+            # the story goes back to what it was (its finished clips kept),
+            # with the task it had (a clips run stays resumable).
             to = _back_to(progress)
+            held = progress.pop(HELD_FROM_KEY, None)
+            if isinstance(held, dict):
+                for k in (TASK_KEY, "previous"):
+                    if held.get(k) is None:
+                        progress.pop(k, None)
+                    else:
+                        progress[k] = held[k]
         elif progress.get(TASK_KEY) == ENHANCE_KEY:
             to = _back_to(progress)
             progress[ENHANCE_KEY] = {**(progress.get(ENHANCE_KEY) or {}), "status": "failed", "error": STOPPED}

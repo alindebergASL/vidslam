@@ -454,20 +454,33 @@ def _providers(clips) -> None:  # noqa: ANN001
         raise HTTPException(422, str(e)) from None
 
 
+def _in_flight(story: models.SoundStory) -> bool:
+    """A cancelled clips run whose job is still running (its call in flight
+    is kept): a new run now would make that clip a second time."""
+    from ..workers.queue import queue_entry_state
+
+    return ((story.claim_token or "").startswith(sound_studio.RUNNING)
+            and queue_entry_state(story.queue_job_id or "") == "alive")
+
+
 def _queue_clips(db: Session, story: models.SoundStory) -> dict:
     _not_busy(story)
+    if _in_flight(story):
+        raise HTTPException(409, "The last clip of the cancelled run is still being made; try again in a moment.")
     _, clips, _check = _prepared(story)
     _providers(clips)
     price = sound_clips.estimate(db, story, clips=clips)
     spend.require_budget_for(db, price["total"])
-    progress = dict(story.progress_json or {})
-    progress[sound_studio.CLIPS_KEY] = {"total": len(clips), "done": 0, "finished": False, "error": ""}
-    story.progress_json = progress
-    story.estimated_cost = price["total"]
-    db.commit()
+    # The checks above can take a while: the story as it is now, and the
+    # clips' progress written by the claim's own conditional UPDATE (never
+    # over a Write or a preview that claimed the story meanwhile).
+    db.refresh(story)
     try:
-        job_id = sound_studio.enqueue_claimed(db, story, story_clips_job, task=sound_studio.CLIPS_KEY,
-                                              status="generating")
+        job_id = sound_studio.enqueue_claimed(
+            db, story, story_clips_job, task=sound_studio.CLIPS_KEY, status="generating",
+            progress_extra={sound_studio.CLIPS_KEY: {"total": len(clips), "done": 0, "finished": False,
+                                                     "error": ""}},
+            fields={"estimated_cost": price["total"]})
     except LookupError as e:
         raise HTTPException(409, str(e)) from None
     return {"story_id": story.id, "job_id": job_id, "status": "enqueued", "price": price}

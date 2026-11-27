@@ -3,8 +3,9 @@
 A story's script (services/story_script.py) is cut into clips (build):
 consecutive lines of the same speaker with the same tags and placement
 merge into one voice clip of at most MAX_CLIP_CHARS characters (a longer
-line is split at sentence ends), and every `[sfx: ...]` cue is a sound
-clip. Cue lines (sound effects, pauses, beds) are never sent to a voice.
+line is split at sentence ends; a run too long for one clip is cut after
+anchor lines chosen by their own keys, so an edit moves only the cuts next
+to it), and every `[sfx: ...]` cue is a sound clip. Cue lines (sound effects, pauses, beds) are never sent to a voice.
 
 Every clip has a fingerprint: the text and tags, the voice, provider,
 model, voice settings, seed and output format of a voice clip; the prompt,
@@ -40,9 +41,11 @@ the provider guards require for every line and sound prompt.
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import logging
+import math
 import random
 import re
 import subprocess
@@ -84,6 +87,17 @@ SHORT_CHARS = 25
 SHORT_BAND = (0.3, 8.0)
 BREATH = 0.3
 PREVIEW_MAX_MINUTES = 3
+# A run of one speaker's lines longer than one clip is cut after the lines
+# whose key hashes to 0 modulo this (and wherever the next line would not
+# fit): the cuts follow the lines themselves, not the running length, so an
+# edit moves at most the cuts next to it (see build).
+ANCHOR_EVERY = 4
+# The version of the post-processing (process_voice): part of a voice
+# clip's fingerprint with the whisper chain, the loudness target and the
+# sample rate, so a clip made under other settings is made again.
+PROCESSING = "voice-post-2"
+# What a clip whose audio the provider returned unreadable is flagged with.
+UNREADABLE = "The provider returned unreadable audio."
 
 BUDGET_REACHED = "Budget reached; raise the cap and resume"
 
@@ -126,6 +140,9 @@ class Clip:
     cost: float = 0.0
     seconds: float = 0.0
     asset_key: str = ""
+    # Post-processing of a voice clip (in the fingerprint).
+    whisper: bool = False
+    target: float = TARGET_LUFS
 
     @property
     def text(self) -> str:
@@ -155,15 +172,23 @@ def sound_model() -> str:
     return "mock/sound" if s.music_is_mocked() else str(s.elevenlabs_sound_model_id)
 
 
-def sfx_key(prompt: str, seconds: float, loop: bool, model: str, variation: int = 0) -> str:
+def sfx_key(prompt: str, seconds: float, loop: bool, model: str, variation: "int | str" = 0) -> str:
     """The cache key of a generated sound (SoundAsset.key_hash): the same
     prompt (normalised), length, loop and model is the same sound. A
-    variation past the first (the effects tool, a regenerated cue) is its
-    own sound."""
+    variation past the first (the effects tool's 1-3) is its own sound; a
+    regenerated cue passes a nonce (regen_variation), so it is always a
+    new sound, never one of the effects tool's or another story's."""
     parts: list = [_norm_prompt(prompt), round(float(seconds), 2), bool(loop), str(model or "")]
-    if variation:
+    if isinstance(variation, str) and variation:
+        parts.append(variation)
+    elif variation:
         parts.append(int(variation))
     return hashlib.sha256(json.dumps(parts).encode("utf-8")).hexdigest()
+
+
+def regen_variation(story_id: int) -> str:
+    """The variation of a regenerated sound cue: its own key, never cached."""
+    return f"regen:{int(story_id)}:{uuid.uuid4().hex}"
 
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+|(?<=[.!?…][\"'”’)])\s+")
@@ -212,10 +237,58 @@ def _wpm(style: str) -> float:
     return float(story_script.WPM_BY_STYLE.get((style or "").lower(), story_script.DEFAULT_WPM))
 
 
+def _whispered(tags: Iterable[str], style: str) -> bool:
+    return (style or "").lower() in WHISPER_STYLES or bool(set(tags) & WHISPER_TAGS)
+
+
+def _loudness_target(speaker: str, cast: Optional[dict], style: str) -> float:
+    member = (cast or {}).get(speaker) if isinstance(cast, dict) else None
+    if isinstance(member, dict) and isinstance(member.get("loudness"), (int, float)):
+        return max(-40.0, min(-10.0, float(member["loudness"])))
+    return WHISPER_TARGET_LUFS if (style or "").lower() in WHISPER_STYLES else TARGET_LUFS
+
+
+def _anchor(key: str) -> bool:
+    """A line a long run is cut after (from its own key, see build)."""
+    return int(hashlib.sha1(key.encode("utf-8")).hexdigest()[:8], 16) % ANCHOR_EVERY == 0
+
+
+def _size(items: list[tuple[int, Item]], lead: str) -> int:
+    return len(lead) + sum(len(" ".join(i.text.split())) + 1 for _, i in items)
+
+
+def _pack(run: list[tuple[int, Item]]) -> list[list[tuple[int, Item]]]:
+    """A run of mergeable lines in clips: the whole run when it fits in one,
+    else cut after every anchor line (_anchor) and wherever the next line
+    would not fit. The cuts come from the lines, not from where the run
+    started, so an edit that grows or shrinks one line changes its own clip
+    and at most the next ones up to the next anchor, never the rest of a
+    long single-narrator chapter."""
+    if not run:
+        return []
+    lead = _lead(run[0][1].tags)
+    if _size(run, lead) <= MAX_CLIP_CHARS:
+        return [run]
+    out: list[list[tuple[int, Item]]] = []
+    chunk: list[tuple[int, Item]] = []
+    for pair in run:
+        if chunk and _size(chunk + [pair], lead) > MAX_CLIP_CHARS:
+            out.append(chunk)
+            chunk = []
+        chunk.append(pair)
+        if _anchor(pair[1].key):
+            out.append(chunk)
+            chunk = []
+    if chunk:
+        out.append(chunk)
+    return out
+
+
 def build(doc: StoryDoc, cast: Optional[dict] = None, settings: Optional[dict] = None) -> list[Clip]:
     """The clips of a parsed story, in order (see the module notes)."""
     settings = dict(settings or {})
     cast = cast if isinstance(cast, dict) else {}
+    style = str(settings.get("style") or doc.style or "")
     wpm = _wpm(doc.style or str(settings.get("style") or ""))
     clips: list[Clip] = []
     run: list[tuple[int, Item]] = []
@@ -226,6 +299,8 @@ def build(doc: StoryDoc, cast: Optional[dict] = None, settings: Optional[dict] =
         joined = " ".join(" ".join(i.text.split()) for _, i in items)
         pieces = split_text(joined, max(200, MAX_CLIP_CHARS - len(lead))) if joined else [""]
         keys = [i.key for _, i in items]
+        whisper = _whispered(first.tags, style)
+        target = _loudness_target(first.speaker, cast, style)
         for part, piece in enumerate(pieces):
             item = Item(kind="speech", line=first.line, chapter=first.chapter, speaker=first.speaker,
                         tags=list(first.tags), pan=first.pan, text=piece, instructions=first.instructions)
@@ -236,10 +311,13 @@ def build(doc: StoryDoc, cast: Optional[dict] = None, settings: Optional[dict] =
                         item=item, item_keys=keys, lines=sorted({i.line for _, i in items}), part=part,
                         provider=p["provider"], model=p["model"], voice_id=p["voice"],
                         seed=int(p["seed"]) if isinstance(p.get("seed"), (int, float)) else None,
-                        voice_settings=p.get("voice_settings") or None)
+                        voice_settings=p.get("voice_settings") or None, whisper=whisper, target=target)
+            # The post-processing is in it too: a clip made with another
+            # whisper chain, loudness target or sample rate is made again.
             clip.fingerprint = sound_estimate._digest(
                 "voice-clip", item.voice_text, item.tags, clip.voice_id, clip.provider, clip.model,
-                clip.voice_settings, clip.seed, OUTPUT_FORMAT, item.instructions)
+                clip.voice_settings, clip.seed, OUTPUT_FORMAT, item.instructions,
+                PROCESSING, SAMPLE_RATE, whisper, round(target, 2))
             clip.chars = sound_estimate.billed_chars(item, clip.provider, clip.model)
             clip.cost = clip.chars / 1000.0 * sound_estimate.voice_rate(clip.provider, clip.model)
             clip.seconds = story_script.item_seconds(item, wpm)
@@ -247,8 +325,8 @@ def build(doc: StoryDoc, cast: Optional[dict] = None, settings: Optional[dict] =
 
     def flush() -> None:
         nonlocal run
-        if run:
-            voice(run)
+        for chunk in _pack(run):
+            voice(chunk)
         run = []
 
     model = sound_model()
@@ -257,11 +335,8 @@ def build(doc: StoryDoc, cast: Optional[dict] = None, settings: Optional[dict] =
             continue
         if it.kind == "speech":
             if run and _mergeable(run[-1][1], it):
-                lead = _lead(it.tags)
-                size = len(lead) + sum(len(" ".join(i.text.split())) + 1 for _, i in run) + len(it.text)
-                if size <= MAX_CLIP_CHARS:
-                    run.append((n, it))
-                    continue
+                run.append((n, it))
+                continue
             flush()
             run = [(n, it)]
             continue
@@ -285,10 +360,19 @@ def plan(story: models.SoundStory) -> tuple[StoryDoc, list[Clip]]:
     return doc, build(doc, story.cast_json, story.settings_json)
 
 
-def clip_doc(doc: StoryDoc, clips: list[Clip]) -> StoryDoc:
+def clip_doc(doc: StoryDoc, clips: list[Clip], library: Optional[dict[int, str]] = None) -> StoryDoc:
     """The story as its clips will be sent (merged lines, split parts, the
-    sound prompts): what check_story judges and its pass covers."""
-    items = [c.item for c in clips if c.kind == "voice" or (c.kind == "sfx" and c.item.prompt)]
+    sound prompts): what check_story judges and its pass covers. A Library
+    cue (`[sfx: #id]`) is judged by its sound's own prompt (`library`:
+    {asset id: prompt}) where it comes in the story, with the cast in view,
+    as a described sound is."""
+    library = library or {}
+    items = []
+    for c in clips:
+        if c.kind == "voice" or (c.kind == "sfx" and c.item.prompt):
+            items.append(c.item)
+        elif c.kind == "sfx" and c.item.asset_id and library.get(int(c.item.asset_id)):
+            items.append(dataclasses.replace(c.item, prompt=library[int(c.item.asset_id)], asset_id=None))
     return StoryDoc(chapters=[], cast=doc.cast, beds=[], items=items, warnings=[], est_seconds=doc.est_seconds,
                     style=doc.style)
 
@@ -323,9 +407,47 @@ def prepare(story: models.SoundStory) -> tuple[StoryDoc, list[Clip], "story_scri
     clips = build(doc, story.cast_json, settings)
     if not clips:
         raise NothingToVoice("There is nothing to voice: the script has no lines or sound effects.")
-    check = story_script.check_story(clip_doc(doc, clips), title=story.title or "", premise=story.premise or "",
-                                     voices=voices_for(doc, story.cast_json, settings))
+    library = library_prompts(story, clips)
+    check = story_script.check_story(clip_doc(doc, clips, library), title=story.title or "",
+                                     premise=story.premise or "", voices=voices_for(doc, story.cast_json, settings))
     return doc, clips, check
+
+
+def library_prompts(story: models.SoundStory, clips: Iterable[Clip]) -> dict[int, str]:
+    """{asset id: prompt} of every Library sound the clips use, for
+    check_story to judge with this story's cast and facts (a Library sound
+    was checked alone when it was made, never next to this story's lines).
+    A sound that is gone is NothingToVoice; one with no prompt to judge
+    (nothing says what it is) is refused (UnsafeScriptError)."""
+    from sqlalchemy.orm import object_session
+
+    from .safety import UnsafeScriptError
+
+    ids = sorted({int(c.item.asset_id) for c in clips if c.kind == "sfx" and c.item.asset_id})
+    if not ids:
+        return {}
+    db = object_session(story)
+    own = db is None
+    if own:
+        from ..db import SessionLocal
+
+        db = SessionLocal()
+    try:
+        rows = {a.id: a for a in db.query(models.SoundAsset).filter(models.SoundAsset.id.in_(ids)).all()}
+    finally:
+        if own:
+            db.close()
+    out: dict[int, str] = {}
+    for i in ids:
+        a = rows.get(i)
+        if a is None or not a.path or not Path(a.path).exists():
+            raise NothingToVoice(f"Library sound #{i} isn't there any more; pick another or describe the sound.")
+        prompt = " ".join(str(a.prompt or "").split())
+        if not prompt:
+            raise UnsafeScriptError(f"Library sound #{i} has no description, so it can't be checked with this "
+                                    "story; describe the sound in the cue instead.")
+        out[i] = prompt
+    return out
 
 
 def require_providers(clips: Iterable[Clip]) -> None:
@@ -352,8 +474,13 @@ def _rows(db: Session, story_id: int) -> list[models.SoundClip]:
             .order_by(models.SoundClip.id).all())
 
 
+def _has_audio(row: models.SoundClip) -> bool:
+    """A finished take (done or flagged) whose audio is still there."""
+    return bool(row.status in ("done", "flagged") and row.path and Path(row.path).exists())
+
+
 def _usable(row: models.SoundClip) -> bool:
-    return bool(row.selected and row.status in ("done", "flagged") and row.path and Path(row.path).exists())
+    return bool(row.selected and _has_audio(row))
 
 
 def _cached_assets(db: Session, keys: Iterable[str]) -> dict[str, models.SoundAsset]:
@@ -365,7 +492,9 @@ def _cached_assets(db: Session, keys: Iterable[str]) -> dict[str, models.SoundAs
 
 
 def is_done(clip: Clip, rows: list[models.SoundClip]) -> bool:
-    return any(_usable(r) and r.fingerprint == clip.fingerprint for r in rows)
+    """Any finished take with the clip's fingerprint, selected or not, of
+    this cue or another (reuse selects or copies it for free)."""
+    return any(_has_audio(r) and r.fingerprint == clip.fingerprint for r in rows)
 
 
 def estimate(db: Session, story: models.SoundStory, *, clips: Optional[list[Clip]] = None,
@@ -387,7 +516,12 @@ def estimate(db: Session, story: models.SoundStory, *, clips: Optional[list[Clip
     skipped = 0
     seen: set[str] = set()
     for c in chosen:
-        if not regenerate and (is_done(c, rows) or (c.kind == "sfx" and (c.item.asset_id or c.asset_key in cached))):
+        if c.kind == "sfx" and c.item.asset_id:
+            # A Library sound costs nothing, a new take of it too.
+            skipped += 1
+            continue
+        # A regenerated sound has its own key (regen_variation): always paid.
+        if not regenerate and (is_done(c, rows) or (c.kind == "sfx" and c.asset_key in cached)):
             skipped += 1
             continue
         if c.kind == "voice":
@@ -451,11 +585,22 @@ def _num(pattern: re.Pattern, text: str, default: float) -> float:
     return float("-inf") if v == "-inf" else float(v)
 
 
+# Shorter than this, EBU R128's 400 ms gate leaves no block and reports
+# -70 LUFS: such a clip is measured looped (measure).
+SHORT_LOUDNESS_SECONDS = 0.4
+
+
 def measure(path: Path) -> dict:
     """Loudness and levels of an audio file: integrated loudness (LUFS),
-    peak and RMS (dBFS), the samples at the peak and the duration."""
+    peak and RMS (dBFS), the samples at full scale and the duration. The
+    levels are read on a 16-bit copy, where a decoded MP3's overshoots
+    saturate at full scale, so a clipped take shows as many samples at the
+    peak (its own decode gives them distinct values just over it). A clip
+    under SHORT_LOUDNESS_SECONDS is measured looped, so a short "Yes." gets
+    its real loudness rather than -70."""
     try:
-        log_ = _ffmpeg(["-i", str(path), "-af", "astats=metadata=0,ebur128=peak=sample", "-f", "null", "-"])
+        log_ = _ffmpeg(["-i", str(path), "-af", "ebur128=peak=sample,aformat=sample_fmts=s16,astats=metadata=0",
+                        "-f", "null", "-"])
     except RuntimeError:
         return {"lufs": -70.0, "peak": float("-inf"), "rms": float("-inf"), "peak_count": 0.0, "samples": 0.0,
                 "duration": 0.0}
@@ -464,6 +609,14 @@ def measure(path: Path) -> dict:
     if out["lufs"] == float("-inf"):
         out["lufs"] = -70.0
     out["duration"] = _duration(path)
+    if 0.0 < out["duration"] < SHORT_LOUDNESS_SECONDS:
+        loops = int(math.ceil(1.2 / out["duration"]))
+        try:
+            looped = _ffmpeg(["-stream_loop", str(loops), "-i", str(path), "-af", "ebur128", "-f", "null", "-"])
+            lufs = _num(_STAT_RE["lufs"], looped, -70.0)
+            out["lufs"] = -70.0 if lufs == float("-inf") else lufs
+        except RuntimeError:
+            pass
     return out
 
 
@@ -490,10 +643,17 @@ _TRIM = ("silenceremove=start_periods=1:start_duration=0:start_threshold=-50dB:d
          "silenceremove=start_periods=1:start_duration=0:start_threshold=-50dB:detection=peak,areverse")
 
 
+# The limiter after the loudness gain: -1 dBFS.
+LIMIT = round(10 ** (-1.0 / 20.0), 4)
+
+
 def process_voice(raw: bytes, out: Path, *, whisper: bool, target: float) -> dict:
     """A provider's voice audio as a clip: 48 kHz pcm_f32le mono WAV,
     silence trimmed at both ends, a 70 Hz high-pass and a de-esser for a
-    whisper, then a gain to `target` LUFS (never past -1 dBFS peak)."""
+    whisper, then the whole gain to `target` LUFS and a limiter at -1 dBFS
+    where the peaks would go past it (a whisper or a breath with high peaks
+    still reaches the character's loudness). Raises RuntimeError when the
+    audio can't be decoded (make_clip treats that as a failed check)."""
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
         src = Path(td) / "in.audio"
@@ -509,9 +669,11 @@ def process_voice(raw: bytes, out: Path, *, whisper: bool, target: float) -> dic
         gain = 0.0
         if not silent:
             gain = max(-20.0, min(20.0, target - float(stats["lufs"])))
-            gain = min(gain, -1.0 - float(stats["peak"]))
         if mid.exists() and mid.stat().st_size > 100:
-            _ffmpeg(["-i", str(mid), "-af", f"volume={gain:.2f}dB", "-ac", "1", "-ar", str(SAMPLE_RATE),
+            chain = [f"volume={gain:.2f}dB"]
+            if float(stats.get("peak") or float("-inf")) + gain > -1.0:
+                chain.append(f"alimiter=limit={LIMIT}:level=0:latency=1")
+            _ffmpeg(["-i", str(mid), "-af", ",".join(chain), "-ac", "1", "-ar", str(SAMPLE_RATE),
                      "-c:a", "pcm_f32le", str(out)])
         else:
             _ffmpeg(["-f", "lavfi", "-i", f"anullsrc=r={SAMPLE_RATE}:cl=mono", "-t", "0.05", "-c:a", "pcm_f32le",
@@ -559,15 +721,11 @@ def qa(clip: Clip, stats: dict, style: str) -> Optional[str]:
     return None
 
 
-def _whisper(clip: Clip, style: str) -> bool:
-    return (style or "").lower() in WHISPER_STYLES or bool(set(clip.item.tags) & WHISPER_TAGS)
-
-
-def _target(clip: Clip, cast: Optional[dict], style: str) -> float:
-    member = (cast or {}).get(clip.item.speaker) if isinstance(cast, dict) else None
-    if isinstance(member, dict) and isinstance(member.get("loudness"), (int, float)):
-        return max(-40.0, min(-10.0, float(member["loudness"])))
-    return WHISPER_TARGET_LUFS if (style or "").lower() in WHISPER_STYLES else TARGET_LUFS
+def _placeholder(out: Path) -> dict:
+    """A short silence where a clip's audio couldn't be read (flagged)."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _ffmpeg(["-f", "lavfi", "-i", f"anullsrc=r={SAMPLE_RATE}:cl=mono", "-t", "0.05", "-c:a", "pcm_f32le", str(out)])
+    return {"duration": 0.05, "lufs": -70.0, "silent": True, "clipped": False, "unreadable": True}
 
 
 def story_dir(story_id: int) -> Path:
@@ -594,14 +752,21 @@ def _retry_seed(clip: Clip, seed: Optional[int]) -> int:
     return (base + 7919) % (2 ** 31) or 1
 
 
-def generate_sound(db: Session, prompt: str, seconds: float, *, loop: bool = False, variation: int = 0,
+def generate_sound(db: Session, prompt: str, seconds: float, *, loop: bool = False, variation: "int | str" = 0,
                    context: str = "", story_id: Optional[int] = None,
                    check_budget: Optional[Callable[[float], None]] = None) -> tuple[models.SoundAsset, bool]:
     """A generated sound, from the shared cache when the same prompt,
     length, loop and model was made before (free), else through the
     guarded sound provider (paid; the prompt is checked there, with the
     story's `context` and pass for a story sound). Returns (asset, cached).
-    The asset row is added to `db`, not committed."""
+
+    The paid sound is committed at once, on its own file: two runs that
+    make the same sound together both pay (neither saw the other's yet),
+    but the second finds the first's row (the key is unique), uses it and
+    drops its own file instead of failing after paying. `db` is committed
+    here: call it with nothing else pending."""
+    from sqlalchemy.exc import IntegrityError
+
     from ..providers.registry import get_sound, unwrap
 
     s = get_settings()
@@ -615,25 +780,42 @@ def generate_sound(db: Session, prompt: str, seconds: float, *, loop: bool = Fal
         check_budget(cost)
     provider = get_sound()
     audio = provider.generate(prompt=prompt, duration_seconds=float(seconds), loop=bool(loop), context=context)
-    path = assets_dir() / f"{key[:32]}.mp3"
+    # Its own file: never written over one another row points to.
+    path = assets_dir() / f"{key[:32]}-{uuid.uuid4().hex[:8]}.mp3"
     path.write_bytes(audio)
     inner = unwrap(provider)
+    fields = {"kind": "ambience" if loop else "sfx", "name": " ".join(prompt.split())[:200], "prompt": prompt,
+              "seconds": float(seconds), "loop": bool(loop), "provider": str(getattr(inner, "name", "") or ""),
+              "model": model, "path": str(path), "source": "generated", "story_id": story_id,
+              "cost_usd": round(cost, 6)}
     row = db.query(models.SoundAsset).filter(models.SoundAsset.key_hash == key).first()
-    if row is None:
-        row = models.SoundAsset(key_hash=key)
-        db.add(row)
-    row.kind = "ambience" if loop else "sfx"
-    row.name = " ".join(prompt.split())[:200]
-    row.prompt = prompt
-    row.seconds = float(seconds)
-    row.loop = bool(loop)
-    row.provider = str(getattr(inner, "name", "") or "")
-    row.model = model
-    row.path = str(path)
-    row.source = "generated"
-    row.story_id = story_id
-    row.cost_usd = round(cost, 6)
-    db.flush()
+    old = None
+    if row is not None and row.path and Path(row.path).exists():
+        # Another run made it while this one was paying: its row and file stay.
+        path.unlink(missing_ok=True)
+        log.info("sound %s was made by another run at the same time; using its file", key[:12])
+        return row, False
+    if row is not None:
+        # A cache row whose file is gone: made again over it.
+        old = row.path
+        for k, v in fields.items():
+            setattr(row, k, v)
+        db.commit()
+    else:
+        try:
+            row = models.SoundAsset(key_hash=key, **fields)
+            db.add(row)
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            path.unlink(missing_ok=True)
+            row = db.query(models.SoundAsset).filter(models.SoundAsset.key_hash == key).first()
+            if row is None:
+                raise
+            log.info("sound %s was made by another run at the same time; using its file", key[:12])
+            return row, False
+    if old and old != str(path):
+        Path(old).unlink(missing_ok=True)
     return row, False
 
 
@@ -641,15 +823,32 @@ def generate_sound(db: Session, prompt: str, seconds: float, *, loop: bool = Fal
 class Made:
     row: models.SoundClip
     paid: int = 0  # paid provider calls
+    # A Cancel or the budget that stopped the retry of a paid take: the
+    # take is kept (flagged); the caller raises this once the row is saved.
+    stop: Optional[BaseException] = None
+
+
+def _sound_qa(clip: Clip, asset: models.SoundAsset, out: Path, style: str) -> tuple[dict, Optional[str]]:
+    try:
+        stats = process_sound(Path(asset.path), out)
+    except RuntimeError as e:
+        log.warning("clip %s: unreadable sound (%s)", clip.key, str(e)[:200])
+        return _placeholder(out), UNREADABLE
+    return stats, qa(clip, stats, style)
 
 
 def make_clip(db: Session, story: models.SoundStory, clip: Clip, check: str, *,
               alive: Callable[[], bool], fresh: bool = False) -> Made:
     """Make one clip (a new take, selected), with the QA gate: one retry
-    with a new seed, then flagged. Before each paid call: `alive()` (else
-    Stopped) and the budget (else BudgetReached). The row is added and
-    flushed, not committed. `fresh`: a regenerate (a new seed; a sound is
-    made anew, not taken from the cache)."""
+    (a voice with a new seed; a sound made anew), then flagged. Audio the
+    provider returned that can't be decoded fails the check like silence
+    does (UNREADABLE; a short silence stands in if the retry fails too).
+    Before each paid call: `alive()` (else Stopped) and the budget (else
+    BudgetReached); when one of them stops the retry of a paid take, that
+    take is kept, flagged with its reason, and the exception is handed back
+    in Made.stop. The row is added and flushed, not committed (a paid
+    sound's asset is committed by generate_sound). `fresh`: a regenerate (a
+    new seed; a sound made anew under its own key, regen_variation)."""
     from ..providers.registry import get_tts_for
     from . import spend
 
@@ -671,13 +870,18 @@ def make_clip(db: Session, story: models.SoundStory, clip: Clip, check: str, *,
     attempts = 0
     stats: dict = {}
     cost = 0.0
+    stop: Optional[BaseException] = None
     out = d / f"{clip.key}-t{take}-{uuid.uuid4().hex[:8]}.wav"
     if clip.kind == "voice":
         seed = _new_seed() if fresh else clip.seed
-        whisper = _whisper(clip, style)
-        target = _target(clip, story.cast_json, style)
         for attempt in (1, 2):
-            budget(clip.cost)
+            try:
+                budget(clip.cost)
+            except (Stopped, BudgetReached) as e:
+                if attempt == 1:
+                    raise
+                stop = e  # the paid first take is kept, flagged
+                break
             tts = get_tts_for(clip.provider, clip.model, clip.voice_id)
             settings: dict = {}
             if clip.provider == "elevenlabs":
@@ -693,32 +897,53 @@ def make_clip(db: Session, story: models.SoundStory, clip: Clip, check: str, *,
             paid += 1
             attempts += 1
             cost += clip.cost
-            stats = process_voice(raw, out, whisper=whisper, target=target)
-            reason = qa(clip, stats, style)
-            params.update({"seed": seed, "whisper": whisper})
+            try:
+                stats = process_voice(raw, out, whisper=clip.whisper, target=clip.target)
+                reason = qa(clip, stats, style)
+            except RuntimeError as e:
+                log.warning("sound story %s: clip %s audio unreadable (%s)", story.id, clip.key, str(e)[:200])
+                stats = _placeholder(out)
+                reason = UNREADABLE
+            params.update({"seed": seed, "whisper": clip.whisper, "target_lufs": clip.target})
             if not reason:
                 break
             log.info("sound story %s: clip %s failed QA (%s); %s", story.id, clip.key, reason,
                      "retrying with a new seed" if attempt == 1 else "flagged")
             seed = _retry_seed(clip, seed)
-    else:
+    elif clip.item.asset_id:
         attempts = 1
-        if clip.item.asset_id:
-            asset = db.get(models.SoundAsset, int(clip.item.asset_id))
-            if asset is None or not asset.path or not Path(asset.path).exists():
-                raise ValueError(f"Library sound #{clip.item.asset_id} isn't there any more.")
-            cached = True
-        else:
-            secs = float(clip.item.seconds or story_script.DEFAULT_SFX_SECONDS)
-            variation = take if fresh else 0
-            asset, cached = generate_sound(db, clip.item.prompt, secs, loop=False, variation=variation,
-                                           context=check, story_id=story.id, check_budget=budget)
+        asset = db.get(models.SoundAsset, int(clip.item.asset_id))
+        if asset is None or not asset.path or not Path(asset.path).exists():
+            raise ValueError(f"Library sound #{clip.item.asset_id} isn't there any more.")
+        params.update({"asset_id": asset.id, "cached": True})
+        stats, reason = _sound_qa(clip, asset, out, style)
+    else:
+        secs = float(clip.item.seconds or story_script.DEFAULT_SFX_SECONDS)
+        for attempt in (1, 2):
+            variation = regen_variation(story.id) if fresh else 0
+            try:
+                asset, cached = generate_sound(db, clip.item.prompt, secs, loop=False, variation=variation,
+                                               context=check, story_id=story.id, check_budget=budget)
+            except (Stopped, BudgetReached) as e:
+                if attempt == 1:
+                    raise
+                stop = e  # the first take is kept, flagged
+                break
+            attempts += 1
             if not cached:
                 paid += 1
-                cost = float(asset.cost_usd or 0.0)
-        params.update({"asset_id": asset.id, "cached": cached})
-        stats = process_sound(Path(asset.path), out)
-        reason = qa(clip, stats, style)
+                cost += float(asset.cost_usd or 0.0)
+            params.update({"asset_id": asset.id, "cached": cached})
+            stats, reason = _sound_qa(clip, asset, out, style)
+            if not reason:
+                break
+            # A sound that fails its check leaves the shared cache (no other
+            # story or Resume gets it for free); the retry makes it anew.
+            log.info("sound story %s: sound %s failed QA (%s); %s", story.id, clip.key, reason,
+                     "retrying" if attempt == 1 else "flagged")
+            asset.key_hash = None
+            asset.tags = "qa-failed"
+            db.flush()
     db.query(models.SoundClip).filter(models.SoundClip.story_id == story.id,
                                       models.SoundClip.cue_key == clip.key).update(
         {"selected": False}, synchronize_session=False)
@@ -731,30 +956,47 @@ def make_clip(db: Session, story: models.SoundStory, clip: Clip, check: str, *,
         status="flagged" if reason else "done", error=reason or "")
     db.add(row)
     db.flush()
-    return Made(row, paid)
+    return Made(row, paid, stop)
 
 
 def _jsonable(x):  # noqa: ANN001, ANN202
     return json.loads(json.dumps(x, default=str).replace("-Infinity", "null").replace("Infinity", "null"))
 
 
-def reuse(db: Session, story: models.SoundStory, clip: Clip, rows: list[models.SoundClip]) -> Optional[models.SoundClip]:
-    """A free clip for `clip`: its own selected take with the same
-    fingerprint (nothing to do), or another cue's with the same audio
-    (copied as a take of this one). None when it has to be made."""
-    own = [r for r in rows if r.cue_key == clip.key and _usable(r) and r.fingerprint == clip.fingerprint]
-    if own:
-        return own[0]
-    other = next((r for r in rows if _usable(r) and r.fingerprint == clip.fingerprint), None)
-    if other is None:
-        return None
-    take = max([r.take_no or 0 for r in rows if r.cue_key == clip.key] or [0]) + 1
+def _select(db: Session, story: models.SoundStory, cue_key: str, rows: list[models.SoundClip],
+            row: models.SoundClip) -> None:
     db.query(models.SoundClip).filter(models.SoundClip.story_id == story.id,
-                                      models.SoundClip.cue_key == clip.key).update(
+                                      models.SoundClip.cue_key == cue_key).update(
         {"selected": False}, synchronize_session=False)
+    for r in rows:
+        if r.cue_key == cue_key and r is not row:
+            r.selected = False
+    row.selected = True
+    db.flush()
+
+
+def reuse(db: Session, story: models.SoundStory, clip: Clip, rows: list[models.SoundClip]) -> Optional[models.SoundClip]:
+    """A free clip for `clip`, from any finished take with the same
+    fingerprint, selected or not: its own selected take (nothing to do),
+    else its own earlier take (selected again: undoing an edit, or going
+    back to a voice tried before, costs nothing), else another cue's
+    (copied as a take of this one). None when it has to be made."""
+    match = [r for r in rows if _has_audio(r) and r.fingerprint == clip.fingerprint]
+    own = [r for r in match if r.cue_key == clip.key]
+    sel = next((r for r in own if r.selected), None)
+    if sel is not None:
+        return sel
+    if own:
+        best = sorted(own, key=lambda r: (r.status != "done", -(r.take_no or 0)))[0]
+        _select(db, story, clip.key, rows, best)
+        return best
+    if not match:
+        return None
+    other = sorted(match, key=lambda r: (not r.selected, r.status != "done"))[0]
+    take = max([r.take_no or 0 for r in rows if r.cue_key == clip.key] or [0]) + 1
     row = models.SoundClip(
         story_id=story.id, cue_key=clip.key, chapter=clip.chapter, seq=clip.seq, kind=clip.kind, take_no=take,
-        selected=True, fingerprint=clip.fingerprint, text_or_prompt=clip.text,
+        selected=False, fingerprint=clip.fingerprint, text_or_prompt=clip.text,
         params_json={**(other.params_json or {}), "items": clip.item_keys, "lines": clip.lines,
                      "reused_from": other.id},
         path=other.path, duration_seconds=other.duration_seconds, provider=other.provider, model=other.model,
@@ -762,6 +1004,7 @@ def reuse(db: Session, story: models.SoundStory, clip: Clip, rows: list[models.S
     db.add(row)
     db.flush()
     rows.append(row)
+    _select(db, story, clip.key, rows, row)
     return row
 
 
@@ -773,11 +1016,15 @@ def run_clips(db: Session, story: models.SoundStory, clips: list[Clip], check: s
               alive: Callable[[], bool], save: Callable[[dict], None]) -> dict:
     """Make every missing clip of `clips`, in order: reused for free when a
     clip with the same fingerprint exists (or the sound is in the cache),
-    else made (make_clip). After each clip `save(counts)` commits it.
-    Raises Stopped, BudgetReached, or what a provider raised."""
+    else made (make_clip). Each clip is committed on its own as soon as it
+    is there, then `save(counts)` records the progress (which needs the
+    run's claim: a take paid for is kept even when a Cancel and a Resume
+    replaced the claim meanwhile). Raises Stopped, BudgetReached, or what a
+    provider raised."""
     rows = _rows(db, story.id)
     counts = {"total": len(clips), "done": 0, "made": 0, "reused": 0, "flagged": 0, "paid": 0}
     for clip in clips:
+        made: Optional[Made] = None
         row = reuse(db, story, clip, rows)
         if row is not None:
             counts["reused"] += 1
@@ -788,9 +1035,12 @@ def run_clips(db: Session, story: models.SoundStory, clips: list[Clip], check: s
             rows.append(row)
             counts["paid"] += made.paid
             counts["made" if not cached else "reused"] += 1
+        db.commit()
         counts["done"] += 1
         counts["flagged"] += 1 if row.status == "flagged" else 0
         save(dict(counts))
+        if made is not None and made.stop is not None:
+            raise made.stop
     return counts
 
 
@@ -908,7 +1158,11 @@ class _Lock:
         self.story = story
         progress = dict(story.progress_json or {})
         self.before = (progress.get(TASK_KEY), progress.get("previous"))
-        token, self.previous = sound_studio.claim(db, story, task, status="generating")
+        # The task it had is kept with the claim too, for sweep_sound to put
+        # back if this request dies (a resumable clips run stays resumable).
+        token, self.previous = sound_studio.claim(
+            db, story, task, status="generating",
+            progress_extra={sound_studio.HELD_FROM_KEY: {TASK_KEY: self.before[0], "previous": self.before[1]}})
         if not sound_studio.consume_claim(db, story.id, token, status="generating"):
             db.rollback()
             raise LookupError("this story is busy; wait or cancel first")
@@ -918,11 +1172,19 @@ class _Lock:
     def alive(self) -> bool:
         return sound_studio._alive(self.story.id, self.gen)
 
+    def beat(self) -> None:
+        """The lock is still held (sweep_sound leaves a story with a fresh
+        heartbeat alone): after every clip of a preview."""
+        sound_studio._held(self.db.query(models.SoundStory), self.story.id, self.gen).update(
+            {"heartbeat_at": datetime.utcnow()}, synchronize_session=False)
+        self.db.commit()
+
     def release(self) -> None:
         db = self.db
         db.rollback()
         db.refresh(self.story)
         progress = dict(self.story.progress_json or {})
+        progress.pop(sound_studio.HELD_FROM_KEY, None)
         task, prev = self.before
         for k, v in ((TASK_KEY, task), ("previous", prev)):
             if v is None:
@@ -957,6 +1219,8 @@ def regenerate(db: Session, story: models.SoundStory, key: str, prepared: Option
             made = make_clip(db, story, clip, check, alive=lock.alive, fresh=True)
         db.commit()
         row_id = made.row.id
+        if made.stop is not None:
+            raise made.stop  # its first take is kept, flagged
     finally:
         lock.release()
     return db.get(models.SoundClip, row_id)
@@ -987,13 +1251,15 @@ def scope_clips(doc: StoryDoc, clips: list[Clip], *, chapter: Optional[int] = No
                 start_line: Optional[int] = None, end_line: Optional[int] = None,
                 first_minutes: Optional[float] = None) -> list[Clip]:
     """The clips of a preview: one chapter, a range of script lines, or
-    the first minutes (at most PREVIEW_MAX_MINUTES, by the estimate)."""
+    the first minutes, each at most PREVIEW_MAX_MINUTES by the estimate (a
+    longer chapter or range is previewed from its start: a preview is made
+    in the request, under the story's lock)."""
     if chapter is not None:
-        return [c for c in clips if c.chapter == chapter]
+        return _capped([c for c in clips if c.chapter == chapter])
     if start_line is not None or end_line is not None:
         a = int(start_line or 1)
         b = int(end_line or 10 ** 9)
-        return [c for c in clips if any(a <= ln <= b for ln in c.lines)]
+        return _capped([c for c in clips if any(a <= ln <= b for ln in c.lines)])
     minutes = min(float(first_minutes or PREVIEW_MAX_MINUTES), PREVIEW_MAX_MINUTES)
     limit = minutes * 60.0
     by_first: dict[str, list[Clip]] = {}
@@ -1014,6 +1280,18 @@ def scope_clips(doc: StoryDoc, clips: list[Clip], *, chapter: Optional[int] = No
     return out
 
 
+def _capped(chosen: list[Clip]) -> list[Clip]:
+    limit = PREVIEW_MAX_MINUTES * 60.0
+    out: list[Clip] = []
+    t = 0.0
+    for c in chosen:
+        if out and t + c.seconds > limit:
+            break
+        out.append(c)
+        t += c.seconds
+    return out
+
+
 def preview(db: Session, story: models.SoundStory, *, chapter: Optional[int] = None,
             start_line: Optional[int] = None, end_line: Optional[int] = None,
             first_minutes: Optional[float] = None, prepared: Optional[tuple] = None) -> dict:
@@ -1030,7 +1308,7 @@ def preview(db: Session, story: models.SoundStory, *, chapter: Optional[int] = N
     lock = _Lock(db, story, PREVIEW_KEY)
     try:
         with _scope(story.id):
-            counts = run_clips(db, story, chosen, check, alive=lock.alive, save=lambda c: db.commit())
+            counts = run_clips(db, story, chosen, check, alive=lock.alive, save=lambda c: lock.beat())
         rows = {r.cue_key: r for r in _rows(db, story.id) if _usable(r)}
         out = story_dir(story.id) / f"preview-{uuid.uuid4().hex[:8]}.mp3"
         duration = mix(doc, chosen, rows, out)

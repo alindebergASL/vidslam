@@ -256,7 +256,7 @@ export function ClipsPanel({
             <option value="first">The first 3 minutes</option>
             {chapters.map((c) => (
               <option key={c.index} value={`ch${c.index}`}>
-                {c.title || "Opening"}
+                {`${c.title || "Opening"} (first 3 minutes)`}
               </option>
             ))}
           </select>
