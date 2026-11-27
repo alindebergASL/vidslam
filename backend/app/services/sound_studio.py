@@ -130,10 +130,6 @@ def _spoken(doc: StoryDoc) -> str:
     return "\n".join(i.spoken_text for i in doc.speech() if i.spoken_text.strip())
 
 
-# A parser warning that some of the line was dropped (an unknown [tag], an
-# unknown @ command, a malformed @cast line, a cue it couldn't read): the
-# raw line is then text no voice reads and check_story never judges.
-_DROPPED_RE = re.compile(r"\b(?:skipped|removed|ignored)\b", re.I)
 _CAST_DECL_RE = re.compile(r"^@cast\s+([^\[:]+?)\s*((?:\[[^\]]*\]\s*)*):\s*(.*)$", re.I)
 
 
@@ -142,45 +138,60 @@ def _raw_lines(text: str) -> list[str]:
     return (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
 
-def _cast_decls(text: str) -> list[tuple[int, str, str]]:
-    """Every well-formed @cast line: (line number, NAME, the declaration
-    after the name, spaces folded)."""
+def _cast_decls(text: str) -> list[tuple[int, str, Optional[str], str]]:
+    """Every well-formed @cast line as the parser reads it (after the sound
+    cues it skips, story_script.line_text): (line number, NAME, its
+    placement, its description, spaces folded)."""
     out = []
     for n, ln in enumerate(_raw_lines(text), start=1):
-        m = _CAST_DECL_RE.match(ln.strip())
+        s = story_script.line_text(ln)
+        if not s.lower().startswith("@cast"):
+            continue
+        m = _CAST_DECL_RE.match(s)
         if m:
             name = " ".join(m.group(1).split()).upper()
-            out.append((n, name, " ".join(f"{m.group(2)}:{m.group(3)}".split()).lower()))
+            member = story_script.parse(s, max_minutes=0).cast.get(name)
+            if member is not None:
+                out.append((n, name, member.pan, member.description))
     return out
-
-
-def _dropped_lines(doc: StoryDoc) -> set[int]:
-    return {w.line for w in doc.warnings if w.line and _DROPPED_RE.search(w.message)}
 
 
 def unvoiced_text(text: str, doc: StoryDoc) -> str:
     """The text of `text` (parsed as `doc`) that no voice reads and
     check_story never judges, one piece per line: notes (// lines), chapter
     headings (an empty chapter's too), a @cast declaration a later one
-    overrides, and the raw line wherever the parser dropped part of one
-    (an unknown [tag], an unknown @ command, a malformed @cast line, a cue
-    it couldn't read). It is still saved, shown and sent to models as
-    context, so it is checked too (check_unvoiced)."""
+    overrides, and the raw line of every line that isn't only voiced words:
+    a line the parser warned about (it may have dropped part of it), a line
+    with a sound cue, a pause or a bed (the parser keeps only what it
+    understands of those, sometimes without a warning: "@bed stop <text>"),
+    and a line it kept nothing of. It is still saved, shown and sent to
+    models as context, so it is checked too (check_unvoiced)."""
     lines = _raw_lines(text)
     picked: dict[int, str] = {}
+    kinds: dict[int, set[str]] = {}
     for i in doc.items:
+        kinds.setdefault(i.line, set()).add(i.kind)
         if i.kind == "comment" and i.text.strip():
             picked[i.line] = i.text
+    headings = {ch.line for ch in doc.chapters if ch.line}
     for ch in doc.chapters:
         if ch.line and ch.title.strip():
             picked[ch.line] = ch.title
-    for n in _dropped_lines(doc):
-        if 0 < n <= len(lines) and lines[n - 1].strip():
-            picked[n] = lines[n - 1].strip()
-    for n, name, _ in _cast_decls(text):
+    warned = {w.line for w in doc.warnings if w.line}
+    decls = _cast_decls(text)
+    cast_lines = {n for n, *_ in decls}
+    for n, raw in enumerate(lines, start=1):
+        s = raw.strip()
+        if not s:
+            continue
+        here = kinds.get(n, set())
+        if n in warned or here - {"speech", "comment"}:
+            picked[n] = s
+        elif not here and n not in headings and n not in cast_lines:
+            picked[n] = s
+    for n, name, pan, description in decls:
         final = doc.cast.get(name)
-        m = _CAST_DECL_RE.match(lines[n - 1].strip())
-        if final is None or " ".join(m.group(3).split()) != final.description:
+        if final is None or description != final.description or pan != final.pan:
             picked[n] = lines[n - 1].strip()
     return "\n".join(picked[k] for k in sorted(picked))
 
@@ -207,12 +218,13 @@ def check_unvoiced(text: str, doc: StoryDoc) -> None:
 
 def context_tail(text: str, *, style: str = "", size: int = 1500) -> str:
     """The end of a script as the writer is shown it (the end of the
-    previous chapter): only the lines it voices and its cues, never a note,
-    heading or line the parser dropped part of."""
+    previous chapter): only what the parser took from it, written back as
+    markup (story_script.serialize_item): its voiced lines and cues, never
+    a note, a heading or a raw line (the parser may have dropped part of
+    one)."""
     doc = story_script.parse(text, style=style, max_minutes=0)
-    keep = {i.line for i in doc.items if i.kind in ("speech", "sfx", "pause", "bed")} - _dropped_lines(doc)
-    lines = _raw_lines(text)
-    out = "\n".join(lines[n - 1].strip() for n in sorted(keep) if 0 < n <= len(lines))
+    out = "\n".join(story_script.serialize_item(i, doc.cast) for i in doc.items
+                    if i.kind in ("speech", "sfx", "pause", "bed"))
     return out[-size:]
 
 
@@ -261,8 +273,9 @@ def check_script_text(text: str, *, style: str = "", title: str = "", premise: s
 
 
 def header_of(text: str) -> str:
-    """The script's @cast lines (the cast every part is read with)."""
-    return "\n".join(ln for ln in (text or "").splitlines() if ln.strip().lower().startswith("@cast"))
+    """The script's @cast lines, as the parser spots them (the cast every
+    part is read with)."""
+    return "\n".join(ln for ln in (text or "").splitlines() if story_script.is_cast_line(ln))
 
 
 def check_part(header: str, part: str, *, style: str = "", title: str = "", premise: str = "") -> None:
@@ -907,24 +920,39 @@ def enhance_text(text: str, action: str, *, header: str = "", style: str = "", t
 
 
 def _reply_cast(text: str, out: str, header: str) -> str:
-    """An Enhance reply's @cast lines: dropped when the range it rewrote
-    had none (the cast is the header's); otherwise a reply that declares a
-    name the header (or the reply itself) already declares, differently,
+    """An Enhance reply's @cast lines, spotted as the parser spots them
+    (story_script.is_cast_line: after the sound cues it skips): dropped
+    when the range it rewrote had none (the cast is the header's);
+    otherwise a reply that declares a name the header, the range or the
+    reply itself already declares, differently (description or placement),
     is refused: the later line would win, and the story would be checked
-    with the new declaration in place of the one it has."""
+    with the new declaration in place of the one it has. Then the header
+    with the reply is parsed and every name the header (or the range)
+    declares must keep its declaration."""
     from .safety import UnsafeScriptError
 
-    def is_cast(ln: str) -> bool:
-        return ln.strip().lower().startswith("@cast")
+    def refuse(name: str) -> None:
+        raise UnsafeScriptError(f"The rewrite changes how {name} is declared in the cast; the cast is "
+                                "edited by hand only.")
 
-    if not any(is_cast(ln) for ln in text.splitlines()):
-        return "\n".join(ln for ln in out.splitlines() if not is_cast(ln)).strip()
-    known = {name: decl for _, name, decl in _cast_decls(header)}
-    for _, name, decl in _cast_decls(out):
-        if name in known and known[name] != decl:
-            raise UnsafeScriptError(f"The rewrite changes how {name} is declared in the cast; the cast is "
-                                    "edited by hand only.")
-        known[name] = decl
+    if not any(story_script.is_cast_line(ln) for ln in text.splitlines()):
+        out = "\n".join(ln for ln in out.splitlines() if not story_script.is_cast_line(ln)).strip()
+    known: dict[str, tuple[Optional[str], str]] = {}
+    for src in (header, text):
+        for _, name, pan, description in _cast_decls(src):
+            known.setdefault(name, (pan, description.lower()))
+    for _, name, pan, description in _cast_decls(out):
+        if name in known and known[name] != (pan, description.lower()):
+            refuse(name)
+        known[name] = (pan, description.lower())
+    before = story_script.parse(f"{header}\n\n{text}" if header else text, max_minutes=0).cast
+    after = story_script.parse(f"{header}\n\n{out}" if header else out, max_minutes=0).cast
+    for name, member in before.items():
+        if not member.declared:
+            continue
+        now = after.get(name)
+        if now is None or (now.pan, now.description.lower()) != (member.pan, member.description.lower()):
+            refuse(name)
     return out
 
 

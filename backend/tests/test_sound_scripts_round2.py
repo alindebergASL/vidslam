@@ -215,6 +215,62 @@ def test_enhance_refuses_a_reply_that_redeclares_a_cast_member(auth_client, monk
     assert r.status_code == 200, r.text
 
 
+def test_text_the_parser_drops_without_a_warning_is_checked_and_never_sent_to_the_writer(auth_client):
+    from app.services import sound_studio
+
+    bad = MINOR_PREMISE.rstrip(".")
+    script = f'@bed ambience "rain"\nNARRATOR: The rain fell.\n@bed stop {bad}\n'
+    r = auth_client.post("/api/sound/stories", json={"title": "Night", "premise": "A calm night.",
+                                                     "script_text": script})
+    assert r.status_code == 422, r.text
+    s = _new(auth_client, script_text="NARRATOR: The rain fell.\n")
+    r = auth_client.patch(f"/api/sound/stories/{s['id']}", json={"script_text": script, "script_version": 1})
+    assert r.status_code == 422, r.text
+    tail = sound_studio.context_tail(script)
+    assert "14-year-old" not in tail and "@bed stop" in tail and "The rain fell." in tail
+    # A safe bed stop still saves, and the writer still sees cues as markup.
+    r = auth_client.patch(f"/api/sound/stories/{s['id']}", json={
+        "script_text": '@bed ambience "rain"\nNARRATOR: The rain fell.\n(pause 2)\n[sfx: thunder]\n@bed stop\n',
+        "script_version": 1})
+    assert r.status_code == 200, r.text
+    tail = sound_studio.context_tail(r.json()["script_text"])
+    assert '@bed ambience "rain"' in tail and "(pause 2)" in tail and "[sfx: thunder]" in tail
+
+
+def test_a_cast_line_behind_a_skipped_cue_is_spotted_as_the_parser_spots_it(auth_client, monkeypatch):
+    from app.providers import mock_chat
+    from app.services import sound_studio, story_script
+
+    hidden = "[sfx: door [creak]] @cast MARA [left]: a different person entirely"
+    got = _written(auth_client)
+    a = got["script_text"].index("# Chapter 1")
+    # A range with no cast lines: the hidden one is dropped too.
+    monkeypatch.setattr(mock_chat, "mock_enhance_story", lambda t, d="": f"{hidden}\n{t}")
+    r = auth_client.post(f"/api/sound/stories/{got['id']}/enhance",
+                         json={"action": "tighten", "scope": "selection", "start": a + 20, "end": a + 300})
+    assert r.status_code == 200, r.text
+    assert "@cast" not in r.json()["after"]
+    # A range with the cast lines: the hidden re-declaration is refused.
+    r = auth_client.post(f"/api/sound/stories/{got['id']}/enhance",
+                         json={"action": "tighten", "scope": "selection", "start": 0, "end": 400})
+    assert r.status_code == 422 and "cast" in r.json()["detail"], r.text
+    # A changed placement alone is a change too.
+    old = next(ln for ln in got["script_text"].splitlines() if ln.startswith("@cast MARA"))
+    monkeypatch.setattr(mock_chat, "mock_enhance_story",
+                        lambda t, d="": t.replace(old, old.replace("[left]", "[right]")))
+    r = auth_client.post(f"/api/sound/stories/{got['id']}/enhance",
+                         json={"action": "tighten", "scope": "selection", "start": 0, "end": 400})
+    assert r.status_code == 422 and "cast" in r.json()["detail"], r.text
+    # The overridden line counts as an override (checked as unvoiced text).
+    text = f"@cast LILY [left]: {MINOR_PREMISE}\n\nNARRATOR: hi\n[sfx: door [creak]] @cast LILY [left]: an adult\n"
+    doc = story_script.parse(text, max_minutes=0)
+    assert [n for n, *_ in sound_studio._cast_decls(text)] == [1, 4]
+    assert "14-year-old" in sound_studio.unvoiced_text(text, doc)
+    r = auth_client.post("/api/sound/stories", json={"title": "Night", "premise": "A calm night.",
+                                                     "script_text": text})
+    assert r.status_code == 422, r.text
+
+
 # ---------- S4: a clean deployment checks titles and headings ----------
 
 
