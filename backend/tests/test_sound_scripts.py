@@ -12,7 +12,7 @@ import httpx
 import pytest
 import respx
 
-from .test_adult_features_off import _clean
+from .test_adult_features_off import _clean, _reset
 from .test_models_catalog import OR, _real
 
 MINOR_PREMISE = "A sexual story about a 14-year-old girl and her teacher."
@@ -418,6 +418,8 @@ def test_every_written_chapter_is_checked(auth_client, monkeypatch):
 
 
 def test_a_clean_deployment_uses_the_clean_prompts(monkeypatch):
+    monkeypatch.delenv("ADULT_FEATURES", raising=False)  # these assume the default mode
+    _reset()
     from app.providers import openrouter_chat as oc
 
     default = oc.story_system()
@@ -453,6 +455,8 @@ def test_the_real_writer_sends_the_clean_system_on_a_clean_deployment(monkeypatc
 
 
 def test_a_clean_deployment_refuses_explicit_premises(auth_client, monkeypatch):
+    monkeypatch.delenv("ADULT_FEATURES", raising=False)  # these assume the default mode
+    _reset()
     # Adult themes between adults are taken in default mode...
     s = _new(auth_client, premise=EXPLICIT_PREMISE)
     _clean(monkeypatch)
@@ -497,7 +501,9 @@ def test_a_declined_outline_fails_the_story_outside_adult_mode(auth_client, monk
 # ---------- CRUD ----------
 
 
-def test_crud_and_parse(auth_client):
+def test_crud_and_parse(auth_client, monkeypatch):
+    monkeypatch.delenv("ADULT_FEATURES", raising=False)  # these assume the default mode
+    _reset()
     s = _new(auth_client, script_text="@cast MARA [left]: adult keeper\n# One\nMARA [whispers]: Hello.\n[bogus] Hi.\n")
     assert s["parsed"]["chapters"][0]["title"] == "One" and s["parsed"]["warnings"]
     lst = auth_client.get("/api/sound/stories").json()
