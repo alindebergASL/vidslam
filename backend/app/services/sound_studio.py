@@ -156,6 +156,20 @@ def _cast_decls(text: str) -> list[tuple[int, str, Optional[str], str]]:
     return out
 
 
+def check_cast_once(text: str) -> None:
+    """Refuse a script that declares a cast name more than once (counting
+    @cast lines behind skipped cues): the last declaration wins in the
+    parser, so a later one could change who a character is after the
+    lines about them. Raises UnsafeScriptError."""
+    from .safety import UnsafeScriptError
+
+    seen: set[str] = set()
+    for _, name, _pan, _desc in _cast_decls(text):
+        if name in seen:
+            raise UnsafeScriptError("A character is declared more than once; declare each character once.")
+        seen.add(name)
+
+
 def unvoiced_text(text: str, doc: StoryDoc) -> str:
     """The text of `text` (parsed as `doc`) that no voice reads and
     check_story never judges, one piece per line: notes (// lines), chapter
@@ -264,6 +278,7 @@ def check_script_text(text: str, *, style: str = "", title: str = "", premise: s
     if not (text or "").strip():
         check_premise(title, premise)
         return None
+    check_cast_once(text)
     about = "\n".join(x.strip() for x in (title or "", premise or "") if x and x.strip())
     if about:
         explicit_check.check(about)

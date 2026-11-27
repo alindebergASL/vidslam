@@ -553,3 +553,48 @@ def test_lengthen_minutes_default_to_the_range_and_are_capped(auth_client):
     s = _story(auth_client, got["id"])
     assert s["enhance"]["status"] == "ready", s["enhance"]["error"]
     assert s["enhance"]["minutes"] == math.ceil(ch["est_seconds"] / 60) and s["enhance"]["minutes"] >= 4
+
+
+# ---------- host re-test: S3 on the paste path ----------
+
+_REDECLARED = (
+    "@cast LILY [left]: a seven-year-old girl\n"
+    "# One\n"
+    "NARRATOR: Lily said goodnight to the moon.\n"
+    "@cast LILY [left]: an adult woman\n"
+    "NARRATOR: Later Lily and the man had sex in the dark.\n"
+)
+
+
+def test_a_cast_name_declared_twice_is_refused_on_create_and_patch(auth_client):
+    r = auth_client.post("/api/sound/stories", json={"script_text": _REDECLARED, "target_minutes": 10})
+    assert r.status_code == 422 and "declared more than once" in r.json()["detail"]
+    # The same, hidden behind a cue the parser skips.
+    hidden = _REDECLARED.replace("@cast LILY [left]: an adult", "[sfx: door [creak]] @cast LILY [left]: an adult")
+    r = auth_client.post("/api/sound/stories", json={"script_text": hidden, "target_minutes": 10})
+    assert r.status_code == 422 and "declared more than once" in r.json()["detail"]
+    s = _new(auth_client, script_text="@cast LILY [left]: an adult woman\n# One\nLILY: Goodnight.\n")
+    for text in (_REDECLARED, hidden):
+        r = auth_client.patch(f"/api/sound/stories/{s['id']}", json={"script_text": text})
+        assert r.status_code == 422 and "declared more than once" in r.json()["detail"]
+    assert _story(auth_client, s["id"])["script_version"] == 1
+
+
+def test_single_declarations_and_a_bedtime_story_with_children_still_save(auth_client):
+    one = "@cast MARA [left]: adult keeper\n# One\nMARA: The lamp is lit.\n"
+    assert auth_client.post("/api/sound/stories", json={"script_text": one, "target_minutes": 10}).status_code == 201
+    bedtime = (
+        "@cast NARRATOR: calm grandmother\n"
+        "@cast TOM [left]: a six-year-old boy\n"
+        "@cast ELLA [right]: his eight-year-old sister\n"
+        "# The Sleepy Forest\n"
+        "NARRATOR: Tom and Ella tiptoed past the sleeping owls.\n"
+        "TOM [whispers]: Do you think the moon is tired too?\n"
+        "ELLA [whispers]: Everyone gets tired. Even the moon.\n"
+        "[sfx: soft wind in the pines | 3s]\n"
+        "NARRATOR: And they curled up under the stars and fell asleep.\n"
+    )
+    r = auth_client.post("/api/sound/stories", json={"script_text": bedtime, "target_minutes": 10})
+    assert r.status_code == 201, r.text
+    s = _new(auth_client, script_text=one)
+    assert auth_client.patch(f"/api/sound/stories/{s['id']}", json={"script_text": bedtime}).status_code == 200

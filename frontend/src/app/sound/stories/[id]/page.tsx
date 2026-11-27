@@ -17,6 +17,7 @@ import {
   usd,
 } from "@/components/sound/shared";
 import { spliceCodePoints, toCodePoints } from "@/lib/textOffsets";
+import { lengthenDefault } from "@/lib/lengthenDefault";
 import { usePoll } from "@/lib/usePoll";
 import {
   api,
@@ -441,7 +442,7 @@ function Inner() {
           <EnhanceMenu
             disabled={scripting || !!busy || !hasLines}
             chapters={parsed.chapters}
-            target={story.target_minutes}
+            storySeconds={parsed.est_seconds}
             maxMinutes={cfg?.max_minutes ?? 90}
             syncMax={cfg?.enhance_sync_max ?? 6000}
             onRun={enhance}
@@ -622,14 +623,14 @@ function CostBar({ est, story }: { est: StoryEstimate | null; story: SoundStory 
 function EnhanceMenu({
   disabled,
   chapters,
-  target,
+  storySeconds,
   maxMinutes,
   syncMax,
   onRun,
 }: {
   disabled: boolean;
   chapters: SoundStory["parsed"]["chapters"];
-  target: number;
+  storySeconds: number;
   maxMinutes: number;
   syncMax: number;
   onRun: (action: StoryEnhanceAction, scope: StoryEnhanceScope, opts: { chapterLine?: number; minutes?: number }) => void;
@@ -637,7 +638,11 @@ function EnhanceMenu({
   const [action, setAction] = useState<StoryEnhanceAction>("tighten");
   const [scope, setScope] = useState<StoryEnhanceScope>("selection");
   const [chapterLine, setChapterLine] = useState<number | undefined>(chapters[0]?.line);
-  const [minutes, setMinutes] = useState(target);
+  // Lengthen starts from the chosen part's own length (re-seeded when the
+  // part changes); for a selection the server measures it (null).
+  const seed = lengthenDefault(scope, chapters, chapterLine, storySeconds, maxMinutes);
+  const [minutes, setMinutes] = useState<number | null>(seed);
+  useEffect(() => setMinutes(seed), [seed]);
   useEffect(() => {
     // A chapter choice that matches no chapter any more (the script
     // changed) goes back to the first, the one the dropdown shows.
@@ -666,8 +671,11 @@ function EnhanceMenu({
             type="number"
             min={1}
             max={maxMinutes}
-            value={minutes}
-            onChange={(e) => setMinutes(Math.max(1, Math.min(maxMinutes, Number(e.target.value) || 1)))}
+            value={minutes ?? ""}
+            placeholder="As long as it is now"
+            onChange={(e) =>
+              setMinutes(e.target.value === "" ? null : Math.max(1, Math.min(maxMinutes, Number(e.target.value) || 1)))
+            }
           />
         </label>
       )}
@@ -697,7 +705,7 @@ function EnhanceMenu({
         type="button"
         className="btn-primary"
         disabled={disabled || (scope === "chapter" && !chapterLine)}
-        onClick={() => onRun(action, scope, { chapterLine, minutes: action === "lengthen" ? minutes : undefined })}
+        onClick={() => onRun(action, scope, { chapterLine, minutes: action === "lengthen" ? (minutes ?? undefined) : undefined })}
       >
         Enhance
       </button>
