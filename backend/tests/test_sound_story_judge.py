@@ -275,7 +275,11 @@ def test_the_note_and_facts_stay_out_of_the_word_filter(client):
                  "Anna had dropped her kids at school that morning.\n" + _FILL + "\nANNA [moans]: Mark.\n")
     context = story_script.check_story(doc)
     assert context.startswith(minor_check.STORY_NOTE)
-    assert any("Mark." in c and "seductive" in c for c in mock_chat.MINOR_CALLS)
+    # The judge reads the line as written: the app's "(seductive)" after
+    # [moans] is for the word layer only (hotfix after #68), so it never
+    # reaches the model, which would read it as the user's.
+    assert any("ANNA: [moans] Mark." in c for c in mock_chat.MINOR_CALLS)
+    assert not any("seductive" in c for c in mock_chat.MINOR_CALLS)
     minor_check.check_long("ANNA [moans] (seductive): Mark.",
                            context=f"{minor_check.STORY_NOTE}\nStory facts: ANNA is an adult.\nCast:\nANNA: adult")
     # The window's own words still refuse.
