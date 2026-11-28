@@ -44,6 +44,9 @@ log = logging.getLogger("avs.sound_studio")
 
 # A story a job is working on: no edit, no second job.
 BUSY = ("scripting", "generating", "rendering")
+# The statuses a claim holds: the writer and Enhance ('scripting'), the
+# clips (services/sound_clips.py: 'generating').
+CLAIMED = ("scripting", "generating")
 STYLES = tuple(story_script.WPM_BY_STYLE)
 # Styles left out on a clean deployment (romance-type presets).
 ADULT_STYLES = ("romance",)
@@ -52,6 +55,16 @@ ENHANCE_ACTIONS = ("tighten", "lengthen", "asmr", "sfx", "sleep")
 WRITER_KEY = "writer"
 ENHANCE_KEY = "enhance"
 TASK_KEY = "task"
+# Sound Studio PR3 (services/sound_clips.py): the clips job, and the
+# synchronous regenerate / preview under the same per-story lock.
+CLIPS_KEY = "clips"
+REGEN_KEY = "regenerate"
+PREVIEW_KEY = "preview"
+# Tasks Cancel or a stopped worker leave 'cancelled' / 'failed' with a Resume.
+RESUMABLE_TASKS = (WRITER_KEY, CLIPS_KEY)
+# progress_json: the task and previous status a regenerate or preview lock
+# found (sweep puts them back if the request dies holding it).
+HELD_FROM_KEY = "held_from"
 
 # A job that took its claim over keeps it as RUNNING + token (its
 # generation). Cancel keeps it (the call in flight is paid for, so its
@@ -304,18 +317,24 @@ def check_part(header: str, part: str, *, style: str = "", title: str = "", prem
 # ---------- claims ----------
 
 
-def claim(db: Session, story: models.SoundStory, task: str) -> tuple[str, str]:
+def claim(db: Session, story: models.SoundStory, task: str, status: str = "scripting", *,
+          progress_extra: Optional[dict] = None, fields: Optional[dict] = None) -> tuple[str, str]:
     """Claim the story for a job (conditional UPDATE: two requests can't
-    both get through): status 'scripting' and a fresh claim_token. Returns
-    (token, previous status). Raises LookupError when it is busy."""
+    both get through): `status` ('scripting', or 'generating' for the
+    clips) and a fresh claim_token. `progress_extra` (keys of
+    progress_json) and `fields` (columns) are written by the same
+    conditional UPDATE, so nothing is saved over a story another request
+    claimed meanwhile. Returns (token, previous status). Raises LookupError
+    when it is busy."""
     previous = story.status
     token = uuid.uuid4().hex
     progress = dict(story.progress_json or {})
+    progress.update(progress_extra or {})
     progress[TASK_KEY] = task
     progress["previous"] = previous
     done = (db.query(models.SoundStory)
             .filter(models.SoundStory.id == story.id, models.SoundStory.status.notin_(BUSY))
-            .update({"status": "scripting", "claim_token": token, "queue_job_id": "", "error": "",
+            .update({**(fields or {}), "status": status, "claim_token": token, "queue_job_id": "", "error": "",
                      "progress_json": progress, "heartbeat_at": datetime.utcnow()},
                     synchronize_session=False))
     db.commit()
@@ -324,24 +343,26 @@ def claim(db: Session, story: models.SoundStory, task: str) -> tuple[str, str]:
     return token, previous
 
 
-def enqueue_claimed(db: Session, story: models.SoundStory, job: Callable, *args, task: str) -> str:
+def enqueue_claimed(db: Session, story: models.SoundStory, job: Callable, *args, task: str,
+                    status: str = "scripting", progress_extra: Optional[dict] = None,
+                    fields: Optional[dict] = None) -> str:
     """Claim, then queue `job(story.id, *args, claim_token=token)`; the
     queue entry is recorded while the story is still claimed. If nothing
     was queued (Redis gone), the claim is given back."""
     from ..workers.queue import enqueue
 
-    token, previous = claim(db, story, task)
+    token, previous = claim(db, story, task, status, progress_extra=progress_extra, fields=fields)
     try:
         job_id = enqueue(job, story.id, *args, claim_token=token)
     except Exception:
         db.query(models.SoundStory).filter(
-            models.SoundStory.id == story.id, models.SoundStory.status == "scripting",
+            models.SoundStory.id == story.id, models.SoundStory.status == status,
             models.SoundStory.claim_token == token,
         ).update({"status": previous, "claim_token": ""}, synchronize_session=False)
         db.commit()
         raise
     db.query(models.SoundStory).filter(
-        models.SoundStory.id == story.id, models.SoundStory.status == "scripting",
+        models.SoundStory.id == story.id, models.SoundStory.status == status,
         models.SoundStory.claim_token.in_((token, running_token(token))),
     ).update({"queue_job_id": str(job_id or "")[:80]}, synchronize_session=False)
     db.commit()
@@ -379,7 +400,7 @@ def _held(query, story_id: int, gen: str):  # noqa: ANN001, ANN202 — a SoundSt
 def _mine(query, story_id: int, gen: str):  # noqa: ANN001, ANN202 — a SoundStory query
     """`query` narrowed to the story while this job (generation `gen`)
     still runs it: claimed by it and not cancelled."""
-    return _held(query, story_id, gen).filter(models.SoundStory.status == "scripting")
+    return _held(query, story_id, gen).filter(models.SoundStory.status.in_(CLAIMED))
 
 
 def _alive(story_id: int, gen: str) -> bool:
@@ -403,11 +424,11 @@ def cancel(db: Session, story: models.SoundStory) -> dict:
     """Cancel the story's job. Waiting in the queue (its claim not taken
     yet): released at once. Running: marked, and the job stops before its
     next call (the call in flight is still paid for and kept)."""
-    if story.status != "scripting":
+    if story.status not in CLAIMED:
         return {"status": story.status, "action": "noop"}
     progress = dict(story.progress_json or {})
     task = progress.get(TASK_KEY)
-    to = "cancelled" if task == WRITER_KEY else _back_to(progress)
+    to = "cancelled" if task in RESUMABLE_TASKS else _back_to(progress)
     if task == ENHANCE_KEY:
         progress[ENHANCE_KEY] = {**(progress.get(ENHANCE_KEY) or {}), "status": "cancelled"}
     waiting = not (story.claim_token or "").startswith(RUNNING)
@@ -416,7 +437,7 @@ def cancel(db: Session, story: models.SoundStory) -> dict:
     # saved); a claim no job has taken yet is given back.
     keep = case((S.claim_token.startswith(RUNNING), S.claim_token), else_="")
     done = (db.query(S)
-            .filter(S.id == story.id, S.status == "scripting")
+            .filter(S.id == story.id, S.status == story.status)
             .update({"status": to, "claim_token": keep, "progress_json": progress,
                      "error": CANCELLED if to == "cancelled" else ""}, synchronize_session=False))
     if done != 1:
@@ -811,6 +832,10 @@ def can_resume(story: models.SoundStory) -> bool:
     w = progress.get(WRITER_KEY) or {}
     if story.status not in ("cancelled", "failed"):
         return False
+    if progress.get(TASK_KEY) == CLIPS_KEY:
+        # A clips run that stopped (services/sound_clips.can_resume): the
+        # writer's own Resume only when it never finished.
+        return bool(w) and not w.get("finished")
     return progress.get(TASK_KEY) in (WRITER_KEY, ENHANCE_KEY) or (bool(w) and not w.get("finished"))
 
 
@@ -1104,7 +1129,19 @@ def sweep(db: Session, *, now: datetime, limit, heartbeat) -> dict:  # noqa: ANN
             continue
         progress = dict(story.progress_json or {})
         to = "failed"
-        if progress.get(TASK_KEY) == ENHANCE_KEY:
+        if progress.get(TASK_KEY) in (REGEN_KEY, PREVIEW_KEY):
+            # A regenerate or preview request that died holding the lock:
+            # the story goes back to what it was (its finished clips kept),
+            # with the task it had (a clips run stays resumable).
+            to = _back_to(progress)
+            held = progress.pop(HELD_FROM_KEY, None)
+            if isinstance(held, dict):
+                for k in (TASK_KEY, "previous"):
+                    if held.get(k) is None:
+                        progress.pop(k, None)
+                    else:
+                        progress[k] = held[k]
+        elif progress.get(TASK_KEY) == ENHANCE_KEY:
             to = _back_to(progress)
             progress[ENHANCE_KEY] = {**(progress.get(ENHANCE_KEY) or {}), "status": "failed", "error": STOPPED}
         res = db.execute(update(S).where(S.id == story.id, S.status == story.status,
@@ -1150,6 +1187,10 @@ def to_out(story: models.SoundStory, *, full: bool = True) -> dict:
         "created_at": story.created_at.isoformat() if story.created_at else None,
         "updated_at": story.updated_at.isoformat() if story.updated_at else None,
     }
+    from . import sound_clips
+
+    out["clips"] = sound_clips.progress_out(story)
+    out["cast_voices"] = dict(story.cast_json or {})
     if full:
         out["script_text"] = story.script_text or ""
         out["enhance"] = progress.get(ENHANCE_KEY)

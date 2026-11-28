@@ -32,6 +32,33 @@ class StoryCreate(BaseModel):
     script_text: str = Field(default="", max_length=SCRIPT_MAX)
 
 
+class VoiceSettings(BaseModel):
+    """ElevenLabs voice settings (only these keys are sent)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    stability: Optional[float] = Field(default=None, ge=0, le=1)
+    similarity_boost: Optional[float] = Field(default=None, ge=0, le=1)
+    style: Optional[float] = Field(default=None, ge=0, le=1)
+    speed: Optional[float] = Field(default=None, ge=0.5, le=2)
+    use_speaker_boost: Optional[bool] = None
+
+
+class CastVoice(BaseModel):
+    """How one character is voiced (cast_json[NAME]): its own provider and
+    model (else the story's), voice id, seed, voice settings and the
+    loudness every clip of it is brought to."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    provider: str = Field(default="", max_length=40)
+    model: str = Field(default="", max_length=200)
+    voice_id: str = Field(default="", max_length=120)
+    seed: Optional[int] = Field(default=None, ge=0, le=4294967295)
+    voice_settings: Optional[VoiceSettings] = None
+    loudness: Optional[float] = Field(default=None, ge=-40, le=-10)
+
+
 class StoryUpdate(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)
     premise: Optional[str] = Field(default=None, max_length=4000)
@@ -40,6 +67,8 @@ class StoryUpdate(BaseModel):
     script_text: Optional[str] = Field(default=None, max_length=SCRIPT_MAX)
     # The version the editor started from: a save over a newer one is a 409.
     script_version: Optional[int] = None
+    # Voices per character (names in any case), replacing the stored ones.
+    cast: Optional[dict[str, CastVoice]] = None
 
 
 class ParseIn(BaseModel):
@@ -60,6 +89,9 @@ class EstimateIn(BaseModel):
     start: Optional[int] = Field(default=None, ge=0)
     end: Optional[int] = Field(default=None, ge=0)
     chapter_line: Optional[int] = Field(default=None, ge=1)
+    # Price a new take of one clip, or a preview.
+    cue_key: Optional[str] = Field(default=None, max_length=64)
+    preview: Optional["PreviewIn"] = None
 
 
 class WriteIn(BaseModel):
@@ -78,3 +110,27 @@ class EnhanceIn(BaseModel):
     chapter_line: Optional[int] = Field(default=None, ge=1)
     script_version: Optional[int] = None
     minutes: Optional[int] = Field(default=None, ge=1, le=600)
+
+
+class PreviewIn(BaseModel):
+    """One of: a chapter (its index), a range of script lines, or the first
+    minutes (at most 3)."""
+
+    chapter: Optional[int] = Field(default=None, ge=0)
+    start_line: Optional[int] = Field(default=None, ge=1)
+    end_line: Optional[int] = Field(default=None, ge=1)
+    first_minutes: Optional[float] = Field(default=None, gt=0, le=3)
+
+
+class RegenerateIn(BaseModel):
+    cue_key: str = Field(min_length=1, max_length=64)
+
+
+class EffectsIn(BaseModel):
+    prompt: str = Field(min_length=1, max_length=400)
+    seconds: float = Field(default=3.0, ge=0.5, le=30)
+    loop: bool = False
+    variations: int = Field(default=1, ge=1, le=4)
+
+
+EstimateIn.model_rebuild()

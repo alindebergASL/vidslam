@@ -34,13 +34,17 @@ class MockTTSProvider(TTSProvider):
         from ..services.story_script import is_story, split_tags
 
         # In story markup, voice tags ([whispers], [short pause]...) aren't words.
-        words = split_tags(text)[1] if is_story(settings) else text
+        story = is_story(settings)
+        words = split_tags(text)[1] if story else text
         seconds = (settings or {}).get("duration") or _estimate_seconds(words)
+        # A story line is a quiet tone, not silence: the clip pipeline
+        # (services/sound_clips.py) trims silence and rejects silent clips.
+        source = "sine=frequency=220:sample_rate=44100" if story else "anullsrc=r=44100:cl=stereo"
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "voice.m4a"
             cmd = [
                 "ffmpeg", "-y",
-                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+                "-f", "lavfi", "-i", source,
                 "-t", str(seconds),
                 "-c:a", "aac", "-b:a", "128k",
                 str(out),

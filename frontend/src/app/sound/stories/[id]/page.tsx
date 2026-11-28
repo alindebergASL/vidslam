@@ -7,6 +7,8 @@ import { AuthGate } from "@/components/AuthGate";
 import { Dialog } from "@/components/Dialog";
 import { useEvents } from "@/components/NotificationsProvider";
 import { useToast } from "@/components/Toaster";
+import { ClipsPanel } from "@/components/sound/ClipsPanel";
+import { VoicesPanel } from "@/components/sound/VoicesPanel";
 import {
   DiffView,
   ENHANCE_ACTIONS,
@@ -99,7 +101,8 @@ function Inner() {
   }, [id, reload]);
 
   const scripting = story?.status === "scripting";
-  const poke = usePoll(reload, { enabled: scripting, interval: 2500 });
+  const generating = story?.status === "generating";
+  const poke = usePoll(reload, { enabled: scripting || generating, interval: 2500 });
   useEvents({ kind: "sound_story", entity_id: id }, () => poke());
 
   // The price bar: what writing (or resuming) and generating would cost.
@@ -323,7 +326,7 @@ function Inner() {
       </nav>
       <header className="flex flex-wrap items-start justify-between gap-3 mb-4">
         <div className="min-w-0">
-          <TitleEdit story={story} onSaved={setStory} busy={scripting} />
+          <TitleEdit story={story} onSaved={setStory} busy={scripting || generating} />
           <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-ink-400">
             <StoryStatus status={story.status} task={story.task} />
             <span>
@@ -339,12 +342,12 @@ function Inner() {
             </button>
           )}
           {!scripting && story.can_resume && (
-            <button type="button" className="btn-primary" disabled={!!busy} onClick={askResume}>
+            <button type="button" className="btn-primary" disabled={!!busy || generating} onClick={askResume}>
               Resume writing
             </button>
           )}
           {!scripting && !story.can_resume && story.premise.trim() && (
-            <button type="button" className={hasLines ? "btn-ghost" : "btn-primary"} disabled={!!busy} onClick={askWrite}>
+            <button type="button" className={hasLines ? "btn-ghost" : "btn-primary"} disabled={!!busy || generating} onClick={askWrite}>
               {hasLines ? "Write again" : "Write it for me"}
               {est ? ` (${usd(est.write.cost)})` : ""}
             </button>
@@ -387,6 +390,8 @@ function Inner() {
       )}
 
       <CostBar est={est} story={story} />
+
+      <ClipsPanel story={story} dirty={dirty} onChanged={reload} />
 
       <div className="grid gap-4 lg:grid-cols-[16rem_1fr]">
         <aside className="flex flex-col gap-4">
@@ -439,8 +444,9 @@ function Inner() {
               </ul>
             </section>
           )}
+          <VoicesPanel story={story} config={cfg} disabled={scripting || generating} onSaved={setStory} />
           <EnhanceMenu
-            disabled={scripting || !!busy || !hasLines}
+            disabled={scripting || generating || !!busy || !hasLines}
             chapters={parsed.chapters}
             storySeconds={parsed.est_seconds}
             maxMinutes={cfg?.max_minutes ?? 90}
@@ -487,7 +493,7 @@ function Inner() {
                 type="button"
                 aria-selected={editing}
                 className={clsx("chip", editing && "chip-active")}
-                disabled={scripting}
+                disabled={scripting || generating}
                 onClick={() => setEditing(true)}
               >
                 Edit
@@ -508,7 +514,7 @@ function Inner() {
               </div>
             )}
           </div>
-          {editing && !scripting ? (
+          {editing && !scripting && !generating ? (
             <textarea
               ref={area}
               className="input w-full font-mono text-[13px] leading-6 min-h-[60vh]"

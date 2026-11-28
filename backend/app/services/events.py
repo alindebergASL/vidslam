@@ -9,7 +9,7 @@ with or without Redis.
 Kinds: render | plan | ambient_loop | ambient_render | studio_job |
 training | publish | budget | hook_lab (one alternative opening of a
 video, entity "hook_variant") | sound_story (a Sound Studio story being
-written or enhanced, entity "sound_story"). Statuses: started | progress | completed |
+written, enhanced or voiced, entity "sound_story"). Statuses: started | progress | completed |
 failed | cancelled. Severity: info | warning | error.
 """
 from __future__ import annotations
@@ -210,15 +210,20 @@ def sound_story_event(db: Session, story: models.SoundStory, status: str, *, det
     completed | failed | cancelled. No project (spend ref sound_story:<id>)."""
     name = _clip(story.title or f"Story {story.id}", 80)
     what = "Enhance" if (detail or "").startswith("Enhance") else "Story"
+    if (detail or "").startswith("Voices"):
+        # The clips (services/sound_clips.py): voices and sound effects.
+        what = "Voices"
     if status == "completed":
-        title = f"{'Enhance ready' if what == 'Enhance' else 'Script ready'}: {name}"
+        done_word = {"Enhance": "Enhance ready", "Voices": "Voices ready"}.get(what, "Script ready")
+        title = f"{done_word}: {name}"
     elif status == "failed":
         title = f"{what} stopped: {plain_error(error)}"
         detail = f"{name}: {str(error or '')[:600]}"
     elif status == "cancelled":
         title = f"Cancelled: {name}"
     elif status == "started":
-        title = f"{'Enhancing' if what == 'Enhance' else 'Writing'}: {name}"
+        doing = {"Enhance": "Enhancing", "Voices": "Generating voices"}.get(what, "Writing")
+        title = f"{doing}: {name}"
     else:
         title = f"{name}: {detail}" if detail else name
     emit(db, "sound_story", "sound_story", story.id, status, title, detail=detail, url=sound_story_url(story))
@@ -359,7 +364,12 @@ def active(db: Session, *, studio_limit: int = 5) -> dict:
                .order_by(SS.updated_at.desc()).limit(20)):
         task = (st.progress_json or {}).get("task")
         w = (st.progress_json or {}).get("writer") or {}
-        if st.status != "scripting":
+        c = (st.progress_json or {}).get("clips") or {}
+        if st.status == "generating" and task == "clips" and c.get("total"):
+            stage = f"Generating voices ({int(c.get('done') or 0)} of {int(c['total'])} clips)"
+        elif st.status == "generating" and task in ("regenerate", "preview"):
+            stage = "Making a preview" if task == "preview" else "Regenerating a clip"
+        elif st.status != "scripting":
             stage = st.status.capitalize()
         elif task == "enhance":
             stage = "Enhancing the script"
