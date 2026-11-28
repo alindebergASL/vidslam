@@ -212,6 +212,9 @@ class OpenRouterChatProvider(ChatProvider):
         body: dict = {
             "model": self.model,
             "temperature": 0.4,
+            # No reasoning: a model that thinks by default spends the reply's
+            # room (and the user's money) before it writes.
+            "reasoning": {"enabled": False},
             "messages": [
                 {"role": "system", "content": enhance_system_prompt(kind, model, direction)},
                 {"role": "user", "content": text},
@@ -244,14 +247,24 @@ class OpenRouterChatProvider(ChatProvider):
 
     # ---------- Sound Studio: the story writer ----------
 
+    # The writer's room is max_tokens times this: a re-ask after a reply
+    # that ran out of room sets it higher (sound_studio._ask).
+    writer_room: float = 1.0
+
     def _story_call(self, user: str, *, note: str, max_tokens: int) -> str:
         """One writer call under story_system(): the reply text as is (the
         caller reads refusals and parses it). Spend is recorded with `note`
-        (the story's spend scope attributes it)."""
+        (the story's spend scope attributes it). Reasoning is switched off:
+        a model that thinks by default could spend all of max_tokens on it
+        and send no text (paid for). A reply with no text, or one that
+        stopped at finish_reason "length" (cut off), raises WriterOutOfRoom
+        after its spend is recorded: it is never used."""
+        room = int(max_tokens * max(1.0, float(self.writer_room or 1.0)))
         body: dict = {
             "model": self.model,
             "temperature": 0.8,
-            "max_tokens": max_tokens,
+            "max_tokens": room,
+            "reasoning": {"enabled": False},
             "messages": [
                 {"role": "system", "content": story_system()},
                 {"role": "user", "content": user},
@@ -271,13 +284,18 @@ class OpenRouterChatProvider(ChatProvider):
                                 generation_id=str(data.get("id") or ""),
                                 estimate=get_settings().cost_chat_per_story_call, note=note)
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (IndexError, KeyError, TypeError):
             raise RuntimeError("OpenRouter returned no message") from None
         if isinstance(content, list):
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-        if not isinstance(content, str):
-            raise RuntimeError("OpenRouter returned no message")
+        finish = finish_of(choice)
+        _log_reply(f"story writer ({note})", data, finish, content, room)
+        if finish == "length":
+            raise WriterOutOfRoom(f"the writer stopped at max_tokens ({room}) before finishing", finish)
+        if not isinstance(content, str) or not content.strip():
+            raise WriterOutOfRoom("the writer sent no text", finish)
         return content
 
     def story_outline(self, *, premise: str, title: str, minutes: int, style: str, sfx_density: str,
@@ -303,6 +321,7 @@ class OpenRouterChatProvider(ChatProvider):
         body: dict = {
             "model": self.model,
             "temperature": 0.7,
+            "reasoning": {"enabled": False},  # as enhance_prompt
             "messages": [
                 {"role": "system", "content": hook_ideas_system()},
                 {"role": "user", "content": json.dumps({
@@ -411,25 +430,61 @@ class OpenRouterChatProvider(ChatProvider):
             _sleep(wait)
 
     def classify_minor(self, text: str) -> dict:
-        """One short call: {"minor_sexual": bool, "reason": str}. Raises on
+        """One short ask: {"minor_sexual": bool, "reason": str}. Raises on
         an error body, a refusal or a reply that isn't that JSON (the caller
-        treats all of those as "the check couldn't run")."""
-        body: dict = {
-            "model": self.model,
-            "temperature": 0.0,
-            "max_tokens": 300,
-            "reasoning": {"effort": "low", "exclude": True},
-            "messages": [
-                {"role": "system", "content": MINOR_CHECK_SYSTEM},
-                {"role": "user", "content": text[:6000]},  # minor_check.JUDGE_WINDOW
-            ],
-        }
+        treats all of those as "the check couldn't run"). A reply the model
+        ran out of room for (finish_reason "length", no text, or JSON cut
+        off) is asked for once more with more room (JUDGE_TOKENS), as
+        story_characters does; a second such reply still raises (fail
+        closed)."""
+        from .mock_chat import CONTEXT_MARK, NO_CONTEXT_HEAD
+
         # No response_format: not every model takes it, and a 400 here would
         # pause sexual prompts. A picture, clip, lip-sync, voice or sound
         # prompt's reply is read leniently (the JSON in a fence or amid
         # prose); a story part's (sent with the story's context block) must
-        # be one JSON object (parse_minor_verdict strict).
-        data = self._post_check(body)
+        # be one JSON object (parse_minor_verdict strict). Strict for a
+        # story part only (a text with no story around it is read
+        # leniently, as before: any "true" in the reply wins).
+        story = text.startswith(CONTEXT_MARK) and not text.startswith(NO_CONTEXT_HEAD)
+        return self._judge(MINOR_CHECK_SYSTEM, text, "safety check",
+                           lambda content: parse_minor_verdict(content, strict=story))
+
+    def _judge(self, system: str, text: str, note: str, parse) -> dict:  # noqa: ANN001 — a reply parser
+        """A minors or content check: one call with JUDGE_TOKENS[0] of room,
+        and one re-ask with JUDGE_TOKENS[1] when the reply ran out of room
+        (finish "length", an empty reply, or JSON cut off) and couldn't be
+        read. Both calls share one retry for a blip (_post_check). A
+        refusal is never asked again."""
+        budget = [1]
+        for attempt, room in enumerate(JUDGE_TOKENS):
+            content, finish = self._judge_call(system, text, note, room, budget)
+            last = attempt == len(JUDGE_TOKENS) - 1
+            try:
+                return parse(content)
+            except ModelDeclined:
+                raise
+            except ValueError:
+                if last or not (finish == "length" or not content.strip() or _cut_off(content)):
+                    raise
+                log.warning("%s: the reply ran out of room (%s tokens, finish %s), asking with more",
+                            note, room, finish or "?")
+        raise AssertionError("unreachable")
+
+    def _judge_call(self, system: str, text: str, note: str, max_tokens: int,
+                    budget: Optional[list[int]] = None) -> tuple[str, str]:
+        """(reply text, finish_reason) of one minors or content check call."""
+        body: dict = {
+            "model": self.model,
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "reasoning": {"effort": "low", "exclude": True},
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": text[:6000]},  # minor_check.JUDGE_WINDOW
+            ],
+        }
+        data = self._post_check(body, budget)
         if "choices" not in data:
             err = data.get("error") or {}
             raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
@@ -437,19 +492,17 @@ class OpenRouterChatProvider(ChatProvider):
 
         spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
                                 generation_id=str(data.get("id") or ""), estimate=MINOR_CHECK_ESTIMATE,
-                                note="safety check")
+                                note=note)
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (IndexError, KeyError, TypeError):
             raise RuntimeError("OpenRouter returned no message") from None
         if isinstance(content, list):
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-        from .mock_chat import CONTEXT_MARK, NO_CONTEXT_HEAD
-
-        # Strict for a story part only (a text with no story around it is
-        # read leniently, as before: any "true" in the reply wins).
-        story = text.startswith(CONTEXT_MARK) and not text.startswith(NO_CONTEXT_HEAD)
-        return parse_minor_verdict(content if isinstance(content, str) else "", strict=story)
+        finish = finish_of(choice)
+        _log_reply(note, data, finish, content, max_tokens)
+        return (content if isinstance(content, str) else ""), finish
 
     def story_characters(self, text: str) -> dict:
         """One short call: {"characters": [{"name", "status", "age"}]}.
@@ -506,45 +559,26 @@ class OpenRouterChatProvider(ChatProvider):
             raise RuntimeError("OpenRouter returned no message") from None
         if isinstance(content, list):
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-        finish = str(choice.get("finish_reason") or choice.get("native_finish_reason") or "").lower()
-        if finish in ("max_tokens", "max_output_tokens"):  # some providers' names for it
-            finish = "length"
+        finish = finish_of(choice)
+        _log_reply("story facts", data, finish, content, max_tokens)
         return (content if isinstance(content, str) else ""), finish
 
     def classify_explicit(self, text: str) -> dict:
-        """One short call: {"explicit": bool, "reason": str}. Raises on an
+        """One short ask: {"explicit": bool, "reason": str}. Raises on an
         error body, a refusal or a reply that isn't that JSON (the caller
-        refuses the text for all of those)."""
-        body: dict = {
-            "model": self.model,
-            "temperature": 0.0,
-            "max_tokens": 300,
-            "reasoning": {"effort": "low", "exclude": True},
-            "messages": [
-                {"role": "system", "content": EXPLICIT_CHECK_SYSTEM},
-                {"role": "user", "content": text[:6000]},  # minor_check.JUDGE_WINDOW
-            ],
-        }
-        data = self._post_check(body)
-        if "choices" not in data:
-            err = data.get("error") or {}
-            raise RuntimeError(f"OpenRouter returned no choices: {err.get('message') or str(data)[:300]}")
-        from ..services import spend
-
-        spend.record_openrouter("chat", data.get("model") or self.model, cost=spend.usage_cost(data),
-                                generation_id=str(data.get("id") or ""), estimate=MINOR_CHECK_ESTIMATE,
-                                note="content check")
-        try:
-            content = data["choices"][0]["message"]["content"]
-        except (IndexError, KeyError, TypeError):
-            raise RuntimeError("OpenRouter returned no message") from None
-        if isinstance(content, list):
-            content = "".join(p.get("text", "") for p in content if isinstance(p, dict))
-        return parse_explicit_verdict(content if isinstance(content, str) else "")
+        refuses the text for all of those). A reply that ran out of room is
+        asked for once more with more room (_judge)."""
+        return self._judge(EXPLICIT_CHECK_SYSTEM, text, "content check", parse_explicit_verdict)
 
 
 # The safety check's rate-card cost per call (a short reply from the planner).
 MINOR_CHECK_ESTIMATE = 0.0005
+
+# The room a minors or content check reply gets (max_tokens): the first ask,
+# then the one more ask when the model thought past it (finish "length", or
+# an empty or cut-off reply). The verdict itself is under 100 tokens; the
+# rest is room for a model that reasons before answering.
+JUDGE_TOKENS = (1000, 3000)
 
 # The room a story facts reply gets (max_tokens): the first ask, then the one
 # more ask when the model ran out of room. A character's entry is about 40
@@ -836,6 +870,49 @@ def _retry_after(response: httpx.Response) -> float:
 
 class ModelDeclined(ValueError):
     """The safety check model answered with a refusal instead of a verdict."""
+
+
+class WriterOutOfRoom(RuntimeError):
+    """The story writer stopped without a usable reply: it ran out of
+    tokens (finish_reason "length", often after reasoning used the room) or
+    sent no text. The call is paid for; its reply, if any, is never used
+    (a chapter cut off at "length" is never saved). `finish`: the call's
+    finish_reason."""
+
+    def __init__(self, message: str, finish: str = "") -> None:
+        super().__init__(message)
+        self.finish = finish
+
+
+def finish_of(choice: object) -> str:
+    """A choice's finish_reason, lower-cased; a provider's own name for
+    running out of tokens ("max_tokens", "max_output_tokens") is "length"."""
+    if not isinstance(choice, dict):
+        return ""
+    finish = str(choice.get("finish_reason") or choice.get("native_finish_reason") or "").lower()
+    return "length" if finish in ("max_tokens", "max_output_tokens") else finish
+
+
+def reasoning_tokens(data: object) -> Optional[int]:
+    """The reasoning tokens a reply's usage reports, or None."""
+    usage = data.get("usage") if isinstance(data, dict) else None
+    details = usage.get("completion_tokens_details") if isinstance(usage, dict) else None
+    n = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    if n is None and isinstance(usage, dict):
+        n = usage.get("reasoning_tokens")
+    return n if isinstance(n, int) and not isinstance(n, bool) else None
+
+
+def _log_reply(what: str, data: dict, finish: str, content: object, room: Optional[int] = None) -> None:
+    """One line per writer or judge call: its finish_reason, reasoning and
+    completion tokens; a warning when it stopped at "length" or sent no
+    text."""
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    empty = not (isinstance(content, str) and content.strip())
+    level = logging.WARNING if finish == "length" or empty else logging.INFO
+    log.log(level, "%s: %s finish=%s reasoning_tokens=%s completion_tokens=%s max_tokens=%s%s", what,
+            data.get("model") or "?", finish or "?", reasoning_tokens(data), usage.get("completion_tokens"),
+            room, " (no text)" if empty else "")
 
 
 # The first word of a string verdict ("True.", "yes - a child", '"yes"',

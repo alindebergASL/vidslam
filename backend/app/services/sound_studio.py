@@ -394,6 +394,14 @@ def _alive(story_id: int, gen: str) -> bool:
         s.close()
 
 
+def cancelled_note(chapter: int, reason: str) -> str:
+    """A cancelled story's error when the writer call in flight at the
+    Cancel failed or was refused (`chapter` 0: the outline)."""
+    reason = " ".join(str(reason or "").split()).rstrip(".") or "it failed"
+    what = f"chapter {chapter}" if chapter else "the outline"
+    return f"Cancelled; {what} wasn't kept: {reason}. Resume writes it again."
+
+
 def _back_to(progress: dict) -> str:
     prev = str(progress.get("previous") or "draft")
     return "draft" if prev in BUSY else prev
@@ -440,32 +448,77 @@ def story_event(db: Session, story: models.SoundStory, status: str, *, detail: s
 # ---------- the writer ----------
 
 
-def _ask(call: Callable, *, text: str = "") -> tuple[str, str]:
+# A writer reply that ran out of room (openrouter_chat.WriterOutOfRoom) is
+# asked for once more with this much more room (and reasoning off, as
+# always), then goes the way of a refusal (the adult fallback model).
+WRITER_RETRY_ROOM = 1.5
+OUT_OF_ROOM = "The writer ran out of room; Resume tries again."
+
+
+def _ask(call: Callable, *, text: str = "", alive: Optional[Callable[[], bool]] = None) -> tuple[str, str]:
     """One writer call through the active chat model (prompting._chat_for:
     the planner, or the adult text model in adult mode): (reply, model). A
-    refusal (prompting.refusal) in adult mode is retried once with the
-    adult fallback model; outside adult mode it stands. A refusal that
-    remains raises WriterRefused."""
+    reply that ran out of room (WriterOutOfRoom: finish "length" or no
+    text, paid for and never used) is asked for once more with more room
+    (WRITER_RETRY_ROOM). A refusal (prompting.refusal), or a reply still
+    out of room, in adult mode is retried once with the adult fallback
+    model; outside adult mode it stands. A refusal that remains raises
+    WriterRefused (OUT_OF_ROOM, reason "out_of_room", for a reply that
+    never came).
+
+    `alive` (the job still holds the story: not cancelled or claimed
+    again) is asked before each extra call: once it says no, no more paid
+    calls are made and the reply in hand stands (out of room or refused)."""
+    from ..providers.openrouter_chat import WriterOutOfRoom
     from . import content_mode, model_registry, prompting
 
     adult = content_mode.adult_mode()
 
-    def run(m: str) -> tuple[str, str]:
+    def run(m: str, room: float = 1.0) -> tuple[Optional[str], str]:
         chat = prompting._chat_for(m)
-        out = call(chat)
-        return out, getattr(chat, "model", "") or m or model_registry.active_model("chat")
+        used = getattr(chat, "model", "") or m or model_registry.active_model("chat")
+        if room != 1.0:
+            chat.writer_room = room
+        try:
+            return call(chat), used
+        except WriterOutOfRoom as e:
+            log.warning("story writer: %s gave no usable reply (%s)", used, e)
+            return None, used
+
+    def read(out: Optional[str]) -> Optional[str]:
+        if out is None:
+            return "out_of_room"
+        return writer_refusal(out, text) if out.strip() else "declined"
+
+    gone = False
+
+    def stopped() -> bool:
+        # A Cancel (or a newer claim) while the call before was in flight:
+        # the job stops before its next call.
+        nonlocal gone
+        if gone or alive is None or alive():
+            return gone
+        gone = True
+        log.info("story writer: the story was cancelled during the call to %s; not asking again", used)
+        return True
 
     out, used = run("")
-    why = writer_refusal(out, text) if out.strip() else "declined"
-    if why == "declined" and adult:
+    if out is None and not stopped():
+        log.info("story writer: asking %s once more with more room", used)
+        out, used = run("", WRITER_RETRY_ROOM)
+    why = read(out)
+    if why in ("declined", "out_of_room") and adult:
         fallback = get_settings().adult_text_fallback_model or ""
-        if fallback and fallback != used:
-            log.info("story writer: %s declined; retrying with %s", used, fallback)
-            out, used = run(fallback)
-            why = writer_refusal(out, text) if out.strip() else "declined"
+        if fallback and fallback != used and not stopped():
+            log.info("story writer: %s %s; retrying with %s", used,
+                     "ran out of room" if why == "out_of_room" else "declined", fallback)
+            out, used = run(fallback, WRITER_RETRY_ROOM if why == "out_of_room" else 1.0)
+            why = read(out)
+    if why == "out_of_room":
+        raise WriterRefused(OUT_OF_ROOM, "out_of_room")
     if why:
         raise _refused(why, used)
-    return out, used
+    return out or "", used
 
 
 def _refused(why: str, used: str) -> WriterRefused:
@@ -664,6 +717,25 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
             db.refresh(story)
             story_event(db, story, status if status != "ready" else "completed", error=error)
             db.commit()
+            return
+        if held or status != "failed":
+            return
+        # Cancelled while its call was in flight, and that call failed or was
+        # refused: the story stays cancelled, but says why the chapter it was
+        # writing wasn't kept (else the failure leaves no trace).
+        why = cancelled_note(int(writer.get("chapters_done") or 0) + 1 if writer.get("outline") else 0, error)
+        done = (_held(db.query(models.SoundStory), story_id, gen)
+                .filter(models.SoundStory.status == "cancelled")
+                .update({"error": why}, synchronize_session=False))
+        db.commit()
+        if done == 1:
+            log.warning("sound story %s: cancelled, and the call in flight failed: %s", story_id, error[:300])
+            db.refresh(story)
+            story_event(db, story, "cancelled", detail=why, error=why)
+            db.commit()
+
+    def still_mine() -> bool:
+        return _alive(story_id, gen)
 
     def check_whole(text: str) -> None:
         check_script_text(text, style=style, title=story.title or "", premise=story.premise or "",
@@ -675,7 +747,7 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
             seen_version = story.script_version or 0
             reply, used = _ask(lambda chat: chat.story_outline(
                 premise=story.premise or "", title=story.title or "", minutes=minutes, style=style,
-                sfx_density=density, chapters=n), text=story.premise or "")
+                sfx_density=density, chapters=n), text=story.premise or "", alive=still_mine)
             outline = read_outline(reply, n, text=story.premise or "", model=used)
             header = cast_lines(outline)
             # The cast (who each character is, and their age) is checked with
@@ -715,7 +787,7 @@ def write_story(db: Session, story_id: int, gen: str = "") -> None:
                                   squeeze=float(writer.get("squeeze") or 1.0), index=i)
             reply, _ = _ask(lambda chat, i=i, previous=previous, per=per: chat.story_chapter(
                 premise=story.premise or "", outline=outline, index=i, minutes=per, style=style,
-                sfx_density=density, previous=previous), text=story.premise or "")
+                sfx_density=density, previous=previous), text=story.premise or "", alive=still_mine)
             body = clean_chapter(reply)
             if not body:
                 raise WriterRefused("The writer returned an empty chapter; Resume tries again.", "unreadable")
