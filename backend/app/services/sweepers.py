@@ -1,7 +1,7 @@
 """Background repair, about once a minute from the video-job sweeper loop:
-Studio jobs and renders that would otherwise stay "running" forever (a
-lost queue entry, a killed worker, a completion handler that raised), and
-event retention once a day. Every step is a few cheap indexed queries, and
+Studio jobs, renders and Sound Studio stories that would otherwise stay
+"running" forever (a lost queue entry, a killed worker, a completion
+handler that raised), and event retention once a day. Every step is a few cheap indexed queries, and
 every change is a conditional UPDATE, so two web processes sweeping at
 once never double-act."""
 from __future__ import annotations
@@ -288,6 +288,23 @@ def sweep_renders(db: Session, *, now: Optional[datetime] = None) -> dict:
     return out
 
 
+# ---------- Sound Studio ----------
+
+# A story job beats its heartbeat after every chapter: one that hasn't for
+# this long, with its queue entry gone, was left behind by a dead worker.
+SOUND_HEARTBEAT = timedelta(minutes=15)
+
+
+def sweep_sound(db: Session, *, now: Optional[datetime] = None) -> dict:
+    """Sound Studio stories a dead worker left 'scripting' (past the queue
+    time limit, or without a heartbeat for SOUND_HEARTBEAT, with the queue
+    entry gone): failed, and Resume continues where they stopped."""
+    from . import sound_studio
+
+    limit = timedelta(seconds=get_settings().queue_job_timeout_seconds) + RENDER_GRACE
+    return sound_studio.sweep(db, now=now or _now(), limit=limit, heartbeat=SOUND_HEARTBEAT)
+
+
 # ---------- the once-a-minute step ----------
 
 
@@ -299,7 +316,8 @@ def run_once(*, now: Optional[datetime] = None) -> dict:
     result: dict = {}
     db = SessionLocal()
     try:
-        for name, step in (("studio", sweep_studio), ("renders", sweep_renders), ("hook_lab", sweep_hook_lab)):
+        for name, step in (("studio", sweep_studio), ("renders", sweep_renders), ("hook_lab", sweep_hook_lab),
+                           ("sound", sweep_sound)):
             try:
                 result[name] = step(db, now=now)
             except Exception:  # noqa: BLE001

@@ -367,6 +367,94 @@ def mock_minor_verdict(text: str) -> dict:
     return {"minor_sexual": False, "reason": "No minor in a sexual context."}
 
 
+# Every mock writer call (("outline", premise) or ("chapter", index)), for tests.
+STORY_CALLS: list[tuple[str, object]] = []
+_ORDINALS = ("One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten", "Eleven", "Twelve",
+             "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen")
+_MOCK_SENTENCES = (
+    "The rain moved softly across the harbour, and the boats rocked on their ropes.",
+    "Far out on the water, a single light turned slowly through the dark.",
+    "The old stairs of the lighthouse creaked under careful steps.",
+    "Warm tea steamed in a chipped blue cup beside the window.",
+    "Wind pressed against the glass, then eased, as if it were tired too.",
+    "Somewhere below, the sea breathed in and out against the rocks.",
+    "A gull settled on the railing and tucked its head beneath a wing.",
+    "The lamp hummed, steady and patient, the way it had for many years.",
+    "Mist gathered over the bay and softened every edge of the night.",
+    "The kettle ticked as it cooled, and the room grew still.",
+    "Footprints in the wet sand slowly filled with water and vanished.",
+    "A distant bell rang once from a buoy and then fell quiet.",
+)
+_MOCK_LINES = (
+    "MARA [softly]: The light is steady tonight.",
+    "MARA: Listen to that rain. It sounds like a lullaby.",
+    "MARA [whispers]: Rest now. The harbour is safe.",
+    "MARA [warmly]: One more turn of the lamp, and then tea.",
+)
+_MOCK_SFX = ("[sfx: gentle rain on glass | 4s | under]", "[sfx: wooden stairs creak | 2s]",
+             "[sfx: distant buoy bell | 3s]", "[sfx: kettle clicks off | 2s]")
+_SFX_EVERY = {"none": 0, "low": 14, "medium": 8, "high": 5}
+
+
+def mock_story_chapter(*, index: int, minutes: float, style: str, sfx_density: str) -> str:
+    """About `minutes` of mock script read at `style`'s speed."""
+    from ..services import story_script
+
+    wpm = story_script.WPM_BY_STYLE.get(style, story_script.DEFAULT_WPM)
+    # Sound cues and pauses take time too: about a tenth of a chapter.
+    target = max(30, int(minutes * wpm * 0.9))
+    whisper = style in ("asmr", "whisper", "sleep", "meditation")
+    every = _SFX_EVERY.get(sfx_density, 8)
+    out: list[str] = []
+    if every and sfx_density == "high":
+        out.append('@bed ambience "soft rain over a quiet harbour"')
+    words, n = 0, index * 7
+    while words < target:
+        if n % 6 == 5:
+            line = _MOCK_LINES[n % len(_MOCK_LINES)]
+        else:
+            a = _MOCK_SENTENCES[n % len(_MOCK_SENTENCES)]
+            b = _MOCK_SENTENCES[(n * 5 + 3) % len(_MOCK_SENTENCES)]
+            line = f"{'[softly] ' if whisper and n % 3 == 0 else ''}{a} {b}"
+        out.append(line)
+        words += len(story_script.strip_tags(line.split(":", 1)[-1]).split())
+        if every and n % every == every - 1:
+            out.append(_MOCK_SFX[n % len(_MOCK_SFX)])
+        if n % 10 == 9:
+            out.append("(pause 2)")
+        n += 1
+    if every and sfx_density == "high":
+        out.append("@bed stop")
+    return "\n".join(out)
+
+
+def mock_enhance_story(text: str, direction: str = "") -> str:
+    """The mock Enhance of an audio story script: the markup its action
+    asks for, every other line kept as it is."""
+    from ..services import story_script
+
+    action = (direction or "").split(":", 1)[0].strip().lower()
+    lines = [ln.rstrip() for ln in (text or "").strip().splitlines()]
+    out: list[str] = []
+    for n, ln in enumerate(lines):
+        plain = ln.strip()
+        narration = bool(plain) and not plain.startswith(("#", "@", "//", "(", "[sfx")) and ":" not in plain[:40]
+        if action == "tighten":
+            out.append(re.sub(r"[ \t]{2,}", " ", ln).strip())
+            continue
+        if action == "asmr" and narration and not story_script.has_tags(plain):
+            out.append(f"[whispers] {plain}")
+            continue
+        out.append(ln)
+        if action == "sleep" and narration:
+            out.append("(pause 2)")
+        elif action == "sfx" and narration and n % 3 == 2:
+            out.append("[sfx: soft wind outside | 3s]")
+        elif action == "lengthen" and narration:
+            out.append("The night stayed calm and quiet around them.")
+    return "\n".join(out).strip()
+
+
 class MockChatProvider(ChatProvider):
     """Deterministic storyboard generator used in MOCK_PROVIDERS mode and tests."""
 
@@ -447,9 +535,12 @@ class MockChatProvider(ChatProvider):
         "video": " \u2014 one continuous shot, the camera pushes in gently, real-time pacing",
     }
 
-    def enhance_prompt(self, text: str, kind: str, model: str = "") -> str:
+    def enhance_prompt(self, text: str, kind: str, model: str = "", direction: str = "") -> str:
         """Deterministic: the text plus a short mock suffix (a script is only
-        tidied, never padded with invented lines)."""
+        tidied, never padded with invented lines; an audio story script gets
+        the markup its Enhance action asks for, mock_enhance_story)."""
+        if kind == "audio_script":
+            return mock_enhance_story(text, direction)
         if kind not in ("image", "video", "script", "scene"):
             raise ValueError(f"unknown prompt kind {kind!r}")
         base = text.strip()
@@ -457,6 +548,32 @@ class MockChatProvider(ChatProvider):
             return "\n".join(re.sub(r"[ \t]{2,}", " ", ln).strip() for ln in base.splitlines()).strip()
         suffix = self.ENHANCE_SUFFIX[kind]
         return base if base.endswith(suffix) else (base.rstrip(" ,.") + suffix)
+
+    # ---------- Sound Studio: the story writer ----------
+
+    def story_outline(self, *, premise: str, title: str, minutes: int, style: str, sfx_density: str,
+                      chapters: int) -> str:
+        """Deterministic: a narrator and one adult character, `chapters`
+        chapters (JSON, as the real writer replies)."""
+        import json
+
+        STORY_CALLS.append(("outline", premise))
+        name = (title or "").strip() or "The Quiet Harbour"
+        return json.dumps({
+            "title": name,
+            "cast": [{"name": "NARRATOR", "pan": "center", "description": "calm adult narrator, close to the mic"},
+                     {"name": "MARA", "pan": "left", "description": "adult lighthouse keeper, low warm voice"}],
+            "chapters": [{"title": f"Part {_ORDINALS[i % len(_ORDINALS)]}",
+                          "summary": "Mara keeps the light through a long, calm night."} for i in range(chapters)],
+        })
+
+    def story_chapter(self, *, premise: str, outline: dict, index: int, minutes: float, style: str,
+                      sfx_density: str, previous: str = "") -> str:
+        """Deterministic: about `minutes` of script at the style's reading
+        speed, with speaker lines, tags, pauses and sound cues as dense as
+        asked (story_script markup, no heading)."""
+        STORY_CALLS.append(("chapter", index))
+        return mock_story_chapter(index=index, minutes=minutes, style=style, sfx_density=sfx_density)
 
     def generate_storyboard(self, *, project: dict, cast: CastContext) -> StoryboardPlan:
         script = (project.get("original_script") or "").strip() or "Sample script."

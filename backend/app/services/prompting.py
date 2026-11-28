@@ -20,7 +20,11 @@ PRESETS_KEY = "prompt.presets"
 NEGATIVE_MAX = 1000
 PRESETS_CAP = 200
 KINDS = ("image", "video")
-ENHANCE_KINDS = ("image", "video", "script", "scene")
+ENHANCE_KINDS = ("image", "video", "script", "scene", "audio_script")
+# The longest audio story text one Enhance call rewrites (a selection is
+# rewritten at once up to this; a chapter or the whole story is a job that
+# sends it in pieces of at most this, services/sound_studio.py).
+AUDIO_SCRIPT_MAX = 6000
 
 # No "text"/"logo": users ask for signs and end cards on purpose.
 BUILTIN_NEGATIVES: dict[str, str] = {
@@ -237,6 +241,19 @@ def _check(kind: str, text: str, *, rewrite: bool = False) -> None:
     the prompt check. A rewrite gets only the minors check."""
     from .safety import check_prompt, check_script, validate_script
 
+    if kind == "audio_script":
+        # An audio story: the words read aloud, the markup removed (the
+        # whole story check runs on the result where it is used:
+        # services/sound_studio.py).
+        from .story_script import parse
+
+        doc = parse(text, max_minutes=0)
+        spoken = "\n".join(i.spoken_text for i in doc.speech())
+        if spoken.strip():
+            if not rewrite:
+                validate_script(spoken)
+            check_script(spoken)
+        return
     if kind != "script":
         check_prompt(text)
         return
@@ -266,7 +283,7 @@ def _chat_for(model: str):
     return OpenRouterChatProvider(model=model)
 
 
-def enhance(text: str, kind: str, model: str = "") -> dict:
+def enhance(text: str, kind: str, model: str = "", *, direction: str = "") -> dict:
     """A better prompt from the text model (the planner; DeepSeek in adult
     mode): {"text", "model"} with the model that wrote it. `model` is the
     target generation model (for a model-family hint).
@@ -278,6 +295,8 @@ def enhance(text: str, kind: str, model: str = "") -> dict:
     rewrite that fails the check is refused too (EnhanceRefused)."""
     if kind not in ENHANCE_KINDS:
         raise ValueError(f"unknown prompt kind {kind!r}")
+    if kind == "audio_script" and len(text) > AUDIO_SCRIPT_MAX:
+        raise ValueError(f"at most {AUDIO_SCRIPT_MAX:,} characters of a script are enhanced at once")
     from ..config import get_settings
     from . import content_mode, model_registry
 
@@ -286,7 +305,10 @@ def enhance(text: str, kind: str, model: str = "") -> dict:
 
     def run(m: str) -> tuple[str, str]:
         chat = _chat_for(m)
-        out = chat.enhance_prompt(text, kind, model or "")
+        if kind == "audio_script":
+            out = chat.enhance_prompt(text, kind, model or "", direction=direction)
+        else:
+            out = chat.enhance_prompt(text, kind, model or "")
         return out, getattr(chat, "model", "") or m or model_registry.active_model("chat")
 
     out, used = run("")
@@ -312,7 +334,11 @@ def enhance(text: str, kind: str, model: str = "") -> dict:
         # clip or scene prompt is sent to a picture or video model, so an
         # explicit rewrite is refused (explicit_check.ExplicitContentError:
         # a plain 422).
-        if kind == "script":
+        if kind == "audio_script":
+            from .story_script import parse
+
+            explicit_check.check("\n".join(i.voice_text for i in parse(out, max_minutes=0).speech()))
+        elif kind == "script":
             explicit_check.check(out)
         else:
             explicit_check.check_prompt(out)

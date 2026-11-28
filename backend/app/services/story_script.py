@@ -923,6 +923,22 @@ def assign_keys(items: list[Item]) -> None:
         it.key = base if seen[base] == 1 else f"{base}-{seen[base]}"
 
 
+def line_text(raw: str) -> str:
+    """One raw line as the parser reads it: stripped, and without the sound
+    cues that have '[' or ']' inside (bracketed_cues). What is left is what
+    the parser decides on (a note, a heading, a @cast line, ...)."""
+    s = (raw or "").strip()
+    if s and _CUE_OPEN_RE.search(s):
+        s = _Parser(True, "", None).bracketed_cues(s, 0)
+    return s
+
+
+def is_cast_line(raw: str) -> bool:
+    """Whether the parser takes `raw` as a @cast line (a declaration, or a
+    malformed one it skips)."""
+    return line_text(raw).lower().startswith("@cast")
+
+
 def parse(text: str, *, style: str = "", clean: Optional[bool] = None,
           max_minutes: Optional[float] = None) -> StoryDoc:
     """The script as a StoryDoc. `style` sets the reading speed of the

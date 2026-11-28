@@ -8,7 +8,8 @@ with or without Redis.
 
 Kinds: render | plan | ambient_loop | ambient_render | studio_job |
 training | publish | budget | hook_lab (one alternative opening of a
-video, entity "hook_variant"). Statuses: started | progress | completed |
+video, entity "hook_variant") | sound_story (a Sound Studio story being
+written or enhanced, entity "sound_story"). Statuses: started | progress | completed |
 failed | cancelled. Severity: info | warning | error.
 """
 from __future__ import annotations
@@ -24,7 +25,7 @@ from .. import models
 log = logging.getLogger("avs.events")
 
 KINDS = ("render", "plan", "ambient_loop", "ambient_render", "studio_job", "training", "publish", "budget",
-         "hook_lab")
+         "hook_lab", "sound_story")
 # needs_look: work that stopped short and wants the person (an Ambient
 # batch scene whose loop jumps at the join was not rendered).
 STATUSES = ("started", "progress", "completed", "failed", "cancelled", "needs_look")
@@ -199,6 +200,30 @@ def publish_event(db: Session, job: models.PublishJob, status: str, *, error: st
          severity="error" if status == "failed" else ("warning" if warning else "info"))
 
 
+def sound_story_url(story: Optional[models.SoundStory]) -> str:
+    return f"/sound/stories/{story.id}" if story is not None else ""
+
+
+def sound_story_event(db: Session, story: models.SoundStory, status: str, *, detail: str = "",
+                      error: str = "") -> None:
+    """A Sound Studio story being written or enhanced: started | progress |
+    completed | failed | cancelled. No project (spend ref sound_story:<id>)."""
+    name = _clip(story.title or f"Story {story.id}", 80)
+    what = "Enhance" if (detail or "").startswith("Enhance") else "Story"
+    if status == "completed":
+        title = f"{'Enhance ready' if what == 'Enhance' else 'Script ready'}: {name}"
+    elif status == "failed":
+        title = f"{what} stopped: {plain_error(error)}"
+        detail = f"{name}: {str(error or '')[:600]}"
+    elif status == "cancelled":
+        title = f"Cancelled: {name}"
+    elif status == "started":
+        title = f"{'Enhancing' if what == 'Enhance' else 'Writing'}: {name}"
+    else:
+        title = f"{name}: {detail}" if detail else name
+    emit(db, "sound_story", "sound_story", story.id, status, title, detail=detail, url=sound_story_url(story))
+
+
 # ---------- retention ----------
 
 
@@ -329,11 +354,30 @@ def active(db: Session, *, studio_limit: int = 5) -> dict:
             "stage": "Queued" if pj.status == "queued" else f"Uploading{pct}",
             "status": pj.status, "started_at": _iso(pj.created_at),
         })
+    SS = models.SoundStory
+    for st in (db.query(SS).filter(SS.status.in_(("scripting", "generating", "rendering")))
+               .order_by(SS.updated_at.desc()).limit(20)):
+        task = (st.progress_json or {}).get("task")
+        w = (st.progress_json or {}).get("writer") or {}
+        if st.status != "scripting":
+            stage = st.status.capitalize()
+        elif task == "enhance":
+            stage = "Enhancing the script"
+        elif w.get("chapters"):
+            stage = f"Writing ({int(w.get('chapters_done') or 0)} of {int(w['chapters'])} chapters)"
+        else:
+            stage = "Writing the outline"
+        items.append({
+            "kind": "sound_story", "entity_type": "sound_story", "entity_id": st.id, "project_id": None,
+            "title": _clip(st.title or f"Story {st.id}", 80), "url": sound_story_url(st), "stage": stage,
+            "status": st.status, "started_at": _iso(st.updated_at),
+        })
     counts = {
         "projects": sum(1 for i in items if i["kind"] in ("render", "plan")),
         "ambient": sum(1 for i in items if i["kind"] in ("ambient_render", "ambient_loop")),
         "studio": studio_count,
         "training": sum(1 for i in items if i["kind"] == "training"),
         "publish": sum(1 for i in items if i["kind"] == "publish"),
+        "sound": sum(1 for i in items if i["kind"] == "sound_story"),
     }
     return {"items": items, "studio": studio, "counts": counts}

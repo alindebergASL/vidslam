@@ -19,6 +19,7 @@ from . import (
     providers,
     publishing,
     settings_keys,
+    sound,
     spend,
     studio,
     system,
@@ -43,6 +44,7 @@ api_router.include_router(providers.router, prefix="/api/providers", tags=["prov
 api_router.include_router(system.router, prefix="/api/system", tags=["system"])
 api_router.include_router(training.router, prefix="/api", tags=["training"])
 api_router.include_router(ambient.router, prefix="/api/ambient", tags=["ambient"])
+api_router.include_router(sound.router, prefix="/api/sound", tags=["sound"])
 api_router.include_router(models_api.router, prefix="/api/models", tags=["models"])
 api_router.include_router(youtube.router, prefix="/api", tags=["publishing"])
 api_router.include_router(publishing.router, prefix="/api", tags=["publishing"])

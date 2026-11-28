@@ -120,11 +120,27 @@ class ChatProvider(Protocol):
         {"scene": str, "light": str, "camera": str}."""
         ...
 
-    def enhance_prompt(self, text: str, kind: str, model: str = "") -> str:
+    def enhance_prompt(self, text: str, kind: str, model: str = "", direction: str = "") -> str:
         """An improved prompt for `kind` ("image" | "video" | "script" |
-        "scene"), keeping the user's subject and intent. `model` is the
-        target generation model, used for a model-family hint. Returns the
-        improved text only."""
+        "scene" | "audio_script"), keeping the user's subject and intent.
+        `model` is the target generation model, used for a model-family
+        hint; `direction` is an audio story script's Enhance action. Returns
+        the improved text only."""
+        ...
+
+    def story_outline(self, *, premise: str, title: str, minutes: int, style: str, sfx_density: str,
+                      chapters: int) -> str:
+        """Sound Studio writer: the plan of an audio story as JSON {"title",
+        "cast": [{"name", "pan", "description"}], "chapters": [{"title",
+        "summary"}]}, or a refusal sentinel (prompting.DECLINED /
+        REFUSED_MINOR). Returns the reply text as is."""
+        ...
+
+    def story_chapter(self, *, premise: str, outline: dict, index: int, minutes: float, style: str,
+                      sfx_density: str, previous: str = "") -> str:
+        """Sound Studio writer: chapter `index` (0-based) of the outline in
+        the script markup (services/story_script.py), with no heading, or a
+        refusal sentinel. Returns the reply text as is."""
         ...
 
     def inspect_images(self, *, system: str, text: str, images: list[str],
