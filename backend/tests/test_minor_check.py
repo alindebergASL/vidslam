@@ -217,7 +217,9 @@ def test_adult_mode_asks_the_planner_not_the_adult_text_model(client, monkeypatc
         minor_check.check_generation(IMPLIED, kind="video")
     bodies = [json.loads(c.request.content) for c in route.calls]
     assert [b["model"] for b in bodies] == ["acme/planner-1", "acme/planner-1"]
-    assert bodies[0]["temperature"] == 0 and bodies[0]["max_tokens"] <= 300
+    from app.providers.openrouter_chat import JUDGE_TOKENS
+
+    assert bodies[0]["temperature"] == 0 and bodies[0]["max_tokens"] == JUDGE_TOKENS[0]
     status = minor_check.availability()
     assert (status["model"], status["available"]) == ("acme/planner-1", True) and status["note"]
 

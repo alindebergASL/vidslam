@@ -1244,6 +1244,25 @@ class _Unit:
             return f"{self.label}: {safety_text(self.text, header, prose=True)}"
         return self.plain()
 
+    def judged(self) -> str:
+        """The unit as the story judge reads it: as the guards send it
+        (normalize: NFKC, bracket look-alikes as [ ]), with none of the
+        markers safety_text adds. MINOR_CHECK_SYSTEM tells the judge every
+        parenthesised direction is the user's, so an app-added "(sensual)"
+        after [murmurs] or [tenderly] in a child's bedtime story read as the
+        user's own and was refused (the #68 live check). The local word
+        filter strips the markers anyway (minor_check.story_word_filter),
+        as registry._audio_guard sends a prompt to the model as written
+        since #58. A "(sensual)" the user typed is still in the text."""
+        if self.speech:
+            line = f"{self.label}: {normalize(self.text)}"
+            if self.instructions.strip():
+                line += f" (delivery instructions: {' '.join(normalize(self.instructions).split())})"
+            return line
+        if self.prompt:
+            return f"{self.label}: {normalize(self.text)}"
+        return self.plain()
+
 
 def _units(doc: StoryDoc, music_prompts: tuple[str, ...], title: str, premise: str, *,
            piece: int) -> list[_Unit]:
@@ -1372,8 +1391,12 @@ def check_story(doc: StoryDoc, *, music_prompts: tuple[str, ...] = (), title: st
     facts = minor_check.story_facts_detail(header, windows=["\n".join(plain_units[a:b]) for a, b in ranges] or [""],
                                            names=required, known=list(doc.cast))
     context = story_context(doc, music_prompts=music_prompts, title=title, premise=premise, facts=facts.line)
-    marked = [u.marked(context) for u in units]
-    windows, part_lines = minor_check.story_judge_windows(marked, ranges, facts, context)
+    # The judge reads each unit unmarked (_Unit.judged): the app's markers
+    # are for the word layer only, which strips them (story_word_filter).
+    # The verdict cache is keyed by exactly what the judge was shown, so a
+    # verdict given on the marked text is never reused for this one.
+    judged = [u.judged() for u in units]
+    windows, part_lines = minor_check.story_judge_windows(judged, ranges, facts, context)
     minor_check.check_story_windows(windows or [""], part_lines or [""], context=context,
                                     summary=facts.summary_line())
     clean = explicit_check.active()
